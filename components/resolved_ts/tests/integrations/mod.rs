@@ -2,13 +2,13 @@
 
 #[path = "../mod.rs"]
 mod testsuite;
-use std::time::Duration;
+pub use testsuite::*;
 
 use futures::executor::block_on;
 use kvproto::kvrpcpb::*;
 use pd_client::PdClient;
+use std::time::Duration;
 use test_raftstore::sleep_ms;
-pub use testsuite::*;
 
 #[test]
 fn test_resolved_ts_basic() {

@@ -2,14 +2,13 @@
 
 #[macro_use]
 extern crate quote;
+extern crate proc_macro;
 
 use proc_macro2::{Group, TokenStream, TokenTree};
 use quote::ToTokens;
-use syn::{
-    parse::{Parse, ParseStream, Result},
-    punctuated::Punctuated,
-    *,
-};
+use syn::parse::{Parse, ParseStream, Result};
+use syn::punctuated::Punctuated;
+use syn::*;
 
 /// This crate provides a macro that can be used to append a match expression with multiple
 /// arms, where the tokens in the first arm, as a template, can be subsitituted and the template

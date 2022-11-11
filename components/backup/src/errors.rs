@@ -1,21 +1,17 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{error, io::Error as IoError, result};
+use std::io::Error as IoError;
+use std::{error, result};
 
+use crossbeam::channel::{RecvError, SendError};
 use engine_traits::Error as EngineTraitError;
-use kvproto::{
-    brpb::Error as ErrorPb,
-    errorpb::{Error as RegionError, ServerIsBusy},
-    kvrpcpb::KeyError,
-};
+use kvproto::brpb::Error as ErrorPb;
+use kvproto::errorpb::{Error as RegionError, ServerIsBusy};
+use kvproto::kvrpcpb::KeyError;
 use thiserror::Error;
-use tikv::storage::{
-    kv::{Error as KvError, ErrorInner as EngineErrorInner},
-    mvcc::{Error as MvccError, ErrorInner as MvccErrorInner},
-    txn::{Error as TxnError, ErrorInner as TxnErrorInner},
-};
-use tikv_util::codec::Error as CodecError;
-use tokio::sync::AcquireError;
+use tikv::storage::kv::{Error as KvError, ErrorInner as EngineErrorInner};
+use tikv::storage::mvcc::{Error as MvccError, ErrorInner as MvccErrorInner};
+use tikv::storage::txn::{Error as TxnError, ErrorInner as TxnErrorInner};
 
 use crate::metrics::*;
 
@@ -118,12 +114,10 @@ pub enum Error {
     ClusterID { current: u64, request: u64 },
     #[error("Invalid cf {cf}")]
     InvalidCf { cf: String },
-    #[error("Failed to acquire the semaphore {0}")]
-    Semaphore(#[from] AcquireError),
-    #[error("Channel is closed")]
-    ChannelClosed,
-    #[error("Codec error {0}")]
-    Codec(#[from] CodecError),
+    #[error("Failed to recv message from channel: {0}")]
+    ChannelRecv(#[from] RecvError),
+    #[error("Failed to send message to channel: {0}")]
+    ChannelSend(#[from] SendError<()>),
 }
 
 macro_rules! impl_from {
@@ -140,12 +134,6 @@ macro_rules! impl_from {
 
 impl_from! {
     String => Rocks,
-}
-
-impl<T> From<async_channel::SendError<T>> for Error {
-    fn from(_: async_channel::SendError<T>) -> Self {
-        Self::ChannelClosed
-    }
 }
 
 pub type Result<T> = result::Result<T, Error>;

@@ -7,7 +7,7 @@
 use std::io;
 
 /// A cross-platform CPU statistics data structure.
-#[derive(Debug, Copy, Clone, Default, PartialEq)]
+#[derive(Default, PartialEq)]
 pub struct ThreadStat {
     // libc::clock_t is not used here because the definition of
     // clock_t is different on linux and bsd.
@@ -25,7 +25,7 @@ impl ThreadStat {
 
 #[inline]
 fn cpu_total(sys_time: i64, user_time: i64) -> f64 {
-    (sys_time + user_time) as f64 / ticks_per_second() as f64
+    (sys_time + user_time) as f64 / clock_tick() as f64
 }
 
 #[cfg(target_os = "linux")]
@@ -38,13 +38,11 @@ pub mod linux {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::{
-        fs,
-        io::{self, Error},
-        iter::FromIterator,
-    };
-
     use libc::c_int;
+    use std::fs;
+    use std::io::{self, Error};
+    use std::iter::FromIterator;
+
     pub use libc::pid_t as Pid;
     pub use procinfo::pid::{self, Stat as FullStat};
 
@@ -60,7 +58,7 @@ mod imp {
     }
 
     #[inline]
-    pub fn ticks_per_second() -> i64 {
+    pub fn clock_tick() -> i64 {
         *CLOCK_TICK
     }
 
@@ -160,10 +158,9 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use std::io::ErrorKind;
-
         use super::*;
         use crate::sys::HIGH_PRI;
+        use std::io::ErrorKind;
 
         #[test]
         fn test_set_priority() {
@@ -184,121 +181,10 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
-#[allow(bad_style)]
+#[cfg(not(target_os = "linux"))]
 mod imp {
-    use std::{io, iter::FromIterator, mem::size_of, ptr::null_mut, slice};
-
-    use libc::*;
-
-    pub type Pid = mach_port_t;
-
-    type task_inspect_t = mach_port_t;
-    type thread_act_t = mach_port_t;
-    type thread_act_array_t = *mut thread_act_t;
-
-    extern "C" {
-        fn task_threads(
-            target_task: task_inspect_t,
-            act_list: *mut thread_act_array_t,
-            act_listCnt: *mut mach_msg_type_number_t,
-        ) -> kern_return_t;
-    }
-
-    const MICRO_SEC_PER_SEC: i64 = 1_000_000;
-
-    #[derive(Default)]
-    pub struct FullStat {
-        pub stime: i64,
-        pub utime: i64,
-        pub command: String,
-    }
-
-    /// Unlike Linux, the unit of `stime` and `utime` is microseconds instead of ticks.
-    /// See [`full_thread_stat()`]
-    #[inline]
-    pub fn ticks_per_second() -> i64 {
-        MICRO_SEC_PER_SEC
-    }
-
-    /// Gets the ID of the current process.
-    #[inline]
-    pub fn process_id() -> Pid {
-        unsafe { mach_task_self_ }
-    }
-
-    /// Gets the ID of the current thread.
-    #[inline]
-    pub fn thread_id() -> Pid {
-        unsafe { mach_thread_self() }
-    }
-
-    pub fn thread_ids<C: FromIterator<Pid>>(pid: Pid) -> io::Result<C> {
-        // https://www.gnu.org/software/hurd/gnumach-doc/Task-Information.html
-
-        unsafe {
-            let mut act_list: thread_act_array_t = null_mut();
-            let mut act_count: mach_msg_type_number_t = 0;
-            let ret = task_threads(pid, &mut act_list, &mut act_count);
-            if ret != KERN_SUCCESS {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-
-            let pids = slice::from_raw_parts_mut(act_list, act_count as _)
-                .iter()
-                .copied()
-                .collect();
-
-            vm_deallocate(
-                pid,
-                act_list as vm_address_t,
-                size_of::<thread_act_t>() * act_count as usize,
-            );
-
-            Ok(pids)
-        }
-    }
-
-    pub fn full_thread_stat(_pid: Pid, tid: Pid) -> io::Result<FullStat> {
-        // https://www.gnu.org/software/hurd/gnumach-doc/Thread-Information.html
-
-        unsafe {
-            let flavor = THREAD_BASIC_INFO;
-            let mut info = std::mem::zeroed::<thread_basic_info>();
-            let mut thread_info_cnt = THREAD_BASIC_INFO_COUNT;
-
-            let ret = thread_info(
-                tid,
-                flavor as task_flavor_t,
-                (&mut info as *mut _) as thread_info_t,
-                &mut thread_info_cnt,
-            );
-            if ret != KERN_SUCCESS {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-
-            Ok(FullStat {
-                stime: info.system_time.seconds as i64 * 1_000_000
-                    + info.system_time.microseconds as i64,
-                utime: info.user_time.seconds as i64 * 1_000_000
-                    + info.user_time.microseconds as i64,
-                ..Default::default()
-            })
-        }
-    }
-
-    pub fn set_priority(_: i32) -> io::Result<()> {
-        Ok(())
-    }
-
-    pub fn get_priority() -> io::Result<i32> {
-        Ok(0)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod imp {
-    use std::{io, iter::FromIterator};
+    use std::io;
+    use std::iter::FromIterator;
 
     pub type Pid = u32;
 
@@ -314,7 +200,7 @@ mod imp {
     }
 
     #[inline]
-    pub fn ticks_per_second() -> i64 {
+    pub fn clock_tick() -> i64 {
         1
     }
 
@@ -363,11 +249,6 @@ pub fn current_thread_stat() -> io::Result<ThreadStat> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashSet,
-        sync::{Arc, Condvar, Mutex},
-    };
-
     use super::*;
 
     #[test]
@@ -383,48 +264,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn test_thread_ids() {
-        const THREAD_COUNT: usize = 10;
-        let (tx, rx) = crossbeam::channel::bounded(THREAD_COUNT);
-
-        #[allow(clippy::mutex_atomic)]
-        let stop_threads_cvar = Arc::new((Mutex::new(false), Condvar::new()));
-
-        let threads = (0..THREAD_COUNT)
-            .map(|_| {
-                let tx = tx.clone();
-                let stop_threads_cvar = stop_threads_cvar.clone();
-                std::thread::spawn(move || {
-                    tx.send(thread_id()).unwrap();
-
-                    let (lock, cvar) = &*stop_threads_cvar;
-                    let _guard = cvar
-                        .wait_while(lock.lock().unwrap(), |stop| !*stop)
-                        .unwrap();
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let actual_tids = rx.iter().take(THREAD_COUNT).collect::<Vec<_>>();
-        let ids = thread_ids::<HashSet<_>>(process_id()).unwrap();
-        for tid in &actual_tids {
-            assert!(ids.contains(tid));
-        }
-
-        {
-            let (lock, cvar) = &*stop_threads_cvar;
-            *lock.lock().unwrap() = true;
-            cvar.notify_all();
-        }
-        for thread in threads {
-            thread.join().unwrap();
-        }
-
-        let stopped_tids = actual_tids;
-        let ids = thread_ids::<HashSet<_>>(process_id()).unwrap();
-        for tid in &stopped_tids {
-            assert!(!ids.contains(tid));
-        }
+        let ids: std::io::Result<Vec<_>> = thread_ids(process_id());
+        assert!(ids.is_ok());
+        assert!(!ids.unwrap().is_empty());
     }
 }

@@ -2,78 +2,67 @@
 
 // #[PerformanceCriticalPath]: Tikv gRPC APIs implementation
 use std::sync::Arc;
+use tikv_util::time::{duration_to_ms, duration_to_sec, Instant};
 
-use api_version::KvFormat;
-use fail::fail_point;
-use futures::{
-    compat::Future01CompatExt,
-    future::{self, Future, FutureExt, TryFutureExt},
-    sink::SinkExt,
-    stream::{StreamExt, TryStreamExt},
+use super::batch::{BatcherBuilder, ReqBatcher};
+use crate::coprocessor::Endpoint;
+use crate::server::gc_worker::GcWorker;
+use crate::server::load_statistics::ThreadLoadPool;
+use crate::server::metrics::*;
+use crate::server::snap::Task as SnapTask;
+use crate::server::Error;
+use crate::server::Proxy;
+use crate::server::Result as ServerResult;
+use crate::storage::{
+    errors::{
+        extract_committed, extract_key_error, extract_key_errors, extract_kv_pairs,
+        extract_region_error, map_kv_pairs,
+    },
+    kv::Engine,
+    lock_manager::LockManager,
+    SecondaryLocksStatus, Storage, TxnStatus,
 };
+use crate::{coprocessor_v2, log_net_error};
+use crate::{forward_duplex, forward_unary};
+use fail::fail_point;
+use futures::compat::Future01CompatExt;
+use futures::future::{self, Future, FutureExt, TryFutureExt};
+use futures::sink::SinkExt;
+use futures::stream::{StreamExt, TryStreamExt};
 use grpcio::{
     ClientStreamingSink, DuplexSink, Error as GrpcError, RequestStream, Result as GrpcResult,
     RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink, WriteFlags,
 };
-use kvproto::{
-    coprocessor::*,
-    errorpb::{Error as RegionError, *},
-    kvrpcpb::*,
-    mpp::*,
-    raft_cmdpb::{CmdType, RaftCmdRequest, RaftRequestHeader, Request as RaftRequest},
-    raft_serverpb::*,
-    tikvpb::*,
-};
-use protobuf::RepeatedField;
+use kvproto::coprocessor::*;
+use kvproto::errorpb::{Error as RegionError, *};
+use kvproto::kvrpcpb::*;
+use kvproto::mpp::*;
+use kvproto::raft_cmdpb::{CmdType, RaftCmdRequest, RaftRequestHeader, Request as RaftRequest};
+use kvproto::raft_serverpb::*;
+use kvproto::tikvpb::*;
 use raft::eraftpb::MessageType;
-use raftstore::{
-    router::RaftStoreRouter,
-    store::{
-        memory::{MEMTRACE_APPLYS, MEMTRACE_RAFT_ENTRIES, MEMTRACE_RAFT_MESSAGES},
-        metrics::RAFT_ENTRIES_CACHES_GAUGE,
-        Callback, CasualMessage, CheckLeaderTask, RaftCmdExtraOpts,
-    },
-    DiscardReason, Error as RaftStoreError, Result as RaftStoreResult,
-};
+use raftstore::router::RaftStoreRouter;
+use raftstore::store::memory::{MEMTRACE_RAFT_ENTRIES, MEMTRACE_RAFT_MESSAGES};
+use raftstore::store::CheckLeaderTask;
+use raftstore::store::{Callback, CasualMessage, RaftCmdExtraOpts};
+use raftstore::{DiscardReason, Error as RaftStoreError, Result as RaftStoreResult};
 use tikv_alloc::trace::MemoryTraceGuard;
-use tikv_util::{
-    future::{paired_future_callback, poll_future_notify},
-    mpsc::batch::{unbounded, BatchCollector, BatchReceiver, Sender},
-    sys::memory_usage_reaches_high_water,
-    time::{duration_to_ms, duration_to_sec, Instant},
-    worker::Scheduler,
-};
+use tikv_util::future::{paired_future_callback, poll_future_notify};
+use tikv_util::mpsc::batch::{unbounded, BatchCollector, BatchReceiver, Sender};
+use tikv_util::sys::memory_usage_reaches_high_water;
+use tikv_util::worker::Scheduler;
 use txn_types::{self, Key};
-
-use super::batch::{BatcherBuilder, ReqBatcher};
-use crate::{
-    coprocessor::Endpoint,
-    coprocessor_v2, forward_duplex, forward_unary, log_net_error,
-    server::{
-        gc_worker::GcWorker, load_statistics::ThreadLoadPool, metrics::*, snap::Task as SnapTask,
-        Error, Proxy, Result as ServerResult,
-    },
-    storage::{
-        errors::{
-            extract_committed, extract_key_error, extract_key_errors, extract_kv_pairs,
-            extract_region_error, map_kv_pairs,
-        },
-        kv::Engine,
-        lock_manager::LockManager,
-        SecondaryLocksStatus, Storage, TxnStatus,
-    },
-};
 
 const GRPC_MSG_MAX_BATCH_SIZE: usize = 128;
 const GRPC_MSG_NOTIFY_SIZE: usize = 8;
 
 /// Service handles the RPC messages for the `Tikv` service.
-pub struct Service<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, F: KvFormat> {
+pub struct Service<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager> {
     store_id: u64,
     /// Used to handle requests related to GC.
     gc_worker: GcWorker<E, T>,
     // For handling KV requests.
-    storage: Storage<E, L, F>,
+    storage: Storage<E, L>,
     // For handling coprocessor requests.
     copr: Endpoint<E>,
     // For handling corprocessor v2 requests.
@@ -95,12 +84,8 @@ pub struct Service<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockMan
     reject_messages_on_memory_ratio: f64,
 }
 
-impl<
-    T: RaftStoreRouter<E::Local> + Clone + 'static,
-    E: Engine + Clone,
-    L: LockManager + Clone,
-    F: KvFormat,
-> Clone for Service<T, E, L, F>
+impl<T: RaftStoreRouter<E::Local> + Clone + 'static, E: Engine + Clone, L: LockManager + Clone>
+    Clone for Service<T, E, L>
 {
     fn clone(&self) -> Self {
         Service {
@@ -120,13 +105,11 @@ impl<
     }
 }
 
-impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, F: KvFormat>
-    Service<T, E, L, F>
-{
+impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager> Service<T, E, L> {
     /// Constructs a new `Service` which provides the `Tikv` service.
     pub fn new(
         store_id: u64,
-        storage: Storage<E, L, F>,
+        storage: Storage<E, L>,
         gc_worker: GcWorker<E, T>,
         copr: Endpoint<E>,
         copr_v2: coprocessor_v2::Endpoint,
@@ -209,9 +192,7 @@ macro_rules! handle_request {
     }
 }
 
-impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, F: KvFormat> Tikv
-    for Service<T, E, L, F>
-{
+impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager> Tikv for Service<T, E, L> {
     handle_request!(kv_get, future_get, GetRequest, GetResponse);
     handle_request!(kv_scan, future_scan, ScanRequest, ScanResponse);
     handle_request!(
@@ -787,12 +768,9 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, F: KvFor
         let (cb, f) = paired_future_callback();
         let mut split_keys = if req.is_raw_kv {
             if !req.get_split_key().is_empty() {
-                vec![F::encode_raw_key_owned(req.take_split_key(), None).into_encoded()]
+                vec![req.get_split_key().to_vec()]
             } else {
-                req.take_split_keys()
-                    .into_iter()
-                    .map(|x| F::encode_raw_key_owned(x, None).into_encoded())
-                    .collect()
+                req.take_split_keys().to_vec()
             }
         } else {
             if !req.get_split_key().is_empty() {
@@ -1193,9 +1171,9 @@ fn response_batch_commands_request<F, T>(
     poll_future_notify(task);
 }
 
-fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
+fn handle_batch_commands_request<E: Engine, L: LockManager>(
     batcher: &mut Option<ReqBatcher>,
-    storage: &Storage<E, L, F>,
+    storage: &Storage<E, L>,
     copr: &Endpoint<E>,
     copr_v2: &coprocessor_v2::Endpoint,
     peer: &str,
@@ -1316,14 +1294,14 @@ async fn future_handle_empty(
     Ok(res)
 }
 
-fn future_get<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_get<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: GetRequest,
 ) -> impl Future<Output = ServerResult<GetResponse>> {
     let start = Instant::now();
     let v = storage.get(
         req.take_context(),
-        Key::from_raw(req.get_key()),
+        req.get_key().into(),
         req.get_version().into(),
     );
 
@@ -1335,16 +1313,14 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
             resp.set_region_error(err);
         } else {
             match v {
-                Ok((val, stats)) => {
+                Ok((val, statistics, perf_statistics_delta)) => {
                     let exec_detail_v2 = resp.mut_exec_details_v2();
-                    let scan_detail_v2 = exec_detail_v2.mut_scan_detail_v2();
-                    stats.stats.write_scan_detail(scan_detail_v2);
-                    stats.perf_stats.write_scan_detail(scan_detail_v2);
-                    let time_detail = exec_detail_v2.mut_time_detail();
-                    time_detail.set_kv_read_wall_time_ms(duration_ms as i64);
-                    time_detail.set_wait_wall_time_ms(stats.latency_stats.wait_wall_time_ms as i64);
-                    time_detail
-                        .set_process_wall_time_ms(stats.latency_stats.process_wall_time_ms as i64);
+                    exec_detail_v2
+                        .mut_time_detail()
+                        .set_kv_read_wall_time_ms(duration_ms as i64);
+                    let scan_detail_v2 = resp.mut_exec_details_v2().mut_scan_detail_v2();
+                    statistics.write_scan_detail(scan_detail_v2);
+                    perf_statistics_delta.write_scan_detail(scan_detail_v2);
                     match val {
                         Some(val) => resp.set_value(val),
                         None => resp.set_not_found(true),
@@ -1357,12 +1333,11 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_scan<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_scan<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: ScanRequest,
 ) -> impl Future<Output = ServerResult<ScanResponse>> {
     let end_key = Key::from_raw_maybe_unbounded(req.get_end_key());
-
     let v = storage.scan(
         req.take_context(),
         Key::from_raw(req.get_start_key()),
@@ -1398,13 +1373,16 @@ fn future_scan<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_batch_get<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: BatchGetRequest,
 ) -> impl Future<Output = ServerResult<BatchGetResponse>> {
     let start = Instant::now();
-    let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
-    let v = storage.batch_get(req.take_context(), keys, req.get_version().into());
+    let v = storage.batch_get(
+        req.take_context(),
+        req.get_keys().to_vec(),
+        req.get_version().into(),
+    );
 
     async move {
         let v = v.await;
@@ -1414,17 +1392,15 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
             resp.set_region_error(err);
         } else {
             match v {
-                Ok((kv_res, stats)) => {
+                Ok((kv_res, statistics, perf_statistics_delta)) => {
                     let pairs = map_kv_pairs(kv_res);
                     let exec_detail_v2 = resp.mut_exec_details_v2();
-                    let scan_detail_v2 = exec_detail_v2.mut_scan_detail_v2();
-                    stats.stats.write_scan_detail(scan_detail_v2);
-                    stats.perf_stats.write_scan_detail(scan_detail_v2);
-                    let time_detail = exec_detail_v2.mut_time_detail();
-                    time_detail.set_kv_read_wall_time_ms(duration_ms as i64);
-                    time_detail.set_wait_wall_time_ms(stats.latency_stats.wait_wall_time_ms as i64);
-                    time_detail
-                        .set_process_wall_time_ms(stats.latency_stats.process_wall_time_ms as i64);
+                    exec_detail_v2
+                        .mut_time_detail()
+                        .set_kv_read_wall_time_ms(duration_ms as i64);
+                    let scan_detail_v2 = resp.mut_exec_details_v2().mut_scan_detail_v2();
+                    statistics.write_scan_detail(scan_detail_v2);
+                    perf_statistics_delta.write_scan_detail(scan_detail_v2);
                     resp.set_pairs(pairs.into());
                 }
                 Err(e) => {
@@ -1441,8 +1417,8 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_scan_lock<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_scan_lock<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: ScanLockRequest,
 ) -> impl Future<Output = ServerResult<ScanLockResponse>> {
     let start_key = Key::from_raw_maybe_unbounded(req.get_start_key());
@@ -1477,8 +1453,8 @@ async fn future_gc(_: GcRequest) -> ServerResult<GcResponse> {
     ))))
 }
 
-fn future_delete_range<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_delete_range<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: DeleteRangeRequest,
 ) -> impl Future<Output = ServerResult<DeleteRangeResponse>> {
     let (cb, f) = paired_future_callback();
@@ -1505,8 +1481,8 @@ fn future_delete_range<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_get<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_get<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawGetRequest,
 ) -> impl Future<Output = ServerResult<RawGetResponse>> {
     let v = storage.raw_get(req.take_context(), req.take_cf(), req.take_key());
@@ -1527,8 +1503,8 @@ fn future_raw_get<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_batch_get<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_batch_get<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawBatchGetRequest,
 ) -> impl Future<Output = ServerResult<RawBatchGetResponse>> {
     let keys = req.take_keys().into();
@@ -1546,8 +1522,8 @@ fn future_raw_batch_get<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_put<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_put<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawPutRequest,
 ) -> impl Future<Output = ServerResult<RawPutResponse>> {
     let (cb, f) = paired_future_callback();
@@ -1586,8 +1562,8 @@ fn future_raw_put<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_batch_put<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_batch_put<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawBatchPutRequest,
 ) -> impl Future<Output = ServerResult<RawBatchPutResponse>> {
     let cf = req.take_cf();
@@ -1633,8 +1609,8 @@ fn future_raw_batch_put<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_delete<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_delete<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawDeleteRequest,
 ) -> impl Future<Output = ServerResult<RawDeleteResponse>> {
     let (cb, f) = paired_future_callback();
@@ -1660,8 +1636,8 @@ fn future_raw_delete<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_batch_delete<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_batch_delete<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawBatchDeleteRequest,
 ) -> impl Future<Output = ServerResult<RawBatchDeleteResponse>> {
     let cf = req.take_cf();
@@ -1689,8 +1665,8 @@ fn future_raw_batch_delete<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_scan<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_scan<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawScanRequest,
 ) -> impl Future<Output = ServerResult<RawScanResponse>> {
     let end_key = if req.get_end_key().is_empty() {
@@ -1720,8 +1696,8 @@ fn future_raw_scan<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_batch_scan<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_batch_scan<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawBatchScanRequest,
 ) -> impl Future<Output = ServerResult<RawBatchScanResponse>> {
     let v = storage.raw_batch_scan(
@@ -1745,8 +1721,8 @@ fn future_raw_batch_scan<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_delete_range<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_delete_range<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawDeleteRangeRequest,
 ) -> impl Future<Output = ServerResult<RawDeleteRangeResponse>> {
     let (cb, f) = paired_future_callback();
@@ -1773,8 +1749,8 @@ fn future_raw_delete_range<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_get_key_ttl<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_get_key_ttl<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawGetKeyTtlRequest,
 ) -> impl Future<Output = ServerResult<RawGetKeyTtlResponse>> {
     let v = storage.raw_get_key_ttl(req.take_context(), req.take_cf(), req.take_key());
@@ -1795,8 +1771,8 @@ fn future_raw_get_key_ttl<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_compare_and_swap<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_compare_and_swap<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawCasRequest,
 ) -> impl Future<Output = ServerResult<RawCasResponse>> {
     let (cb, f) = paired_future_callback();
@@ -1839,8 +1815,8 @@ fn future_raw_compare_and_swap<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-fn future_raw_checksum<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+fn future_raw_checksum<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
     mut req: RawChecksumRequest,
 ) -> impl Future<Output = ServerResult<RawChecksumResponse>> {
     let f = storage.raw_checksum(
@@ -1876,9 +1852,9 @@ fn future_copr<E: Engine>(
     async move { Ok(ret.await) }
 }
 
-fn future_raw_coprocessor<E: Engine, L: LockManager, F: KvFormat>(
+fn future_raw_coprocessor<E: Engine, L: LockManager>(
     copr_v2: &coprocessor_v2::Endpoint,
-    storage: &Storage<E, L, F>,
+    storage: &Storage<E, L>,
     req: RawCoprocessorRequest,
 ) -> impl Future<Output = ServerResult<RawCoprocessorResponse>> {
     let ret = copr_v2.handle_request(storage, req);
@@ -1887,8 +1863,8 @@ fn future_raw_coprocessor<E: Engine, L: LockManager, F: KvFormat>(
 
 macro_rules! txn_command_future {
     ($fn_name: ident, $req_ty: ident, $resp_ty: ident, ($req: ident) $prelude: stmt; ($v: ident, $resp: ident) { $else_branch: expr }) => {
-        fn $fn_name<E: Engine, L: LockManager, F: KvFormat>(
-            storage: &Storage<E, L, F>,
+        fn $fn_name<E: Engine, L: LockManager>(
+            storage: &Storage<E, L>,
             $req: $req_ty,
         ) -> impl Future<Output = ServerResult<$resp_ty>> {
             $prelude
@@ -2030,6 +2006,7 @@ txn_command_future!(future_mvcc_get_by_start_ts, MvccGetByStartTsRequest, MvccGe
     }
 });
 
+#[cfg(feature = "protobuf-codec")]
 pub mod batch_commands_response {
     pub type Response = kvproto::tikvpb::BatchCommandsResponseResponse;
 
@@ -2038,6 +2015,7 @@ pub mod batch_commands_response {
     }
 }
 
+#[cfg(feature = "protobuf-codec")]
 pub mod batch_commands_request {
     pub type Request = kvproto::tikvpb::BatchCommandsRequestRequest;
 
@@ -2045,6 +2023,12 @@ pub mod batch_commands_request {
         pub type Cmd = kvproto::tikvpb::BatchCommandsRequest_Request_oneof_cmd;
     }
 }
+
+#[cfg(feature = "prost-codec")]
+pub use kvproto::tikvpb::batch_commands_request;
+#[cfg(feature = "prost-codec")]
+pub use kvproto::tikvpb::batch_commands_response;
+use protobuf::RepeatedField;
 
 /// To measure execute time for a given request.
 #[derive(Debug)]
@@ -2119,24 +2103,14 @@ fn raftstore_error_to_region_error(e: RaftStoreError, region_id: u64) -> RegionE
 
 fn needs_reject_raft_append(reject_messages_on_memory_ratio: f64) -> bool {
     fail_point!("needs_reject_raft_append", |_| true);
-    if reject_messages_on_memory_ratio < f64::EPSILON {
+    if reject_messages_on_memory_ratio - 0.0 < std::f64::EPSILON {
         return false;
     }
 
     let mut usage = 0;
     if memory_usage_reaches_high_water(&mut usage) {
         let raft_msg_usage = (MEMTRACE_RAFT_ENTRIES.sum() + MEMTRACE_RAFT_MESSAGES.sum()) as u64;
-        let cached_entries = RAFT_ENTRIES_CACHES_GAUGE.get() as u64;
-        let applying_entries = MEMTRACE_APPLYS.sum() as u64;
-        if (raft_msg_usage + cached_entries + applying_entries) as f64
-            > usage as f64 * reject_messages_on_memory_ratio
-        {
-            debug!("need reject log append on memory limit";
-                "raft messages" => raft_msg_usage,
-                "cached entries" => cached_entries,
-                "applying entries" => applying_entries,
-                "current usage" => usage,
-                "reject ratio" => reject_messages_on_memory_ratio);
+        if raft_msg_usage as f64 > usage as f64 * reject_messages_on_memory_ratio {
             return true;
         }
     }
@@ -2145,11 +2119,10 @@ fn needs_reject_raft_append(reject_messages_on_memory_ratio: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
-
-    use futures::{channel::oneshot, executor::block_on};
-
     use super::*;
+    use futures::channel::oneshot;
+    use futures::executor::block_on;
+    use std::thread;
 
     #[test]
     fn test_poll_future_notify_with_slow_source() {

@@ -1,10 +1,10 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::Arc;
-
-use kvproto::{kvrpcpb::Op, metapb::Peer};
+use kvproto::kvrpcpb::Op;
+use kvproto::metapb::Peer;
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
+use std::sync::Arc;
 use test_raftstore::*;
 
 fn prepare_for_stale_read(leader: Peer) -> (Cluster<ServerCluster>, Arc<TestPdClient>, PeerClient) {
@@ -313,7 +313,7 @@ fn test_stale_read_while_applying_snapshot() {
     );
 
     // Compact logs to force requesting snapshot after clearing send filters.
-    let gc_limit = cluster.cfg.raft_store.raft_log_gc_count_limit();
+    let gc_limit = cluster.cfg.raft_store.raft_log_gc_count_limit;
     let state = cluster.truncated_state(1, 1);
     for i in 1..gc_limit * 10 {
         let (k, v) = (
@@ -401,11 +401,11 @@ fn test_stale_read_while_region_merge() {
 
     let mut follower_client2 = PeerClient::new(&cluster, target.get_id(), new_peer(2, 2));
     follower_client2.ctx.set_stale_read(true);
-    // We can read `(key5, value1)` with `k1_prewrite_ts`
-    follower_client2.must_kv_read_equal(b"key5".to_vec(), b"value1".to_vec(), k1_prewrite_ts);
     // Can't read `key5` with `k5_commit_ts` because `k1_prewrite_ts` is smaller than `k5_commit_ts`
     let resp = follower_client2.kv_read(b"key5".to_vec(), k5_commit_ts);
     assert!(resp.get_region_error().has_data_is_not_ready());
+    // We can read `(key5, value1)` with `k1_prewrite_ts`
+    follower_client2.must_kv_read_equal(b"key5".to_vec(), b"value1".to_vec(), k1_prewrite_ts);
 
     let target_leader = PeerClient::new(&cluster, target.get_id(), new_peer(1, 1));
     // Commit on `key1`

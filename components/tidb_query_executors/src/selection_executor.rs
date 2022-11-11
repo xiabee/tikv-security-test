@@ -2,16 +2,18 @@
 
 use std::sync::Arc;
 
-use tidb_query_common::{storage::IntervalRange, Result};
-use tidb_query_datatype::{
-    codec::data_type::*,
-    expr::{EvalConfig, EvalContext},
-    match_template_evaltype,
-};
-use tidb_query_expr::{RpnExpression, RpnExpressionBuilder, RpnStackNode};
-use tipb::{Expr, FieldType, Selection};
+use tipb::Expr;
+use tipb::FieldType;
+use tipb::Selection;
 
 use crate::interface::*;
+use tidb_query_common::storage::IntervalRange;
+use tidb_query_common::Result;
+use tidb_query_datatype::codec::data_type::*;
+use tidb_query_datatype::expr::{EvalConfig, EvalContext};
+use tidb_query_datatype::match_template_evaltype;
+use tidb_query_expr::RpnStackNode;
+use tidb_query_expr::{RpnExpression, RpnExpressionBuilder};
 
 pub struct BatchSelectionExecutor<Src: BatchExecutor> {
     context: EvalContext,
@@ -67,7 +69,9 @@ impl<Src: BatchExecutor> BatchSelectionExecutor<Src> {
     /// When errors are returned, it means there are errors during the evaluation. Currently
     /// we treat this situation as "completely failed".
     fn handle_src_result(&mut self, src_result: &mut BatchExecuteResult) -> Result<()> {
-        // We handle errors in next_batch, so we can ingore it here.
+        // When there are errors in `src_result`, it means that the first several rows do not
+        // have error, which should be filtered according to predicate in this executor.
+        // So we actually don't care whether or not there are errors from src executor.
 
         // TODO: Avoid allocation.
         let mut src_logical_rows_copy = Vec::with_capacity(src_result.logical_rows.len());
@@ -131,7 +135,7 @@ fn update_logical_rows_by_vector_value<'a, TT: EvaluableRef<'a>, T: 'a + ChunkRe
     logical_rows: &mut Vec<usize>,
     ctx: &mut EvalContext,
     eval_result: T,
-    eval_result_logical_rows: LogicalRows<'_>,
+    eval_result_logical_rows: LogicalRows,
 ) -> tidb_query_common::error::Result<()>
 where
     Option<TT>: AsMySQLBool,
@@ -211,11 +215,14 @@ impl<Src: BatchExecutor> BatchExecutor for BatchSelectionExecutor<Src> {
 
 #[cfg(test)]
 mod tests {
-    use tidb_query_codegen::rpn_fn;
-    use tidb_query_datatype::{codec::batch::LazyBatchColumnVec, expr::EvalWarnings, FieldTypeTp};
-
     use super::*;
+
+    use tidb_query_codegen::rpn_fn;
+    use tidb_query_datatype::FieldTypeTp;
+
     use crate::util::mock_executor::MockExecutor;
+    use tidb_query_datatype::codec::batch::LazyBatchColumnVec;
+    use tidb_query_datatype::expr::EvalWarnings;
 
     #[test]
     fn test_empty_rows() {

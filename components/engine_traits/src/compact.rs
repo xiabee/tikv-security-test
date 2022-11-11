@@ -2,9 +2,8 @@
 
 //! Functionality related to compaction
 
-use std::collections::BTreeMap;
-
 use crate::errors::Result;
+use std::collections::BTreeMap;
 
 pub trait CompactExt {
     type CompactedEvent: CompactedEvent;

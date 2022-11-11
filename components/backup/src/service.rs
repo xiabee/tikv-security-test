@@ -2,10 +2,12 @@
 
 use std::sync::atomic::*;
 
-use futures::{channel::mpsc, FutureExt, SinkExt, StreamExt, TryFutureExt};
+use futures::channel::mpsc;
+use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
 use grpcio::{self, *};
 use kvproto::brpb::*;
-use tikv_util::{error, info, worker::*};
+use tikv_util::worker::*;
+use tikv_util::{error, info};
 
 use super::Task;
 
@@ -25,7 +27,7 @@ impl Service {
 impl Backup for Service {
     fn backup(
         &mut self,
-        ctx: RpcContext<'_>,
+        ctx: RpcContext,
         req: BackupRequest,
         mut sink: ServerStreamingSink<BackupResponse>,
     ) {
@@ -79,15 +81,15 @@ impl Backup for Service {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use super::*;
+    use crate::endpoint::tests::*;
     use external_storage_export::make_local_backend;
     use tikv::storage::txn::tests::{must_commit, must_prewrite_put};
     use tikv_util::worker::{dummy_scheduler, ReceiverWrapper};
     use txn_types::TimeStamp;
-
-    use super::*;
-    use crate::endpoint::tests::*;
 
     fn new_rpc_suite() -> (Server, BackupClient, ReceiverWrapper<Task>) {
         let env = Arc::new(EnvBuilder::new().build());

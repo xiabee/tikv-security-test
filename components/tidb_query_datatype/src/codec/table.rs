@@ -1,20 +1,21 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{cmp, convert::TryInto, io::Write, sync::Arc, u8};
+use std::convert::TryInto;
+use std::io::Write;
+use std::sync::Arc;
+use std::{cmp, u8};
 
-use codec::prelude::*;
-use collections::{HashMap, HashSet};
+use crate::prelude::*;
+use crate::FieldTypeTp;
 use kvproto::coprocessor::KeyRange;
-use tikv_util::codec::BytesSlice;
 use tipb::ColumnInfo;
 
-use super::{
-    datum,
-    datum::DatumDecoder,
-    mysql::{Duration, Time},
-    Datum, Error, Result,
-};
-use crate::{expr::EvalContext, prelude::*, FieldTypeTp};
+use super::mysql::{Duration, Time};
+use super::{datum, datum::DatumDecoder, Datum, Error, Result};
+use crate::expr::EvalContext;
+use codec::prelude::*;
+use collections::{HashMap, HashSet};
+use tikv_util::codec::BytesSlice;
 
 // handle or index id
 pub const ID_LEN: usize = 8;
@@ -40,9 +41,6 @@ pub const INDEX_VALUE_RESTORED_DATA_FLAG: u8 = crate::codec::row::v2::CODEC_VERS
 
 /// ID for partition column, see <https://github.com/pingcap/parser/pull/1010>
 pub const EXTRA_PARTITION_ID_COL_ID: i64 = -2;
-
-/// ID for physical table id column, see <https://github.com/tikv/tikv/issues/11888>
-pub const EXTRA_PHYSICAL_TABLE_ID_COL_ID: i64 = -3;
 
 /// `TableEncoder` encodes the table record/index prefix.
 trait TableEncoder: NumberEncoder {
@@ -452,10 +450,8 @@ fn cut_row_v1(data: Vec<u8>, cols: &HashSet<i64>) -> Result<RowColsDict> {
 
 /// Cuts a non-empty row in row format v2 and encodes into v1 format.
 fn cut_row_v2(data: Vec<u8>, cols: Arc<[ColumnInfo]>) -> Result<RowColsDict> {
-    use crate::codec::{
-        datum_codec::{ColumnIdDatumEncoder, EvaluableDatumEncoder},
-        row::v2::{RowSlice, V1CompatibleEncoder},
-    };
+    use crate::codec::datum_codec::{ColumnIdDatumEncoder, EvaluableDatumEncoder};
+    use crate::codec::row::v2::{RowSlice, V1CompatibleEncoder};
 
     let mut meta_map = HashMap::with_capacity_and_hasher(cols.len(), Default::default());
     let mut result = Vec::with_capacity(data.len() + cols.len() * 8);
@@ -542,11 +538,12 @@ pub fn generate_index_data_for_test(
 mod tests {
     use std::{i64, iter::FromIterator};
 
-    use collections::{HashMap, HashSet};
     use tipb::ColumnInfo;
 
-    use super::*;
     use crate::codec::datum::{self, Datum};
+    use collections::{HashMap, HashSet};
+
+    use super::*;
 
     const TABLE_ID: i64 = 1;
     const INDEX_ID: i64 = 1;
@@ -661,7 +658,8 @@ mod tests {
         let r = decode_row(&mut bs.as_slice(), &mut ctx, &cols).unwrap();
         assert_eq!(row, r);
 
-        let mut datums: HashMap<_, _> = cut_row_as_owned(&bs, &col_id_set);
+        let mut datums: HashMap<_, _>;
+        datums = cut_row_as_owned(&bs, &col_id_set);
         assert_eq!(col_encoded, datums);
 
         cols.insert(4, FieldTypeTp::Float.into());

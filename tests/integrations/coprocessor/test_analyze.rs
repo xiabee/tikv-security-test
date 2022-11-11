@@ -1,15 +1,14 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use kvproto::{
-    coprocessor::{KeyRange, Request},
-    kvrpcpb::{Context, IsolationLevel},
-};
+use kvproto::coprocessor::{KeyRange, Request};
+use kvproto::kvrpcpb::{Context, IsolationLevel};
 use protobuf::Message;
-use test_coprocessor::*;
 use tipb::{
     AnalyzeColumnGroup, AnalyzeColumnsReq, AnalyzeColumnsResp, AnalyzeIndexReq, AnalyzeIndexResp,
     AnalyzeReq, AnalyzeType,
 };
+
+use test_coprocessor::*;
 
 pub const REQ_TYPE_ANALYZE: i64 = 104;
 
@@ -84,9 +83,9 @@ fn new_analyze_sampling_req(
     let mut col_groups: Vec<AnalyzeColumnGroup> = Vec::new();
     let mut col_group = AnalyzeColumnGroup::default();
     let offsets = vec![idx];
-    let lengths = vec![-1_i64];
-    col_group.set_column_offsets(offsets);
-    col_group.set_prefix_lengths(lengths);
+    let lengths = vec![-1 as i64];
+    col_group.set_column_offsets(offsets.into());
+    col_group.set_prefix_lengths(lengths.into());
     col_groups.push(col_group);
     col_req.set_column_groups(col_groups.into());
     col_req.set_columns_info(table.columns_info().into());
@@ -134,7 +133,6 @@ fn test_analyze_column_with_lock() {
                 assert!(hist.get_buckets().is_empty());
                 assert_eq!(hist.get_ndv(), 0);
             }
-            IsolationLevel::RcCheckTs => unimplemented!(),
         }
     }
 }
@@ -167,8 +165,6 @@ fn test_analyze_column() {
     assert_eq!(rows.len(), 4);
     let sum: u32 = rows.first().unwrap().get_counters().iter().sum();
     assert_eq!(sum, 3);
-    assert_eq!(collectors[0].get_total_size(), 21);
-    assert_eq!(collectors[1].get_total_size(), 4);
 }
 
 #[test]
@@ -226,7 +222,6 @@ fn test_analyze_index_with_lock() {
                 assert!(hist.get_buckets().is_empty());
                 assert_eq!(hist.get_ndv(), 0);
             }
-            IsolationLevel::RcCheckTs => unimplemented!(),
         }
     }
 }
@@ -302,7 +297,7 @@ fn test_analyze_sampling_reservoir() {
     assert_eq!(collector.get_null_counts(), vec![0, 1, 0, 1]);
     assert_eq!(collector.get_count(), 9);
     assert_eq!(collector.get_fm_sketch().len(), 4);
-    assert_eq!(collector.get_total_size(), vec![72, 56, 9, 56]);
+    assert_eq!(collector.get_total_size(), vec![81, 64, 18, 64]);
 }
 
 #[test]
@@ -333,7 +328,7 @@ fn test_analyze_sampling_bernoulli() {
     assert_eq!(collector.get_null_counts(), vec![0, 1, 0, 1]);
     assert_eq!(collector.get_count(), 9);
     assert_eq!(collector.get_fm_sketch().len(), 4);
-    assert_eq!(collector.get_total_size(), vec![72, 56, 9, 56]);
+    assert_eq!(collector.get_total_size(), vec![81, 64, 18, 64]);
 }
 
 #[test]

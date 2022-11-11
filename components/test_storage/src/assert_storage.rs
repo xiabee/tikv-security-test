@@ -1,39 +1,27 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use api_version::{ApiV1, KvFormat};
-use kvproto::kvrpcpb::{Context, KeyRange, LockInfo};
+use kvproto::kvrpcpb::{ApiVersion, Context, LockInfo};
+
 use test_raftstore::{Cluster, ServerCluster, SimulateEngine};
+use tikv::storage::kv::{Error as KvError, ErrorInner as KvErrorInner, RocksEngine};
+use tikv::storage::mvcc::{Error as MvccError, ErrorInner as MvccErrorInner, MAX_TXN_WRITE_SIZE};
+use tikv::storage::txn::{Error as TxnError, ErrorInner as TxnErrorInner};
 use tikv::storage::{
-    self,
-    kv::{Error as KvError, ErrorInner as KvErrorInner, RocksEngine},
-    mvcc::{Error as MvccError, ErrorInner as MvccErrorInner, MAX_TXN_WRITE_SIZE},
-    txn::{Error as TxnError, ErrorInner as TxnErrorInner},
-    Engine, Error as StorageError, ErrorInner as StorageErrorInner, TxnStatus,
+    self, Engine, Error as StorageError, ErrorInner as StorageErrorInner, TxnStatus,
 };
 use tikv_util::HandyRwLock;
-use txn_types::{self, Key, KvPair, Mutation, TimeStamp, Value};
+use txn_types::{Key, KvPair, Mutation, TimeStamp, Value};
 
 use super::*;
 
 #[derive(Clone)]
-pub struct AssertionStorage<E: Engine, F: KvFormat> {
-    pub store: SyncTestStorage<E, F>,
+pub struct AssertionStorage<E: Engine> {
+    pub store: SyncTestStorage<E>,
     pub ctx: Context,
 }
 
-pub type AssertionStorageApiV1<E> = AssertionStorage<E, ApiV1>;
-
-impl Default for AssertionStorage<RocksEngine, ApiV1> {
+impl Default for AssertionStorage<RocksEngine> {
     fn default() -> Self {
-        AssertionStorage {
-            ctx: Context::default(),
-            store: SyncTestStorageBuilder::default().build().unwrap(),
-        }
-    }
-}
-
-impl<F: KvFormat> AssertionStorage<RocksEngine, F> {
-    pub fn new() -> Self {
         AssertionStorage {
             ctx: Context::default(),
             store: SyncTestStorageBuilder::new().build().unwrap(),
@@ -41,12 +29,24 @@ impl<F: KvFormat> AssertionStorage<RocksEngine, F> {
     }
 }
 
-impl<F: KvFormat> AssertionStorage<SimulateEngine, F> {
+impl AssertionStorage<RocksEngine> {
+    pub fn new(api_version: ApiVersion) -> Self {
+        AssertionStorage {
+            ctx: Context::default(),
+            store: SyncTestStorageBuilder::new()
+                .api_version(api_version)
+                .build()
+                .unwrap(),
+        }
+    }
+}
+
+impl AssertionStorage<SimulateEngine> {
     pub fn new_raft_storage_with_store_count(
         count: usize,
         key: &str,
     ) -> (Cluster<ServerCluster>, Self) {
-        let (cluster, store, ctx) = new_raft_storage_with_store_count::<F>(count, key);
+        let (cluster, store, ctx) = new_raft_storage_with_store_count(count, key);
         let storage = Self { store, ctx };
         (cluster, storage)
     }
@@ -73,7 +73,7 @@ impl<F: KvFormat> AssertionStorage<SimulateEngine, F> {
         start_ts: impl Into<TimeStamp>,
         commit_ts: impl Into<TimeStamp>,
     ) {
-        let mutations = vec![Mutation::make_delete(Key::from_raw(key))];
+        let mutations = vec![Mutation::Delete(Key::from_raw(key))];
         let commit_keys = vec![Key::from_raw(key)];
         self.two_pc_ok_for_cluster(
             cluster,
@@ -93,7 +93,7 @@ impl<F: KvFormat> AssertionStorage<SimulateEngine, F> {
     ) -> Option<Value> {
         let ts = ts.into();
         for _ in 0..3 {
-            let res = self.store.get(self.ctx.clone(), &Key::from_raw(key), ts);
+            let res = self.store.get(self.ctx.clone(), key.to_vec(), ts);
             if let Ok((data, ..)) = res {
                 return data;
             }
@@ -120,7 +120,7 @@ impl<F: KvFormat> AssertionStorage<SimulateEngine, F> {
         start_ts: impl Into<TimeStamp>,
         commit_ts: impl Into<TimeStamp>,
     ) {
-        let mutations = vec![Mutation::make_put(Key::from_raw(key), value.to_vec())];
+        let mutations = vec![Mutation::Put((Key::from_raw(key), value.to_vec()))];
         let commit_keys = vec![Key::from_raw(key)];
         self.two_pc_ok_for_cluster(cluster, mutations, key, commit_keys, start_ts, commit_ts);
     }
@@ -136,7 +136,7 @@ impl<F: KvFormat> AssertionStorage<SimulateEngine, F> {
         let mutations: Vec<_> = keys
             .iter()
             .zip(vals)
-            .map(|(k, v)| Mutation::make_put(Key::from_raw(k.as_ref()), v.to_vec()))
+            .map(|(k, v)| Mutation::Put((Key::from_raw(k.as_ref()), v.to_vec())))
             .collect();
         let commit_keys: Vec<_> = keys.iter().map(|k| Key::from_raw(k.as_ref())).collect();
         self.two_pc_ok_for_cluster(
@@ -229,25 +229,29 @@ impl<F: KvFormat> AssertionStorage<SimulateEngine, F> {
     }
 }
 
-impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
+impl<E: Engine> AssertionStorage<E> {
     pub fn get_none(&self, key: &[u8], ts: impl Into<TimeStamp>) {
-        let key = Key::from_raw(key);
         assert_eq!(
-            self.store.get(self.ctx.clone(), &key, ts.into()).unwrap().0,
+            self.store
+                .get(self.ctx.clone(), key.to_vec(), ts.into())
+                .unwrap()
+                .0,
             None
         );
     }
 
     pub fn get_err(&self, key: &[u8], ts: impl Into<TimeStamp>) {
-        let key = Key::from_raw(key);
-        assert!(self.store.get(self.ctx.clone(), &key, ts.into()).is_err());
+        assert!(
+            self.store
+                .get(self.ctx.clone(), key.to_vec(), ts.into())
+                .is_err()
+        );
     }
 
     pub fn get_ok(&self, key: &[u8], ts: impl Into<TimeStamp>, expect: &[u8]) {
-        let key = Key::from_raw(key);
         assert_eq!(
             self.store
-                .get(self.ctx.clone(), &key, ts.into())
+                .get(self.ctx.clone(), key.to_vec(), ts.into())
                 .unwrap()
                 .0
                 .unwrap(),
@@ -256,7 +260,7 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
     }
 
     pub fn batch_get_ok(&self, keys: &[&[u8]], ts: impl Into<TimeStamp>, expect: Vec<&[u8]>) {
-        let keys: Vec<Key> = keys.iter().map(|x| Key::from_raw(x)).collect();
+        let keys: Vec<Vec<u8>> = keys.iter().map(|x| x.to_vec()).collect();
         let result: Vec<Vec<u8>> = self
             .store
             .batch_get(self.ctx.clone(), &keys, ts.into())
@@ -270,7 +274,7 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
     }
 
     pub fn batch_get_err(&self, keys: &[&[u8]], ts: impl Into<TimeStamp>) {
-        let keys: Vec<Key> = keys.iter().map(|x| Key::from_raw(x)).collect();
+        let keys: Vec<Vec<u8>> = keys.iter().map(|x| x.to_vec()).collect();
         assert!(
             self.store
                 .batch_get(self.ctx.clone(), &keys, ts.into())
@@ -361,7 +365,7 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
         self.store
             .prewrite(
                 self.ctx.clone(),
-                vec![Mutation::make_put(Key::from_raw(key), value.to_vec())],
+                vec![Mutation::Put((Key::from_raw(key), value.to_vec()))],
                 key.to_vec(),
                 start_ts,
             )
@@ -388,7 +392,7 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
             self.store
                 .prewrite(
                     self.ctx.clone(),
-                    vec![Mutation::make_put(Key::from_raw(key), value.to_vec())],
+                    vec![Mutation::Put((Key::from_raw(key), value.to_vec()))],
                     key.to_vec(),
                     start_ts,
                 )
@@ -406,7 +410,7 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
         self.store
             .prewrite(
                 self.ctx.clone(),
-                vec![Mutation::make_delete(Key::from_raw(key))],
+                vec![Mutation::Delete(Key::from_raw(key))],
                 key.to_vec(),
                 start_ts,
             )
@@ -424,23 +428,14 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
     pub fn scan_ok(
         &self,
         start_key: &[u8],
-        end_key: Option<&[u8]>,
         limit: usize,
         ts: impl Into<TimeStamp>,
         expect: Vec<Option<(&[u8], &[u8])>>,
     ) {
-        let start_key = Key::from_raw(start_key);
-        let end_key = end_key.map(Key::from_raw);
+        let key_address = Key::from_raw(start_key);
         let result = self
             .store
-            .scan(
-                self.ctx.clone(),
-                start_key,
-                end_key,
-                limit,
-                false,
-                ts.into(),
-            )
+            .scan(self.ctx.clone(), key_address, None, limit, false, ts.into())
             .unwrap();
         let result: Vec<Option<KvPair>> = result.into_iter().map(Result::ok).collect();
         let expect: Vec<Option<KvPair>> = expect
@@ -450,47 +445,17 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
         assert_eq!(result, expect);
     }
 
-    pub fn scan_err(
-        &self,
-        start_key: &[u8],
-        end_key: Option<&[u8]>,
-        limit: usize,
-        ts: impl Into<TimeStamp>,
-    ) {
-        let start_key = Key::from_raw(start_key);
-        let end_key = end_key.map(Key::from_raw);
-        self.store
-            .scan(
-                self.ctx.clone(),
-                start_key,
-                end_key,
-                limit,
-                false,
-                ts.into(),
-            )
-            .unwrap_err();
-    }
-
     pub fn reverse_scan_ok(
         &self,
         start_key: &[u8],
-        end_key: Option<&[u8]>,
         limit: usize,
         ts: impl Into<TimeStamp>,
         expect: Vec<Option<(&[u8], &[u8])>>,
     ) {
-        let start_key = Key::from_raw(start_key);
-        let end_key = end_key.map(Key::from_raw);
+        let key_address = Key::from_raw(start_key);
         let result = self
             .store
-            .reverse_scan(
-                self.ctx.clone(),
-                start_key,
-                end_key,
-                limit,
-                false,
-                ts.into(),
-            )
+            .reverse_scan(self.ctx.clone(), key_address, None, limit, false, ts.into())
             .unwrap();
         let result: Vec<Option<KvPair>> = result.into_iter().map(Result::ok).collect();
         let expect: Vec<Option<KvPair>> = expect
@@ -503,16 +468,14 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
     pub fn scan_key_only_ok(
         &self,
         start_key: &[u8],
-        end_key: Option<&[u8]>,
         limit: usize,
         ts: impl Into<TimeStamp>,
         expect: Vec<Option<&[u8]>>,
     ) {
-        let start_key = Key::from_raw(start_key);
-        let end_key = end_key.map(Key::from_raw);
+        let key_address = Key::from_raw(start_key);
         let result = self
             .store
-            .scan(self.ctx.clone(), start_key, end_key, limit, true, ts.into())
+            .scan(self.ctx.clone(), key_address, None, limit, true, ts.into())
             .unwrap();
         let result: Vec<Option<KvPair>> = result.into_iter().map(Result::ok).collect();
         let expect: Vec<Option<KvPair>> = expect
@@ -738,29 +701,6 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
         );
     }
 
-    pub fn scan_locks_err(
-        &self,
-        max_ts: impl Into<TimeStamp>,
-        start_key: &[u8],
-        end_key: &[u8],
-        limit: usize,
-    ) {
-        let start_key = if start_key.is_empty() {
-            None
-        } else {
-            Some(Key::from_raw(start_key))
-        };
-        let end_key = if end_key.is_empty() {
-            None
-        } else {
-            Some(Key::from_raw(end_key))
-        };
-
-        self.store
-            .scan_locks(self.ctx.clone(), max_ts.into(), start_key, end_key, limit)
-            .unwrap_err();
-    }
-
     pub fn resolve_lock_ok(
         &self,
         start_ts: impl Into<TimeStamp>,
@@ -806,28 +746,6 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
         self.store.gc(self.ctx.clone(), safe_point.into()).unwrap();
     }
 
-    pub fn delete_range_ok(&self, start_key: &[u8], end_key: &[u8]) {
-        self.store
-            .delete_range(
-                self.ctx.clone(),
-                Key::from_raw(start_key),
-                Key::from_raw(end_key),
-                false,
-            )
-            .unwrap();
-    }
-
-    pub fn delete_range_err(&self, start_key: &[u8], end_key: &[u8]) {
-        self.store
-            .delete_range(
-                self.ctx.clone(),
-                Key::from_raw(start_key),
-                Key::from_raw(end_key),
-                false,
-            )
-            .unwrap_err();
-    }
-
     pub fn raw_get_ok(&self, cf: String, key: Vec<u8>, value: Option<Vec<u8>>) {
         assert_eq!(
             self.store.raw_get(self.ctx.clone(), cf, key).unwrap(),
@@ -837,21 +755,6 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
 
     pub fn raw_get_err(&self, cf: String, key: Vec<u8>) {
         self.store.raw_get(self.ctx.clone(), cf, key).unwrap_err();
-    }
-
-    pub fn raw_get_key_ttl_ok(&self, cf: String, key: Vec<u8>, ttl: Option<u64>) {
-        assert_eq!(
-            self.store
-                .raw_get_key_ttl(self.ctx.clone(), cf, key)
-                .unwrap(),
-            ttl
-        );
-    }
-
-    pub fn raw_get_key_ttl_err(&self, cf: String, key: Vec<u8>) {
-        self.store
-            .raw_get_key_ttl(self.ctx.clone(), cf, key)
-            .unwrap_err();
     }
 
     pub fn raw_batch_get_ok(&self, cf: String, keys: Vec<Vec<u8>>, expect: Vec<(&[u8], &[u8])>) {
@@ -875,28 +778,6 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
             .unwrap_err();
     }
 
-    pub fn raw_batch_get_command_ok(&self, cf: String, keys: Vec<Vec<u8>>, expect: Vec<&[u8]>) {
-        let result: Vec<Option<Vec<u8>>> = self
-            .store
-            .raw_batch_get_command(self.ctx.clone(), cf, keys)
-            .unwrap()
-            .into_iter()
-            .collect();
-        let expect: Vec<Option<Vec<u8>>> = expect
-            .into_iter()
-            .map(|x| if x.is_empty() { None } else { Some(x.to_vec()) })
-            .collect();
-        assert_eq!(result, expect);
-    }
-
-    pub fn raw_batch_get_command_err(&self, cf: String, keys: Vec<Vec<u8>>) {
-        assert!(
-            self.store
-                .raw_batch_get_command(self.ctx.clone(), cf, keys)
-                .is_err()
-        );
-    }
-
     pub fn raw_put_ok(&self, cf: String, key: Vec<u8>, value: Vec<u8>) {
         self.store
             .raw_put(self.ctx.clone(), cf, key, value)
@@ -906,18 +787,6 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
     pub fn raw_put_err(&self, cf: String, key: Vec<u8>, value: Vec<u8>) {
         self.store
             .raw_put(self.ctx.clone(), cf, key, value)
-            .unwrap_err();
-    }
-
-    pub fn raw_batch_put_ok(&self, cf: String, pairs: Vec<KvPair>) {
-        self.store
-            .raw_batch_put(self.ctx.clone(), cf, pairs)
-            .unwrap();
-    }
-
-    pub fn raw_batch_put_err(&self, cf: String, pairs: Vec<KvPair>) {
-        self.store
-            .raw_batch_put(self.ctx.clone(), cf, pairs)
             .unwrap_err();
     }
 
@@ -931,41 +800,16 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
             .unwrap_err();
     }
 
-    pub fn raw_delete_range_ok(&self, cf: String, start_key: Vec<u8>, end_key: Vec<u8>) {
-        self.store
-            .raw_delete_range(self.ctx.clone(), cf, start_key, end_key)
-            .unwrap()
-    }
-
-    pub fn raw_delete_range_err(&self, cf: String, start_key: Vec<u8>, end_key: Vec<u8>) {
-        self.store
-            .raw_delete_range(self.ctx.clone(), cf, start_key, end_key)
-            .unwrap_err();
-    }
-
-    pub fn raw_batch_delete_ok(&self, cf: String, keys: Vec<Vec<u8>>) {
-        self.store
-            .raw_batch_delete(self.ctx.clone(), cf, keys)
-            .unwrap()
-    }
-
-    pub fn raw_batch_delete_err(&self, cf: String, keys: Vec<Vec<u8>>) {
-        self.store
-            .raw_batch_delete(self.ctx.clone(), cf, keys)
-            .unwrap_err();
-    }
-
     pub fn raw_scan_ok(
         &self,
         cf: String,
         start_key: Vec<u8>,
-        end_key: Option<Vec<u8>>,
         limit: usize,
         expect: Vec<(&[u8], &[u8])>,
     ) {
         let result: Vec<KvPair> = self
             .store
-            .raw_scan(self.ctx.clone(), cf, start_key, end_key, limit)
+            .raw_scan(self.ctx.clone(), cf, start_key, None, limit)
             .unwrap()
             .into_iter()
             .map(|x| x.unwrap())
@@ -975,109 +819,6 @@ impl<E: Engine, F: KvFormat> AssertionStorage<E, F> {
             .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect();
         assert_eq!(result, expect);
-    }
-
-    pub fn raw_scan_err(
-        &self,
-        cf: String,
-        start_key: Vec<u8>,
-        end_key: Option<Vec<u8>>,
-        limit: usize,
-    ) {
-        self.store
-            .raw_scan(self.ctx.clone(), cf, start_key, end_key, limit)
-            .unwrap_err();
-    }
-
-    pub fn raw_batch_scan_ok(
-        &self,
-        cf: String,
-        ranges: Vec<KeyRange>,
-        limit: usize,
-        expect: Vec<(&[u8], &[u8])>,
-    ) {
-        let result: Vec<KvPair> = self
-            .store
-            .raw_batch_scan(self.ctx.clone(), cf, ranges, limit)
-            .unwrap()
-            .into_iter()
-            .map(|x| x.unwrap())
-            .collect();
-        let expect: Vec<KvPair> = expect
-            .into_iter()
-            .map(|(k, v)| (k.to_vec(), v.to_vec()))
-            .collect();
-        assert_eq!(result, expect);
-    }
-
-    pub fn raw_batch_scan_err(&self, cf: String, ranges: Vec<KeyRange>, limit: usize) {
-        self.store
-            .raw_batch_scan(self.ctx.clone(), cf, ranges, limit)
-            .unwrap_err();
-    }
-
-    pub fn raw_compare_and_swap_atomic_ok(
-        &self,
-        cf: String,
-        key: Vec<u8>,
-        previous_value: Option<Vec<u8>>,
-        value: Vec<u8>,
-        expect: (Option<Vec<u8>>, bool),
-    ) {
-        let result = self
-            .store
-            .raw_compare_and_swap_atomic(self.ctx.clone(), cf, key, previous_value, value, 0)
-            .unwrap();
-        assert_eq!(result, expect);
-    }
-
-    pub fn raw_compare_and_swap_atomic_err(
-        &self,
-        cf: String,
-        key: Vec<u8>,
-        previous_value: Option<Vec<u8>>,
-        value: Vec<u8>,
-    ) {
-        self.store
-            .raw_compare_and_swap_atomic(self.ctx.clone(), cf, key, previous_value, value, 0)
-            .unwrap_err();
-    }
-
-    pub fn raw_batch_put_atomic_ok(&self, cf: String, pairs: Vec<KvPair>) {
-        let ttls = vec![0; pairs.len()];
-        self.store
-            .raw_batch_put_atomic(self.ctx.clone(), cf, pairs, ttls)
-            .unwrap();
-    }
-
-    pub fn raw_batch_put_atomic_err(&self, cf: String, pairs: Vec<KvPair>) {
-        let ttls = vec![0; pairs.len()];
-        self.store
-            .raw_batch_put_atomic(self.ctx.clone(), cf, pairs, ttls)
-            .unwrap_err();
-    }
-
-    pub fn raw_batch_delete_atomic_ok(&self, cf: String, keys: Vec<Vec<u8>>) {
-        self.store
-            .raw_batch_delete_atomic(self.ctx.clone(), cf, keys)
-            .unwrap();
-    }
-
-    pub fn raw_batch_delete_atomic_err(&self, cf: String, keys: Vec<Vec<u8>>) {
-        self.store
-            .raw_batch_delete_atomic(self.ctx.clone(), cf, keys)
-            .unwrap_err();
-    }
-
-    pub fn raw_checksum_ok(&self, ranges: Vec<KeyRange>, expect: (u64, u64, u64)) {
-        let result = self.store.raw_checksum(self.ctx.clone(), ranges).unwrap();
-        assert_eq!(result, expect);
-    }
-
-    pub fn raw_checksum_err(&self, ranges: Vec<KeyRange>) {
-        self.store
-            .raw_checksum(self.ctx.clone(), ranges)
-            .unwrap_err();
     }
 
     pub fn test_txn_store_gc(&self, key: &str) {

@@ -1,10 +1,8 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp::Reverse,
-    collections::{binary_heap, BinaryHeap},
-    iter,
-};
+use std::cmp::Reverse;
+use std::collections::{binary_heap, BinaryHeap};
+use std::iter;
 
 // todo: Make it TopN<T, const N: usize> when we update our Rust version
 /// TopN is used to collect the largest `cap` items pushed in

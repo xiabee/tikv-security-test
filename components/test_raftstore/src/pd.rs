@@ -1,51 +1,36 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp,
-    collections::{
-        BTreeMap,
-        Bound::{Excluded, Unbounded},
-    },
-    sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, RwLock,
-    },
-    time::Duration,
+use std::cmp;
+use std::collections::BTreeMap;
+use std::collections::Bound::{Excluded, Unbounded};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures::compat::Future01CompatExt;
+use futures::executor::block_on;
+use futures::future::{err, ok, ready, BoxFuture, FutureExt};
+use futures::{stream, stream::StreamExt};
+use tokio_timer::timer::Handle;
+
+use kvproto::metapb::{self, PeerRole};
+use kvproto::pdpb;
+use kvproto::replication_modepb::{
+    DrAutoSyncState, RegionReplicationStatus, ReplicationMode, ReplicationStatus,
 };
+use raft::eraftpb::ConfChangeType;
 
 use collections::{HashMap, HashMapEntry, HashSet};
 use fail::fail_point;
-use futures::{
-    channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    compat::Future01CompatExt,
-    executor::block_on,
-    future::{err, ok, ready, BoxFuture, FutureExt},
-    stream,
-    stream::StreamExt,
-};
 use keys::{self, data_key, enc_end_key, enc_start_key};
-use kvproto::{
-    metapb::{self, PeerRole},
-    pdpb,
-    replication_modepb::{
-        DrAutoSyncState, RegionReplicationStatus, ReplicationMode, ReplicationStatus,
-        StoreDrAutoSyncStatus,
-    },
-};
-use pd_client::{
-    BucketStat, Error, FeatureGate, Key, PdClient, PdFuture, RegionInfo, RegionStat, Result,
-};
-use raft::eraftpb::ConfChangeType;
-use raftstore::store::{
-    util::{check_key_in_region, find_peer, is_learner},
-    QueryStats, INIT_EPOCH_CONF_VER, INIT_EPOCH_VER,
-};
-use tikv_util::{
-    time::{Instant, UnixSecs},
-    timer::GLOBAL_TIMER_HANDLE,
-    Either, HandyRwLock,
-};
-use tokio_timer::timer::Handle;
+use pd_client::{Error, FeatureGate, Key, PdClient, PdFuture, RegionInfo, RegionStat, Result};
+use raftstore::store::util::{check_key_in_region, find_peer, is_learner};
+use raftstore::store::QueryStats;
+use raftstore::store::{INIT_EPOCH_CONF_VER, INIT_EPOCH_VER};
+use tikv_util::time::{Instant, UnixSecs};
+use tikv_util::timer::GLOBAL_TIMER_HANDLE;
+use tikv_util::{Either, HandyRwLock};
 use txn_types::TimeStamp;
 
 use super::*;
@@ -110,7 +95,6 @@ enum Operator {
     },
     TransferLeader {
         peer: metapb::Peer,
-        peers: Vec<metapb::Peer>,
         policy: SchedulePolicy,
     },
     MergeRegion {
@@ -163,11 +147,7 @@ impl Operator {
             Operator::RemovePeer { ref peer, .. } => {
                 new_pd_change_peer(ConfChangeType::RemoveNode, peer.clone())
             }
-            Operator::TransferLeader {
-                ref peer,
-                ref peers,
-                ..
-            } => new_pd_transfer_leader(peer.clone(), peers.clone()),
+            Operator::TransferLeader { ref peer, .. } => new_pd_transfer_leader(peer.clone()),
             Operator::MergeRegion {
                 target_region_id, ..
             } => {
@@ -259,9 +239,8 @@ impl Operator {
             } => region.get_peers().iter().all(|p| p != peer) || !policy.schedule(),
             Operator::TransferLeader {
                 ref peer,
-                ref peers,
                 ref mut policy,
-            } => leader == peer || peers.iter().any(|peer| leader == peer) || !policy.schedule(),
+            } => leader == peer || !policy.schedule(),
             Operator::MergeRegion {
                 source_region_id,
                 ref mut policy,
@@ -314,7 +293,6 @@ struct PdCluster {
     region_last_report_ts: HashMap<u64, UnixSecs>,
     region_last_report_term: HashMap<u64, u64>,
     base_id: AtomicUsize,
-    buckets: HashMap<u64, BucketStat>,
 
     store_stats: HashMap<u64, pdpb::StoreStats>,
     store_hotspots: HashMap<u64, HashMap<u64, pdpb::PeerStat>>,
@@ -331,16 +309,12 @@ struct PdCluster {
     is_bootstraped: bool,
 
     gc_safe_point: u64,
-    min_resolved_ts: u64,
 
     replication_status: Option<ReplicationStatus>,
     region_replication_status: HashMap<u64, RegionReplicationStatus>,
 
     // for merging
     pub check_merge_target_integrity: bool,
-
-    unsafe_recovery_store_reports: HashMap<u64, pdpb::StoreReport>,
-    unsafe_recovery_plan: HashMap<u64, pdpb::RecoveryPlan>,
 }
 
 impl PdCluster {
@@ -370,13 +344,9 @@ impl PdCluster {
             is_bootstraped: false,
 
             gc_safe_point: 0,
-            min_resolved_ts: 0,
             replication_status: None,
             region_replication_status: HashMap::default(),
             check_merge_target_integrity: true,
-            unsafe_recovery_store_reports: HashMap::default(),
-            unsafe_recovery_plan: HashMap::default(),
-            buckets: HashMap::default(),
         }
     }
 
@@ -533,11 +503,11 @@ impl PdCluster {
             region.get_region_epoch().clone(),
         );
         assert!(end_key > start_key);
-        let created_by_unsafe_recovery = (!start_key.is_empty() || !end_key.is_empty())
-            && incoming_epoch.get_version() == 0
-            && incoming_epoch.get_conf_ver() == 0;
+        let created_by_unsafe_recover = (!start_key.is_empty() || !end_key.is_empty())
+            && incoming_epoch.get_version() == 1
+            && incoming_epoch.get_conf_ver() == 1;
         let overlaps = self.get_overlap(start_key, end_key);
-        if created_by_unsafe_recovery {
+        if created_by_unsafe_recover {
             // Allow recreated region by unsafe recover to overwrite other regions with a "older"
             // epoch.
             return Ok(overlaps);
@@ -734,37 +704,6 @@ impl PdCluster {
     fn get_gc_safe_point(&self) -> u64 {
         self.gc_safe_point
     }
-
-    fn set_min_resolved_ts(&mut self, min_resolved_ts: u64) {
-        self.min_resolved_ts = min_resolved_ts;
-    }
-
-    fn get_min_resolved_ts(&self) -> u64 {
-        self.min_resolved_ts
-    }
-
-    fn handle_store_heartbeat(&mut self, store_id: u64) -> Result<pdpb::StoreHeartbeatResponse> {
-        debug!("Unsafe recovery, a heartbeat"; "store_id" => store_id, "plan" => ?self.unsafe_recovery_plan);
-        let mut resp = pdpb::StoreHeartbeatResponse::default();
-        if let Some((_, plan)) = self.unsafe_recovery_plan.remove_entry(&store_id) {
-            debug!("Unsafe recovery, sending recovery plan"; "store_id" => store_id, "plan" => ?plan);
-            resp.set_recovery_plan(plan);
-        }
-
-        Ok(resp)
-    }
-
-    fn set_unsafe_recovery_plan(&mut self, store_id: u64, recovery_plan: pdpb::RecoveryPlan) {
-        self.unsafe_recovery_plan.insert(store_id, recovery_plan);
-    }
-
-    fn get_store_report(&mut self, store_id: u64) -> Option<pdpb::StoreReport> {
-        self.unsafe_recovery_store_reports.remove(&store_id)
-    }
-
-    fn set_store_report(&mut self, store_id: u64, report: pdpb::StoreReport) {
-        let _ = self.unsafe_recovery_store_reports.insert(store_id, report);
-    }
 }
 
 fn check_stale_region(region: &metapb::Region, check_region: &metapb::Region) -> Result<()> {
@@ -807,15 +746,6 @@ pub struct TestPdClient {
     trigger_tso_failure: AtomicBool,
     feature_gate: FeatureGate,
     trigger_leader_info_loss: AtomicBool,
-
-    pub gc_safepoints: RwLock<Vec<GcSafePoint>>,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct GcSafePoint {
-    pub serivce: String,
-    pub ttl: Duration,
-    pub safepoint: TimeStamp,
 }
 
 impl TestPdClient {
@@ -832,7 +762,6 @@ impl TestPdClient {
             trigger_tso_failure: AtomicBool::new(false),
             trigger_leader_info_loss: AtomicBool::new(false),
             feature_gate,
-            gc_safepoints: Default::default(),
         }
     }
 
@@ -987,10 +916,9 @@ impl TestPdClient {
         self.cluster.wl().add_region(region)
     }
 
-    pub fn transfer_leader(&self, region_id: u64, peer: metapb::Peer, peers: Vec<metapb::Peer>) {
+    pub fn transfer_leader(&self, region_id: u64, peer: metapb::Peer) {
         let op = Operator::TransferLeader {
             peer,
-            peers,
             policy: SchedulePolicy::TillSuccess,
         };
         self.schedule_operator(region_id, op);
@@ -1249,13 +1177,12 @@ impl TestPdClient {
         cluster.replication_status = Some(status);
     }
 
-    pub fn switch_replication_mode(&self, state: DrAutoSyncState, available_stores: Vec<u64>) {
+    pub fn switch_replication_mode(&self, state: DrAutoSyncState) {
         let mut cluster = self.cluster.wl();
         let status = cluster.replication_status.as_mut().unwrap();
         let mut dr = status.mut_dr_auto_sync();
         dr.state_id += 1;
         dr.set_state(state);
-        dr.available_stores = available_stores;
     }
 
     pub fn region_replication_status(&self, region_id: u64) -> RegionReplicationStatus {
@@ -1291,10 +1218,6 @@ impl TestPdClient {
         self.cluster.wl().set_gc_safe_point(safe_point);
     }
 
-    pub fn get_min_resolved_ts(&self) -> u64 {
-        self.cluster.rl().get_min_resolved_ts()
-    }
-
     pub fn trigger_tso_failure(&self) {
         self.trigger_tso_failure.store(true, Ordering::SeqCst);
     }
@@ -1318,7 +1241,6 @@ impl TestPdClient {
         self.cluster.wl().check_merge_target_integrity = false;
     }
 
-    /// The next generated TSO will be `ts + 1`. See `get_tso()` and `batch_get_tso()`.
     pub fn set_tso(&self, ts: TimeStamp) {
         let old = self.tso.swap(ts.into_inner(), Ordering::SeqCst);
         if old > ts.into_inner() {
@@ -1331,18 +1253,6 @@ impl TestPdClient {
 
     pub fn reset_version(&self, version: &str) {
         unsafe { self.feature_gate.reset_version(version).unwrap() }
-    }
-
-    pub fn must_get_store_report(&self, store_id: u64) -> Option<pdpb::StoreReport> {
-        self.cluster.wl().get_store_report(store_id)
-    }
-
-    pub fn must_set_unsafe_recovery_plan(&self, store_id: u64, plan: pdpb::RecoveryPlan) {
-        self.cluster.wl().set_unsafe_recovery_plan(store_id, plan)
-    }
-
-    pub fn get_buckets(&self, region_id: u64) -> Option<BucketStat> {
-        self.cluster.rl().buckets.get(&region_id).cloned()
     }
 }
 
@@ -1598,8 +1508,7 @@ impl PdClient for TestPdClient {
     fn store_heartbeat(
         &self,
         stats: pdpb::StoreStats,
-        report: Option<pdpb::StoreReport>,
-        _: Option<StoreDrAutoSyncStatus>,
+        _: Option<pdpb::StoreReport>,
     ) -> PdFuture<pdpb::StoreHeartbeatResponse> {
         if let Err(e) = self.check_bootstrap() {
             return Box::pin(err(e));
@@ -1629,12 +1538,7 @@ impl PdClient for TestPdClient {
 
         cluster.store_stats.insert(store_id, stats);
 
-        if let Some(store_report) = report {
-            cluster.set_store_report(store_id, store_report);
-        }
-
-        let mut resp = cluster.handle_store_heartbeat(store_id).unwrap();
-
+        let mut resp = pdpb::StoreHeartbeatResponse::default();
         if let Some(ref status) = cluster.replication_status {
             resp.set_replication_status(status.clone());
         }
@@ -1678,7 +1582,7 @@ impl PdClient for TestPdClient {
         Ok(resp)
     }
 
-    fn batch_get_tso(&self, count: u32) -> PdFuture<TimeStamp> {
+    fn get_tso(&self) -> PdFuture<TimeStamp> {
         fail_point!("test_raftstore_get_tso", |t| {
             let duration = Duration::from_millis(t.map_or(1000, |t| t.parse().unwrap()));
             Box::pin(async move {
@@ -1697,60 +1601,11 @@ impl PdClient for TestPdClient {
                 )),
             )));
         }
-        let tso = self.tso.fetch_add(count as u64, Ordering::SeqCst);
-        Box::pin(ok(TimeStamp::new(tso + count as u64)))
-    }
-
-    fn update_service_safe_point(
-        &self,
-        name: String,
-        safepoint: TimeStamp,
-        ttl: Duration,
-    ) -> PdFuture<()> {
-        if ttl.as_secs() > 0 {
-            self.gc_safepoints.wl().push(GcSafePoint {
-                serivce: name,
-                ttl,
-                safepoint,
-            });
-        }
-        Box::pin(ok(()))
+        let tso = self.tso.fetch_add(1, Ordering::SeqCst);
+        Box::pin(ok(TimeStamp::new(tso)))
     }
 
     fn feature_gate(&self) -> &FeatureGate {
         &self.feature_gate
-    }
-
-    fn report_min_resolved_ts(&self, _store_id: u64, min_resolved_ts: u64) -> PdFuture<()> {
-        if let Err(e) = self.check_bootstrap() {
-            return Box::pin(err(e));
-        }
-        self.cluster.wl().set_min_resolved_ts(min_resolved_ts);
-        Box::pin(ok(()))
-    }
-
-    fn report_region_buckets(&self, buckets: &BucketStat, _period: Duration) -> PdFuture<()> {
-        if let Err(e) = self.check_bootstrap() {
-            return Box::pin(err(e));
-        }
-        let mut buckets = buckets.clone();
-        self.cluster
-            .wl()
-            .buckets
-            .entry(buckets.meta.region_id)
-            .and_modify(|current| {
-                if current.meta < buckets.meta {
-                    std::mem::swap(current, &mut buckets);
-                }
-
-                pd_client::merge_bucket_stats(
-                    &current.meta.keys,
-                    &mut current.stats,
-                    &buckets.meta.keys,
-                    &buckets.stats,
-                );
-            })
-            .or_insert(buckets);
-        ready(Ok(())).boxed()
     }
 }

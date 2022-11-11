@@ -1,6 +1,9 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::{super::Result, modifier::BinaryModifier, path_expr::PathExpression, Json, JsonRef};
+use super::super::Result;
+use super::modifier::BinaryModifier;
+use super::path_expr::PathExpression;
+use super::{Json, JsonRef};
 
 impl<'a> JsonRef<'a> {
     /// Removes elements from Json,
@@ -25,7 +28,8 @@ impl<'a> JsonRef<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{super::path_expr::parse_json_path_expr, *};
+    use super::super::path_expr::parse_json_path_expr;
+    use super::*;
 
     #[test]
     fn test_json_remove() {

@@ -20,14 +20,19 @@
 //! For more information on the procedural macro, see the documentation in
 //! `components/tidb_query_codegen/src/rpn_function`.
 
-use std::{any::Any, convert::TryFrom, marker::PhantomData};
-
 use static_assertions::assert_eq_size;
-use tidb_query_common::Result;
-use tidb_query_datatype::{codec::data_type::*, expr::EvalContext, EvalType, FieldTypeAccessor};
+use std::any::Any;
+use std::convert::TryFrom;
+use std::marker::PhantomData;
+
+use tidb_query_datatype::{EvalType, FieldTypeAccessor};
 use tipb::{Expr, FieldType};
 
-use super::{expr_eval::LogicalRows, RpnStackNode};
+use super::expr_eval::LogicalRows;
+use super::RpnStackNode;
+use tidb_query_common::Result;
+use tidb_query_datatype::codec::data_type::*;
+use tidb_query_datatype::expr::EvalContext;
 
 /// Metadata of an RPN function.
 #[derive(Clone, Copy)]

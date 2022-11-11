@@ -1,18 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp::Ordering,
-    fmt::{Display, Formatter},
-};
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter};
 
-use codec::prelude::*;
 use tipb::FieldType;
 
-use crate::{
-    codec::{convert::ToInt, Result},
-    expr::EvalContext,
-    FieldTypeTp,
-};
+use crate::codec::convert::ToInt;
+use crate::codec::Result;
+use crate::expr::EvalContext;
+use crate::FieldTypeTp;
+use codec::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct Enum {
@@ -193,7 +190,7 @@ impl<'a> ToString for EnumRef<'a> {
 
 pub trait EnumEncoder: NumberEncoder {
     #[inline]
-    fn write_enum_uint(&mut self, data: EnumRef<'_>) -> Result<()> {
+    fn write_enum_uint(&mut self, data: EnumRef) -> Result<()> {
         self.write_u64(*data.value)?;
         Ok(())
     }

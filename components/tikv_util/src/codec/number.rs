@@ -1,11 +1,8 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    io::{self, ErrorKind, Write},
-    mem,
-};
-
 use byteorder::{BigEndian, ByteOrder, LittleEndian, WriteBytesExt};
+use std::io::{self, ErrorKind, Write};
+use std::mem;
 
 use super::{BytesSlice, Error, Result};
 
@@ -330,12 +327,12 @@ pub fn read_u8(data: &mut BytesSlice<'_>) -> Result<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
-
-    use protobuf::CodedOutputStream;
-
     use super::*;
     use crate::codec::Error;
+
+    use protobuf::CodedOutputStream;
+    use std::io::ErrorKind;
+    use std::{f32, f64, i16, i32, i64, u16, u32, u64};
 
     const U16_TESTS: &[u16] = &[
         i16::MIN as u16,

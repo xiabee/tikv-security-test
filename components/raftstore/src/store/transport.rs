@@ -1,24 +1,16 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::sync::mpsc;
-
-use crossbeam::channel::{SendError, TrySendError};
+use crate::store::{CasualMessage, PeerMsg, RaftCommand, RaftRouter, StoreMsg};
+use crate::{DiscardReason, Error, Result};
+use crossbeam::channel::TrySendError;
 use engine_traits::{KvEngine, RaftEngine, Snapshot};
 use kvproto::raft_serverpb::RaftMessage;
-use tikv_util::error;
-
-use crate::{
-    store::{CasualMessage, PeerMsg, RaftCommand, RaftRouter, SignificantMsg, StoreMsg},
-    DiscardReason, Error, Result,
-};
+use std::sync::mpsc;
 
 /// Transports messages between different Raft peers.
 pub trait Transport: Send + Clone {
     fn send(&mut self, msg: RaftMessage) -> Result<()>;
-
-    // empty list means all stores are allowed to send.
-    fn set_store_allowlist(&mut self, stores: Vec<u64>);
 
     fn need_flush(&self) -> bool;
 
@@ -33,16 +25,6 @@ where
     EK: KvEngine,
 {
     fn send(&self, region_id: u64, msg: CasualMessage<EK>) -> Result<()>;
-}
-
-/// Routes message to target region.
-///
-/// Messages aret guaranteed to be delivered by this trait.
-pub trait SignificantRouter<EK>: Send
-where
-    EK: KvEngine,
-{
-    fn significant_send(&self, region_id: u64, msg: SignificantMsg<EK::Snapshot>) -> Result<()>;
 }
 
 /// Routes proposal to target region.
@@ -75,26 +57,6 @@ where
             Err(TrySendError::Full(_)) => Err(Error::Transport(DiscardReason::Full)),
             Err(TrySendError::Disconnected(_)) => Err(Error::RegionNotFound(region_id)),
         }
-    }
-}
-
-impl<EK, ER> SignificantRouter<EK> for RaftRouter<EK, ER>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
-    #[inline]
-    fn significant_send(&self, region_id: u64, msg: SignificantMsg<EK::Snapshot>) -> Result<()> {
-        if let Err(SendError(msg)) = self
-            .router
-            .force_send(region_id, PeerMsg::SignificantMsg(msg))
-        {
-            // TODO: panic here once we can detect system is shutting down reliably.
-            error!("failed to send significant msg"; "msg" => ?msg);
-            return Err(Error::RegionNotFound(region_id));
-        }
-
-        Ok(())
     }
 }
 

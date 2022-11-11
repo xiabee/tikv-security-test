@@ -1,26 +1,21 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cell::RefCell,
-    mem,
-    sync::{Arc, Mutex},
-};
+use std::cell::RefCell;
+use std::mem;
+use std::sync::{Arc, Mutex};
+use tikv_util::time::Duration;
 
 use collections::HashMap;
 use file_system::{set_io_type, IOType};
 use kvproto::pdpb::QueryKind;
 use prometheus::local::*;
 use raftstore::store::WriteStats;
-use tikv_util::{
-    sys::SysQuota,
-    time::Duration,
-    yatp_pool::{FuturePool, PoolTicker, YatpPoolBuilder},
-};
+use tikv_util::yatp_pool::{FuturePool, PoolTicker, YatpPoolBuilder};
 
-use crate::storage::{
-    kv::{destroy_tls_engine, set_tls_engine, Engine, FlowStatsReporter, Statistics},
-    metrics::*,
+use crate::storage::kv::{
+    destroy_tls_engine, set_tls_engine, Engine, FlowStatsReporter, Statistics,
 };
+use crate::storage::metrics::*;
 
 pub struct SchedLocalMetrics {
     local_scan_details: HashMap<&'static str, Statistics>,
@@ -66,13 +61,8 @@ impl SchedPool {
         name_prefix: &str,
     ) -> Self {
         let engine = Arc::new(Mutex::new(engine));
-        // for low cpu quota env, set the max-thread-count as 4 to allow potential cases that we need more thread than cpu num.
-        let max_pool_size = std::cmp::max(
-            pool_size,
-            std::cmp::max(4, SysQuota::cpu_cores_quota() as usize),
-        );
         let pool = YatpPoolBuilder::new(SchedTicker {reporter:reporter.clone()})
-            .thread_count(1, pool_size, max_pool_size)
+            .thread_count(pool_size, pool_size)
             .name_prefix(name_prefix)
             // Safety: by setting `after_start` and `before_stop`, `FuturePool` ensures
             // the tls_engine invariants.

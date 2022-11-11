@@ -1,19 +1,14 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
-use std::{
-    fmt::{self, Debug, Formatter},
-    fs,
-    io::{self, Read, Seek, Write},
-    path::Path,
-    sync::Arc,
-};
-
-// Extention Traits
-use fs2::FileExt;
-
 use super::{get_io_rate_limiter, get_io_type, IOOp, IORateLimiter};
+
+use std::fmt::{self, Debug, Formatter};
+use std::fs;
+use std::io::{self, Read, Seek, Write};
+use std::path::Path;
+use std::sync::Arc;
+
+use fs2::FileExt;
 
 /// A wrapper around `std::fs::File` with capability to track and regulate IO flow.
 pub struct File {
@@ -236,36 +231,21 @@ impl Default for OpenOptions {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl OpenOptionsExt for OpenOptions {
-    fn mode(&mut self, mode: u32) -> &mut Self {
-        self.0.mode(mode);
-        self
-    }
-
-    fn custom_flags(&mut self, flags: i32) -> &mut Self {
-        self.0.custom_flags(flags);
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use tempfile::Builder;
+    use tempfile::TempDir;
 
-    use super::{super::*, *};
+    use super::super::*;
+    use super::*;
 
     #[test]
     fn test_instrumented_file() {
-        let tmp_dir = Builder::new()
-            .prefix("test_instrumented_file")
-            .tempdir()
-            .unwrap();
         let limiter = Arc::new(IORateLimiter::new_for_test());
         // make sure read at most one bytes at a time
         limiter.set_io_rate_limit(20 /* 1s / refill_period */);
         let stats = limiter.statistics().unwrap();
 
+        let tmp_dir = TempDir::new().unwrap();
         let tmp_file = tmp_dir.path().join("instrumented.txt");
         let content = String::from("drink full and descend");
         {
@@ -288,22 +268,5 @@ mod tests {
             // it requires two EOF reads to finish the call.
             assert_eq!(stats.fetch(IOType::Export, IOOp::Read), content.len() + 2);
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_unix_file_allocate_failure() {
-        let tmp_dir = Builder::new()
-            .prefix("test_unix_file_allocate_failure")
-            .tempdir()
-            .unwrap();
-        let data_path = tmp_dir.path();
-        let file_path = data_path.join(SPACE_PLACEHOLDER_FILE);
-        let f = File::create(file_path).unwrap();
-        // EINVAL when len == 0.
-        assert_eq!(
-            f.allocate(0).unwrap_err().raw_os_error().unwrap(),
-            libc::EINVAL
-        );
     }
 }

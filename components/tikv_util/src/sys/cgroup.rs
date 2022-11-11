@@ -1,15 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs::read_to_string,
-    mem::MaybeUninit,
-    num::IntErrorKind,
-    path::{Path, PathBuf},
-};
-
 use num_traits::Bounded;
 use procfs::process::{MountInfo, Process};
+use std::collections::{HashMap, HashSet};
+use std::fs::read_to_string;
+use std::mem::MaybeUninit;
+use std::num::IntErrorKind;
+use std::path::{Component, Path, PathBuf};
 
 // ## Differences between cgroup v1 and v2:
 // ### memory subsystem, memory limitation
@@ -98,7 +95,7 @@ impl CGroupSys {
                         .flatten();
                 }
             } else {
-                warn!("cgroup memory controller found but not mounted.");
+                warn!("Cgroup memory controller found but not mounted.");
             }
         }
         None
@@ -115,7 +112,7 @@ impl CGroupSys {
                     }
                 }
             } else {
-                warn!("cgroup cpuset controller found but not mounted.");
+                warn!("Cgroup cpuset controller found but not mounted.");
             }
         }
         Default::default()
@@ -143,7 +140,7 @@ impl CGroupSys {
                     }
                 }
             } else {
-                warn!("cgroup cpu controller found but not mounted.");
+                warn!("Cgroup cpu controller found but not mounted.");
             }
         }
         None
@@ -263,7 +260,7 @@ fn parse_mountinfos_v2(infos: Vec<MountInfo>) -> HashMap<String, (String, PathBu
 // `root` is mounted on `mount_point`. `path` is a sub path of `root`.
 // This is used to build an absolute path starts with `mount_point`.
 fn build_path(path: &str, root: &str, mount_point: &Path) -> Option<PathBuf> {
-    let abs_root = super::super::config::normalize_path(Path::new(root));
+    let abs_root = normalize_path(Path::new(root));
     let root = abs_root.to_str().unwrap();
     if path.starts_with('/') && root.starts_with('/') {
         if let Some(relative) = path.strip_prefix(root) {
@@ -281,13 +278,44 @@ fn build_path(path: &str, root: &str, mount_point: &Path) -> Option<PathBuf> {
     None
 }
 
-fn parse_memory_max(line: &str) -> Option<u64> {
-    if line != "max" {
-        capping_parse_int::<u64>(line)
-            .map_err(|e| warn!("fail to parse memory max"; "line" => %line, "err" => %e))
-            .ok()
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = path.components().peekable();
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        PathBuf::from(c.as_os_str())
     } else {
-        None
+        PathBuf::new()
+    };
+
+    for component in components {
+        match component {
+            Component::Prefix(..) => unreachable!(),
+            Component::RootDir => {
+                ret.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
+            }
+        }
+    }
+    ret
+}
+
+fn parse_memory_max(line: &str) -> Option<u64> {
+    if line == "max" {
+        return None;
+    }
+    match line.parse::<u64>() {
+        Ok(x) => Some(x),
+        Err(e) if matches!(e.kind(), IntErrorKind::PosOverflow) => Some(u64::MAX),
+        Err(e) => {
+            warn!("parse uint: {}", e);
+            None
+        }
     }
 }
 
@@ -358,9 +386,9 @@ fn parse_cpu_quota_v1(line1: &str, line2: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::OpenOptions, io::Write};
-
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     #[test]
     fn test_defult_cgroup_sys() {
@@ -509,18 +537,23 @@ mod tests {
 
     #[test]
     fn test_parse_memory_max() {
-        let cases = vec![
-            ("max", None),
-            ("-1", None),
-            ("9223372036854771712", Some(9223372036854771712)),
-            ("21474836480", Some(21474836480)),
-            // Malformed.
-            ("19446744073709551610", Some(u64::MAX)),
-            ("-18446744073709551610", None), // Raise InvalidDigit instead of NegOverflow.
-            ("0.1", None),
+        let contents = vec![
+            "max",
+            "-1",
+            "9223372036854771712",
+            "21474836480",
+            "19446744073709551610",
+            "-18446744073709551610",
         ];
-        println!("{:?}", "-18446744073709551610".parse::<u64>());
-        for (content, expect) in cases.into_iter() {
+        let expects = vec![
+            None,
+            None,
+            Some(9223372036854771712),
+            Some(21474836480),
+            Some(u64::MAX),
+            None,
+        ];
+        for (content, expect) in contents.into_iter().zip(expects) {
             let limit = parse_memory_max(content);
             assert_eq!(limit, expect);
         }

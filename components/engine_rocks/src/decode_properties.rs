@@ -2,16 +2,11 @@
 
 //! Base types used by various rocks properties decoders
 
-use std::{
-    collections::BTreeMap,
-    io::Read,
-    ops::{Deref, DerefMut},
-};
-
-use tikv_util::codec::{
-    number::{self, NumberEncoder},
-    Result,
-};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::ops::{Deref, DerefMut};
+use tikv_util::codec::number::{self, NumberEncoder};
+use tikv_util::codec::Result;
 
 #[derive(Clone, Debug, Default)]
 pub struct IndexHandle {

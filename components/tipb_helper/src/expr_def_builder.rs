@@ -79,7 +79,6 @@ impl ExprDefBuilder {
         Self(expr)
     }
 
-    #[must_use]
     pub fn push_child(mut self, child: impl Into<Expr>) -> Self {
         self.0.mut_children().push(child.into());
         self

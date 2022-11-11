@@ -5,9 +5,10 @@
 //!
 //! FIXME: Things here need to be moved elsewhere.
 
-use crate::{
-    cf_names::CFNamesExt, errors::Result, flow_control_factors::FlowControlFactorsExt, range::Range,
-};
+use crate::cf_names::CFNamesExt;
+use crate::errors::Result;
+use crate::flow_control_factors::FlowControlFactorsExt;
+use crate::range::Range;
 
 #[derive(Clone, Debug)]
 pub enum DeleteStrategy {
@@ -30,22 +31,17 @@ pub trait MiscExt: CFNamesExt + FlowControlFactorsExt {
 
     fn flush_cf(&self, cf: &str, sync: bool) -> Result<()>;
 
-    fn delete_all_in_range(&self, strategy: DeleteStrategy, ranges: &[Range<'_>]) -> Result<()> {
+    fn delete_all_in_range(&self, strategy: DeleteStrategy, ranges: &[Range]) -> Result<()> {
         for cf in self.cf_names() {
             self.delete_ranges_cf(cf, strategy.clone(), ranges)?;
         }
         Ok(())
     }
 
-    fn delete_ranges_cf(
-        &self,
-        cf: &str,
-        strategy: DeleteStrategy,
-        ranges: &[Range<'_>],
-    ) -> Result<()>;
+    fn delete_ranges_cf(&self, cf: &str, strategy: DeleteStrategy, ranges: &[Range]) -> Result<()>;
 
     /// Return the approximate number of records and size in the range of memtables of the cf.
-    fn get_approximate_memtable_stats_cf(&self, cf: &str, range: &Range<'_>) -> Result<(u64, u64)>;
+    fn get_approximate_memtable_stats_cf(&self, cf: &str, range: &Range) -> Result<(u64, u64)>;
 
     fn ingest_maybe_slowdown_writes(&self, cf: &str) -> Result<bool>;
 

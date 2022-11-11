@@ -1,10 +1,13 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{DBOptions, DBOptionsExt, Result, TitanDBOptions};
-use rocksdb::{DBOptions as RawDBOptions, TitanDBOptions as RawTitanDBOptions};
-use tikv_util::box_err;
-
 use crate::engine::RocksEngine;
+use engine_traits::DBOptions;
+use engine_traits::DBOptionsExt;
+use engine_traits::Result;
+use engine_traits::TitanDBOptions;
+use rocksdb::DBOptions as RawDBOptions;
+use rocksdb::TitanDBOptions as RawTitanDBOptions;
+use tikv_util::box_err;
 
 impl DBOptionsExt for RocksEngine {
     type DBOptions = RocksDBOptions;

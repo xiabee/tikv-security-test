@@ -1,25 +1,25 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc, Arc,
-    },
-    thread,
-    time::Duration,
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
 
 use error_code::ErrorCodeExt;
 use futures::executor::block_on;
-use grpcio::{EnvBuilder, Error as GrpcError, RpcStatus, RpcStatusCode};
-use kvproto::{metapb, pdpb};
+use grpcio::EnvBuilder;
+use grpcio::{Error as GrpcError, RpcStatus, RpcStatusCode};
+use kvproto::metapb;
+use kvproto::pdpb;
+use tokio::runtime::Builder;
+
 use pd_client::{Error as PdError, Feature, PdClient, PdConnector, RegionStat, RpcClient};
 use raftstore::store;
 use security::{SecurityConfig, SecurityManager};
-use test_pd::{mocker::*, util::*, Server as MockServer};
 use tikv_util::config::ReadableDuration;
-use tokio::runtime::Builder;
 use txn_types::TimeStamp;
+
+use test_pd::{mocker::*, util::*, Server as MockServer};
 
 #[test]
 fn test_retry_rpc_client() {
@@ -92,9 +92,6 @@ fn test_rpc_client() {
     let ts = block_on(client.get_tso()).unwrap();
     assert_ne!(ts, TimeStamp::zero());
 
-    let ts100 = block_on(client.batch_get_tso(100)).unwrap();
-    assert_eq!(ts.logical() + 100, ts100.logical());
-
     let mut prev_id = 0;
     for _ in 0..100 {
         let client = new_client(eps.clone(), None);
@@ -126,12 +123,7 @@ fn test_rpc_client() {
     assert_eq!(region_info.region, region);
     assert_eq!(region_info.leader.unwrap(), peer);
 
-    block_on(client.store_heartbeat(
-        pdpb::StoreStats::default(),
-        /*store_report=*/ None,
-        None,
-    ))
-    .unwrap();
+    block_on(client.store_heartbeat(pdpb::StoreStats::default(), /*store_report=*/ None)).unwrap();
     block_on(client.ask_batch_split(metapb::Region::default(), 1)).unwrap();
     block_on(client.report_batch_split(vec![metapb::Region::default(), metapb::Region::default()]))
         .unwrap();
@@ -476,20 +468,6 @@ fn test_change_leader_async() {
 }
 
 #[test]
-fn test_pd_client_ok_when_cluster_not_ready() {
-    let pd_client_cluster_id_zero = "cluster_id_is_not_ready";
-    let server = MockServer::with_case(3, Arc::new(AlreadyBootstrapped));
-    let eps = server.bind_addrs();
-
-    let client = new_client(eps, None);
-    fail::cfg(pd_client_cluster_id_zero, "return()").unwrap();
-    // wait 100ms to let client load member.
-    thread::sleep(Duration::from_millis(101));
-    assert_eq!(client.reconnect().is_err(), true);
-    fail::remove(pd_client_cluster_id_zero);
-}
-
-#[test]
 fn test_pd_client_heartbeat_send_failed() {
     let pd_client_send_fail_fp = "region_heartbeat_send_failed";
     fail::cfg(pd_client_send_fail_fp, "return()").unwrap();
@@ -645,7 +623,7 @@ fn test_cluster_version() {
 
     let emit_heartbeat = || {
         let req = pdpb::StoreStats::default();
-        block_on(client.store_heartbeat(req, /*store_report=*/ None, None)).unwrap();
+        block_on(client.store_heartbeat(req, /*store_report=*/ None)).unwrap();
     };
 
     let set_cluster_version = |version: &str| {

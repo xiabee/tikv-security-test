@@ -1,14 +1,10 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::str::FromStr;
-
 use online_config::ConfigValue;
-use rocksdb::{
-    CompactionPriority, DBCompactionStyle, DBCompressionType, DBInfoLogLevel, DBRateLimiterMode,
-    DBRecoveryMode, DBTitanDBBlobRunMode,
-};
+pub use rocksdb::PerfLevel;
+use rocksdb::{DBCompressionType, DBInfoLogLevel, DBTitanDBBlobRunMode};
 use serde::{Deserialize, Serialize};
-use tikv_util::numeric_enum_serializing_mod;
+use std::str::FromStr;
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -63,12 +59,11 @@ impl From<CompressionType> for DBCompressionType {
 pub mod compression_type_level_serde {
     use std::fmt;
 
+    use serde::de::{Error, SeqAccess, Unexpected, Visitor};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserializer, Serializer};
+
     use rocksdb::DBCompressionType;
-    use serde::{
-        de::{Error, SeqAccess, Unexpected, Visitor},
-        ser::SerializeSeq,
-        Deserializer, Serializer,
-    };
 
     pub fn serialize<S>(ts: &[DBCompressionType; 7], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -150,11 +145,10 @@ pub mod compression_type_level_serde {
 pub mod compression_type_serde {
     use std::fmt;
 
+    use serde::de::{Error, Unexpected, Visitor};
+    use serde::{Deserializer, Serializer};
+
     use rocksdb::DBCompressionType;
-    use serde::{
-        de::{Error, Unexpected, Visitor},
-        Deserializer, Serializer,
-    };
 
     pub fn serialize<S>(t: &DBCompressionType, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -202,7 +196,7 @@ pub mod compression_type_serde {
                     "disable" => DBCompressionType::Disable,
                     _ => {
                         return Err(E::invalid_value(
-                            Unexpected::Other("invalid compression type"),
+                            Unexpected::Other(&"invalid compression type".to_string()),
                             &self,
                         ));
                     }
@@ -269,38 +263,116 @@ impl From<BlobRunMode> for DBTitanDBBlobRunMode {
     }
 }
 
-numeric_enum_serializing_mod! {compaction_pri_serde CompactionPriority {
+macro_rules! numeric_enum_mod {
+    ($name:ident $enum:ident { $($variant:ident = $value:expr, )* }) => {
+        pub mod $name {
+            use std::fmt;
+
+            use serde::{Serializer, Deserializer};
+            use serde::de::{self, Unexpected, Visitor};
+            use rocksdb::$enum;
+
+            pub fn serialize<S>(mode: &$enum, serializer: S) -> Result<S::Ok, S::Error>
+                where S: Serializer
+            {
+                serializer.serialize_i64(*mode as i64)
+            }
+
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<$enum, D::Error>
+                where D: Deserializer<'de>
+            {
+                struct EnumVisitor;
+
+                impl<'de> Visitor<'de> for EnumVisitor {
+                    type Value = $enum;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        write!(formatter, concat!("valid ", stringify!($enum)))
+                    }
+
+                    fn visit_i64<E>(self, value: i64) -> Result<$enum, E>
+                        where E: de::Error
+                    {
+                        match value {
+                            $( $value => Ok($enum::$variant), )*
+                            _ => Err(E::invalid_value(Unexpected::Signed(value), &self))
+                        }
+                    }
+                }
+
+                deserializer.deserialize_i64(EnumVisitor)
+            }
+
+            #[cfg(test)]
+            mod tests {
+                use toml;
+                use rocksdb::$enum;
+                use serde::{Deserialize, Serialize};
+
+                #[test]
+                fn test_serde() {
+                    #[derive(Serialize, Deserialize, PartialEq)]
+                    struct EnumHolder {
+                        #[serde(with = "super")]
+                        e: $enum,
+                    }
+
+                    let cases = vec![
+                        $(($enum::$variant, $value), )*
+                    ];
+                    for (e, v) in cases {
+                        let holder = EnumHolder { e };
+                        let res = toml::to_string(&holder).unwrap();
+                        let exp = format!("e = {}\n", v);
+                        assert_eq!(res, exp);
+                        let h: EnumHolder = toml::from_str(&exp).unwrap();
+                        assert!(h == holder);
+                    }
+                }
+            }
+        }
+    }
+}
+
+numeric_enum_mod! {compaction_pri_serde CompactionPriority {
     ByCompensatedSize = 0,
     OldestLargestSeqFirst = 1,
     OldestSmallestSeqFirst = 2,
     MinOverlappingRatio = 3,
 }}
 
-numeric_enum_serializing_mod! {rate_limiter_mode_serde DBRateLimiterMode {
+numeric_enum_mod! {rate_limiter_mode_serde DBRateLimiterMode {
     ReadOnly = 1,
     WriteOnly = 2,
     AllIo = 3,
 }}
 
-numeric_enum_serializing_mod! {compaction_style_serde DBCompactionStyle {
+numeric_enum_mod! {compaction_style_serde DBCompactionStyle {
     Level = 0,
     Universal = 1,
-    Fifo = 2,
-    None = 3,
 }}
 
-numeric_enum_serializing_mod! {recovery_mode_serde DBRecoveryMode {
+numeric_enum_mod! {recovery_mode_serde DBRecoveryMode {
     TolerateCorruptedTailRecords = 0,
     AbsoluteConsistency = 1,
     PointInTime = 2,
     SkipAnyCorruptedRecords = 3,
 }}
 
+numeric_enum_mod! {perf_level_serde PerfLevel {
+    Uninitialized = 0,
+    Disable = 1,
+    EnableCount = 2,
+    EnableTimeExceptForMutex = 3,
+    EnableTimeAndCPUTimeExceptForMutex = 4,
+    EnableTime = 5,
+    OutOfBounds = 6,
+}}
+
 #[cfg(test)]
 mod tests {
-    use rocksdb::DBCompressionType;
-
     use super::*;
+    use rocksdb::DBCompressionType;
 
     #[test]
     fn test_parse_compression_type() {

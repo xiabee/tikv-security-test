@@ -1,26 +1,30 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use crate::recorder::RecorderHandle;
+use crate::reporter::Task;
+
 use std::error::Error;
 
 use online_config::{ConfigChange, OnlineConfig};
 use serde_derive::{Deserialize, Serialize};
 use tikv_util::config::ReadableDuration;
+use tikv_util::worker::Scheduler;
 
-use crate::{
-    recorder::ConfigChangeNotifier as RecorderConfigChangeNotifier,
-    reporter::ConfigChangeNotifier as ReporterConfigChangeNotifier, AddressChangeNotifier,
-};
-
-const MIN_PRECISION: ReadableDuration = ReadableDuration::millis(100);
+const MIN_PRECISION: ReadableDuration = ReadableDuration::secs(1);
 const MAX_PRECISION: ReadableDuration = ReadableDuration::hours(1);
 const MAX_MAX_RESOURCE_GROUPS: usize = 5_000;
-const MIN_REPORT_RECEIVER_INTERVAL: ReadableDuration = ReadableDuration::millis(500);
+const MIN_REPORT_RECEIVER_INTERVAL: ReadableDuration = ReadableDuration::secs(5);
 
 /// Public configuration of resource metering module.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
+    /// Turn on resource metering.
+    ///
+    /// This configuration will affect all resource modules such as cpu/summary.
+    pub enabled: bool,
+
     /// Data reporting destination address.
     pub receiver_address: String,
 
@@ -39,9 +43,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            enabled: false,
             receiver_address: "".to_string(),
             report_receiver_interval: ReadableDuration::minutes(1),
-            max_resource_groups: 100,
+            max_resource_groups: 2000,
             precision: ReadableDuration::secs(1),
         }
     }
@@ -85,24 +90,20 @@ impl Config {
 /// to control the dynamic update of the configuration.
 pub struct ConfigManager {
     current_config: Config,
-
-    recorder_notifier: RecorderConfigChangeNotifier,
-    reporter_notifier: ReporterConfigChangeNotifier,
-    address_notifier: AddressChangeNotifier,
+    scheduler: Scheduler<Task>,
+    recorder: RecorderHandle,
 }
 
 impl ConfigManager {
     pub fn new(
         current_config: Config,
-        recorder_notifier: RecorderConfigChangeNotifier,
-        reporter_notifier: ReporterConfigChangeNotifier,
-        address_notifier: AddressChangeNotifier,
+        scheduler: Scheduler<Task>,
+        recorder: RecorderHandle,
     ) -> Self {
         ConfigManager {
             current_config,
-            recorder_notifier,
-            reporter_notifier,
-            address_notifier,
+            scheduler,
+            recorder,
         }
     }
 }
@@ -112,13 +113,21 @@ impl online_config::ConfigManager for ConfigManager {
         let mut new_config = self.current_config.clone();
         new_config.update(change);
         new_config.validate()?;
-        if self.current_config.receiver_address != new_config.receiver_address {
-            self.address_notifier
-                .notify(new_config.receiver_address.clone());
+        // Pause or resume the recorder thread.
+        if self.current_config.enabled != new_config.enabled {
+            if new_config.enabled {
+                self.recorder.resume();
+            } else {
+                self.recorder.pause();
+            }
+        }
+        if self.current_config.precision != new_config.precision {
+            self.recorder.precision(new_config.precision.0);
         }
         // Notify reporter that the configuration has changed.
-        self.recorder_notifier.notify(new_config.clone());
-        self.reporter_notifier.notify(new_config.clone());
+        self.scheduler
+            .schedule(Task::ConfigChange(new_config.clone()))
+            .ok();
         self.current_config = new_config;
         Ok(())
     }
@@ -126,15 +135,15 @@ impl online_config::ConfigManager for ConfigManager {
 
 #[cfg(test)]
 mod tests {
-    use tikv_util::config::ReadableDuration;
-
     use super::*;
+    use tikv_util::config::ReadableDuration;
 
     #[test]
     fn test_config_validate() {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok()); // Empty address is allowed.
         let cfg = Config {
+            enabled: false,
             receiver_address: "127.0.0.1:6666".to_string(),
             report_receiver_interval: ReadableDuration::minutes(1),
             max_resource_groups: 2000,
@@ -142,6 +151,7 @@ mod tests {
         };
         assert!(cfg.validate().is_ok());
         let cfg = Config {
+            enabled: false,
             receiver_address: "127.0.0.1:6666".to_string(),
             report_receiver_interval: ReadableDuration::days(999), // invalid
             max_resource_groups: 2000,
@@ -149,6 +159,7 @@ mod tests {
         };
         assert!(cfg.validate().is_err());
         let cfg = Config {
+            enabled: false,
             receiver_address: "127.0.0.1:6666".to_string(),
             report_receiver_interval: ReadableDuration::minutes(1),
             max_resource_groups: usize::MAX, // invalid
@@ -156,6 +167,7 @@ mod tests {
         };
         assert!(cfg.validate().is_err());
         let cfg = Config {
+            enabled: false,
             receiver_address: "127.0.0.1:6666".to_string(),
             report_receiver_interval: ReadableDuration::minutes(1),
             max_resource_groups: 2000,

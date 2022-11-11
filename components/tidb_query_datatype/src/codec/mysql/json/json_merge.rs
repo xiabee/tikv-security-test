@@ -1,9 +1,8 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::BTreeMap;
-
 use super::{Json, JsonRef, JsonType};
 use crate::codec::{Error, Result};
+use std::collections::BTreeMap;
 
 impl Json {
     /// `merge` is the implementation for JSON_MERGE in mysql
@@ -17,7 +16,7 @@ impl Json {
     ///
     /// See `MergeBinary()` in TiDB `json/binary_function.go`
     #[allow(clippy::comparison_chain)]
-    pub fn merge(bjs: Vec<JsonRef<'_>>) -> Result<Json> {
+    pub fn merge(bjs: Vec<JsonRef>) -> Result<Json> {
         let mut result = vec![];
         let mut objects = vec![];
         for j in bjs {
@@ -66,7 +65,7 @@ impl<'a> MergeUnit<'a> {
 }
 
 // See `mergeBinaryArray()` in TiDB `json/binary_function.go`
-fn merge_binary_array(elems: &[MergeUnit<'_>]) -> Result<Json> {
+fn merge_binary_array(elems: &[MergeUnit]) -> Result<Json> {
     let mut buf = vec![];
     for j in elems.iter() {
         let j = j.as_ref();
@@ -83,7 +82,7 @@ fn merge_binary_array(elems: &[MergeUnit<'_>]) -> Result<Json> {
 }
 
 // See `mergeBinaryObject()` in TiDB `json/binary_function.go`
-fn merge_binary_object(objects: &mut Vec<JsonRef<'_>>) -> Result<Json> {
+fn merge_binary_object(objects: &mut Vec<JsonRef>) -> Result<Json> {
     let mut kv_map: BTreeMap<String, Json> = BTreeMap::new();
     for j in objects.drain(..) {
         let elem_count = j.get_elem_count();

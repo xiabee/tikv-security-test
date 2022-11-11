@@ -1,27 +1,21 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use tidb_query_codegen::rpn_fn;
-use tidb_query_common::Result;
-use tidb_query_datatype::{
-    codec::{
-        data_type::*,
-        mysql::{
-            duration::{
-                MAX_HOUR_PART, MAX_MINUTE_PART, MAX_NANOS, MAX_NANOS_PART, MAX_SECOND_PART,
-                NANOS_PER_SEC,
-            },
-            time::{
-                extension::DateTimeExtension, weekmode::WeekMode, WeekdayExtension, MONTH_NAMES,
-            },
-            Duration, TimeType, MAX_FSP,
-        },
-        Error,
-    },
-    expr::{EvalContext, SqlMode},
-    FieldTypeAccessor,
-};
 
 use crate::RpnFnCallExtra;
+use tidb_query_common::Result;
+
+use tidb_query_datatype::codec::data_type::*;
+use tidb_query_datatype::codec::mysql::duration::{
+    MAX_HOUR_PART, MAX_MINUTE_PART, MAX_NANOS, MAX_NANOS_PART, MAX_SECOND_PART, NANOS_PER_SEC,
+};
+use tidb_query_datatype::codec::mysql::time::extension::DateTimeExtension;
+use tidb_query_datatype::codec::mysql::time::weekmode::WeekMode;
+use tidb_query_datatype::codec::mysql::time::{WeekdayExtension, MONTH_NAMES};
+use tidb_query_datatype::codec::mysql::{Duration, TimeType, MAX_FSP};
+use tidb_query_datatype::codec::Error;
+use tidb_query_datatype::expr::{EvalContext, SqlMode};
+use tidb_query_datatype::FieldTypeAccessor;
 
 #[rpn_fn(nullable, capture = [ctx])]
 #[inline]
@@ -62,22 +56,6 @@ pub fn date(ctx: &mut EvalContext, t: &DateTime) -> Result<Option<DateTime>> {
     let mut res = *t;
     res.set_time_type(TimeType::Date)?;
     Ok(Some(res))
-}
-
-#[rpn_fn(capture = [ctx])]
-#[inline]
-pub fn sysdate_with_fsp(ctx: &mut EvalContext, fsp: &Int) -> Result<Option<DateTime>> {
-    DateTime::from_local_time(ctx, TimeType::DateTime, *fsp as i8)
-        .map(Some)
-        .or_else(|e| ctx.handle_invalid_time_error(e).map(|_| Ok(None))?)
-}
-
-#[rpn_fn(capture = [ctx])]
-#[inline]
-pub fn sysdate_without_fsp(ctx: &mut EvalContext) -> Result<Option<DateTime>> {
-    DateTime::from_local_time(ctx, TimeType::DateTime, 0)
-        .map(Some)
-        .or_else(|e| ctx.handle_invalid_time_error(e).map(|_| Ok(None))?)
 }
 
 #[rpn_fn(nullable, capture = [ctx])]
@@ -871,28 +849,6 @@ pub fn string_string_time_diff(
     duration_duration_time_diff(ctx, &arg1, &arg2)
 }
 
-#[rpn_fn(capture = [ctx])]
-#[inline]
-pub fn duration_string_time_diff(
-    ctx: &mut EvalContext,
-    arg1: &Duration,
-    arg2: BytesRef,
-) -> Result<Option<Duration>> {
-    let arg2 = std::str::from_utf8(arg2).map_err(Error::Encoding)?;
-    let arg2 = match Duration::parse(ctx, arg2, MAX_FSP) {
-        Ok(arg) => arg,
-        Err(_) => return Ok(None),
-    };
-
-    duration_duration_time_diff(ctx, arg1, &arg2)
-}
-
-#[rpn_fn]
-#[inline]
-pub fn quarter(t: &DateTime) -> Result<Option<Int>> {
-    Ok(Some(Int::from(t.month() + 2) / 3))
-}
-
 /// Cast Duration into string representation and drop subsec if possible.
 fn duration_to_string(duration: Duration) -> String {
     match duration.subsec_micros() {
@@ -912,18 +868,15 @@ fn datetime_to_string(mut datetime: DateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use tidb_query_datatype::{
-        builder::FieldTypeBuilder,
-        codec::{
-            error::ERR_TRUNCATE_WRONG_VALUE,
-            mysql::{Time, MAX_FSP},
-        },
-        FieldTypeTp,
-    };
+    use super::*;
+
     use tipb::ScalarFuncSig;
 
-    use super::*;
     use crate::types::test_util::RpnFnScalarEvaluator;
+    use tidb_query_datatype::builder::FieldTypeBuilder;
+    use tidb_query_datatype::codec::error::ERR_TRUNCATE_WRONG_VALUE;
+    use tidb_query_datatype::codec::mysql::{Time, MAX_FSP};
+    use tidb_query_datatype::FieldTypeTp;
 
     #[test]
     fn test_add_duration_and_duration() {
@@ -2446,7 +2399,7 @@ mod tests {
                 .push_param(duration2)
                 .evaluate::<Duration>(ScalarFuncSig::DurationDurationTimeDiff)
                 .unwrap();
-            assert_eq!(output, expected, "got {}", output.unwrap());
+            assert_eq!(output, expected, "got {}", output.unwrap().to_string());
         }
     }
 
@@ -2506,7 +2459,7 @@ mod tests {
                 .push_param(duration)
                 .evaluate::<Duration>(ScalarFuncSig::StringDurationTimeDiff)
                 .unwrap();
-            assert_eq!(output, expected, "got {}", output.unwrap());
+            assert_eq!(output, expected, "got {}", output.unwrap().to_string());
         }
     }
 
@@ -2566,94 +2519,7 @@ mod tests {
                 .push_param(string2)
                 .evaluate::<Duration>(ScalarFuncSig::StringStringTimeDiff)
                 .unwrap();
-            assert_eq!(output, expected, "got {}", output.unwrap());
-        }
-    }
-
-    #[test]
-    fn test_duration_string_time_diff() {
-        let cases = vec![
-            (Some("00:02:02"), Some("00:01:01"), Some("00:01:01")),
-            (Some("12:00:00"), Some("00:00:01"), Some("11:59:59")),
-            (Some("24:00:00"), Some("00:00:01"), Some("23:59:59")),
-            (Some("24:00:01"), Some("00:00:02"), Some("23:59:59")),
-            (None, None, None),
-            // corner case
-            (
-                Some("00:59:59.999999"),
-                Some("01:00:00.000000"),
-                Some("-00:00:00.000001"),
-            ),
-            (
-                Some("00:59:59.999999"),
-                Some("-00:00:00.000001"),
-                Some("01:00:00.000000"),
-            ),
-            (
-                Some("-00:00:00.000001"),
-                Some("00:00:00.000001"),
-                Some("-00:00:00.000002"),
-            ),
-            (
-                Some("-00:00:00.000001"),
-                Some("-00:00:00.000001"),
-                Some("00:00:00.000000"),
-            ),
-            // overflow or underflow case
-            (
-                Some("-00:00:01"),
-                Some("838:59:59.000000"),
-                Some("-838:59:59.000000"),
-            ),
-            (
-                Some("838:59:59.000000"),
-                Some("-00:00:01"),
-                Some("838:59:59.000000"),
-            ),
-            (
-                Some("838:59:59.000000"),
-                Some("-838:59:59.000000"),
-                Some("838:59:59.000000"),
-            ),
-        ];
-        let mut ctx = EvalContext::default();
-        for (duration, string, exp) in cases {
-            let expected = exp.map(|exp| Duration::parse(&mut ctx, exp, MAX_FSP).unwrap());
-            let duration = duration.map(|arg1| Duration::parse(&mut ctx, arg1, MAX_FSP).unwrap());
-            let string = string.map(|str| str.as_bytes().to_vec());
-            let output = RpnFnScalarEvaluator::new()
-                .push_param(duration)
-                .push_param(string)
-                .evaluate::<Duration>(ScalarFuncSig::DurationStringTimeDiff)
-                .unwrap();
-            assert_eq!(output, expected, "got {}", output.unwrap());
-        }
-    }
-
-    #[test]
-    fn test_quarter() {
-        let cases = vec![
-            (Some("2008-04-01"), Some(2)),
-            (Some("2008-01-01"), Some(1)),
-            (Some("2008-03-31"), Some(1)),
-            (Some("2008-06-30"), Some(2)),
-            (Some("2008-07-01"), Some(3)),
-            (Some("2008-09-30"), Some(3)),
-            (Some("2008-10-01"), Some(4)),
-            (Some("2008-12-31"), Some(4)),
-            (Some("2008-00-01"), Some(0)),
-            (None, None),
-        ];
-        let mut ctx = EvalContext::default();
-        for (datetime, exp) in cases {
-            let expected = exp.map(|exp| Int::from(exp));
-            let datetime = datetime
-                .map(|arg1| DateTime::parse_datetime(&mut ctx, arg1, MAX_FSP, true).unwrap());
-            let output = RpnFnScalarEvaluator::new()
-                .push_param(datetime)
-                .evaluate::<Int>(ScalarFuncSig::Quarter)
-                .unwrap();
-            assert_eq!(output, expected, "got {}", output.unwrap());
+            assert_eq!(output, expected, "got {}", output.unwrap().to_string());
         }
     }
 }

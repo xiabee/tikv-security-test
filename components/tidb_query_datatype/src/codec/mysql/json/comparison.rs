@@ -1,11 +1,11 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp::{Ord, Ordering},
-    f64,
-};
+use std::cmp::{Ord, Ordering};
+use std::f64;
 
-use super::{super::Result, constants::*, Json, JsonRef, JsonType, ERR_CONVERT_FAILED};
+use super::super::Result;
+use super::constants::*;
+use super::{Json, JsonRef, JsonType, ERR_CONVERT_FAILED};
 
 fn compare<T: Ord>(x: T, y: T) -> Ordering {
     x.cmp(&y)
@@ -202,8 +202,8 @@ mod tests {
             ),
             (Json::from_i64(2), Json::from_u64(1), Ordering::Greater),
             (
-                Json::from_i64(i64::MAX),
-                Json::from_u64(i64::MAX as u64),
+                Json::from_i64(std::i64::MAX),
+                Json::from_u64(std::i64::MAX as u64),
                 Ordering::Equal,
             ),
             (
@@ -218,8 +218,8 @@ mod tests {
             ),
             (Json::from_u64(1), Json::from_i64(2), Ordering::Less),
             (
-                Json::from_u64(i64::MAX as u64),
-                Json::from_i64(i64::MAX),
+                Json::from_u64(std::i64::MAX as u64),
+                Json::from_i64(std::i64::MAX),
                 Ordering::Equal,
             ),
             (Json::from_f64(9.0), Json::from_i64(9), Ordering::Equal),

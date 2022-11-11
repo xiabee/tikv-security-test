@@ -1,15 +1,24 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::*, time::Duration};
+use std::sync::*;
+use std::time::Duration;
 
-use cdc::{Task, Validate};
-use futures::{executor::block_on, SinkExt};
+use crate::{new_event_feed, TestSuiteBuilder};
+use futures::executor::block_on;
+use futures::SinkExt;
 use grpcio::WriteFlags;
-use kvproto::{cdcpb::*, kvrpcpb::*};
+#[cfg(not(feature = "prost-codec"))]
+use kvproto::cdcpb::*;
+#[cfg(feature = "prost-codec")]
+use kvproto::cdcpb::{
+    event::{row::OpType as EventRowOpType, Event as Event_oneof_event, LogType as EventLogType},
+    ChangeDataEvent,
+};
+use kvproto::kvrpcpb::*;
 use pd_client::PdClient;
 use test_raftstore::*;
 
-use crate::{new_event_feed, TestSuiteBuilder};
+use cdc::{Task, Validate};
 
 #[test]
 fn test_cdc_congest() {
@@ -93,7 +102,7 @@ fn test_cdc_congest() {
         .unwrap();
 
     assert!(
-        rx.recv_timeout(Duration::from_millis(1000)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
         "find unexpected delegate"
     );
     suite.stop();

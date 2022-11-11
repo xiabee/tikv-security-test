@@ -1,31 +1,23 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp,
-    collections::HashMap,
-    io::Read,
-    ops::{Deref, DerefMut},
-    u64,
-};
+use std::cmp;
+use std::collections::HashMap;
+use std::io::Read;
+use std::ops::{Deref, DerefMut};
+use std::u64;
 
+use crate::decode_properties::{DecodeProperties, IndexHandle, IndexHandles};
 use engine_traits::{MvccProperties, Range};
 use rocksdb::{
     DBEntryType, TablePropertiesCollector, TablePropertiesCollectorFactory, TitanBlobIndex,
     UserCollectedProperties,
 };
-use tikv_util::{
-    codec::{
-        number::{self, NumberEncoder},
-        Error, Result,
-    },
-    info,
-};
+use tikv_util::codec::number::{self, NumberEncoder};
+use tikv_util::codec::{Error, Result};
+use tikv_util::info;
 use txn_types::{Key, Write, WriteType};
 
-use crate::{
-    decode_properties::{DecodeProperties, IndexHandle, IndexHandles},
-    mvcc_properties::*,
-};
+use crate::mvcc_properties::*;
 
 const PROP_TOTAL_SIZE: &str = "tikv.total_size";
 const PROP_SIZE_INDEX: &str = "tikv.size_index";
@@ -136,10 +128,19 @@ pub enum RangeOffsetKind {
     Keys,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct RangeOffsets {
     pub size: u64,
     pub keys: u64,
+}
+
+impl RangeOffsets {
+    fn get(&self, kind: RangeOffsetKind) -> u64 {
+        match kind {
+            RangeOffsetKind::Keys => self.keys,
+            RangeOffsetKind::Size => self.size,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -197,31 +198,52 @@ impl RangeProperties {
     }
 
     pub fn get_approximate_size_in_range(&self, start: &[u8], end: &[u8]) -> u64 {
-        self.get_approximate_distance_in_range(start, end).0
+        self.get_approximate_distance_in_range(RangeOffsetKind::Size, start, end)
     }
 
     pub fn get_approximate_keys_in_range(&self, start: &[u8], end: &[u8]) -> u64 {
-        self.get_approximate_distance_in_range(start, end).1
+        self.get_approximate_distance_in_range(RangeOffsetKind::Keys, start, end)
     }
 
-    /// Returns `size` and `keys`.
-    pub fn get_approximate_distance_in_range(&self, start: &[u8], end: &[u8]) -> (u64, u64) {
+    fn get_approximate_distance_in_range(
+        &self,
+        kind: RangeOffsetKind,
+        start: &[u8],
+        end: &[u8],
+    ) -> u64 {
         assert!(start <= end);
         if start == end {
-            return (0, 0);
+            return 0;
         }
         let start_offset = match self.offsets.binary_search_by_key(&start, |&(ref k, _)| k) {
-            Ok(idx) => Some(idx),
-            Err(next_idx) => next_idx.checked_sub(1),
+            Ok(idx) => self.offsets[idx].1.get(kind),
+            Err(next_idx) => {
+                if next_idx == 0 {
+                    0
+                } else {
+                    self.offsets[next_idx - 1].1.get(kind)
+                }
+            }
         };
+
         let end_offset = match self.offsets.binary_search_by_key(&end, |&(ref k, _)| k) {
-            Ok(idx) => Some(idx),
-            Err(next_idx) => next_idx.checked_sub(1),
+            Ok(idx) => self.offsets[idx].1.get(kind),
+            Err(next_idx) => {
+                if next_idx == 0 {
+                    0
+                } else {
+                    self.offsets[next_idx - 1].1.get(kind)
+                }
+            }
         };
-        let start = start_offset.map_or_else(|| Default::default(), |x| self.offsets[x].1);
-        let end = end_offset.map_or_else(|| Default::default(), |x| self.offsets[x].1);
-        assert!(end.size >= start.size && end.keys >= start.keys);
-        (end.size - start.size, end.keys - start.keys)
+
+        if end_offset < start_offset {
+            panic!(
+                "start {:?} end {:?} start_offset {} end_offset {}",
+                start, end, start_offset, end_offset
+            );
+        }
+        end_offset - start_offset
     }
 
     // equivalent to range(Excluded(start_key), Excluded(end_key))
@@ -331,8 +353,8 @@ impl RangePropertiesCollector {
     }
 
     fn insert_new_point(&mut self, key: Vec<u8>) {
-        self.last_offsets = self.cur_offsets;
-        self.props.offsets.push((key, self.cur_offsets));
+        self.last_offsets = self.cur_offsets.clone();
+        self.props.offsets.push((key, self.cur_offsets.clone()));
     }
 }
 
@@ -380,9 +402,12 @@ impl Default for RangePropertiesCollectorFactory {
     }
 }
 
-impl TablePropertiesCollectorFactory<RangePropertiesCollector> for RangePropertiesCollectorFactory {
-    fn create_table_properties_collector(&mut self, _: u32) -> RangePropertiesCollector {
-        RangePropertiesCollector::new(self.prop_size_index_distance, self.prop_keys_index_distance)
+impl TablePropertiesCollectorFactory for RangePropertiesCollectorFactory {
+    fn create_table_properties_collector(&mut self, _: u32) -> Box<dyn TablePropertiesCollector> {
+        Box::new(RangePropertiesCollector::new(
+            self.prop_size_index_distance,
+            self.prop_keys_index_distance,
+        ))
     }
 }
 
@@ -497,9 +522,9 @@ impl TablePropertiesCollector for MvccPropertiesCollector {
 #[derive(Default)]
 pub struct MvccPropertiesCollectorFactory {}
 
-impl TablePropertiesCollectorFactory<MvccPropertiesCollector> for MvccPropertiesCollectorFactory {
-    fn create_table_properties_collector(&mut self, _: u32) -> MvccPropertiesCollector {
-        MvccPropertiesCollector::new()
+impl TablePropertiesCollectorFactory for MvccPropertiesCollectorFactory {
+    fn create_table_properties_collector(&mut self, _: u32) -> Box<dyn TablePropertiesCollector> {
+        Box::new(MvccPropertiesCollector::new())
     }
 }
 
@@ -536,20 +561,21 @@ pub fn get_range_entries_and_versions(
 
 #[cfg(test)]
 mod tests {
+    use rand::Rng;
+
     use std::sync::Arc;
 
-    use engine_traits::{CF_WRITE, LARGE_CFS};
-    use rand::Rng;
+    use crate::raw::{ColumnFamilyOptions, DBOptions, Writable};
+    use crate::raw::{DBEntryType, TablePropertiesCollector};
     use tempfile::Builder;
     use test::Bencher;
+
+    use crate::compat::Compat;
+    use crate::raw_util::CFOptions;
+    use engine_traits::{CF_WRITE, LARGE_CFS};
     use txn_types::{Key, Write, WriteType};
 
     use super::*;
-    use crate::{
-        compat::Compat,
-        raw::{ColumnFamilyOptions, DBEntryType, DBOptions, TablePropertiesCollector, Writable},
-        raw_util::CFOptions,
-    };
 
     #[allow(clippy::many_single_char_names)]
     #[test]
@@ -605,19 +631,19 @@ mod tests {
         assert_eq!(props.get_approximate_keys_in_range(b"", b"k"), 11_u64);
 
         assert_eq!(props.offsets.len(), 7);
-        let a = props.get(b"a");
+        let a = props.get(b"a".as_ref());
         assert_eq!(a.size, 1);
-        let e = props.get(b"e");
+        let e = props.get(b"e".as_ref());
         assert_eq!(e.size, DEFAULT_PROP_SIZE_INDEX_DISTANCE + 5);
-        let i = props.get(b"i");
+        let i = props.get(b"i".as_ref());
         assert_eq!(i.size, DEFAULT_PROP_SIZE_INDEX_DISTANCE / 8 * 17 + 9);
-        let k = props.get(b"k");
+        let k = props.get(b"k".as_ref());
         assert_eq!(k.size, DEFAULT_PROP_SIZE_INDEX_DISTANCE / 8 * 25 + 11);
-        let m = props.get(b"m");
+        let m = props.get(b"m".as_ref());
         assert_eq!(m.keys, 11 + DEFAULT_PROP_KEYS_INDEX_DISTANCE);
-        let n = props.get(b"n");
+        let n = props.get(b"n".as_ref());
         assert_eq!(n.keys, 11 + 2 * DEFAULT_PROP_KEYS_INDEX_DISTANCE);
-        let o = props.get(b"o");
+        let o = props.get(b"o".as_ref());
         assert_eq!(o.keys, 12 + 2 * DEFAULT_PROP_KEYS_INDEX_DISTANCE);
         let empty = RangeOffsets::default();
         let cases = [
@@ -717,10 +743,8 @@ mod tests {
         let db_opts = DBOptions::new();
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_level_zero_file_num_compaction_trigger(10);
-        cf_opts.add_table_properties_collector_factory(
-            "tikv.mvcc-properties-collector",
-            MvccPropertiesCollectorFactory::default(),
-        );
+        let f = Box::new(MvccPropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.mvcc-properties-collector", f);
         let cfs_opts = LARGE_CFS
             .iter()
             .map(|cf| CFOptions::new(cf, cf_opts.clone()))

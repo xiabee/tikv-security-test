@@ -2,16 +2,14 @@
 
 //! Core data types.
 
-use std::fmt::Debug;
-
-use kvproto::kvrpcpb;
-use txn_types::{Key, Value};
-
 use crate::storage::{
     mvcc::{Lock, LockType, TimeStamp, Write, WriteType},
     txn::ProcessResult,
     Callback, Result,
 };
+use kvproto::kvrpcpb;
+use std::fmt::Debug;
+use txn_types::{Key, Value};
 
 /// `MvccInfo` stores all mvcc information of given key.
 /// Used by `MvccGetByKey` and `MvccGetByStartTs`.
@@ -123,12 +121,7 @@ pub struct PrewriteResult {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PessimisticLockRes {
-    /// The previous value is loaded while handling the `AcquirePessimisticLock` command. The i-th
-    /// item is the value of the i-th key in the `AcquirePessimisticLock` command.
     Values(Vec<Option<Value>>),
-    /// Checked whether the key exists while handling the `AcquirePessimisticLock` command. The i-th
-    /// item is true if the i-th key in the `AcquirePessimisticLock` command exists.
-    Existence(Vec<bool>),
     Empty,
 }
 
@@ -136,7 +129,6 @@ impl PessimisticLockRes {
     pub fn push(&mut self, value: Option<Value>) {
         match self {
             PessimisticLockRes::Values(v) => v.push(value),
-            PessimisticLockRes::Existence(v) => v.push(value.is_some()),
             _ => panic!("unexpected PessimisticLockRes"),
         }
     }
@@ -150,10 +142,6 @@ impl PessimisticLockRes {
                     (v.unwrap_or_default(), is_not_found)
                 })
                 .unzip(),
-            PessimisticLockRes::Existence(mut vals) => {
-                vals.iter_mut().for_each(|x| *x = !*x);
-                (vec![], vals)
-            }
             PessimisticLockRes::Empty => (vec![], vec![]),
         }
     }

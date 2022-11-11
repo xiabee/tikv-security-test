@@ -3,9 +3,10 @@
 // #[PerformanceCriticalPath]
 use std::sync::{Arc, Mutex};
 
-use collections::HashSet;
 use prometheus::local::LocalHistogram;
 use raft::eraftpb::MessageType;
+
+use collections::HashSet;
 
 use super::metrics::*;
 
@@ -220,7 +221,6 @@ pub struct RaftProposeMetrics {
     pub local_read: u64,
     pub read_index: u64,
     pub unsafe_read_index: u64,
-    pub dropped_read_index: u64,
     pub normal: u64,
     pub batch: usize,
     pub transfer_leader: u64,
@@ -239,7 +239,6 @@ impl Default for RaftProposeMetrics {
             transfer_leader: 0,
             conf_change: 0,
             batch: 0,
-            dropped_read_index: 0,
             request_wait_time: REQUEST_WAIT_TIME_HISTOGRAM.local(),
         }
     }
@@ -267,12 +266,6 @@ impl RaftProposeMetrics {
                 .inc_by(self.unsafe_read_index);
             self.unsafe_read_index = 0;
         }
-        if self.dropped_read_index > 0 {
-            PEER_PROPOSAL_COUNTER
-                .dropped_read_index
-                .inc_by(self.dropped_read_index);
-            self.dropped_read_index = 0;
-        }
         if self.normal > 0 {
             PEER_PROPOSAL_COUNTER.normal.inc_by(self.normal);
             self.normal = 0;
@@ -296,7 +289,7 @@ impl RaftProposeMetrics {
 }
 
 /// The buffered metrics counter for invalid propose
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RaftInvalidProposeMetrics {
     pub mismatch_store_id: u64,
     pub region_not_found: u64,
@@ -307,6 +300,22 @@ pub struct RaftInvalidProposeMetrics {
     pub read_index_no_leader: u64,
     pub region_not_initialized: u64,
     pub is_applying_snapshot: u64,
+}
+
+impl Default for RaftInvalidProposeMetrics {
+    fn default() -> RaftInvalidProposeMetrics {
+        RaftInvalidProposeMetrics {
+            mismatch_store_id: 0,
+            region_not_found: 0,
+            not_leader: 0,
+            mismatch_peer_id: 0,
+            stale_command: 0,
+            epoch_not_match: 0,
+            read_index_no_leader: 0,
+            region_not_initialized: 0,
+            is_applying_snapshot: 0,
+        }
+    }
 }
 
 impl RaftInvalidProposeMetrics {
@@ -368,11 +377,21 @@ impl RaftInvalidProposeMetrics {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RaftLogGcSkippedMetrics {
     pub reserve_log: u64,
     pub threshold_limit: u64,
     pub compact_idx_too_small: u64,
+}
+
+impl Default for RaftLogGcSkippedMetrics {
+    fn default() -> RaftLogGcSkippedMetrics {
+        RaftLogGcSkippedMetrics {
+            reserve_log: 0,
+            threshold_limit: 0,
+            compact_idx_too_small: 0,
+        }
+    }
 }
 
 impl RaftLogGcSkippedMetrics {

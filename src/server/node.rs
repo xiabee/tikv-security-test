@@ -1,65 +1,52 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-use api_version::{api_v2::TIDB_RANGES_COMPLEMENT, KvFormat};
+use super::RaftKv;
+use super::Result;
+use crate::import::SSTImporter;
+use crate::read_pool::ReadPoolHandle;
+use crate::server::lock_manager::LockManager;
+use crate::server::Config as ServerConfig;
+use crate::storage::key_prefix::TIDB_RANGES_COMPLEMENT;
+use crate::storage::kv::FlowStatsReporter;
+use crate::storage::txn::flow_controller::FlowController;
+use crate::storage::{config::Config as StorageConfig, Storage};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{Engines, Iterable, KvEngine, RaftEngine, DATA_CFS, DATA_KEY_PREFIX_LEN};
 use grpcio_health::HealthService;
-use kvproto::{
-    kvrpcpb::ApiVersion, metapb, raft_serverpb::StoreIdent, replication_modepb::ReplicationStatus,
-};
-use pd_client::{Error as PdError, FeatureGate, PdClient, INVALID_ID};
-use raftstore::{
-    coprocessor::dispatcher::CoprocessorHost,
-    router::{LocalReadRouter, RaftStoreRouter},
-    store::{
-        self,
-        fsm::{store::StoreMeta, ApplyRouter, RaftBatchSystem, RaftRouter},
-        initial_region, AutoSplitController, Config as StoreConfig, GlobalReplicationState, PdTask,
-        RefreshConfigTask, SnapManager, SplitCheckTask, Transport,
-    },
-};
-use resource_metering::{CollectorRegHandle, ResourceTagFactory};
-use tikv_util::{
-    config::VersionTrack,
-    quota_limiter::QuotaLimiter,
-    worker::{LazyWorker, Scheduler, Worker},
-};
-
-use super::{RaftKv, Result};
-use crate::{
-    import::SstImporter,
-    read_pool::ReadPoolHandle,
-    server::{lock_manager::LockManager, Config as ServerConfig},
-    storage::{
-        config::Config as StorageConfig, kv::FlowStatsReporter,
-        txn::flow_controller::FlowController, DynamicConfigs as StorageDynamicConfigs, Storage,
-    },
-};
+use kvproto::kvrpcpb::ApiVersion;
+use kvproto::metapb;
+use kvproto::raft_serverpb::StoreIdent;
+use kvproto::replication_modepb::ReplicationStatus;
+use pd_client::{Error as PdError, PdClient, INVALID_ID};
+use raftstore::coprocessor::dispatcher::CoprocessorHost;
+use raftstore::router::{LocalReadRouter, RaftStoreRouter};
+use raftstore::store::fsm::store::StoreMeta;
+use raftstore::store::fsm::{ApplyRouter, RaftBatchSystem, RaftRouter};
+use raftstore::store::AutoSplitController;
+use raftstore::store::{self, initial_region, Config as StoreConfig, SnapManager, Transport};
+use raftstore::store::{GlobalReplicationState, PdTask, SplitCheckTask};
+use tikv_util::config::VersionTrack;
+use tikv_util::worker::{LazyWorker, Scheduler, Worker};
 
 const MAX_CHECK_CLUSTER_BOOTSTRAPPED_RETRY_COUNT: u64 = 60;
 const CHECK_CLUSTER_BOOTSTRAPPED_RETRY_SECONDS: u64 = 3;
 
 /// Creates a new storage engine which is backed by the Raft consensus
 /// protocol.
-pub fn create_raft_storage<S, EK, R: FlowStatsReporter, F: KvFormat>(
+pub fn create_raft_storage<S, EK, R: FlowStatsReporter>(
     engine: RaftKv<EK, S>,
     cfg: &StorageConfig,
     read_pool: ReadPoolHandle,
     lock_mgr: LockManager,
     concurrency_manager: ConcurrencyManager,
-    dynamic_configs: StorageDynamicConfigs,
+    pipelined_pessimistic_lock: Arc<AtomicBool>,
     flow_controller: Arc<FlowController>,
     reporter: R,
-    resource_tag_factory: ResourceTagFactory,
-    quota_limiter: Arc<QuotaLimiter>,
-    feature_gate: FeatureGate,
-) -> Result<Storage<RaftKv<EK, S>, LockManager, F>>
+) -> Result<Storage<RaftKv<EK, S>, LockManager>>
 where
     S: RaftStoreRouter<EK> + LocalReadRouter<EK> + 'static,
     EK: KvEngine,
@@ -70,12 +57,9 @@ where
         read_pool,
         lock_mgr,
         concurrency_manager,
-        dynamic_configs,
+        pipelined_pessimistic_lock,
         flow_controller,
         reporter,
-        resource_tag_factory,
-        quota_limiter,
-        feature_gate,
     )?;
     Ok(store)
 }
@@ -190,11 +174,10 @@ where
         pd_worker: LazyWorker<PdTask<EK, ER>>,
         store_meta: Arc<Mutex<StoreMeta>>,
         coprocessor_host: CoprocessorHost<EK>,
-        importer: Arc<SstImporter>,
+        importer: Arc<SSTImporter>,
         split_check_scheduler: Scheduler<SplitCheckTask>,
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
-        collector_reg_handle: CollectorRegHandle,
     ) -> Result<()>
     where
         T: Transport + 'static,
@@ -230,7 +213,6 @@ where
             split_check_scheduler,
             auto_split_controller,
             concurrency_manager,
-            collector_reg_handle,
         )?;
 
         Ok(())
@@ -239,11 +221,6 @@ where
     /// Gets the store id.
     pub fn id(&self) -> u64 {
         self.store.get_id()
-    }
-
-    /// Gets the Scheduler of RaftstoreConfigTask, it must be called after start.
-    pub fn refresh_config_scheduler(&mut self) -> Scheduler<RefreshConfigTask> {
-        self.system.refresh_config_scheduler()
     }
 
     /// Gets a transmission end of a channel which is used to send `Msg` to the
@@ -468,11 +445,10 @@ where
         pd_worker: LazyWorker<PdTask<EK, ER>>,
         store_meta: Arc<Mutex<StoreMeta>>,
         coprocessor_host: CoprocessorHost<EK>,
-        importer: Arc<SstImporter>,
+        importer: Arc<SSTImporter>,
         split_check_scheduler: Scheduler<SplitCheckTask>,
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
-        collector_reg_handle: CollectorRegHandle,
     ) -> Result<()>
     where
         T: Transport + 'static,
@@ -503,7 +479,6 @@ where
             auto_split_controller,
             self.state.clone(),
             concurrency_manager,
-            collector_reg_handle,
             self.health_service.clone(),
         )?;
         Ok(())

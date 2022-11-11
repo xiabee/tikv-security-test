@@ -1,8 +1,7 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use fail::fail_point;
-
 use super::time::{Duration, Instant};
+use fail::fail_point;
 
 #[derive(Debug, Copy, Clone)]
 pub struct DeadlineError;
@@ -14,7 +13,7 @@ impl std::error::Error for DeadlineError {
 }
 
 impl std::fmt::Display for DeadlineError {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(fmt, "deadline has elapsed")
     }
 }

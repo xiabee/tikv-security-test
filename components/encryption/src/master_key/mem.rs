@@ -1,10 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use kvproto::encryptionpb::EncryptedContent;
-use tikv_util::box_err;
 
 use super::metadata::*;
-use crate::{crypter::*, AesGcmCrypter, Error, Iv, Result};
+use crate::crypter::*;
+use crate::{AesGcmCrypter, Error, Iv, Result};
+
+use tikv_util::box_err;
 
 /// An in-memory backend, it saves master key in memory.
 #[derive(Debug)]

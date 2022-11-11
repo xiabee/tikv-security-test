@@ -2,7 +2,8 @@
 
 //! Utilities to work with tests.
 
-use std::{io, sync};
+use std::io;
+use std::sync;
 
 /// A buffer which can be served as a logging destination while being able to access its content.
 #[derive(Clone, Default)]

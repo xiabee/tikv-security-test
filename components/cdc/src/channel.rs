@@ -1,13 +1,8 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    fmt,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::fmt;
+use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
+use std::time::Duration;
 
 use futures::{
     channel::mpsc::{
@@ -20,7 +15,8 @@ use futures::{
 use grpcio::WriteFlags;
 use kvproto::cdcpb::{ChangeDataEvent, Event, ResolvedTs};
 use protobuf::Message;
-use tikv_util::{impl_display_as_debug, time::Instant, warn};
+use tikv_util::time::Instant;
+use tikv_util::{impl_display_as_debug, warn};
 
 use crate::metrics::*;
 
@@ -112,8 +108,16 @@ impl fmt::Debug for CdcEvent {
                 let mut d = f.debug_struct("Event");
                 d.field("region_id", &e.region_id);
                 d.field("request_id", &e.request_id);
+                #[cfg(not(feature = "prost-codec"))]
                 if e.has_entries() {
                     d.field("entries count", &e.get_entries().get_entries().len());
+                }
+                #[cfg(feature = "prost-codec")]
+                if e.event.is_some() {
+                    use kvproto::cdcpb::event;
+                    if let Some(event::Event::Entries(ref es)) = e.event.as_ref() {
+                        d.field("entries count", &es.entries.len());
+                    }
                 }
                 d.finish()
             }
@@ -168,7 +172,7 @@ impl EventBatcher {
                 self.total_resolved_ts_bytes += size as usize;
             }
             CdcEvent::Barrier(_) => {
-                // Barrier requires events must be batched across the barrier.
+                // Barrier requires events must be batched accross the barrier.
                 self.last_size = CDC_RESP_MAX_BYTES;
             }
         }
@@ -391,12 +395,12 @@ impl<'a> Drain {
             });
             let (event_bytes, resolved_ts_bytes) = batcher.statistics();
             let resps = batcher.build();
-            let resps_len = resps.len();
+            let last_idx = resps.len() - 1;
             // Events are about to be sent, free pending events memory counter.
             memory_quota.free(bytes as _);
             for (i, e) in resps.into_iter().enumerate() {
                 // Buffer messages and flush them at once.
-                let write_flags = WriteFlags::default().buffer_hint(i + 1 != resps_len);
+                let write_flags = WriteFlags::default().buffer_hint(i != last_idx);
                 sink.feed((e, write_flags)).await?;
             }
             sink.flush().await?;
@@ -454,12 +458,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{assert_matches::assert_matches, sync::mpsc, time::Duration};
+    use std::assert_matches::assert_matches;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use futures::executor::block_on;
-    use kvproto::cdcpb::{
-        ChangeDataEvent, Event, EventEntries, EventRow, Event_oneof_event, ResolvedTs,
+    #[cfg(feature = "prost-codec")]
+    use kvproto::cdcpb::event::{
+        Entries as EventEntries, Event as Event_oneof_event, Row as EventRow,
     };
+    use kvproto::cdcpb::{ChangeDataEvent, Event, ResolvedTs};
+    #[cfg(not(feature = "prost-codec"))]
+    use kvproto::cdcpb::{EventEntries, EventRow, Event_oneof_event};
 
     use super::*;
 

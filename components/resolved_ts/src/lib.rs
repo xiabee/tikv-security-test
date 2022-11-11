@@ -34,4 +34,3 @@ mod scanner;
 pub use scanner::*;
 mod metrics;
 pub use metrics::*;
-mod util;

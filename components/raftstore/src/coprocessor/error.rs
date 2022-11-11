@@ -1,9 +1,11 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{error::Error as StdError, result::Result as StdResult};
+use std::error::Error as StdError;
+use std::result::Result as StdResult;
+
+use thiserror::Error;
 
 use error_code::{self, ErrorCode, ErrorCodeExt};
-use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {

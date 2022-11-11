@@ -1,13 +1,16 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{io, path, process::Stdio};
+use std::{
+    io, path,
+    process::{Command, Stdio},
+};
 
-use async_trait::async_trait;
-use tokio::{io as async_io, process::Command};
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+use futures::io::AllowStdIo;
+use futures_executor::block_on;
+use futures_util::io::copy;
 use url::Url;
 
-use crate::{ExternalStorage, UnpinReader};
+use crate::ExternalStorage;
 
 /// Convert `hdfs:///path` to `/path`
 fn try_convert_to_path(url: &Url) -> &str {
@@ -66,7 +69,6 @@ impl HdfsStorage {
 
 const STORAGE_NAME: &str = "hdfs";
 
-#[async_trait]
 impl ExternalStorage for HdfsStorage {
     fn name(&self) -> &'static str {
         STORAGE_NAME
@@ -76,7 +78,12 @@ impl ExternalStorage for HdfsStorage {
         Ok(self.remote.clone())
     }
 
-    async fn write(&self, name: &str, reader: UnpinReader, _content_length: u64) -> io::Result<()> {
+    fn write(
+        &self,
+        name: &str,
+        reader: Box<dyn futures::AsyncRead + Send + Unpin>,
+        _content_length: u64,
+    ) -> io::Result<()> {
         if name.contains(path::MAIN_SEPARATOR) {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -107,11 +114,11 @@ impl ExternalStorage for HdfsStorage {
             .stderr(Stdio::piped())
             .args(&cmd_with_args[1..])
             .spawn()?;
-        let mut stdin = hdfs_cmd.stdin.take().unwrap();
+        let stdin = hdfs_cmd.stdin.take().unwrap();
 
-        async_io::copy(&mut reader.0.compat(), &mut stdin).await?;
+        block_on(copy(reader, &mut AllowStdIo::new(stdin)))?;
 
-        let output = hdfs_cmd.wait_with_output().await?;
+        let output = hdfs_cmd.wait_with_output()?;
         if output.status.success() {
             debug!("save file to hdfs"; "path" => ?path);
             Ok(())

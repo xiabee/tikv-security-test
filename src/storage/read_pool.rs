@@ -2,18 +2,12 @@
 
 //! Distinct thread pools to handle read commands having different priority levels.
 
-use std::sync::{Arc, Mutex};
-
+use crate::config::StorageReadPoolConfig;
+use crate::storage::kv::{destroy_tls_engine, set_tls_engine, Engine, FlowStatsReporter};
+use crate::storage::metrics;
 use file_system::{set_io_type, IOType};
+use std::sync::{Arc, Mutex};
 use tikv_util::yatp_pool::{Config, DefaultTicker, FuturePool, PoolTicker, YatpPoolBuilder};
-
-use crate::{
-    config::StorageReadPoolConfig,
-    storage::{
-        kv::{destroy_tls_engine, set_tls_engine, Engine, FlowStatsReporter},
-        metrics,
-    },
-};
 
 #[derive(Clone)]
 struct FuturePoolTicker<R: FlowStatsReporter> {

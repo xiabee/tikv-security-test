@@ -1,15 +1,21 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
-use futures::{executor::block_on, stream, SinkExt};
+use futures::executor::block_on;
+use futures::{stream, SinkExt};
 use grpcio::{ChannelBuilder, Environment, Result, WriteFlags};
-use kvproto::{import_sstpb::*, kvrpcpb::*, tikvpb::*};
+use kvproto::import_sstpb::*;
+use kvproto::kvrpcpb::*;
+use kvproto::tikvpb::*;
 use security::SecurityConfig;
+use uuid::Uuid;
+
 use test_raftstore::*;
 use tikv::config::TiKvConfig;
 use tikv_util::HandyRwLock;
-use uuid::Uuid;
 
 const CLEANUP_SST_MILLIS: u64 = 10;
 
@@ -38,7 +44,6 @@ pub fn open_cluster_and_tikv_import_client(
 ) -> (Cluster<ServerCluster>, Context, TikvClient, ImportSstClient) {
     let cfg = cfg.unwrap_or_else(|| {
         let mut config = TiKvConfig::default();
-        config.server.addr = "127.0.0.1:0".to_owned();
         let cleanup_interval = Duration::from_millis(CLEANUP_SST_MILLIS);
         config.raft_store.cleanup_import_sst_interval.0 = cleanup_interval;
         config.server.grpc_concurrency = 1;
@@ -85,7 +90,6 @@ pub fn new_cluster_and_tikv_import_client_tde() -> (
     let mut security = test_util::new_security_cfg(None);
     security.encryption = encryption_cfg;
     let mut config = TiKvConfig::default();
-    config.server.addr = "127.0.0.1:0".to_owned();
     let cleanup_interval = Duration::from_millis(CLEANUP_SST_MILLIS);
     config.raft_store.cleanup_import_sst_interval.0 = cleanup_interval;
     config.server.grpc_concurrency = 1;
@@ -132,7 +136,15 @@ pub fn send_write_sst(
     commit_ts: u64,
 ) -> Result<WriteResponse> {
     let mut r1 = WriteRequest::default();
-    r1.set_meta(meta.clone());
+    // TODO rewrite following code blocks with cfg-if.
+    #[cfg(feature = "prost-codec")]
+    {
+        r1.chunk = Some(write_request::Chunk::Meta(meta.clone()));
+    }
+    #[cfg(not(feature = "prost-codec"))]
+    {
+        r1.set_meta(meta.clone());
+    }
     let mut r2 = WriteRequest::default();
 
     let mut batch = WriteBatch::default();
@@ -146,7 +158,14 @@ pub fn send_write_sst(
     }
     batch.set_commit_ts(commit_ts);
     batch.set_pairs(pairs.into());
-    r2.set_batch(batch);
+    #[cfg(feature = "prost-codec")]
+    {
+        r2.chunk = Some(write_request::Chunk::Batch(batch));
+    }
+    #[cfg(not(feature = "prost-codec"))]
+    {
+        r2.set_batch(batch);
+    }
 
     let reqs: Vec<_> = vec![r1, r2]
         .into_iter()

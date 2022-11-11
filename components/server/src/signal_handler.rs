@@ -6,7 +6,8 @@ pub use self::imp::wait_for_signal;
 mod imp {
     use engine_traits::{Engines, KvEngine, MiscExt, RaftEngine};
     use libc::c_int;
-    use signal::{trap::Trap, Signal::*};
+    use nix::sys::signal::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
+    use signal::trap::Trap;
     use tikv_util::metrics;
 
     #[allow(dead_code)]
@@ -20,7 +21,7 @@ mod imp {
                 }
                 SIGUSR1 => {
                     // Use SIGUSR1 to log metrics.
-                    info!("{}", metrics::dump(false));
+                    info!("{}", metrics::dump());
                     if let Some(ref engines) = engines {
                         info!("{:?}", MiscExt::dump_stats(&engines.kv));
                         info!("{:?}", RaftEngine::dump_stats(&engines.raft));

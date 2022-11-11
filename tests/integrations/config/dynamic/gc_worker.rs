@@ -1,14 +1,16 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::mpsc::channel, time::Duration};
-
 use raftstore::router::RaftStoreBlackHole;
-use tikv::{
-    config::{ConfigController, Module, TiKvConfig},
-    server::gc_worker::{GcConfig, GcTask, GcWorker},
-    storage::kv::TestEngineBuilder,
-};
-use tikv_util::{config::ReadableSize, time::Limiter, worker::Scheduler};
+use std::f64::INFINITY;
+use std::sync::mpsc::channel;
+use std::time::Duration;
+use tikv::config::{ConfigController, Module, TiKvConfig};
+use tikv::server::gc_worker::GcConfig;
+use tikv::server::gc_worker::{GcTask, GcWorker};
+use tikv::storage::kv::TestEngineBuilder;
+use tikv_util::config::ReadableSize;
+use tikv_util::time::Limiter;
+use tikv_util::worker::Scheduler;
 
 #[test]
 fn test_gc_config_validate() {
@@ -102,7 +104,7 @@ fn test_change_io_limit_by_config_manager() {
     let scheduler = gc_worker.scheduler();
 
     validate(&scheduler, move |_, limiter: &Limiter| {
-        assert_eq!(limiter.speed_limit(), f64::INFINITY);
+        assert_eq!(limiter.speed_limit(), INFINITY);
     });
 
     // Enable io iolimit
@@ -126,7 +128,7 @@ fn test_change_io_limit_by_config_manager() {
         .update_config("gc.max-write-bytes-per-sec", "0")
         .unwrap();
     validate(&scheduler, move |_, limiter: &Limiter| {
-        assert_eq!(limiter.speed_limit(), f64::INFINITY);
+        assert_eq!(limiter.speed_limit(), INFINITY);
     });
 }
 
@@ -141,7 +143,7 @@ fn test_change_io_limit_by_debugger() {
     let config_manager = gc_worker.get_config_manager();
 
     validate(&scheduler, move |_, limiter: &Limiter| {
-        assert_eq!(limiter.speed_limit(), f64::INFINITY);
+        assert_eq!(limiter.speed_limit(), INFINITY);
     });
 
     // Enable io iolimit
@@ -159,6 +161,6 @@ fn test_change_io_limit_by_debugger() {
     // Disable io iolimit
     config_manager.update(|cfg: &mut GcConfig| cfg.max_write_bytes_per_sec = ReadableSize(0));
     validate(&scheduler, move |_, limiter: &Limiter| {
-        assert_eq!(limiter.speed_limit(), f64::INFINITY);
+        assert_eq!(limiter.speed_limit(), INFINITY);
     });
 }

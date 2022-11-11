@@ -2,7 +2,8 @@
 
 #![feature(proc_macro_hygiene)]
 
-use std::{path::Path, process};
+use std::path::Path;
+use std::process;
 
 use clap::{crate_authors, App, Arg};
 use server::setup::{ensure_no_unrecognized_config, validate_and_persist_config};
@@ -40,7 +41,7 @@ fn main() {
                 .takes_value(true)
                 .value_name("LEVEL")
                 .possible_values(&[
-                    "trace", "debug", "info", "warn", "warning", "error", "critical", "fatal",
+                    "trace", "debug", "info", "warn", "warning", "error", "critical",
                 ])
                 .help("Set the log level"),
         )
@@ -158,26 +159,17 @@ fn main() {
     let mut config = matches
         .value_of_os("config")
         .map_or_else(TiKvConfig::default, |path| {
-            let path = Path::new(path);
             TiKvConfig::from_file(
-                path,
+                Path::new(path),
                 if is_config_check {
                     Some(&mut unrecognized_keys)
                 } else {
                     None
                 },
             )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "invalid auto generated configuration file {}, err {}",
-                    path.display(),
-                    e
-                );
-            })
         });
 
     server::setup::overwrite_config_with_cmd_args(&mut config, &matches);
-    config.logger_compatible_adjust();
 
     if is_config_check {
         validate_and_persist_config(&mut config, false);

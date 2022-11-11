@@ -1,22 +1,16 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+use tipb::FieldType;
+
+use super::expr::{RpnExpression, RpnExpressionNode};
+use super::RpnFnCallExtra;
 use tidb_query_common::Result;
+use tidb_query_datatype::codec::batch::LazyBatchColumnVec;
 pub use tidb_query_datatype::codec::data_type::{
     LogicalRows, BATCH_MAX_SIZE, IDENTICAL_LOGICAL_ROWS,
 };
-use tidb_query_datatype::{
-    codec::{
-        batch::LazyBatchColumnVec,
-        data_type::{ScalarValue, ScalarValueRef, VectorValue},
-    },
-    expr::EvalContext,
-};
-use tipb::FieldType;
-
-use super::{
-    expr::{RpnExpression, RpnExpressionNode},
-    RpnFnCallExtra,
-};
+use tidb_query_datatype::codec::data_type::{ScalarValue, ScalarValueRef, VectorValue};
+use tidb_query_datatype::expr::EvalContext;
 
 /// Represents a vector value node in the RPN stack.
 ///
@@ -278,23 +272,22 @@ impl RpnExpression {
 mod tests {
     #![allow(clippy::float_cmp)]
 
-    use test::{black_box, Bencher};
+    use super::*;
+
     use tidb_query_codegen::rpn_fn;
-    use tidb_query_common::Result;
-    use tidb_query_datatype::{
-        codec::{
-            batch::LazyBatchColumn,
-            data_type::*,
-            datum::{Datum, DatumEncoder},
-        },
-        expr::EvalContext,
-        EvalType, FieldTypeAccessor, FieldTypeTp,
-    };
+    use tidb_query_datatype::{EvalType, FieldTypeAccessor, FieldTypeTp};
     use tipb::FieldType;
     use tipb_helper::ExprDefBuilder;
 
-    use super::*;
-    use crate::{impl_arithmetic::*, impl_compare::*, RpnExpressionBuilder, RpnFnMeta};
+    use crate::impl_arithmetic::*;
+    use crate::impl_compare::*;
+    use crate::{RpnExpressionBuilder, RpnFnMeta};
+    use test::{black_box, Bencher};
+    use tidb_query_common::Result;
+    use tidb_query_datatype::codec::batch::LazyBatchColumn;
+    use tidb_query_datatype::codec::data_type::*;
+    use tidb_query_datatype::codec::datum::{Datum, DatumEncoder};
+    use tidb_query_datatype::expr::EvalContext;
 
     /// Single constant node
     #[test]
@@ -1324,16 +1317,15 @@ mod tests {
 
 #[cfg(test)]
 mod benches {
+    use super::*;
+
+    use crate::RpnExpressionBuilder;
     use tidb_query_codegen::rpn_fn;
     use tidb_query_common::Result;
-    use tidb_query_datatype::{
-        codec::{batch::LazyBatchColumn, data_type::*},
-        expr::EvalContext,
-        EvalType, FieldTypeTp,
-    };
-
-    use super::*;
-    use crate::RpnExpressionBuilder;
+    use tidb_query_datatype::codec::batch::LazyBatchColumn;
+    use tidb_query_datatype::codec::data_type::*;
+    use tidb_query_datatype::expr::EvalContext;
+    use tidb_query_datatype::{EvalType, FieldTypeTp};
 
     #[bench]
     fn bench_int_eval(b: &mut test::Bencher) {

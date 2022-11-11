@@ -1,17 +1,15 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    collections::Bound::{Excluded, Unbounded},
-    fmt,
-    sync::{Arc, Mutex},
-};
-
+use crate::store::fsm::store::StoreMeta;
+use crate::store::util::RegionReadProgressRegistry;
 use fail::fail_point;
 use keys::{data_end_key, data_key, enc_start_key};
 use kvproto::kvrpcpb::{KeyRange, LeaderInfo};
+use std::collections::Bound::{Excluded, Unbounded};
+use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
 use tikv_util::worker::Runnable;
-
-use crate::store::{fsm::store::StoreMeta, util::RegionReadProgressRegistry};
 
 pub struct Runner {
     store_meta: Arc<Mutex<StoreMeta>>,
@@ -82,7 +80,7 @@ impl Runner {
                 meta.region_ranges
                 // get overlapped regions
                 .range((Excluded(start_key), Unbounded))
-                .take_while(|(_, id)| end_key > enc_start_key(&meta.regions[*id]))
+                .take_while(|(_, id)| end_key > enc_start_key(&meta.regions[id]))
                 // get the min `safe_ts`
                 .map(|(_, id)| {
                     registry.get(id).unwrap().safe_ts()
@@ -123,11 +121,10 @@ impl Runnable for Runner {
 
 #[cfg(test)]
 mod tests {
-    use keys::enc_end_key;
-    use kvproto::metapb::Region;
-
     use super::*;
     use crate::store::util::RegionReadProgress;
+    use keys::enc_end_key;
+    use kvproto::metapb::Region;
 
     #[test]
     fn test_get_range_min_safe_ts() {

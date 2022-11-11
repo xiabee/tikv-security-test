@@ -2,13 +2,18 @@
 
 use std::sync::Arc;
 
-use criterion::{black_box, measurement::Measurement};
-use tidb_query_datatype::expr::EvalConfig;
-use tidb_query_executors::{interface::BatchExecutor, BatchSimpleAggregationExecutor};
-use tikv::storage::Statistics;
+use criterion::black_box;
+use criterion::measurement::Measurement;
+
 use tipb::Expr;
 
-use crate::util::{bencher::Bencher, FixtureBuilder};
+use tidb_query_datatype::expr::EvalConfig;
+use tidb_query_executors::interface::BatchExecutor;
+use tidb_query_executors::BatchSimpleAggregationExecutor;
+use tikv::storage::Statistics;
+
+use crate::util::bencher::Bencher;
+use crate::util::FixtureBuilder;
 
 pub trait SimpleAggrBencher<M>
 where
@@ -16,7 +21,7 @@ where
 {
     fn name(&self) -> &'static str;
 
-    fn bench(&self, b: &mut criterion::Bencher<'_, M>, fb: &FixtureBuilder, aggr_expr: &[Expr]);
+    fn bench(&self, b: &mut criterion::Bencher<M>, fb: &FixtureBuilder, aggr_expr: &[Expr]);
 
     fn box_clone(&self) -> Box<dyn SimpleAggrBencher<M>>;
 }
@@ -43,7 +48,7 @@ where
         "batch"
     }
 
-    fn bench(&self, b: &mut criterion::Bencher<'_, M>, fb: &FixtureBuilder, aggr_expr: &[Expr]) {
+    fn bench(&self, b: &mut criterion::Bencher<M>, fb: &FixtureBuilder, aggr_expr: &[Expr]) {
         crate::util::bencher::BatchNextAllBencher::new(|| {
             let src = fb.clone().build_batch_fixture_executor();
             Box::new(

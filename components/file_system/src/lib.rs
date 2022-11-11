@@ -1,47 +1,42 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 #![feature(test)]
-#![feature(duration_consts_float)]
+#![feature(duration_consts_2)]
 
 #[macro_use]
 extern crate lazy_static;
-
-#[cfg(test)]
 extern crate test;
-
 #[allow(unused_extern_crates)]
 extern crate tikv_alloc;
 
 mod file;
-mod io_stats;
+mod iosnoop;
 mod metrics;
 mod metrics_manager;
 mod rate_limiter;
+
+pub use file::{File, OpenOptions};
+pub use iosnoop::{get_io_type, init_io_snooper, set_io_type};
+pub use metrics_manager::{BytesFetcher, MetricsManager};
+pub use rate_limiter::{
+    get_io_rate_limiter, set_io_rate_limiter, IOBudgetAdjustor, IORateLimitMode, IORateLimiter,
+    IORateLimiterStatistics,
+};
 
 pub use std::fs::{
     canonicalize, create_dir, create_dir_all, hard_link, metadata, read_dir, read_link, remove_dir,
     remove_dir_all, remove_file, rename, set_permissions, symlink_metadata, DirBuilder, DirEntry,
     FileType, Metadata, Permissions, ReadDir,
 };
-use std::{
-    io::{self, ErrorKind, Read, Write},
-    path::Path,
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
 
-pub use file::{File, OpenOptions};
-pub use io_stats::{get_io_type, init as init_io_stats_collector, set_io_type};
-pub use metrics_manager::{BytesFetcher, MetricsManager};
+use std::io::{self, ErrorKind, Read, Write};
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+
 use online_config::ConfigValue;
-use openssl::{
-    error::ErrorStack,
-    hash::{self, Hasher, MessageDigest},
-};
-pub use rate_limiter::{
-    get_io_rate_limiter, set_io_rate_limiter, IOBudgetAdjustor, IORateLimitMode, IORateLimiter,
-    IORateLimiterStatistics,
-};
+use openssl::error::ErrorStack;
+use openssl::hash::{self, Hasher, MessageDigest};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use strum::{EnumCount, EnumIter};
 
@@ -108,10 +103,16 @@ impl Drop for WithIOType {
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone)]
 pub struct IOBytes {
     read: u64,
     write: u64,
+}
+
+impl Default for IOBytes {
+    fn default() -> Self {
+        IOBytes { read: 0, write: 0 }
+    }
 }
 
 impl std::ops::Sub for IOBytes {
@@ -190,7 +191,7 @@ impl<'de> Deserialize<'de> for IOPriority {
                     Ok(p) => p,
                     _ => {
                         return Err(E::invalid_value(
-                            Unexpected::Other("invalid IO priority"),
+                            Unexpected::Other(&"invalid IO priority".to_string()),
                             &self,
                         ));
                     }
@@ -422,28 +423,21 @@ pub fn reserve_space_for_recover<P: AsRef<Path>>(data_dir: P, file_size: u64) ->
         }
         delete_file_if_exist(&path)?;
     }
-    fn do_reserve(dir: &Path, path: &Path, file_size: u64) -> io::Result<()> {
+    if file_size > 0 {
         let f = File::create(&path)?;
         f.allocate(file_size)?;
         f.sync_all()?;
-        sync_dir(dir)
+        sync_dir(data_dir)?;
     }
-    if file_size > 0 {
-        let res = do_reserve(data_dir.as_ref(), &path, file_size);
-        if res.is_err() {
-            let _ = delete_file_if_exist(&path);
-        }
-        res
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, iter};
-
-    use rand::{distributions::Alphanumeric, thread_rng, Rng};
+    use rand::distributions::Alphanumeric;
+    use rand::{thread_rng, Rng};
+    use std::io::Write;
+    use std::iter;
     use tempfile::{Builder, TempDir};
 
     use super::*;

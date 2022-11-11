@@ -1,17 +1,19 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
+use crate::{util, RocksEngine, RocksWriteBatch};
+
 use engine_traits::{
-    Error, Iterable, KvEngine, MiscExt, Mutable, Peekable, RaftEngine, RaftEngineDebug,
-    RaftEngineReadOnly, RaftLogBatch, RaftLogGCTask, Result, SyncMutable, WriteBatch,
-    WriteBatchExt, WriteOptions, CF_DEFAULT, RAFT_LOG_MULTI_GET_CNT,
+    Error, Iterable, KvEngine, MiscExt, Mutable, Peekable, RaftEngine, RaftEngineReadOnly,
+    RaftLogBatch, RaftLogGCTask, Result, SyncMutable, WriteBatch, WriteBatchExt, WriteOptions,
+    CF_DEFAULT,
 };
 use kvproto::raft_serverpb::RaftLocalState;
 use protobuf::Message;
 use raft::eraftpb::Entry;
 use tikv_util::{box_err, box_try};
 
-use crate::{util, RocksEngine, RocksWriteBatch};
+const RAFT_LOG_MULTI_GET_CNT: u64 = 8;
 
 impl RaftEngineReadOnly for RocksEngine {
     fn get_raft_state(&self, raft_group_id: u64) -> Result<Option<RaftLocalState>> {
@@ -57,7 +59,7 @@ impl RaftEngineReadOnly for RocksEngine {
             return Ok(count);
         }
 
-        let (mut check_compacted, mut compacted, mut next_index) = (true, false, low);
+        let (mut check_compacted, mut next_index) = (true, low);
         let start_key = keys::raft_log_key(region_id, low);
         let end_key = keys::raft_log_key(region_id, high);
         self.scan(
@@ -70,7 +72,6 @@ impl RaftEngineReadOnly for RocksEngine {
 
                 if check_compacted {
                     if entry.get_index() != low {
-                        compacted = true;
                         // May meet gap or has been compacted.
                         return Ok(false);
                     }
@@ -91,10 +92,6 @@ impl RaftEngineReadOnly for RocksEngine {
         // Or the total size almost exceeds max_size, returns.
         if count == (high - low) as usize || total_size >= max_size {
             return Ok(count);
-        }
-
-        if compacted {
-            return Err(Error::EntriesCompacted);
         }
 
         // Here means we don't fetch enough entries.
@@ -118,27 +115,6 @@ impl RaftEngineReadOnly for RocksEngine {
         Ok(())
     }
 }
-
-impl RaftEngineDebug for RocksEngine {
-    fn scan_entries<F>(&self, raft_group_id: u64, mut f: F) -> Result<()>
-    where
-        F: FnMut(&Entry) -> Result<bool>,
-    {
-        let start_key = keys::raft_log_key(raft_group_id, 0);
-        let end_key = keys::raft_log_key(raft_group_id, u64::MAX);
-        self.scan(
-            &start_key,
-            &end_key,
-            false, // fill_cache
-            |_, value| {
-                let mut entry = Entry::default();
-                entry.merge_from_bytes(value)?;
-                f(&entry)
-            },
-        )
-    }
-}
-
 impl RocksEngine {
     fn gc_impl(
         &self,
@@ -179,7 +155,7 @@ impl RaftEngine for RocksEngine {
     type LogBatch = RocksWriteBatch;
 
     fn log_batch(&self, capacity: usize) -> Self::LogBatch {
-        RocksWriteBatch::with_capacity(self, capacity)
+        RocksWriteBatch::with_capacity(self.as_inner().clone(), capacity)
     }
 
     fn sync(&self) -> Result<()> {
@@ -244,7 +220,7 @@ impl RaftEngine for RocksEngine {
     }
 
     fn append(&self, raft_group_id: u64, entries: Vec<Entry>) -> Result<usize> {
-        let mut wb = self.write_batch();
+        let mut wb = RocksWriteBatch::new(self.as_inner().clone());
         let buf = Vec::with_capacity(1024);
         wb.append_impl(raft_group_id, &entries, buf)?;
         self.consume(&mut wb, false)
@@ -279,6 +255,10 @@ impl RaftEngine for RocksEngine {
 
     fn purge_expired_files(&self) -> Result<Vec<u64>> {
         Ok(vec![])
+    }
+
+    fn has_builtin_entry_cache(&self) -> bool {
+        false
     }
 
     fn flush_metrics(&self, instance: &str) {
@@ -329,8 +309,8 @@ impl RaftLogBatch for RocksWriteBatch {
         WriteBatch::is_empty(self)
     }
 
-    fn merge(&mut self, src: Self) -> Result<()> {
-        WriteBatch::merge(self, src)
+    fn merge(&mut self, src: Self) {
+        WriteBatch::<RocksEngine>::merge(self, src);
     }
 }
 

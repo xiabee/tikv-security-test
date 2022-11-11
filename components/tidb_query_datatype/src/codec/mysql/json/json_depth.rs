@@ -1,6 +1,7 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::{super::Result, JsonRef, JsonType};
+use super::super::Result;
+use super::{JsonRef, JsonType};
 
 impl<'a> JsonRef<'a> {
     /// Returns maximum depth of JSON document

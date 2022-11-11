@@ -65,7 +65,7 @@ pub fn prepare_sst_for_ingestion<P: AsRef<Path>, Q: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use super::prepare_sst_for_ingestion;
 
     use encryption::DataKeyManager;
     use engine_rocks::{
@@ -77,10 +77,9 @@ mod tests {
         CfName, ColumnFamilyOptions, DBOptions, EncryptionKeyManager, ImportExt, Peekable,
         SstWriter, SstWriterBuilder, TitanDBOptions,
     };
+    use std::{path::Path, sync::Arc};
     use tempfile::Builder;
     use test_util::encryption::new_test_key_manager;
-
-    use super::prepare_sst_for_ingestion;
 
     #[cfg(unix)]
     fn check_hard_link<P: AsRef<Path>>(path: P, nlink: u64) {
@@ -116,7 +115,7 @@ mod tests {
 
     fn check_prepare_sst_for_ingestion(
         db_opts: Option<RocksDBOptions>,
-        cf_opts: Option<Vec<RocksCFOptions<'_>>>,
+        cf_opts: Option<Vec<RocksCFOptions>>,
         key_manager: Option<&DataKeyManager>,
         was_encrypted: bool,
     ) {

@@ -10,7 +10,8 @@ use file_system::{File, OpenOptions};
 use ini::ini::Ini;
 use kvproto::encryptionpb::EncryptedContent;
 use protobuf::Message;
-use structopt::{clap::arg_enum, StructOpt};
+use structopt::clap::arg_enum;
+use structopt::StructOpt;
 use tikv_util::box_err;
 
 arg_enum! {

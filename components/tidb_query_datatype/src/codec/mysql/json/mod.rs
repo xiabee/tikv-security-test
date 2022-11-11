@@ -76,27 +76,24 @@ mod json_remove;
 mod json_type;
 pub mod json_unquote;
 
-use std::{collections::BTreeMap, convert::TryFrom, str};
+pub use self::jcodec::{JsonDatumPayloadChunkEncoder, JsonDecoder, JsonEncoder};
+pub use self::json_modify::ModifyType;
+pub use self::path_expr::{parse_json_path_expr, PathExpression};
 
-use codec::number::{NumberCodec, F64_SIZE, I64_SIZE};
-use constants::{JSON_LITERAL_FALSE, JSON_LITERAL_NIL, JSON_LITERAL_TRUE};
+use std::collections::BTreeMap;
+use std::convert::TryFrom;
+use std::str;
 use tikv_util::is_even;
 
-pub use self::{
-    jcodec::{JsonDatumPayloadChunkEncoder, JsonDecoder, JsonEncoder},
-    json_modify::ModifyType,
-    path_expr::{parse_json_path_expr, PathExpression},
-};
-use super::super::{datum::Datum, Error, Result};
-use crate::{
-    codec::{
-        convert::ConvertTo,
-        data_type::{Decimal, Real},
-        mysql,
-        mysql::{Duration, Time, TimeType},
-    },
-    expr::EvalContext,
-};
+use super::super::datum::Datum;
+use super::super::{Error, Result};
+use crate::codec::convert::ConvertTo;
+use crate::codec::data_type::{Decimal, Real};
+use crate::codec::mysql;
+use crate::codec::mysql::{Duration, Time, TimeType};
+use crate::expr::EvalContext;
+use codec::number::{NumberCodec, F64_SIZE, I64_SIZE};
+use constants::{JSON_LITERAL_FALSE, JSON_LITERAL_NIL, JSON_LITERAL_TRUE};
 
 const ERR_CONVERT_FAILED: &str = "Can not covert from ";
 
@@ -238,7 +235,7 @@ pub struct Json {
 use std::fmt::{Display, Formatter};
 
 impl Display for Json {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let s = serde_json::to_string(&self.as_ref()).unwrap();
         write!(f, "{}", s)
     }
@@ -319,7 +316,7 @@ impl Json {
     }
 
     /// Creates a `object` JSON from key-value pairs
-    pub fn from_kv_pairs(entries: Vec<(&[u8], JsonRef<'_>)>) -> Result<Self> {
+    pub fn from_kv_pairs(entries: Vec<(&[u8], JsonRef)>) -> Result<Self> {
         let mut value = vec![];
         value.write_json_obj_from_keys_values(entries)?;
         Ok(Self::new(JsonType::Object, value))
@@ -495,13 +492,12 @@ impl crate::codec::data_type::AsMySQLBool for Json {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use std::sync::Arc;
 
-    use super::*;
-    use crate::{
-        codec::error::ERR_TRUNCATE_WRONG_VALUE,
-        expr::{EvalConfig, EvalContext},
-    };
+    use crate::codec::error::ERR_TRUNCATE_WRONG_VALUE;
+    use crate::expr::{EvalConfig, EvalContext};
 
     #[test]
     fn test_json_array() {
@@ -575,7 +571,7 @@ mod tests {
             let json: Json = jstr.parse().unwrap();
             let get: f64 = json.convert(&mut ctx).unwrap();
             assert!(
-                (get - exp).abs() < f64::EPSILON,
+                (get - exp).abs() < std::f64::EPSILON,
                 "json.as_f64 get: {}, exp: {}",
                 get,
                 exp

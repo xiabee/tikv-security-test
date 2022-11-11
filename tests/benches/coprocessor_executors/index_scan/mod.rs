@@ -5,7 +5,9 @@ mod util;
 
 use criterion::measurement::Measurement;
 
-use crate::util::{scan_bencher::ScanBencher, store::*, BenchCase};
+use crate::util::scan_bencher::ScanBencher;
+use crate::util::store::*;
+use crate::util::BenchCase;
 
 const ROWS: usize = 5000;
 
@@ -13,7 +15,7 @@ const ROWS: usize = 5000;
 ///
 /// This kind of scanner is used in SQLs like `SELECT * FROM .. WHERE index = X`, an index lookup
 /// will be performed so that PK is needed.
-fn bench_index_scan_primary_key<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_index_scan_primary_key<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement + 'static,
 {
@@ -31,7 +33,7 @@ where
 ///
 /// This kind of scanner is used in SQLs like `SELECT COUNT(*) FROM .. WHERE index = X` or
 /// `SELECT index FROM .. WHERE index = X`. There is no double read.
-fn bench_index_scan_index<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_index_scan_index<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement + 'static,
 {

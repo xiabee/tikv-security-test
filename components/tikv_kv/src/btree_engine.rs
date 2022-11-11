@@ -1,26 +1,23 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    collections::{
-        BTreeMap,
-        Bound::{self, Excluded, Included, Unbounded},
-    },
-    default::Default,
-    fmt::{self, Debug, Display, Formatter},
-    ops::RangeBounds,
-    sync::{Arc, RwLock},
-};
+use std::collections::BTreeMap;
+use std::collections::Bound::{self, Excluded, Included, Unbounded};
+use std::default::Default;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::ops::RangeBounds;
+use std::sync::{Arc, RwLock};
 
 use engine_panic::PanicEngine;
 use engine_traits::{CfName, IterOptions, ReadOptions, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::kvrpcpb::Context;
 use txn_types::{Key, Value};
 
-use super::SnapContext;
 use crate::{
-    Callback as EngineCallback, DummySnapshotExt, Engine, Error as EngineError,
+    Callback as EngineCallback, CbContext, Engine, Error as EngineError,
     ErrorInner as EngineErrorInner, Iterator, Modify, Result as EngineResult, Snapshot, WriteData,
 };
+
+use super::SnapContext;
 
 type RwLockTree = RwLock<BTreeMap<Key, Value>>;
 
@@ -97,7 +94,7 @@ impl Engine for BTreeEngine {
         if batch.modifies.is_empty() {
             return Err(EngineError::from(EngineErrorInner::EmptyRequest));
         }
-        cb(write_modifies(self, batch.modifies));
+        cb((CbContext::new(), write_modifies(self, batch.modifies)));
 
         Ok(())
     }
@@ -108,7 +105,7 @@ impl Engine for BTreeEngine {
         _ctx: SnapContext<'_>,
         cb: EngineCallback<Self::Snap>,
     ) -> EngineResult<()> {
-        cb(Ok(BTreeEngineSnapshot::new(self)));
+        cb((CbContext::new(), Ok(BTreeEngineSnapshot::new(self))));
         Ok(())
     }
 }
@@ -229,7 +226,6 @@ impl Iterator for BTreeEngineIterator {
 
 impl Snapshot for BTreeEngineSnapshot {
     type Iter = BTreeEngineIterator;
-    type Ext<'a> = DummySnapshotExt;
 
     fn get(&self, key: &Key) -> EngineResult<Option<Value>> {
         self.get_cf(CF_DEFAULT, key)
@@ -253,9 +249,6 @@ impl Snapshot for BTreeEngineSnapshot {
     fn iter_cf(&self, cf: CfName, iter_opt: IterOptions) -> EngineResult<Self::Iter> {
         let tree = self.inner_engine.get_cf(cf);
         Ok(BTreeEngineIterator::new(tree, iter_opt))
-    }
-    fn ext(&self) -> DummySnapshotExt {
-        DummySnapshotExt
     }
 }
 
@@ -283,11 +276,7 @@ fn write_modifies(engine: &BTreeEngine, modifies: Vec<Modify>) -> EngineResult<(
                 let cf_tree = engine.get_cf(cf);
                 cf_tree.write().unwrap().insert(k, v);
             }
-            Modify::PessimisticLock(k, lock) => {
-                let cf_tree = engine.get_cf(CF_LOCK);
-                let v = lock.into_lock().to_bytes();
-                cf_tree.write().unwrap().insert(k, v);
-            }
+
             Modify::DeleteRange(_cf, _start_key, _end_key, _notify_only) => unimplemented!(),
         };
     }
@@ -296,13 +285,11 @@ fn write_modifies(engine: &BTreeEngine, modifies: Vec<Modify>) -> EngineResult<(
 
 #[cfg(test)]
 pub mod tests {
-    use engine_traits::IterOptions;
-
-    use super::{
-        super::{tests::*, CfStatistics, TEST_ENGINE_CFS},
-        *,
-    };
+    use super::super::tests::*;
+    use super::super::CfStatistics;
+    use super::*;
     use crate::{Cursor, ScanMode};
+    use engine_traits::IterOptions;
 
     #[test]
     fn test_btree_engine() {

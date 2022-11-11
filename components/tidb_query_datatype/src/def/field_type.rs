@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use tipb::{ColumnInfo, FieldType};
+use tipb::ColumnInfo;
+use tipb::FieldType;
 
 use crate::error::DataTypeError;
 
@@ -128,7 +129,6 @@ impl Collation {
             -63 | 63 | 47 => Ok(Collation::Binary),
             -224 | -192 => Ok(Collation::Utf8Mb4UnicodeCi),
             -87 => Ok(Collation::GbkBin),
-            -28 => Ok(Collation::GbkChineseCi),
             n if n >= 0 => Ok(Collation::Utf8Mb4BinNoPadding),
             n => Err(DataTypeError::UnsupportedCollation { code: n }),
         }
@@ -142,32 +142,6 @@ impl Collation {
 impl fmt::Display for Collation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
-    }
-}
-
-#[derive(PartialEq, Debug, Clone, Copy)]
-pub enum Charset {
-    UTF8,
-    UTF8Mb4,
-    Latin1,
-    GBK,
-    Binary,
-    Ascii,
-}
-
-impl Charset {
-    pub fn from_name(name: &str) -> Result<Self, DataTypeError> {
-        match name {
-            "utf8mb4" => Ok(Charset::UTF8Mb4),
-            "utf8" => Ok(Charset::UTF8),
-            "latin1" => Ok(Charset::Latin1),
-            "gbk" => Ok(Charset::GBK),
-            "binary" => Ok(Charset::Binary),
-            "ascii" => Ok(Charset::Ascii),
-            _ => Err(DataTypeError::UnsupportedCharset {
-                name: String::from(name),
-            }),
-        }
     }
 }
 
@@ -444,9 +418,8 @@ impl FieldTypeAccessor for ColumnInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::i32;
-
     use super::*;
+    use std::i32;
 
     fn field_types() -> Vec<FieldTypeTp> {
         vec![
@@ -531,8 +504,6 @@ mod tests {
             (i32::MIN, None),
             (-192, Some(Collation::Utf8Mb4UnicodeCi)),
             (-224, Some(Collation::Utf8Mb4UnicodeCi)),
-            (-28, Some(Collation::GbkChineseCi)),
-            (-87, Some(Collation::GbkBin)),
         ];
 
         for (collate, expected) in cases {
@@ -545,32 +516,6 @@ mod tests {
                 assert_eq!(coll.unwrap(), c);
             } else {
                 assert!(coll.is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn test_charset_from_str() {
-        let cases = vec![
-            ("gbk", Some(Charset::GBK)),
-            ("utf8mb4", Some(Charset::UTF8Mb4)),
-            ("utf8", Some(Charset::UTF8)),
-            ("binary", Some(Charset::Binary)),
-            ("latin1", Some(Charset::Latin1)),
-            ("ascii", Some(Charset::Ascii)),
-            ("somethingwrong", None),
-        ];
-
-        for (charset, expected) in cases {
-            let mut ft = tipb::FieldType::default();
-            ft.set_charset(charset.to_string());
-
-            let charset = Charset::from_name(ft.get_charset());
-
-            if let Some(c) = expected {
-                assert_eq!(charset.unwrap(), c);
-            } else {
-                assert!(charset.is_err());
             }
         }
     }

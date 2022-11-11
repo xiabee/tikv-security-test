@@ -1,24 +1,18 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::{
-    cell::Cell,
-    mem,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-};
-
+use crate::fsm::{Fsm, FsmScheduler, FsmState};
+use crate::mailbox::{BasicMailbox, Mailbox};
+use crate::metrics::CHANNEL_FULL_COUNTER_VEC;
 use collections::HashMap;
 use crossbeam::channel::{SendError, TrySendError};
-use tikv_util::{debug, info, lru::LruCache, Either};
-
-use crate::{
-    fsm::{Fsm, FsmScheduler, FsmState},
-    mailbox::{BasicMailbox, Mailbox},
-    metrics::CHANNEL_FULL_COUNTER_VEC,
-};
+use std::cell::Cell;
+use std::mem;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tikv_util::lru::LruCache;
+use tikv_util::Either;
+use tikv_util::{debug, info};
 
 /// A struct that traces the approximate memory usage of router.
 #[derive(Default)]
@@ -58,7 +52,7 @@ pub struct Router<N: Fsm, C: Fsm, Ns, Cs> {
     // it's not possible to write FsmScheduler<Fsm=C> + FsmScheduler<Fsm=N>
     // for now.
     pub(crate) normal_scheduler: Ns,
-    pub(crate) control_scheduler: Cs,
+    control_scheduler: Cs,
 
     // Count of Mailboxes that is not destroyed.
     // Added when a Mailbox created, and subtracted it when a Mailbox destroyed.

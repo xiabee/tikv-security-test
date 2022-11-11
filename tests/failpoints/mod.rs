@@ -7,5 +7,6 @@
 
 #[macro_use]
 extern crate slog_global;
+extern crate test;
 
 mod cases;

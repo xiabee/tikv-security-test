@@ -1,26 +1,18 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{ffi::CString, marker::PhantomData};
-
-use api_version::{KeyMode, KvFormat, RawValue};
-use engine_rocks::{
-    raw::{
-        new_compaction_filter_raw, CompactionFilter, CompactionFilterContext,
-        CompactionFilterDecision, CompactionFilterFactory, CompactionFilterValueType,
-        DBCompactionFilter,
-    },
-    RocksTtlProperties,
-};
-use engine_traits::raw_ttl::ttl_current_ts;
+use std::ffi::CString;
 
 use crate::server::metrics::TTL_CHECKER_ACTIONS_COUNTER_VEC;
+use engine_rocks::raw::{
+    new_compaction_filter_raw, CompactionFilter, CompactionFilterContext, CompactionFilterDecision,
+    CompactionFilterFactory, CompactionFilterValueType, DBCompactionFilter,
+};
+use engine_rocks::RocksTtlProperties;
+use engine_traits::util::{get_expire_ts, ttl_current_ts};
 
-#[derive(Default)]
-pub struct TtlCompactionFilterFactory<F: KvFormat> {
-    _phantom: PhantomData<F>,
-}
+pub struct TTLCompactionFilterFactory;
 
-impl<F: KvFormat> CompactionFilterFactory for TtlCompactionFilterFactory<F> {
+impl CompactionFilterFactory for TTLCompactionFilterFactory {
     fn create_compaction_filter(
         &self,
         context: &CompactionFilterContext,
@@ -42,20 +34,16 @@ impl<F: KvFormat> CompactionFilterFactory for TtlCompactionFilterFactory<F> {
         }
 
         let name = CString::new("ttl_compaction_filter").unwrap();
-        let filter = TtlCompactionFilter::<F> {
-            ts: current,
-            _phantom: PhantomData,
-        };
+        let filter = Box::new(TTLCompactionFilter { ts: current });
         unsafe { new_compaction_filter_raw(name, filter) }
     }
 }
 
-struct TtlCompactionFilter<F: KvFormat> {
+struct TTLCompactionFilter {
     ts: u64,
-    _phantom: PhantomData<F>,
 }
 
-impl<F: KvFormat> CompactionFilter for TtlCompactionFilter<F> {
+impl CompactionFilter for TTLCompactionFilter {
     fn featured_filter(
         &mut self,
         _level: usize,
@@ -67,33 +55,25 @@ impl<F: KvFormat> CompactionFilter for TtlCompactionFilter<F> {
         if value_type != CompactionFilterValueType::Value {
             return CompactionFilterDecision::Keep;
         }
-        // Only consider data keys.
+        // only consider data keys
         if !key.starts_with(keys::DATA_PREFIX_KEY) {
             return CompactionFilterDecision::Keep;
         }
-        // Only consider raw keys.
-        if F::parse_key_mode(&key[keys::DATA_PREFIX_KEY.len()..]) != KeyMode::Raw {
+
+        let expire_ts = get_expire_ts(value).unwrap_or_else(|_| {
+            TTL_CHECKER_ACTIONS_COUNTER_VEC
+                .with_label_values(&["ts_error"])
+                .inc();
+            error!("unexpected ttl key:{:?}, value:{:?}", key, value);
+            0
+        });
+        if expire_ts == 0 {
             return CompactionFilterDecision::Keep;
         }
-
-        match F::decode_raw_value(value) {
-            Ok(RawValue {
-                expire_ts: Some(expire_ts),
-                ..
-            }) if expire_ts <= self.ts => CompactionFilterDecision::Remove,
-            Err(err) => {
-                TTL_CHECKER_ACTIONS_COUNTER_VEC
-                    .with_label_values(&["ts_error"])
-                    .inc();
-                error!(
-                    "unexpected ttl key";
-                    "key" => log_wrappers::Value::key(key),
-                    "value" => log_wrappers::Value::value(value),
-                    "err" => %err,
-                );
-                CompactionFilterDecision::Keep
-            }
-            _ => CompactionFilterDecision::Keep,
+        if expire_ts <= self.ts {
+            CompactionFilterDecision::Remove
+        } else {
+            CompactionFilterDecision::Keep
         }
     }
 }

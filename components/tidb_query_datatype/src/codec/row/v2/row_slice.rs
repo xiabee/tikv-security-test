@@ -1,14 +1,10 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp::Ordering::{Equal, Greater, Less},
-    marker::PhantomData,
-};
-
+use crate::codec::{Error, Result};
 use codec::prelude::*;
 use num_traits::PrimInt;
-
-use crate::codec::{Error, Result};
+use std::cmp::Ordering::{Equal, Greater, Less};
+use std::marker::PhantomData;
 
 pub enum RowSlice<'a> {
     Small {
@@ -31,7 +27,7 @@ impl RowSlice<'_> {
     /// # Panics
     ///
     /// Panics if the value of first byte is not 128(v2 version code)
-    pub fn from_bytes(mut data: &[u8]) -> Result<RowSlice<'_>> {
+    pub fn from_bytes(mut data: &[u8]) -> Result<RowSlice> {
         let origin = data;
         assert_eq!(data.read_u8()?, super::CODEC_VERSION);
         let is_big = super::Flags::from_bits_truncate(data.read_u8()?) == super::Flags::BIG;
@@ -250,15 +246,12 @@ impl<'a, T: PrimInt> LEBytes<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::u16;
-
+    use super::super::encoder_for_test::{Column, RowEncoder};
+    use super::{read_le_bytes, RowSlice};
+    use crate::codec::data_type::ScalarValue;
+    use crate::expr::EvalContext;
     use codec::prelude::NumberEncoder;
-
-    use super::{
-        super::encoder_for_test::{Column, RowEncoder},
-        read_le_bytes, RowSlice,
-    };
-    use crate::{codec::data_type::ScalarValue, expr::EvalContext};
+    use std::u16;
 
     #[test]
     fn test_read_le_bytes() {
@@ -356,13 +349,11 @@ mod tests {
 
 #[cfg(test)]
 mod benches {
+    use super::super::encoder_for_test::{Column, RowEncoder};
+    use super::RowSlice;
+    use crate::codec::data_type::ScalarValue;
+    use crate::expr::EvalContext;
     use test::black_box;
-
-    use super::{
-        super::encoder_for_test::{Column, RowEncoder},
-        RowSlice,
-    };
-    use crate::{codec::data_type::ScalarValue, expr::EvalContext};
 
     fn encoded_data(len: usize) -> Vec<u8> {
         let mut cols = vec![];

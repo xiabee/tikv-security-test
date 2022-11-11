@@ -6,7 +6,8 @@ use engine_traits::{CfName, CF_DEFAULT, CF_WRITE};
 use raftstore::store::*;
 use rand::prelude::*;
 use test_raftstore::*;
-use tikv_util::{config::*, time::Instant};
+use tikv_util::config::*;
+use tikv_util::time::Instant;
 
 // TODO add epoch not match test cases.
 
@@ -56,25 +57,18 @@ fn test_put<T: Simulator>(cluster: &mut Cluster<T>) {
 fn test_delete<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.run();
 
-    let data_set: Vec<_> = (1..1000)
-        .map(|i| {
-            (
-                format!("key{}", i).into_bytes(),
-                format!("value{}", i).into_bytes(),
-            )
-        })
-        .collect();
-
-    for kvs in data_set.chunks(50) {
-        let requests = kvs.iter().map(|(k, v)| new_put_cmd(k, v)).collect();
-        // key999 is always the last region.
-        cluster.batch_put(b"key999", requests).unwrap();
+    for i in 1..1000 {
+        let (k, v) = (format!("key{}", i), format!("value{}", i));
+        let key = k.as_bytes();
+        let value = v.as_bytes();
+        cluster.must_put(key, value);
+        let v = cluster.get(key);
+        assert_eq!(v, Some(value.to_vec()));
     }
 
-    let mut rng = rand::thread_rng();
-    for (key, value) in data_set.choose_multiple(&mut rng, 50) {
-        let v = cluster.get(key);
-        assert_eq!(v.as_ref(), Some(value));
+    for i in 1..1000 {
+        let k = format!("key{}", i);
+        let key = k.as_bytes();
         cluster.must_delete(key);
         assert!(cluster.get(key).is_none());
     }

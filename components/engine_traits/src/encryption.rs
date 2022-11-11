@@ -1,9 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    fmt::{self, Debug, Formatter},
-    io::Result,
-};
+use std::fmt::{self, Debug, Formatter};
+use std::io::Result;
 
 pub trait EncryptionKeyManager: Sync + Send {
     fn get_file(&self, fname: &str) -> Result<FileEncryptionInfo>;
@@ -29,7 +27,7 @@ impl Default for FileEncryptionInfo {
 }
 
 impl Debug for FileEncryptionInfo {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "FileEncryptionInfo [method={:?}, key=...<{} bytes>, iv=...<{} bytes>]",

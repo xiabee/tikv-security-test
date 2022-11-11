@@ -1,16 +1,19 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
-use std::{
-    sync::{atomic::AtomicBool, Arc},
-    thread, time,
-};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::thread;
+use std::time;
 
-use engine_traits::{CfName, IterOptions, CF_DEFAULT};
 use futures::executor::block_on;
 use kvproto::kvrpcpb::{Context, KeyRange};
 use raft::eraftpb::MessageType;
+
+use engine_traits::{CfName, IterOptions, CF_DEFAULT};
 use test_raftstore::*;
-use tikv::storage::{kv::*, CfStatistics};
-use tikv_util::{codec::bytes, HandyRwLock};
+use tikv::storage::kv::*;
+use tikv::storage::CfStatistics;
+use tikv_util::codec::bytes;
+use tikv_util::HandyRwLock;
 use txn_types::{Key, Lock, LockType};
 
 #[test]
@@ -328,55 +331,6 @@ fn test_invalid_read_index_when_no_leader() {
         "{:?}",
         resp.get_header()
     );
-}
-
-/// RaftKV precheck_write_with_ctx checks if the current role is leader.
-/// When it is not, it should return NotLeader error during prechecking.
-#[test]
-fn test_raftkv_precheck_write_with_ctx() {
-    let mut cluster = new_server_cluster(0, 3);
-    cluster.run();
-
-    // make sure leader has been elected.
-    assert_eq!(cluster.must_get(b"k1"), None);
-
-    let region = cluster.get_region(b"");
-    let leader = cluster.leader_of_region(region.get_id()).unwrap();
-    let follower = region
-        .get_peers()
-        .iter()
-        .find(|p| p.get_id() != leader.get_id())
-        .unwrap();
-
-    let leader_storage = cluster.sim.rl().storages[&leader.get_id()].clone();
-    let follower_storage = cluster.sim.rl().storages[&follower.get_id()].clone();
-
-    // Assume this is a write request.
-    let mut ctx = Context::default();
-    ctx.set_region_id(region.get_id());
-    ctx.set_region_epoch(region.get_region_epoch().clone());
-    ctx.set_peer(region.get_peers()[0].clone());
-
-    // The (write) request can be sent to the leader.
-    leader_storage.precheck_write_with_ctx(&ctx).unwrap();
-    // The (write) request should not be send to a follower.
-    follower_storage.precheck_write_with_ctx(&ctx).unwrap_err();
-
-    // Leader has network partition and it must be not leader any more.
-    let filter = Box::new(RegionPacketFilter::new(
-        region.get_id(),
-        leader.get_store_id(),
-    ));
-    cluster
-        .sim
-        .wl()
-        .add_recv_filter(leader.get_store_id(), filter.clone());
-    cluster
-        .sim
-        .wl()
-        .add_send_filter(leader.get_store_id(), filter);
-    sleep_until_election_triggered(&cluster.cfg);
-    leader_storage.precheck_write_with_ctx(&ctx).unwrap_err();
 }
 
 fn must_put<E: Engine>(ctx: &Context, engine: &E, key: &[u8], value: &[u8]) {

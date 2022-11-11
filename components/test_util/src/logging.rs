@@ -1,12 +1,9 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    env, fmt,
-    fs::{File, OpenOptions},
-    io,
-    io::prelude::*,
-    sync::{Mutex, Once},
-};
+use std::fs::{File, OpenOptions};
+use std::io::prelude::*;
+use std::sync::{Mutex, Once};
+use std::{env, fmt, io};
 
 use slog::{self, Drain, OwnedKVList, Record};
 

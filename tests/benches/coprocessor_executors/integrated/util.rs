@@ -1,18 +1,22 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
+use std::sync::Arc;
 
-use criterion::{black_box, measurement::Measurement};
+use criterion::black_box;
+use criterion::measurement::Measurement;
+
 use kvproto::coprocessor::KeyRange;
-use test_coprocessor::*;
-use tidb_query_datatype::expr::EvalConfig;
-use tikv::{
-    coprocessor::dag::TiKvStorage,
-    storage::{RocksEngine, Store as TxnStore},
-};
 use tipb::Executor as PbExecutor;
 
-use crate::util::{bencher::Bencher, store::StoreDescriber};
+use test_coprocessor::*;
+
+use tidb_query_datatype::expr::EvalConfig;
+use tikv::coprocessor::dag::TiKVStorage;
+use tikv::storage::{RocksEngine, Store as TxnStore};
+
+use crate::util::bencher::Bencher;
+use crate::util::store::StoreDescriber;
 
 pub trait IntegratedBencher<M>
 where
@@ -22,7 +26,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         executors: &[PbExecutor],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,
@@ -65,7 +69,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         executors: &[PbExecutor],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,
@@ -73,7 +77,7 @@ where
         crate::util::bencher::BatchNextAllBencher::new(|| {
             tidb_query_executors::runner::build_executors(
                 black_box(executors.to_vec()),
-                black_box(TiKvStorage::new(ToTxnStore::<T>::to_store(store), false)),
+                black_box(TiKVStorage::new(ToTxnStore::<T>::to_store(store), false)),
                 black_box(ranges.to_vec()),
                 black_box(Arc::new(EvalConfig::default())),
                 black_box(false),
@@ -114,7 +118,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         executors: &[PbExecutor],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,

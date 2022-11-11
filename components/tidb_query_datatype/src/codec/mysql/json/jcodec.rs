@@ -1,11 +1,14 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{collections::BTreeMap, convert::TryInto, f64, str};
+use std::collections::BTreeMap;
+use std::convert::TryInto;
+use std::{f64, str};
 
-use codec::{number::NumberCodec, prelude::*};
-
-use super::{constants::*, Json, JsonRef, JsonType};
+use super::constants::*;
+use super::{Json, JsonRef, JsonType};
 use crate::codec::{Error, Result};
+use codec::number::NumberCodec;
+use codec::prelude::*;
 
 impl<'a> JsonRef<'a> {
     fn encoded_len(&self) -> usize {
@@ -19,7 +22,7 @@ impl<'a> JsonRef<'a> {
 }
 
 pub trait JsonEncoder: NumberEncoder {
-    fn write_json(&mut self, data: JsonRef<'_>) -> Result<()> {
+    fn write_json(&mut self, data: JsonRef) -> Result<()> {
         self.write_u8(data.get_type() as u8)?;
         self.write_bytes(data.value()).map_err(Error::from)
     }

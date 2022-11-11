@@ -2,21 +2,16 @@
 
 mod future_pool;
 mod metrics;
-use std::sync::Arc;
-
-use fail::fail_point;
 pub use future_pool::{Full, FuturePool};
-use yatp::{
-    pool::{CloneRunnerBuilder, Local, Runner},
-    queue::{multilevel, QueueType},
-    task::future::{Runner as FutureRunner, TaskCell},
-    ThreadPool,
-};
 
-use crate::{
-    thread_group::GroupProperties,
-    time::{Duration, Instant},
-};
+use crate::thread_group::GroupProperties;
+use crate::time::{Duration, Instant};
+use fail::fail_point;
+use std::sync::Arc;
+use yatp::pool::{CloneRunnerBuilder, Local, Runner};
+use yatp::queue::{multilevel, QueueType};
+use yatp::task::future::{Runner as FutureRunner, TaskCell};
+use yatp::ThreadPool;
 
 pub(crate) const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -158,7 +153,6 @@ pub struct YatpPoolBuilder<T: PoolTicker> {
     before_stop: Option<Arc<dyn Fn() + Send + Sync>>,
     before_pause: Option<Arc<dyn Fn() + Send + Sync>>,
     min_thread_count: usize,
-    core_thread_count: usize,
     max_thread_count: usize,
     stack_size: usize,
     max_tasks: usize,
@@ -173,7 +167,6 @@ impl<T: PoolTicker> YatpPoolBuilder<T> {
             before_stop: None,
             before_pause: None,
             min_thread_count: 1,
-            core_thread_count: 1,
             max_thread_count: 1,
             stack_size: 0,
             max_tasks: std::usize::MAX,
@@ -181,8 +174,7 @@ impl<T: PoolTicker> YatpPoolBuilder<T> {
     }
 
     pub fn config(&mut self, config: Config) -> &mut Self {
-        // TODO: maybe we should use (1, num_cpu) for min and max thread count.
-        self.thread_count(config.workers, config.workers, config.workers)
+        self.thread_count(config.workers, config.workers)
             .stack_size(config.stack_size)
             .max_tasks(config.workers.saturating_mul(config.max_tasks_per_worker))
     }
@@ -198,14 +190,8 @@ impl<T: PoolTicker> YatpPoolBuilder<T> {
         self
     }
 
-    pub fn thread_count(
-        &mut self,
-        min_thread_count: usize,
-        core_thread_count: usize,
-        max_thread_count: usize,
-    ) -> &mut Self {
+    pub fn thread_count(&mut self, min_thread_count: usize, max_thread_count: usize) -> &mut Self {
         self.min_thread_count = min_thread_count;
-        self.core_thread_count = core_thread_count;
         self.max_thread_count = max_thread_count;
         self
     }
@@ -242,7 +228,7 @@ impl<T: PoolTicker> YatpPoolBuilder<T> {
     pub fn build_future_pool(&mut self) -> FuturePool {
         let pool = self.build_single_level_pool();
         let name = self.name_prefix.as_deref().unwrap_or("yatp_pool");
-        FuturePool::from_pool(pool, name, self.core_thread_count, self.max_tasks)
+        FuturePool::from_pool(pool, name, self.max_thread_count, self.max_tasks)
     }
 
     pub fn build_single_level_pool(&mut self) -> ThreadPool<TaskCell> {
@@ -271,7 +257,6 @@ impl<T: PoolTicker> YatpPoolBuilder<T> {
         builder
             .stack_size(self.stack_size)
             .min_thread_count(self.min_thread_count)
-            .core_thread_count(self.core_thread_count)
             .max_thread_count(self.max_thread_count);
 
         let after_start = self.after_start.take();

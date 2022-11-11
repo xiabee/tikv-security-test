@@ -1,18 +1,18 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{cell::Cell, cmp::Ordering, ops::Bound};
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::ops::Bound;
 
-use engine_traits::{CfName, IterOptions, DATA_KEY_PREFIX_LEN};
-use tikv_util::{
-    keybuilder::KeyBuilder, metrics::CRITICAL_ERROR, panic_when_unexpected_key_or_data,
-    set_panic_mark,
-};
+use engine_traits::CfName;
+use engine_traits::{IterOptions, DATA_KEY_PREFIX_LEN};
+use tikv_util::keybuilder::KeyBuilder;
+use tikv_util::metrics::CRITICAL_ERROR;
+use tikv_util::{panic_when_unexpected_key_or_data, set_panic_mark};
 use txn_types::{Key, TimeStamp};
 
-use crate::{
-    stats::{StatsCollector, StatsKind},
-    CfStatistics, Error, Iterator, Result, ScanMode, Snapshot, SEEK_BOUND,
-};
+use crate::stats::{StatsCollector, StatsKind};
+use crate::{CfStatistics, Error, Iterator, Result, ScanMode, Snapshot, SEEK_BOUND};
 
 pub struct Cursor<I: Iterator> {
     iter: I,
@@ -459,7 +459,6 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
     ///
     /// Defaults to `true`.
     #[inline]
-    #[must_use]
     pub fn fill_cache(mut self, fill_cache: bool) -> Self {
         self.fill_cache = fill_cache;
         self
@@ -469,7 +468,6 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
     ///
     /// Defaults to `false`, it means use total order seek.
     #[inline]
-    #[must_use]
     pub fn prefix_seek(mut self, prefix_seek: bool) -> Self {
         self.prefix_seek = prefix_seek;
         self
@@ -479,7 +477,6 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
     ///
     /// Defaults to `ScanMode::Forward`.
     #[inline]
-    #[must_use]
     pub fn scan_mode(mut self, scan_mode: ScanMode) -> Self {
         self.scan_mode = scan_mode;
         self
@@ -490,7 +487,6 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
     ///
     /// Both default to `None`.
     #[inline]
-    #[must_use]
     pub fn range(mut self, lower: Option<Key>, upper: Option<Key>) -> Self {
         self.lower_bound = lower;
         self.upper_bound = upper;
@@ -501,7 +497,6 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
     ///
     /// Default is empty.
     #[inline]
-    #[must_use]
     pub fn hint_min_ts(mut self, min_ts: Option<TimeStamp>) -> Self {
         self.hint_min_ts = min_ts;
         self
@@ -511,21 +506,18 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
     ///
     /// Default is empty.
     #[inline]
-    #[must_use]
     pub fn hint_max_ts(mut self, max_ts: Option<TimeStamp>) -> Self {
         self.hint_max_ts = max_ts;
         self
     }
 
     #[inline]
-    #[must_use]
     pub fn key_only(mut self, key_only: bool) -> Self {
         self.key_only = key_only;
         self
     }
 
     #[inline]
-    #[must_use]
     pub fn max_skippable_internal_keys(mut self, count: u64) -> Self {
         self.max_skippable_internal_keys = count;
         self
@@ -570,22 +562,20 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use engine_rocks::{
-        raw::ColumnFamilyOptions,
-        raw_util::{new_engine, CFOptions},
-        util::{new_temp_engine, FixedPrefixSliceTransform},
-        RocksEngine, RocksSnapshot,
-    };
+    use engine_rocks::raw::ColumnFamilyOptions;
+    use engine_rocks::raw_util::{new_engine, CFOptions};
+    use engine_rocks::util::FixedPrefixSliceTransform;
+    use engine_rocks::{RocksEngine, RocksSnapshot};
     use engine_traits::{IterOptions, SyncMutable, CF_DEFAULT};
     use keys::data_key;
     use kvproto::metapb::{Peer, Region};
-    use raftstore::store::RegionSnapshot;
+    use std::sync::Arc;
     use tempfile::Builder;
     use txn_types::Key;
 
     use crate::{CfStatistics, Cursor, ScanMode};
+    use engine_rocks::util::new_temp_engine;
+    use raftstore::store::RegionSnapshot;
 
     type DataSet = Vec<(Vec<u8>, Vec<u8>)>;
 
@@ -614,11 +604,9 @@ mod tests {
     fn test_seek_and_prev_with_prefix_seek() {
         let path = Builder::new().prefix("test-cursor").tempdir().unwrap();
         let mut cf_opts = ColumnFamilyOptions::new();
+        let e = Box::new(FixedPrefixSliceTransform::new(3));
         cf_opts
-            .set_prefix_extractor(
-                "FixedPrefixSliceTransform",
-                FixedPrefixSliceTransform::new(3),
-            )
+            .set_prefix_extractor("FixedPrefixSliceTransform", e)
             .unwrap();
         let engine = new_engine(
             path.path().to_str().unwrap(),

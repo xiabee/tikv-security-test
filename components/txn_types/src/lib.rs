@@ -13,15 +13,16 @@ mod write;
 
 use std::io;
 
-use error_code::{self, ErrorCode, ErrorCodeExt};
-pub use lock::{Lock, LockType, PessimisticLock};
-use thiserror::Error;
+pub use lock::{Lock, LockType};
 pub use timestamp::{TimeStamp, TsSet};
 pub use types::{
-    is_short_value, Key, KvPair, Mutation, MutationType, OldValue, OldValues, TxnExtra,
-    TxnExtraScheduler, Value, WriteBatchFlags, SHORT_VALUE_MAX_LEN,
+    is_short_value, Key, KvPair, Mutation, MutationType, OldValue, OldValues, RawMutation,
+    TxnExtra, TxnExtraScheduler, Value, WriteBatchFlags, SHORT_VALUE_MAX_LEN,
 };
 pub use write::{Write, WriteRef, WriteType};
+
+use error_code::{self, ErrorCode, ErrorCodeExt};
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ErrorInner {
@@ -35,18 +36,6 @@ pub enum ErrorInner {
     BadFormatWrite,
     #[error("key is locked (backoff or cleanup) {0:?}")]
     KeyIsLocked(kvproto::kvrpcpb::LockInfo),
-    #[error(
-        "write conflict, start_ts: {}, conflict_start_ts: {}, conflict_commit_ts: {}, key: {}, primary: {}",
-        .start_ts, .conflict_start_ts, .conflict_commit_ts,
-        log_wrappers::Value::key(.key), log_wrappers::Value::key(.primary)
-    )]
-    WriteConflict {
-        start_ts: TimeStamp,
-        conflict_start_ts: TimeStamp,
-        conflict_commit_ts: TimeStamp,
-        key: Vec<u8>,
-        primary: Vec<u8>,
-    },
 }
 
 impl ErrorInner {
@@ -57,19 +46,6 @@ impl ErrorInner {
             ErrorInner::BadFormatWrite => Some(ErrorInner::BadFormatWrite),
             ErrorInner::KeyIsLocked(info) => Some(ErrorInner::KeyIsLocked(info.clone())),
             ErrorInner::Io(_) => None,
-            ErrorInner::WriteConflict {
-                start_ts,
-                conflict_start_ts,
-                conflict_commit_ts,
-                key,
-                primary,
-            } => Some(ErrorInner::WriteConflict {
-                start_ts: *start_ts,
-                conflict_start_ts: *conflict_start_ts,
-                conflict_commit_ts: *conflict_commit_ts,
-                key: key.to_owned(),
-                primary: primary.to_owned(),
-            }),
         }
     }
 }
@@ -109,7 +85,6 @@ impl ErrorCodeExt for Error {
             ErrorInner::BadFormatLock => error_code::storage::BAD_FORMAT_LOCK,
             ErrorInner::BadFormatWrite => error_code::storage::BAD_FORMAT_WRITE,
             ErrorInner::KeyIsLocked(_) => error_code::storage::KEY_IS_LOCKED,
-            ErrorInner::WriteConflict { .. } => error_code::storage::WRITE_CONFLICT,
         }
     }
 }

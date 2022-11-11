@@ -8,14 +8,13 @@ extern crate slog;
 extern crate tikv_alloc;
 
 pub mod hex;
+pub use crate::hex::*;
+
+use protobuf::atomic_flags::set_redact_bytes as proto_set_redact_bytes;
 use std::{
     fmt,
     sync::atomic::{AtomicBool, Ordering},
 };
-
-use protobuf::atomic_flags::set_redact_bytes as proto_set_redact_bytes;
-
-pub use crate::hex::*;
 
 pub mod test_util;
 
@@ -102,8 +101,8 @@ impl<'a> Value<'a> {
         Value(key)
     }
 
-    pub fn value(v: &'a [u8]) -> Self {
-        Value(v)
+    pub fn value(value: &'a [u8]) -> Self {
+        Value(value)
     }
 }
 
@@ -125,7 +124,7 @@ impl<'a> slog::Value for Value<'a> {
 
 impl<'a> fmt::Display for Value<'a> {
     #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if REDACT_INFO_LOG.load(Ordering::Relaxed) {
             // Print placeholder instead of the value itself.
             write!(f, "?")
@@ -137,7 +136,7 @@ impl<'a> fmt::Display for Value<'a> {
 
 impl<'a> fmt::Debug for Value<'a> {
     #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
 }

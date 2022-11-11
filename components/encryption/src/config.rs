@@ -97,14 +97,11 @@ impl Default for MasterKeyConfig {
 }
 
 mod encryption_method_serde {
+    use super::EncryptionMethod;
     use std::fmt;
 
-    use serde::{
-        de::{self, Unexpected, Visitor},
-        Deserializer, Serializer,
-    };
-
-    use super::EncryptionMethod;
+    use serde::de::{self, Unexpected, Visitor};
+    use serde::{Deserializer, Serializer};
 
     const UNKNOWN: &str = "unknown";
     const PLAINTEXT: &str = "plaintext";
@@ -135,7 +132,7 @@ mod encryption_method_serde {
         impl<'de> Visitor<'de> for EncryptionMethodVisitor {
             type Value = EncryptionMethod;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 write!(formatter, "valid encryption method")
             }
 

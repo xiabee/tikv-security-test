@@ -1,26 +1,19 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
+use crate::storage::kv::WriteData;
+use crate::storage::lock_manager::LockManager;
+use crate::storage::mvcc::{
+    Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader, MAX_TXN_WRITE_SIZE,
+};
+use crate::storage::txn::commands::{
+    Command, CommandExt, ReaderWithStats, ReleasedLocks, ResolveLockReadPhase, ResponsePolicy,
+    TypedCommand, WriteCommand, WriteContext, WriteResult,
+};
+use crate::storage::txn::{cleanup, commit, Error, ErrorInner, Result};
+use crate::storage::{ProcessResult, Snapshot};
 use collections::HashMap;
 use txn_types::{Key, Lock, TimeStamp};
-
-use crate::storage::{
-    kv::WriteData,
-    lock_manager::LockManager,
-    mvcc::{
-        Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader,
-        MAX_TXN_WRITE_SIZE,
-    },
-    txn::{
-        cleanup,
-        commands::{
-            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResolveLockReadPhase,
-            ResponsePolicy, TypedCommand, WriteCommand, WriteContext, WriteResult,
-        },
-        commit, Error, ErrorInner, Result,
-    },
-    ProcessResult, Snapshot,
-};
 
 command! {
     /// Resolve locks according to `txn_status`.
@@ -70,13 +63,17 @@ impl CommandExt for ResolveLock {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
-    fn process_write(mut self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(
+        mut self,
+        snapshot: S,
+        mut context: WriteContext<'_, L>,
+    ) -> Result<WriteResult> {
         let (ctx, txn_status, key_locks) = (self.ctx, self.txn_status, self.key_locks);
 
         let mut txn = MvccTxn::new(TimeStamp::zero(), context.concurrency_manager);
         let mut reader = ReaderWithStats::new(
-            SnapshotReader::new_with_ctx(TimeStamp::zero(), snapshot, &ctx),
-            context.statistics,
+            SnapshotReader::new(TimeStamp::zero(), snapshot, !ctx.get_not_fill_cache()),
+            &mut context.statistics,
         );
 
         let mut scan_key = self.scan_key.take();

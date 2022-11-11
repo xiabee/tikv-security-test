@@ -30,25 +30,24 @@ pub mod readpool_impl;
 mod statistics;
 mod tracker;
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
+pub use self::endpoint::Endpoint;
+pub use self::error::{Error, Result};
 pub use checksum::checksum_crc64_xor;
-use engine_traits::PerfLevel;
+
+use crate::storage::mvcc::TimeStamp;
+use crate::storage::Statistics;
+use async_trait::async_trait;
+use engine_rocks::PerfLevel;
 use kvproto::{coprocessor as coppb, kvrpcpb};
 use lazy_static::lazy_static;
 use metrics::ReqTag;
 use rand::prelude::*;
+use std::sync::Arc;
 use tidb_query_common::execute_stats::ExecSummary;
 use tikv_alloc::{mem_trace, Id, MemoryTrace, MemoryTraceGuard};
-use tikv_util::{deadline::Deadline, time::Duration};
+use tikv_util::deadline::Deadline;
+use tikv_util::time::Duration;
 use txn_types::TsSet;
-
-pub use self::{
-    endpoint::Endpoint,
-    error::{Error, Result},
-};
-use crate::storage::{mvcc::TimeStamp, Statistics};
 
 pub const REQ_TYPE_DAG: i64 = 103;
 pub const REQ_TYPE_ANALYZE: i64 = 104;
@@ -114,13 +113,8 @@ pub struct ReqContext {
     /// The transaction start_ts of the request
     pub txn_start_ts: TimeStamp,
 
-    /// The set of timestamps of locks that can be bypassed during the reading
-    /// because either they will be rolled back or their commit_ts > read request's start_ts.
+    /// The set of timestamps of locks that can be bypassed during the reading.
     pub bypass_locks: TsSet,
-
-    /// The set of timestamps of locks that value in it can be accessed during the reading
-    /// because they will be committed and their commit_ts <= read request's start_ts.
-    pub access_locks: TsSet,
 
     /// The data version to match. If it matches the underlying data version,
     /// request will not be processed (i.e. cache hit).
@@ -152,7 +146,6 @@ impl ReqContext {
     ) -> Self {
         let deadline = Deadline::from_now(max_handle_duration);
         let bypass_locks = TsSet::from_u64s(context.take_resolved_locks());
-        let access_locks = TsSet::from_u64s(context.take_committed_locks());
         let lower_bound = match ranges.first().as_ref() {
             Some(range) => range.start.clone(),
             None => vec![],
@@ -170,7 +163,6 @@ impl ReqContext {
             txn_start_ts,
             ranges,
             bypass_locks,
-            access_locks,
             cache_match_version,
             lower_bound,
             upper_bound,

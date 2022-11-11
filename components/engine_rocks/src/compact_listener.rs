@@ -1,25 +1,19 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp,
-    collections::{
-        BTreeMap,
-        Bound::{Excluded, Included, Unbounded},
-    },
-    path::Path,
-};
+use std::cmp;
+use std::path::Path;
 
+use crate::properties::{RangeProperties, UserCollectedPropertiesDecoder};
+use crate::raw::EventListener;
 use collections::hash_set_with_capacity;
-use engine_traits::{CompactedEvent, CompactionJobInfo};
+use engine_traits::CompactedEvent;
+use engine_traits::CompactionJobInfo;
 use rocksdb::{
     CompactionJobInfo as RawCompactionJobInfo, CompactionReason, TablePropertiesCollectionView,
 };
+use std::collections::BTreeMap;
+use std::collections::Bound::{Excluded, Included, Unbounded};
 use tikv_util::warn;
-
-use crate::{
-    properties::{RangeProperties, UserCollectedPropertiesDecoder},
-    raw::EventListener,
-};
 
 pub struct RocksCompactionJobInfo<'a>(&'a RawCompactionJobInfo);
 
@@ -119,7 +113,7 @@ pub struct RocksCompactedEvent {
 
 impl RocksCompactedEvent {
     pub fn new(
-        info: &RocksCompactionJobInfo<'_>,
+        info: &RocksCompactionJobInfo,
         start_key: Vec<u8>,
         end_key: Vec<u8>,
         input_props: Vec<RangeProperties>,
@@ -203,7 +197,7 @@ impl CompactedEvent for RocksCompactedEvent {
     }
 }
 
-pub type Filter = fn(&RocksCompactionJobInfo<'_>) -> bool;
+pub type Filter = fn(&RocksCompactionJobInfo) -> bool;
 
 pub struct CompactionListener {
     ch: Box<dyn Fn(RocksCompactedEvent) + Send + Sync>,

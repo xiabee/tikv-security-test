@@ -1,14 +1,11 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
-    string::ToString,
-};
+use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
+use std::string::ToString;
 
-use crate::{
-    codec::{error::Error, Result},
-    expr::EvalContext,
-};
+use crate::codec::error::Error;
+use crate::codec::Result;
+use crate::expr::EvalContext;
 
 /// BinaryLiteral is the internal type for storing bit / hex literal type.
 #[derive(Debug)]
@@ -37,7 +34,7 @@ pub fn to_uint(ctx: &mut EvalContext, bytes: &[u8]) -> Result<u64> {
             "BINARY",
             BinaryLiteral(bytes.to_owned()).to_string(),
         ))?;
-        return Ok(u64::MAX);
+        return Ok(std::u64::MAX);
     }
     let val = bytes.iter().fold(0, |acc, x| acc << 8 | (u64::from(*x)));
     Ok(val)

@@ -2,6 +2,7 @@
 
 use std::ffi::CString;
 
+use crate::{coprocessor::RegionInfoProvider, Error, Result};
 use engine_traits::{
     CfName, SstPartitioner, SstPartitionerContext, SstPartitionerFactory, SstPartitionerRequest,
     SstPartitionerResult, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
@@ -11,7 +12,6 @@ use lazy_static::lazy_static;
 use tikv_util::warn;
 
 use super::metrics::*;
-use crate::{coprocessor::RegionInfoProvider, Error, Result};
 
 const COMPACTION_GUARD_MAX_POS_SKIP: u32 = 10;
 
@@ -58,7 +58,7 @@ impl<P: RegionInfoProvider + Clone + 'static> SstPartitionerFactory
         &COMPACTION_GUARD
     }
 
-    fn create_partitioner(&self, context: &SstPartitionerContext<'_>) -> Option<Self::Partitioner> {
+    fn create_partitioner(&self, context: &SstPartitionerContext) -> Option<Self::Partitioner> {
         // create_partitioner can be called in RocksDB while holding db_mutex. It can block
         // other operations on RocksDB. To avoid such caces, we defer region info query to
         // the first time should_partition is called.
@@ -146,7 +146,7 @@ impl<P: RegionInfoProvider> CompactionGuardGenerator<P> {
 }
 
 impl<P: RegionInfoProvider> SstPartitioner for CompactionGuardGenerator<P> {
-    fn should_partition(&mut self, req: &SstPartitionerRequest<'_>) -> SstPartitionerResult {
+    fn should_partition(&mut self, req: &SstPartitionerRequest) -> SstPartitionerResult {
         if !self.initialized {
             self.initialize();
         }
@@ -195,8 +195,8 @@ impl<P: RegionInfoProvider> SstPartitioner for CompactionGuardGenerator<P> {
 
 #[cfg(test)]
 mod tests {
-    use std::{str, sync::Arc};
-
+    use super::*;
+    use crate::coprocessor::region_info_accessor::MockRegionInfoProvider;
     use engine_rocks::{
         raw::{BlockBasedOptions, ColumnFamilyOptions, DBCompressionType, DBOptions},
         raw_util::{new_engine_opt, CFOptions},
@@ -207,10 +207,8 @@ mod tests {
     };
     use keys::DATA_PREFIX_KEY;
     use kvproto::metapb::Region;
+    use std::{str, sync::Arc};
     use tempfile::TempDir;
-
-    use super::*;
-    use crate::coprocessor::region_info_accessor::MockRegionInfoProvider;
 
     #[test]
     fn test_compaction_guard_non_data() {

@@ -1,21 +1,19 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    fs,
-    fs::File,
-    io,
-    io::prelude::*,
-    path::PathBuf,
-    sync::{atomic::Ordering, mpsc, Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use std::sync::atomic::Ordering;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use std::{fs, io, thread};
 
 use engine_traits::RaftEngineReadOnly;
-use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
+use std::fs::File;
+use std::io::prelude::*;
+use std::path::PathBuf;
 use test_raftstore::*;
-use tikv_util::{config::*, time::Instant, HandyRwLock};
+use tikv_util::config::*;
+use tikv_util::time::Instant;
+use tikv_util::HandyRwLock;
 
 #[test]
 fn test_overlap_cleanup() {
@@ -103,7 +101,7 @@ fn test_server_snapshot_on_resolve_failure() {
 fn test_generate_snapshot() {
     let mut cluster = new_server_cluster(1, 5);
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(20);
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(8);
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 8;
     cluster.cfg.raft_store.merge_max_log_gap = 3;
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -418,6 +416,7 @@ fn test_receive_old_snapshot() {
             .reserve_dropped(Arc::clone(&dropped_msgs)),
     );
     cluster.sim.wl().add_recv_filter(2, recv_filter);
+
     cluster.clear_send_filters();
 
     for _ in 0..20 {
@@ -515,7 +514,7 @@ fn test_cancel_snapshot_generating() {
     let mut cluster = new_node_cluster(0, 5);
     cluster.cfg.raft_store.snap_mgr_gc_tick_interval = ReadableDuration(Duration::from_secs(100));
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(10);
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(10);
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 10;
     cluster.cfg.raft_store.merge_max_log_gap = 5;
 
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -637,42 +636,35 @@ fn test_snapshot_gc_after_failed() {
 fn test_sending_fail_with_net_error() {
     let mut cluster = new_server_cluster(1, 2);
     configure_for_snapshot(&mut cluster);
-    cluster.cfg.raft_store.snap_gc_timeout = ReadableDuration::millis(300);
 
     let pd_client = Arc::clone(&cluster.pd_client);
     // Disable default max peer count check.
     pd_client.disable_default_operator();
-    let r1 = cluster.run_conf_change();
+    cluster.run_conf_change();
+
     cluster.must_put(b"k1", b"v1");
-    let (send_tx, send_rx) = mpsc::sync_channel(1);
-    // only send one MessageType::MsgSnapshot message
-    cluster.sim.wl().add_send_filter(
+    let ready_notify = Arc::default();
+    let (notify_tx, notify_rx) = mpsc::channel();
+    cluster.sim.write().unwrap().add_send_filter(
         1,
-        Box::new(
-            RegionPacketFilter::new(r1, 1)
-                .allow(1)
-                .direction(Direction::Send)
-                .msg_type(MessageType::MsgSnapshot)
-                .set_msg_callback(Arc::new(move |m: &RaftMessage| {
-                    if m.get_message().get_msg_type() == MessageType::MsgSnapshot {
-                        let _ = send_tx.send(());
-                    }
-                })),
-        ),
+        Box::new(MessageTypeNotifier::new(
+            MessageType::MsgSnapshot,
+            notify_tx,
+            Arc::clone(&ready_notify),
+        )),
     );
 
-    // peer2 will interrupt in receiving snapshot
+    // store2 will return err when receive data
     fail::cfg("receiving_snapshot_net_error", "return()").unwrap();
-    pd_client.must_add_peer(r1, new_learner_peer(2, 2));
+    pd_client.add_peer(1, new_learner_peer(2, 2));
 
-    // ready to send notify.
-    send_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    // need to wait receiver handle the snapshot request
-    sleep_ms(100);
-
-    // peer2 will not become learner so ti will has k1 key and receiving count will zero
+    // We are ready to recv notify.
+    ready_notify.store(true, Ordering::SeqCst);
+    notify_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     let engine2 = cluster.get_engine(2);
     must_get_none(&engine2, b"k1");
+
+    assert_eq!(cluster.get_snap_mgr(1).stats().sending_count, 0);
     assert_eq!(cluster.get_snap_mgr(2).stats().receiving_count, 0);
 }
 
@@ -682,7 +674,7 @@ fn test_sending_fail_with_net_error() {
 #[test]
 fn test_snapshot_clean_up_logs_with_unfinished_log_gc() {
     let mut cluster = new_node_cluster(0, 3);
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(15);
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 15;
     cluster.cfg.raft_store.raft_log_gc_threshold = 15;
     // Speed up log gc.
     cluster.cfg.raft_store.raft_log_compact_sync_interval = ReadableDuration::millis(1);
@@ -728,60 +720,4 @@ fn test_snapshot_clean_up_logs_with_unfinished_log_gc() {
     raft_engine.get_all_entries_to(1, &mut dest).unwrap();
     // Only previous log should be cleaned up.
     assert!(dest[0].get_index() > truncated_index, "{:?}", dest);
-}
-
-/// Redo snapshot apply after restart when kvdb state is updated but raftdb state is not.
-#[test]
-fn test_snapshot_recover_from_raft_write_failure() {
-    let mut cluster = new_server_cluster(0, 3);
-    configure_for_snapshot(&mut cluster);
-    // Avoid triggering snapshot at final step.
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(10);
-    let pd_client = Arc::clone(&cluster.pd_client);
-    pd_client.disable_default_operator();
-
-    let r1 = cluster.run_conf_change();
-    pd_client.must_add_peer(r1, new_peer(2, 2));
-    pd_client.must_add_peer(r1, new_peer(3, 3));
-
-    cluster.must_put(b"k1", b"v1");
-    must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
-
-    cluster.must_transfer_leader(r1, new_peer(3, 3));
-
-    cluster.add_send_filter(IsolationFilterFactory::new(1));
-
-    for i in 0..20 {
-        cluster.must_put(format!("k1{}", i).as_bytes(), b"v1");
-    }
-
-    // Raft writes are dropped.
-    let raft_before_save_on_store_1_fp = "raft_before_save_on_store_1";
-    fail::cfg(raft_before_save_on_store_1_fp, "return").unwrap();
-    // Skip applying snapshot into RocksDB to keep peer status in Applying.
-    let apply_snapshot_fp = "apply_pending_snapshot";
-    fail::cfg(apply_snapshot_fp, "return()").unwrap();
-
-    cluster.clear_send_filters();
-    // Wait for leader send snapshot.
-    sleep_ms(100);
-
-    cluster.stop_node(1);
-    fail::remove(raft_before_save_on_store_1_fp);
-    fail::remove(apply_snapshot_fp);
-    cluster.run_node(1).unwrap();
-    // Snapshot is applied.
-    must_get_equal(&cluster.get_engine(1), b"k119", b"v1");
-    let mut ents = Vec::new();
-    cluster
-        .get_raft_engine(1)
-        .get_all_entries_to(1, &mut ents)
-        .unwrap();
-    // Raft logs are cleared.
-    assert!(ents.is_empty());
-
-    // Final step: append some more entries to make sure raftdb is healthy.
-    for i in 20..25 {
-        cluster.must_put(format!("k1{}", i).as_bytes(), b"v1");
-    }
 }

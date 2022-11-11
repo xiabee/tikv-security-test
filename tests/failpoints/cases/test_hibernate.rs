@@ -1,16 +1,16 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::{atomic::*, *},
-    thread,
-    time::Duration,
-};
+use std::sync::atomic::*;
+use std::sync::*;
+use std::thread;
+use std::time::Duration;
 
 use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
-use raftstore::store::{PeerMsg, PeerTick};
+use raftstore::store::{PeerMsg, PeerTicks};
 use test_raftstore::*;
-use tikv_util::{config::ReadableDuration, HandyRwLock};
+use tikv_util::config::ReadableDuration;
+use tikv_util::HandyRwLock;
 
 #[test]
 fn test_break_leadership_on_restart() {
@@ -58,7 +58,7 @@ fn test_break_leadership_on_restart() {
     rx.recv_timeout(Duration::from_millis(200)).unwrap();
     fail::remove("on_raft_base_tick_idle");
     router
-        .send(1, PeerMsg::Tick(PeerTick::CheckPeerStaleState))
+        .send(1, PeerMsg::Tick(PeerTicks::CHECK_PEER_STALE_STATE))
         .unwrap();
 
     // Wait until the peer 3 hibernates again.

@@ -3,21 +3,16 @@
 use std::convert::{TryFrom, TryInto};
 
 use codec::prelude::NumberDecoder;
-use tidb_query_common::Result;
-use tidb_query_datatype::{
-    codec::{
-        data_type::*,
-        mysql::{EnumDecoder, JsonDecoder, MAX_FSP},
-    },
-    expr::EvalContext,
-    match_template_evaltype, EvalType, FieldTypeAccessor,
-};
+use tidb_query_datatype::{EvalType, FieldTypeAccessor};
 use tipb::{Expr, ExprType, FieldType};
 
-use super::{
-    super::function::RpnFnMeta,
-    expr::{RpnExpression, RpnExpressionNode},
-};
+use super::super::function::RpnFnMeta;
+use super::expr::{RpnExpression, RpnExpressionNode};
+use tidb_query_common::Result;
+use tidb_query_datatype::codec::data_type::*;
+use tidb_query_datatype::codec::mysql::{EnumDecoder, JsonDecoder, MAX_FSP};
+use tidb_query_datatype::expr::EvalContext;
+use tidb_query_datatype::match_template_evaltype;
 
 /// Helper to build an `RpnExpression`.
 #[derive(Debug)]
@@ -121,7 +116,6 @@ impl RpnExpressionBuilder {
     }
 
     /// Pushes a `FnCall` node.
-    #[must_use]
     pub fn push_fn_call_for_test(
         mut self,
         func_meta: RpnFnMeta,
@@ -139,7 +133,6 @@ impl RpnExpressionBuilder {
     }
 
     #[cfg(test)]
-    #[must_use]
     pub fn push_fn_call_with_metadata(
         mut self,
         func_meta: RpnFnMeta,
@@ -159,7 +152,6 @@ impl RpnExpressionBuilder {
 
     /// Pushes a `Constant` node. The field type will be auto inferred by choosing an arbitrary
     /// field type that matches the field type of the given value.
-    #[must_use]
     pub fn push_constant_for_test(mut self, value: impl Into<ScalarValue>) -> Self {
         let value = value.into();
         let field_type = value
@@ -173,7 +165,6 @@ impl RpnExpressionBuilder {
 
     /// Pushes a `Constant` node.
     #[cfg(test)]
-    #[must_use]
     pub fn push_constant_with_field_type(
         mut self,
         value: impl Into<ScalarValue>,
@@ -188,7 +179,6 @@ impl RpnExpressionBuilder {
     }
 
     /// Pushes a `ColumnRef` node.
-    #[must_use]
     pub fn push_column_ref_for_test(mut self, offset: usize) -> Self {
         let node = RpnExpressionNode::ColumnRef { offset };
         self.0.push(node);
@@ -367,9 +357,6 @@ fn handle_node_constant(
         ExprType::MysqlEnum if eval_type == EvalType::Enum => {
             extract_scalar_value_enum(tree_node.take_val(), tree_node.get_field_type())?
         }
-        ExprType::MysqlBit if eval_type == EvalType::Int => {
-            extract_scalar_value_uint64_from_bits(tree_node.take_val())?
-        }
         expr_type => {
             return Err(other_err!(
                 "Unexpected ExprType {:?} and EvalType {:?}",
@@ -401,17 +388,6 @@ fn extract_scalar_value_int64(val: Vec<u8>) -> Result<ScalarValue> {
         .read_i64()
         .map_err(|_| other_err!("Unable to decode int64 from the request"))?;
     Ok(ScalarValue::Int(Some(value)))
-}
-
-#[inline]
-fn extract_scalar_value_uint64_from_bits(val: Vec<u8>) -> Result<ScalarValue> {
-    debug_assert!(val.len() <= 8);
-    let mut res = 0;
-    for v in val {
-        res <<= 8;
-        res |= v as u64;
-    }
-    Ok(ScalarValue::Int(Some(res as i64)))
 }
 
 #[inline]
@@ -494,13 +470,14 @@ fn extract_scalar_value_enum(val: Vec<u8>, field_type: &FieldType) -> Result<Sca
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use tidb_query_codegen::rpn_fn;
-    use tidb_query_common::Result;
     use tidb_query_datatype::FieldTypeTp;
     use tipb::ScalarFuncSig;
     use tipb_helper::ExprDefBuilder;
 
-    use super::*;
+    use tidb_query_common::Result;
 
     /// An RPN function for test. It accepts 1 int argument, returns float.
     #[rpn_fn(nullable)]
@@ -910,15 +887,5 @@ mod tests {
                 .is_ok()
             );
         }
-    }
-
-    #[test]
-    fn test_extract_scalar_value_uint64_from_bits() {
-        let mut res = extract_scalar_value_uint64_from_bits(vec![0x01, 0x56, 0x12, 0x34]).unwrap();
-        assert_eq!(ScalarValue::Int(Some(0x1561234)), res);
-        res = extract_scalar_value_uint64_from_bits(vec![0x56, 0x34, 0x12, 0x78]).unwrap();
-        assert_eq!(ScalarValue::Int(Some(0x56341278)), res);
-        res = extract_scalar_value_uint64_from_bits(vec![0x78]).unwrap();
-        assert_eq!(ScalarValue::Int(Some(0x78)), res);
     }
 }

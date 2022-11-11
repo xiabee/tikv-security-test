@@ -2,14 +2,13 @@
 
 use std::cmp::Ordering;
 
+use crate::codec::collation::Collator;
+use crate::{match_template_collator, match_template_evaltype};
+use crate::{Collation, EvalType, FieldTypeAccessor};
 use match_template::match_template;
 use tipb::FieldType;
 
 use super::*;
-use crate::{
-    codec::collation::Collator, match_template_collator, match_template_evaltype, Collation,
-    EvalType, FieldTypeAccessor,
-};
 
 /// A scalar value container, a.k.a. datum, for all concrete eval types.
 ///
@@ -337,7 +336,7 @@ impl<'a> ScalarValueRef<'a> {
     #[inline]
     pub fn cmp_sort_key(
         &self,
-        other: &ScalarValueRef<'_>,
+        other: &ScalarValueRef,
         field_type: &FieldType,
     ) -> crate::codec::Result<Ordering> {
         Ok(match_template! {
@@ -400,7 +399,7 @@ impl_as_ref! { Duration, as_duration }
 
 impl ScalarValue {
     #[inline]
-    pub fn as_json(&self) -> Option<JsonRef<'_>> {
+    pub fn as_json(&self) -> Option<JsonRef> {
         EvaluableRef::borrow_scalar_value(self)
     }
 }
@@ -414,7 +413,7 @@ impl<'a> ScalarValueRef<'a> {
 
 impl ScalarValue {
     #[inline]
-    pub fn as_bytes(&self) -> Option<BytesRef<'_>> {
+    pub fn as_bytes(&self) -> Option<BytesRef> {
         EvaluableRef::borrow_scalar_value(self)
     }
 }

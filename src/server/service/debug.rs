@@ -2,34 +2,25 @@
 
 use engine_rocks::RocksEngine;
 use engine_traits::{Engines, MiscExt, RaftEngine};
-use futures::{
-    channel::oneshot,
-    future::{Future, FutureExt, TryFutureExt},
-    sink::SinkExt,
-    stream::{self, TryStreamExt},
+use futures::channel::oneshot;
+use futures::future::Future;
+use futures::future::{FutureExt, TryFutureExt};
+use futures::sink::SinkExt;
+use futures::stream::{self, TryStreamExt};
+use grpcio::{Error as GrpcError, WriteFlags};
+use grpcio::{RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink};
+use kvproto::debugpb::{self, *};
+use kvproto::raft_cmdpb::{
+    AdminCmdType, AdminRequest, RaftCmdRequest, RaftRequestHeader, RegionDetailResponse,
+    StatusCmdType, StatusRequest,
 };
-use grpcio::{
-    Error as GrpcError, RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink,
-    WriteFlags,
-};
-use kvproto::{
-    debugpb::{self, *},
-    raft_cmdpb::{
-        AdminCmdType, AdminRequest, RaftCmdRequest, RaftRequestHeader, RegionDetailResponse,
-        StatusCmdType, StatusRequest,
-    },
-};
-use raftstore::{
-    router::RaftStoreRouter,
-    store::msg::{Callback, RaftCmdExtraOpts},
-};
-use tikv_util::metrics;
 use tokio::runtime::Handle;
 
-use crate::{
-    config::ConfigController,
-    server::debug::{Debugger, Error, Result},
-};
+use crate::config::ConfigController;
+use crate::server::debug::{Debugger, Error, Result};
+use raftstore::router::RaftStoreRouter;
+use raftstore::store::msg::{Callback, RaftCmdExtraOpts};
+use tikv_util::metrics;
 
 fn error_to_status(e: Error) -> RpcStatus {
     let (code, msg) = match e {
@@ -359,8 +350,8 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug f
             .pool
             .spawn(async move {
                 let mut resp = GetMetricsResponse::default();
-                resp.set_store_id(debugger.get_store_ident()?.store_id);
-                resp.set_prometheus(metrics::dump(false));
+                resp.set_store_id(debugger.get_store_id()?);
+                resp.set_prometheus(metrics::dump());
                 if req.get_all() {
                     let engines = debugger.get_engine();
                     resp.set_rocksdb_kv(box_try!(MiscExt::dump_stats(&engines.kv)));
@@ -386,7 +377,7 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug f
         let router2 = self.raft_router.clone();
 
         let consistency_check_task = async move {
-            let store_id = debugger.get_store_ident()?.store_id;
+            let store_id = debugger.get_store_id()?;
             let detail = region_detail(router2, region_id, store_id).await?;
             consistency_check(router1, detail).await
         };
@@ -459,11 +450,8 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug f
             .pool
             .spawn(async move {
                 let mut resp = GetStoreInfoResponse::default();
-                match debugger.get_store_ident() {
-                    Ok(ident) => {
-                        resp.set_store_id(ident.get_store_id());
-                        resp.set_api_version(ident.get_api_version());
-                    }
+                match debugger.get_store_id() {
+                    Ok(store_id) => resp.set_store_id(store_id),
                     Err(_) => resp.set_store_id(0),
                 }
                 Ok(resp)
@@ -486,8 +474,8 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug f
             .pool
             .spawn(async move {
                 let mut resp = GetClusterInfoResponse::default();
-                match debugger.get_store_ident() {
-                    Ok(ident) => resp.set_cluster_id(ident.get_cluster_id()),
+                match debugger.get_cluster_id() {
+                    Ok(cluster_id) => resp.set_cluster_id(cluster_id),
                     Err(_) => resp.set_cluster_id(0),
                 }
                 Ok(resp)
@@ -519,16 +507,6 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug f
             .map(|res| res.unwrap());
 
         self.handle_response(ctx, sink, f, TAG);
-    }
-
-    fn reset_to_version(
-        &mut self,
-        _ctx: RpcContext<'_>,
-        req: ResetToVersionRequest,
-        sink: UnarySink<ResetToVersionResponse>,
-    ) {
-        self.debugger.reset_to_version(req.get_ts());
-        sink.success(ResetToVersionResponse::default());
     }
 }
 
@@ -605,10 +583,12 @@ fn consistency_check<T: RaftStoreRouter<RocksEngine>>(
     }
 }
 
+#[cfg(feature = "protobuf-codec")]
 mod region_size_response {
     pub type Entry = kvproto::debugpb::RegionSizeResponseEntry;
 }
 
+#[cfg(feature = "protobuf-codec")]
 mod list_fail_points_response {
     pub type Entry = kvproto::debugpb::ListFailPointsResponseEntry;
 }

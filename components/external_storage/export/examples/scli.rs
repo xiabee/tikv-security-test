@@ -7,14 +7,14 @@ use std::{
 };
 
 use external_storage_export::{
-    create_storage, make_azblob_backend, make_cloud_backend, make_gcs_backend, make_hdfs_backend,
-    make_local_backend, make_noop_backend, make_s3_backend, ExternalStorage, UnpinReader,
+    create_storage, make_cloud_backend, make_gcs_backend, make_hdfs_backend, make_local_backend,
+    make_noop_backend, make_s3_backend, ExternalStorage,
 };
 use futures_util::io::{copy, AllowStdIo};
 use ini::ini::Ini;
-use kvproto::brpb::{AzureBlobStorage, Bucket, CloudDynamic, Gcs, StorageBackend, S3};
-use structopt::{clap::arg_enum, StructOpt};
-use tikv_util::stream::block_on_external_io;
+use kvproto::brpb::{Bucket, CloudDynamic, Gcs, StorageBackend, S3};
+use structopt::clap::arg_enum;
+use structopt::StructOpt;
 use tokio::runtime::Runtime;
 
 arg_enum! {
@@ -25,7 +25,6 @@ arg_enum! {
         Hdfs,
         S3,
         GCS,
-        Azure,
         Cloud,
     }
 }
@@ -167,42 +166,6 @@ fn create_gcs_storage(opt: &Opt) -> Result<StorageBackend> {
     Ok(make_gcs_backend(config))
 }
 
-fn create_azure_storage(opt: &Opt) -> Result<StorageBackend> {
-    let mut config = AzureBlobStorage::default();
-
-    if let Some(credential_file) = &opt.credential_file {
-        let ini = Ini::load_from_file(credential_file).map_err(|e| {
-            Error::new(
-                ErrorKind::Other,
-                format!("Failed to parse credential file as ini: {}", e),
-            )
-        })?;
-        let props = ini
-            .section(Some("default"))
-            .ok_or_else(|| Error::new(ErrorKind::Other, "fail to parse section"))?;
-        config.account_name = props
-            .get("azure_storage_name")
-            .ok_or_else(|| Error::new(ErrorKind::Other, "fail to parse credential"))?
-            .clone();
-        config.shared_key = props
-            .get("azure_storage_key")
-            .ok_or_else(|| Error::new(ErrorKind::Other, "fail to parse credential"))?
-            .clone();
-    }
-    if let Some(endpoint) = &opt.endpoint {
-        config.endpoint = endpoint.to_string();
-    }
-    if let Some(bucket) = &opt.bucket {
-        config.bucket = bucket.to_string();
-    } else {
-        return Err(Error::new(ErrorKind::Other, "missing bucket"));
-    }
-    if let Some(prefix) = &opt.prefix {
-        config.prefix = prefix.to_string();
-    }
-    Ok(make_azblob_backend(config))
-}
-
 fn process() -> Result<()> {
     let opt = Opt::from_args();
     let storage: Box<dyn ExternalStorage> = create_storage(
@@ -212,7 +175,6 @@ fn process() -> Result<()> {
             StorageType::Hdfs => make_hdfs_backend(opt.path.unwrap()),
             StorageType::S3 => create_s3_storage(&opt)?,
             StorageType::GCS => create_gcs_storage(&opt)?,
-            StorageType::Azure => create_azure_storage(&opt)?,
             StorageType::Cloud => create_cloud_storage(&opt)?,
         }),
         Default::default(),
@@ -222,11 +184,7 @@ fn process() -> Result<()> {
         Command::Save => {
             let file = File::open(&opt.file)?;
             let file_size = file.metadata()?.len();
-            block_on_external_io(storage.write(
-                &opt.name,
-                UnpinReader(Box::new(AllowStdIo::new(file))),
-                file_size,
-            ))?;
+            storage.write(&opt.name, Box::new(AllowStdIo::new(file)), file_size)?;
         }
         Command::Load => {
             let reader = storage.read(&opt.name);

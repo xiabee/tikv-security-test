@@ -2,13 +2,18 @@
 
 use std::sync::Arc;
 
-use criterion::{black_box, measurement::Measurement};
-use tidb_query_datatype::expr::EvalConfig;
-use tidb_query_executors::{interface::BatchExecutor, BatchStreamAggregationExecutor};
-use tikv::storage::Statistics;
+use criterion::black_box;
+use criterion::measurement::Measurement;
+
 use tipb::Expr;
 
-use crate::util::{bencher::Bencher, FixtureBuilder};
+use tidb_query_datatype::expr::EvalConfig;
+use tidb_query_executors::interface::BatchExecutor;
+use tidb_query_executors::BatchStreamAggregationExecutor;
+use tikv::storage::Statistics;
+
+use crate::util::bencher::Bencher;
+use crate::util::FixtureBuilder;
 
 pub trait StreamAggrBencher<M>
 where
@@ -18,7 +23,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         fb: &FixtureBuilder,
         group_by_expr: &[Expr],
         aggr_expr: &[Expr],
@@ -51,7 +56,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         fb: &FixtureBuilder,
         group_by_expr: &[Expr],
         aggr_expr: &[Expr],

@@ -1,25 +1,25 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use tempfile::Builder;
+
+use kvproto::kvrpcpb::ApiVersion;
+use kvproto::metapb;
+use kvproto::raft_serverpb::RegionLocalState;
 
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::{Compat, RocksEngine};
 use engine_traits::{Engines, Peekable, ALL_CFS, CF_RAFT};
-use kvproto::{kvrpcpb::ApiVersion, metapb, raft_serverpb::RegionLocalState};
-use raftstore::{
-    coprocessor::CoprocessorHost,
-    store::{bootstrap_store, fsm, fsm::store::StoreMeta, AutoSplitController, SnapManager},
-};
-use resource_metering::CollectorRegHandle;
-use tempfile::Builder;
+use raftstore::coprocessor::CoprocessorHost;
+use raftstore::store::fsm::store::StoreMeta;
+use raftstore::store::{bootstrap_store, fsm, AutoSplitController, SnapManager};
 use test_raftstore::*;
-use tikv::{import::SstImporter, server::Node};
-use tikv_util::{
-    config::VersionTrack,
-    worker::{dummy_scheduler, Builder as WorkerBuilder, LazyWorker},
-};
+use tikv::import::SSTImporter;
+use tikv::server::Node;
+use tikv_util::config::VersionTrack;
+use tikv_util::worker::{dummy_scheduler, Builder as WorkerBuilder, LazyWorker};
 
 fn test_bootstrap_idempotent<T: Simulator>(cluster: &mut Cluster<T>) {
     // assume that there is a node  bootstrap the cluster and add region in pd successfully
@@ -100,7 +100,7 @@ fn test_node_bootstrap_with_prepared_data() {
 
     let importer = {
         let dir = tmp_path.path().join("import-sst");
-        Arc::new(SstImporter::new(&cfg.import, dir, None, cfg.storage.api_version()).unwrap())
+        Arc::new(SSTImporter::new(&cfg.import, dir, None, false).unwrap())
     };
     let (split_check_scheduler, _) = dummy_scheduler();
 
@@ -117,7 +117,6 @@ fn test_node_bootstrap_with_prepared_data() {
         split_check_scheduler,
         AutoSplitController::default(),
         ConcurrencyManager::new(1.into()),
-        CollectorRegHandle::new_for_test(),
     )
     .unwrap();
     assert!(
@@ -185,12 +184,14 @@ fn test_node_switch_api_version() {
             cluster.put(b"k1", b"").unwrap();
             cluster.shutdown();
 
-            cluster.cfg.storage.set_api_version(to_api);
             if from_api == to_api {
+                // Should start with if there is no api version change
+                cluster.cfg.storage.set_api_version(to_api);
                 cluster.start().unwrap();
                 cluster.shutdown();
             } else {
-                // Should not be able to switch to `to_api`.
+                // Should not be able to switch to `to_api`
+                cluster.cfg.storage.set_api_version(to_api);
                 assert!(cluster.start().is_err());
             }
         }

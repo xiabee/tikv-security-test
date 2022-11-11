@@ -1,20 +1,22 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::io::{self};
-
+use crate::export::{create_storage_no_client, read_external_storage_into_file, ExternalStorage};
 use anyhow::Context;
 use external_storage::request::file_name_for_write;
 use file_system::File;
 use futures::executor::block_on;
 use futures_io::AsyncRead;
 use kvproto::brpb as proto;
+#[cfg(feature = "prost-codec")]
+pub use kvproto::brpb::storage_backend::Backend;
+#[cfg(feature = "protobuf-codec")]
 pub use kvproto::brpb::StorageBackend_oneof_backend as Backend;
 use slog_global::info;
+use std::f64::INFINITY;
+use std::io::{self};
 use tikv_util::time::Limiter;
 use tokio::runtime::Runtime;
 use tokio_util::compat::Tokio02AsyncReadCompatExt;
-
-use crate::export::{create_storage_no_client, read_external_storage_into_file, ExternalStorage};
 
 pub fn write_receiver(
     runtime: &Runtime,
@@ -65,13 +67,12 @@ pub async fn restore_inner(
     // a "TimedOut" error.
     // (at 8 KB/s for a 2 MB buffer, this means we timeout after 4m16s.)
     const MINIMUM_READ_SPEED: usize = 8192;
-    let limiter = Limiter::new(f64::INFINITY);
+    let limiter = Limiter::new(INFINITY);
     let x = read_external_storage_into_file(
         &mut storage.read(object_name),
         output,
         &limiter,
         expected_length,
-        None,
         MINIMUM_READ_SPEED,
     )
     .await;

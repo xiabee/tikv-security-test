@@ -2,25 +2,25 @@
 
 //! Prometheus metrics for storage functionality.
 
-use std::{cell::RefCell, mem, sync::Arc};
-
-use collections::HashMap;
-use engine_rocks::ReadPerfContext;
-use kvproto::{kvrpcpb::KeyRange, metapb, pdpb::QueryKind};
-use pd_client::BucketMeta;
 use prometheus::*;
 use prometheus_static_metric::*;
-use raftstore::store::{util::build_key_range, ReadStats};
 
-use crate::{
-    server::metrics::{GcKeysCF as ServerGcKeysCF, GcKeysDetail as ServerGcKeysDetail},
-    storage::kv::{FlowStatsReporter, Statistics},
-};
+use std::cell::RefCell;
+use std::mem;
+
+use crate::server::metrics::{GcKeysCF as ServerGcKeysCF, GcKeysDetail as ServerGcKeysDetail};
+use crate::storage::kv::{FlowStatsReporter, PerfStatisticsDelta, Statistics};
+use collections::HashMap;
+use kvproto::kvrpcpb::KeyRange;
+use kvproto::metapb;
+use kvproto::pdpb::QueryKind;
+use raftstore::store::util::build_key_range;
+use raftstore::store::ReadStats;
 
 struct StorageLocalMetrics {
     local_scan_details: HashMap<CommandKind, Statistics>,
     local_read_stats: ReadStats,
-    local_perf_stats: HashMap<CommandKind, ReadPerfContext>,
+    local_perf_stats: HashMap<CommandKind, PerfStatisticsDelta>,
 }
 
 thread_local! {
@@ -38,7 +38,7 @@ macro_rules! tls_flush_perf_stats {
         STORAGE_ROCKSDB_PERF_COUNTER_STATIC
             .get($tag)
             .$stat
-            .inc_by($local_stats.$stat as u64);
+            .inc_by($local_stats.0.$stat as u64);
     };
 }
 
@@ -128,20 +128,11 @@ pub fn tls_collect_scan_details(cmd: CommandKind, stats: &Statistics) {
     });
 }
 
-pub fn tls_collect_read_flow(
-    region_id: u64,
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
-    statistics: &Statistics,
-    buckets: Option<&Arc<BucketMeta>>,
-) {
+pub fn tls_collect_read_flow(region_id: u64, statistics: &Statistics) {
     TLS_STORAGE_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.local_read_stats.add_flow(
             region_id,
-            buckets,
-            start,
-            end,
             &statistics.write.flow_stats,
             &statistics.data.flow_stats,
         );
@@ -177,7 +168,7 @@ pub fn tls_collect_query_batch(
     });
 }
 
-pub fn tls_collect_perf_stats(cmd: CommandKind, perf_stats: &ReadPerfContext) {
+pub fn tls_collect_perf_stats(cmd: CommandKind, perf_stats: &PerfStatisticsDelta) {
     TLS_STORAGE_METRICS.with(|m| {
         *(m.borrow_mut()
             .local_perf_stats
@@ -228,8 +219,6 @@ make_auto_flush_static_metric! {
         new,
         snapshot,
         async_snapshot_err,
-        precheck_write_ok,
-        precheck_write_err,
         snapshot_ok,
         snapshot_err,
         read_finish,
@@ -271,7 +260,7 @@ make_auto_flush_static_metric! {
         prev_tombstone,
         seek_tombstone,
         seek_for_prev_tombstone,
-        raw_value_tombstone,
+        ttl_tombstone,
     }
 
     pub label_enum CheckMemLockResult {
@@ -330,11 +319,6 @@ make_auto_flush_static_metric! {
         decrypt_data_nanos,
     }
 
-    pub label_enum InMemoryPessimisticLockingResult {
-        success,
-        full,
-    }
-
     pub struct CommandScanDetails: LocalIntCounter {
         "req" => CommandKind,
         "cf" => GcKeysCF,
@@ -387,14 +371,6 @@ make_auto_flush_static_metric! {
         "req" => CommandKind,
         "metric" => PerfMetric,
     }
-
-    pub struct TxnCommandThrottleTimeCounterVec: LocalIntCounter {
-        "type" => CommandKind,
-    }
-
-    pub struct InMemoryPessimisticLockingCounter: LocalIntCounter {
-        "result" => InMemoryPessimisticLockingResult,
-    }
 }
 
 impl From<ServerGcKeysCF> for GcKeysCF {
@@ -421,7 +397,7 @@ impl From<ServerGcKeysDetail> for GcKeysDetail {
             ServerGcKeysDetail::prev_tombstone => GcKeysDetail::prev_tombstone,
             ServerGcKeysDetail::seek_tombstone => GcKeysDetail::seek_tombstone,
             ServerGcKeysDetail::seek_for_prev_tombstone => GcKeysDetail::seek_for_prev_tombstone,
-            ServerGcKeysDetail::raw_value_tombstone => GcKeysDetail::raw_value_tombstone,
+            ServerGcKeysDetail::ttl_tombstone => GcKeysDetail::ttl_tombstone,
         }
     }
 }
@@ -631,23 +607,4 @@ lazy_static! {
 
     pub static ref STORAGE_ROCKSDB_PERF_COUNTER_STATIC: PerfCounter =
         auto_flush_from!(STORAGE_ROCKSDB_PERF_COUNTER, PerfCounter);
-
-    pub static ref TXN_COMMAND_THROTTLE_TIME_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
-        "tikv_txn_command_throttle_time_total",
-        "Total throttle time (microsecond) of txn commands.",
-        &["type"]
-    )
-    .unwrap();
-
-    pub static ref TXN_COMMAND_THROTTLE_TIME_COUNTER_VEC_STATIC: TxnCommandThrottleTimeCounterVec =
-        auto_flush_from!(TXN_COMMAND_THROTTLE_TIME_COUNTER_VEC, TxnCommandThrottleTimeCounterVec);
-
-    pub static ref IN_MEMORY_PESSIMISTIC_LOCKING_COUNTER: IntCounterVec = register_int_counter_vec!(
-        "tikv_in_memory_pessimistic_locking",
-        "Count of different types of in-memory pessimistic locking",
-        &["result"]
-    )
-    .unwrap();
-    pub static ref IN_MEMORY_PESSIMISTIC_LOCKING_COUNTER_STATIC: InMemoryPessimisticLockingCounter =
-        auto_flush_from!(IN_MEMORY_PESSIMISTIC_LOCKING_COUNTER, InMemoryPessimisticLockingCounter);
 }

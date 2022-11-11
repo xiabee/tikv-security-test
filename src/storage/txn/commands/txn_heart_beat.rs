@@ -1,21 +1,18 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use txn_types::{Key, TimeStamp};
-
-use crate::storage::{
-    kv::WriteData,
-    lock_manager::LockManager,
-    mvcc::{Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader},
-    txn::{
-        commands::{
-            Command, CommandExt, ReaderWithStats, ResponsePolicy, TypedCommand, WriteCommand,
-            WriteContext, WriteResult,
-        },
-        Result,
-    },
-    ProcessResult, Snapshot, TxnStatus,
+use crate::storage::kv::WriteData;
+use crate::storage::lock_manager::LockManager;
+use crate::storage::mvcc::{
+    Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader,
 };
+use crate::storage::txn::commands::{
+    Command, CommandExt, ReaderWithStats, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
+    WriteResult,
+};
+use crate::storage::txn::Result;
+use crate::storage::{ProcessResult, Snapshot, TxnStatus};
+use txn_types::{Key, TimeStamp};
 
 command! {
     /// Heart beat of a transaction. It enlarges the primary lock's TTL.
@@ -46,12 +43,12 @@ impl CommandExt for TxnHeartBeat {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
-    fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(self, snapshot: S, mut context: WriteContext<'_, L>) -> Result<WriteResult> {
         // TxnHeartBeat never remove locks. No need to wake up waiters.
         let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
         let mut reader = ReaderWithStats::new(
-            SnapshotReader::new_with_ctx(self.start_ts, snapshot, &self.ctx),
-            context.statistics,
+            SnapshotReader::new(self.start_ts, snapshot, !self.ctx.get_not_fill_cache()),
+            &mut context.statistics,
         );
         fail_point!("txn_heart_beat", |err| Err(
             crate::storage::mvcc::Error::from(crate::storage::mvcc::txn::make_txn_error(
@@ -98,18 +95,17 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
 
 #[cfg(test)]
 pub mod tests {
+    use super::*;
+    use crate::storage::kv::TestEngineBuilder;
+    use crate::storage::lock_manager::DummyLockManager;
+    use crate::storage::mvcc::tests::*;
+    use crate::storage::txn::commands::WriteCommand;
+    use crate::storage::txn::scheduler::DEFAULT_EXECUTION_DURATION_LIMIT;
+    use crate::storage::txn::tests::*;
+    use crate::storage::Engine;
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
     use tikv_util::deadline::Deadline;
-
-    use super::*;
-    use crate::storage::{
-        kv::TestEngineBuilder,
-        lock_manager::DummyLockManager,
-        mvcc::tests::*,
-        txn::{commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*},
-        Engine,
-    };
 
     pub fn must_success<E: Engine>(
         engine: &E,

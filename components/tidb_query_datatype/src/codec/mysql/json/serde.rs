@@ -1,12 +1,13 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{collections::BTreeMap, f64, fmt, str, str::FromStr, string::ToString};
-
-use serde::{
-    de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor},
-    ser::{Error as SerError, Serialize, SerializeMap, SerializeTuple, Serializer},
-};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Error as SerError, Serialize, SerializeMap, SerializeTuple, Serializer};
 use serde_json::Serializer as JsonSerializer;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
+use std::string::ToString;
+use std::{f64, str};
 
 use super::{Json, JsonRef, JsonType};
 use crate::codec::Error;
@@ -158,7 +159,7 @@ impl<'de> Visitor<'de> for JsonVisitor {
     where
         E: de::Error,
     {
-        if v > (i64::MAX as u64) {
+        if v > (std::i64::MAX as u64) {
             Ok(Json::from_f64(v as f64).map_err(de::Error::custom)?)
         } else {
             Ok(Json::from_i64(v as i64).map_err(de::Error::custom)?)

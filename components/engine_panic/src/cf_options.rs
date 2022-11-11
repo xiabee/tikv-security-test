@@ -1,8 +1,9 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{CFOptionsExt, ColumnFamilyOptions, Result, SstPartitionerFactory};
-
-use crate::{db_options::PanicTitanDBOptions, engine::PanicEngine};
+use crate::db_options::PanicTitanDBOptions;
+use crate::engine::PanicEngine;
+use engine_traits::{CFOptionsExt, Result};
+use engine_traits::{ColumnFamilyOptions, SstPartitionerFactory};
 
 impl CFOptionsExt for PanicEngine {
     type ColumnFamilyOptions = PanicColumnFamilyOptions;

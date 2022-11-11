@@ -2,21 +2,17 @@
 
 use std::u64;
 
-use kvproto::{
-    coprocessor::{KeyRange, Request},
-    kvrpcpb::{Context, IsolationLevel},
-};
+use kvproto::coprocessor::{KeyRange, Request};
+use kvproto::kvrpcpb::{Context, IsolationLevel};
 use protobuf::Message;
-use test_coprocessor::*;
-use tidb_query_common::storage::{
-    scanner::{RangesScanner, RangesScannerOptions},
-    Range,
-};
-use tikv::{
-    coprocessor::{dag::TiKvStorage, *},
-    storage::{Engine, SnapshotStore},
-};
 use tipb::{ChecksumAlgorithm, ChecksumRequest, ChecksumResponse, ChecksumScanOn};
+
+use test_coprocessor::*;
+use tidb_query_common::storage::scanner::{RangesScanner, RangesScannerOptions};
+use tidb_query_common::storage::Range;
+use tikv::coprocessor::dag::TiKVStorage;
+use tikv::coprocessor::*;
+use tikv::storage::{Engine, SnapshotStore};
 use txn_types::TimeStamp;
 
 fn new_checksum_request(range: KeyRange, scan_on: ChecksumScanOn) -> Request {
@@ -75,11 +71,10 @@ fn reversed_checksum_crc64_xor<E: Engine>(store: &Store<E>, range: KeyRange) -> 
         IsolationLevel::Si,
         true,
         Default::default(),
-        Default::default(),
         false,
     );
     let mut scanner = RangesScanner::new(RangesScannerOptions {
-        storage: TiKvStorage::new(store, false),
+        storage: TiKVStorage::new(store, false),
         ranges: vec![Range::from_pb_range(range, false)],
         scan_backward_in_range: true,
         is_key_only: false,

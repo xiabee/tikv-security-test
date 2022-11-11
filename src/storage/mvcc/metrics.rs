@@ -28,14 +28,6 @@ make_static_metric! {
         pessimistic_rollback,
     }
 
-    pub label_enum MvccPrewriteAssertionPerfKind {
-        none,
-        write_loaded,
-        non_data_version_reload,
-        write_not_loaded_reload,
-        write_not_loaded_skip
-    }
-
     pub struct MvccConflictCounterVec: IntCounter {
         "type" => MvccConflictKind,
     }
@@ -46,10 +38,6 @@ make_static_metric! {
 
     pub struct MvccCheckTxnStatusCounterVec: IntCounter {
         "type" => MvccCheckTxnStatusKind,
-    }
-
-    pub struct MvccPrewriteAssertionPerfCounterVec: IntCounter {
-        "type" => MvccPrewriteAssertionPerfKind,
     }
 }
 
@@ -98,13 +86,5 @@ lazy_static! {
             &["type"]
         )
         .unwrap()
-    };
-    pub static ref MVCC_PREWRITE_ASSERTION_PERF_COUNTER_VEC: MvccPrewriteAssertionPerfCounterVec = {
-        register_static_int_counter_vec!(
-            MvccPrewriteAssertionPerfCounterVec,
-            "tikv_storage_mvcc_prewrite_assertion_perf",
-            "Counter of assertion operations in transactions",
-            &["type"]
-        ).unwrap()
     };
 }

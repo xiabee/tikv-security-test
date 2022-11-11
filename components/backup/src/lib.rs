@@ -10,10 +10,9 @@ mod errors;
 mod metrics;
 mod service;
 mod softlimit;
-mod utils;
 mod writer;
 
 pub use endpoint::{backup_file_name, Endpoint, Task};
 pub use errors::{Error, Result};
 pub use service::Service;
-pub use writer::{BackupRawKvWriter, BackupWriter};
+pub use writer::{BackupRawKVWriter, BackupWriter};

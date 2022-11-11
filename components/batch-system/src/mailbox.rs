@@ -1,15 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::{
-    borrow::Cow,
-    sync::{atomic::AtomicUsize, Arc},
-};
-
-use crossbeam::channel::{SendError, TrySendError};
-use tikv_util::mpsc;
-
 use crate::fsm::{Fsm, FsmScheduler, FsmState};
+use crossbeam::channel::{SendError, TrySendError};
+use std::borrow::Cow;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use tikv_util::mpsc;
 
 /// A basic mailbox.
 ///

@@ -15,6 +15,8 @@
 #![feature(iter_order_by)]
 #![recursion_limit = "256"]
 
+extern crate proc_macro;
+
 mod aggr_function;
 mod rpn_function;
 

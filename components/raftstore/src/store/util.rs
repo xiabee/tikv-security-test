@@ -1,36 +1,28 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::{
-    cmp,
-    collections::{HashMap, VecDeque},
-    fmt,
-    fmt::Display,
-    option::Option,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
-        Arc, Mutex,
-    },
-    u64,
-};
+use std::collections::{HashMap, VecDeque};
+use std::fmt::Display;
+use std::option::Option;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::{cmp, fmt, u64};
 
-use kvproto::{
-    kvrpcpb::{self, KeyRange, LeaderInfo},
-    metapb::{self, Peer, PeerRole, Region, RegionEpoch},
-    raft_cmdpb::{AdminCmdType, ChangePeerRequest, ChangePeerV2Request, RaftCmdRequest},
-    raft_serverpb::RaftMessage,
-};
+use kvproto::kvrpcpb::{self, KeyRange, LeaderInfo};
+use kvproto::metapb::{self, Peer, PeerRole, Region, RegionEpoch};
+use kvproto::raft_cmdpb::{AdminCmdType, ChangePeerRequest, ChangePeerV2Request, RaftCmdRequest};
+use kvproto::raft_serverpb::RaftMessage;
 use protobuf::{self, Message};
-use raft::{
-    eraftpb::{self, ConfChangeType, ConfState, MessageType},
-    INVALID_INDEX,
-};
+use raft::eraftpb::{self, ConfChangeType, ConfState, MessageType};
+use raft::INVALID_INDEX;
 use raft_proto::ConfChangeI;
-use tikv_util::{box_err, debug, info, time::monotonic_raw_now, Either};
+use tikv_util::time::monotonic_raw_now;
+use tikv_util::{box_err, debug, info};
 use time::{Duration, Timespec};
 
 use super::peer_storage;
 use crate::{Error, Result};
+use tikv_util::Either;
 
 pub fn find_peer(region: &metapb::Region, store_id: u64) -> Option<&metapb::Peer> {
     region
@@ -438,7 +430,6 @@ pub struct Lease {
     max_lease: Duration,
 
     max_drift: Duration,
-    advance_renew_lease: Duration,
     last_update: Timespec,
     remote: Option<RemoteLease>,
 }
@@ -454,13 +445,12 @@ pub enum LeaseState {
 }
 
 impl Lease {
-    pub fn new(max_lease: Duration, advance_renew_lease: Duration) -> Lease {
+    pub fn new(max_lease: Duration) -> Lease {
         Lease {
             bound: None,
             max_lease,
 
             max_drift: max_lease / 3,
-            advance_renew_lease,
             last_update: Timespec::new(0, 0),
             remote: None,
         }
@@ -504,10 +494,6 @@ impl Lease {
         self.expire_remote_lease();
         let bound = self.next_expired_time(send_ts);
         self.bound = Some(Either::Left(bound));
-    }
-
-    pub fn is_suspect(&self) -> bool {
-        matches!(self.bound, Some(Either::Left(_)))
     }
 
     /// Inspect the lease state for the ts or now.
@@ -555,31 +541,12 @@ impl Lease {
         };
         let remote = RemoteLease {
             expired_time: Arc::new(AtomicU64::new(expired_time)),
-            renewing: Arc::new(AtomicBool::new(false)),
             term,
-            advance_renew_lease: self.advance_renew_lease,
         };
         // Clone the remote.
         let remote_clone = remote.clone();
         self.remote = Some(remote);
         Some(remote_clone)
-    }
-
-    /// Check if the lease will be expired in near future, if so return a
-    /// future timestamp in which the lease will be expired, if not `None`
-    /// will return
-    pub fn need_renew(&self, ts: Timespec) -> Option<Timespec> {
-        let future_ts = ts + self.advance_renew_lease;
-        match self.bound {
-            Some(Either::Right(bound)) => {
-                if future_ts < bound {
-                    None
-                } else {
-                    Some(future_ts)
-                }
-            }
-            None | Some(Either::Left(_)) => Some(future_ts),
-        }
     }
 }
 
@@ -600,8 +567,6 @@ impl fmt::Debug for Lease {
 #[derive(Clone)]
 pub struct RemoteLease {
     expired_time: Arc<AtomicU64>,
-    renewing: Arc<AtomicBool>,
-    advance_renew_lease: Duration,
     term: u64,
 }
 
@@ -618,12 +583,6 @@ impl RemoteLease {
     fn renew(&self, bound: Timespec) {
         self.expired_time
             .store(timespec_to_u64(bound), AtomicOrdering::Release);
-        self.renewing.store(false, AtomicOrdering::Release);
-    }
-
-    pub fn need_renew(&self, ts: Timespec) -> bool {
-        self.inspect(Some(ts + self.advance_renew_lease)) == LeaseState::Expired
-            && !self.renewing.swap(true, AtomicOrdering::Relaxed)
     }
 
     fn expire(&self) {
@@ -788,6 +747,10 @@ impl<
     }
 }
 
+pub fn integration_on_half_fail_quorum_fn(voters: usize) -> usize {
+    (voters + 1) / 2 + 1
+}
+
 #[derive(PartialEq, Eq, Debug)]
 pub enum ConfChangeKind {
     // Only contains one configuration change
@@ -873,7 +836,7 @@ impl<'a> ChangePeerI for &'a ChangePeerV2Request {
 pub struct MsgType<'a>(pub &'a RaftMessage);
 
 impl Display for MsgType<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if !self.0.has_extra_msg() {
             write!(f, "{:?}", self.0.get_message().get_msg_type())
         } else {
@@ -972,7 +935,7 @@ impl Default for RegionReadProgressRegistry {
 /// is usually stale i.e seconds ago).
 ///
 /// `safe_ts` is updated by the `(apply index, safe ts)` item:
-/// ```ignore
+/// ```
 /// if self.applied_index >= item.apply_index {
 ///     self.safe_ts = max(self.safe_ts, item.safe_ts)
 /// }
@@ -1060,7 +1023,7 @@ impl RegionReadProgress {
     }
 
     // Dump the `LeaderInfo` and the peer list
-    pub fn dump_leader_info(&self) -> (Vec<Peer>, LeaderInfo) {
+    fn dump_leader_info(&self) -> (Vec<Peer>, LeaderInfo) {
         let mut leader_info = LeaderInfo::default();
         let core = self.core.lock().unwrap();
         let read_state = {
@@ -1345,16 +1308,15 @@ impl LatencyInspector {
 mod tests {
     use std::thread;
 
-    use kvproto::{
-        metapb::{self, RegionEpoch},
-        raft_cmdpb::AdminRequest,
-    };
+    use kvproto::metapb::{self, RegionEpoch};
+    use kvproto::raft_cmdpb::AdminRequest;
     use raft::eraftpb::{ConfChangeType, Entry, Message, MessageType};
-    use tikv_util::time::monotonic_raw_now;
     use time::Duration as TimeDuration;
 
-    use super::*;
     use crate::store::peer_storage;
+    use tikv_util::time::monotonic_raw_now;
+
+    use super::*;
 
     #[test]
     fn test_lease() {
@@ -1376,7 +1338,7 @@ mod tests {
         let duration = TimeDuration::milliseconds(1500);
 
         // Empty lease.
-        let mut lease = Lease::new(duration, duration / 4);
+        let mut lease = Lease::new(duration);
         let remote = lease.maybe_new_remote_lease(1).unwrap();
         let inspect_test = |lease: &Lease, ts: Option<Timespec>, state: LeaseState| {
             assert_eq!(lease.inspect(ts), state);
@@ -1937,6 +1899,16 @@ mod tests {
                 check_region_epoch(&req, &region, false).unwrap_err();
                 check_region_epoch(&req, &region, true).unwrap_err();
             }
+        }
+    }
+
+    #[test]
+    fn test_integration_on_half_fail_quorum_fn() {
+        let voters = vec![1, 2, 3, 4, 5, 6, 7];
+        let quorum = vec![2, 2, 3, 3, 4, 4, 5];
+        for (voter_count, expected_quorum) in voters.into_iter().zip(quorum) {
+            let quorum = super::integration_on_half_fail_quorum_fn(voter_count);
+            assert_eq!(quorum, expected_quorum);
         }
     }
 

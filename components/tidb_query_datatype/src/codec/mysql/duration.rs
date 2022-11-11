@@ -1,24 +1,18 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp::Ordering,
-    fmt::{self, Display, Formatter},
-};
+use std::cmp::Ordering;
+use std::fmt::{self, Display, Formatter};
 
+use crate::FieldTypeAccessor;
 use codec::prelude::*;
 use tipb::FieldType;
 
 use super::{check_fsp, Decimal, DEFAULT_FSP};
-use crate::{
-    codec::{
-        convert::ConvertTo,
-        error::{ERR_DATA_OUT_OF_RANGE, ERR_TRUNCATE_WRONG_VALUE},
-        mysql::{Time as DateTime, TimeType, MAX_FSP, MIN_FSP},
-        Error, Result, TEN_POW,
-    },
-    expr::EvalContext,
-    FieldTypeAccessor,
-};
+use crate::codec::convert::ConvertTo;
+use crate::codec::error::{ERR_DATA_OUT_OF_RANGE, ERR_TRUNCATE_WRONG_VALUE};
+use crate::codec::mysql::{Time as DateTime, TimeType, MAX_FSP, MIN_FSP};
+use crate::codec::{Error, Result, TEN_POW};
+use crate::expr::EvalContext;
 
 pub const NANOS_PER_SEC: i64 = 1_000_000_000;
 pub const NANOS_PER_MILLI: i64 = 1_000_000;
@@ -89,13 +83,10 @@ fn check_nanos(nanos: i64) -> Result<i64> {
 }
 
 mod parser {
-    use nom::{
-        character::complete::{anychar, char, digit0, digit1, space0, space1},
-        combinator::opt,
-        IResult,
-    };
-
     use super::*;
+    use nom::character::complete::{anychar, char, digit0, digit1, space0, space1};
+    use nom::combinator::opt;
+    use nom::IResult;
 
     fn number(input: &str) -> IResult<&str, u32, ()> {
         let (rest, num) = digit1(input)?;
@@ -316,7 +307,6 @@ impl Duration {
     }
 
     #[inline]
-    #[must_use]
     pub fn minimize_fsp(self) -> Self {
         Duration {
             fsp: MIN_FSP as u8,
@@ -325,7 +315,6 @@ impl Duration {
     }
 
     #[inline]
-    #[must_use]
     pub fn maximize_fsp(self) -> Self {
         Duration {
             fsp: MAX_FSP as u8,
@@ -377,7 +366,6 @@ impl Duration {
 
     /// Returns the absolute value of `Duration`
     #[inline]
-    #[must_use]
     pub fn abs(self) -> Self {
         Duration {
             nanos: self.nanos.abs(),
@@ -513,7 +501,7 @@ impl Duration {
         }
 
         write!(
-            string,
+            &mut string,
             "{:02}{}{:02}{}{:02}",
             self.hours(),
             sep,
@@ -525,7 +513,7 @@ impl Duration {
 
         if self.fsp > 0 {
             let frac = self.subsec_nanos() / TEN_POW[NANO_WIDTH - self.fsp as usize];
-            write!(string, ".{:0width$}", frac, width = self.fsp as usize).unwrap();
+            write!(&mut string, ".{:0width$}", frac, width = self.fsp as usize).unwrap();
         }
 
         string
@@ -684,13 +672,12 @@ impl crate::codec::data_type::AsMySQLBool for Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::{
-        codec::{data_type::DateTime, mysql::UNSPECIFIED_FSP},
-        expr::{EvalConfig, EvalContext, Flag},
-    };
+    use crate::codec::data_type::DateTime;
+    use crate::codec::mysql::UNSPECIFIED_FSP;
+    use crate::expr::{EvalConfig, EvalContext, Flag};
+    use std::f64::EPSILON;
+    use std::sync::Arc;
 
     #[test]
     fn test_hours() {
@@ -965,7 +952,7 @@ mod tests {
             let du: Duration = t.convert(&mut ctx).unwrap();
             let get: f64 = du.convert(&mut ctx).unwrap();
             assert!(
-                (expect - get).abs() < f64::EPSILON,
+                (expect - get).abs() < EPSILON,
                 "expect: {}, got: {}",
                 expect,
                 get

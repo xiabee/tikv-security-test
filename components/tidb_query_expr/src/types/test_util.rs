@@ -2,17 +2,14 @@
 
 use std::any::Any;
 
-use tidb_query_common::Result;
-use tidb_query_datatype::{
-    codec::{
-        batch::LazyBatchColumnVec,
-        data_type::{EvaluableRet, ScalarValue},
-    },
-    expr::EvalContext,
-};
 use tipb::{Expr, ExprType, FieldType, ScalarFuncSig};
 
-use crate::{types::function::RpnFnMeta, RpnExpressionBuilder};
+use crate::types::function::RpnFnMeta;
+use crate::RpnExpressionBuilder;
+use tidb_query_common::Result;
+use tidb_query_datatype::codec::batch::LazyBatchColumnVec;
+use tidb_query_datatype::codec::data_type::{EvaluableRet, ScalarValue};
+use tidb_query_datatype::expr::EvalContext;
 
 /// Helper utility to evaluate RPN function over scalar inputs.
 ///
@@ -38,13 +35,11 @@ impl RpnFnScalarEvaluator {
     /// Pushes a parameter as the value of an argument for evaluation. The field type will be auto
     /// inferred by choosing an arbitrary field type that matches the field type of the given
     /// value.
-    #[must_use]
     pub fn push_param(mut self, value: impl Into<ScalarValue>) -> Self {
         self.rpn_expr_builder = self.rpn_expr_builder.push_constant_for_test(value);
         self
     }
 
-    #[must_use]
     pub fn push_params(mut self, values: impl IntoIterator<Item = impl Into<ScalarValue>>) -> Self {
         for value in values {
             self.rpn_expr_builder = self.rpn_expr_builder.push_constant_for_test(value);
@@ -53,7 +48,6 @@ impl RpnFnScalarEvaluator {
     }
 
     /// Pushes a parameter as the value of an argument for evaluation using a specified field type.
-    #[must_use]
     pub fn push_param_with_field_type(
         mut self,
         value: impl Into<ScalarValue>,
@@ -69,7 +63,6 @@ impl RpnFnScalarEvaluator {
     ///
     /// If not set, the evaluation will use an inferred return field type by choosing an arbitrary
     /// field type that matches the field type of the generic type `T` when calling `evaluate()`.
-    #[must_use]
     pub fn return_field_type(mut self, field_type: impl Into<FieldType>) -> Self {
         self.return_field_type = Some(field_type.into());
         self
@@ -78,14 +71,12 @@ impl RpnFnScalarEvaluator {
     /// Sets the context to use during evaluation.
     ///
     /// If not set, a default `EvalContext` will be used.
-    #[must_use]
     pub fn context(mut self, context: impl Into<EvalContext>) -> Self {
         self.context = Some(context.into());
         self
     }
 
     /// Sets the metadata to use during evaluation.
-    #[must_use]
     pub fn metadata(mut self, metadata: Box<dyn Any + Send>) -> Self {
         self.metadata = Some(metadata);
         self

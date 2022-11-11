@@ -1,28 +1,27 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    marker::PhantomData,
-    mem,
-    sync::{atomic::*, mpsc::Sender, Arc, Mutex, RwLock},
-    thread, time,
-    time::Duration,
-    usize,
-};
+use std::marker::PhantomData;
+use std::sync::atomic::*;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use std::{mem, thread, time, usize};
 
 use collections::{HashMap, HashSet};
 use crossbeam::channel::TrySendError;
 use engine_rocks::{RocksEngine, RocksSnapshot};
-use kvproto::{raft_cmdpb::RaftCmdRequest, raft_serverpb::RaftMessage};
+use kvproto::raft_cmdpb::RaftCmdRequest;
+use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
-use raftstore::{
-    router::{LocalReadRouter, RaftStoreRouter},
-    store::{
-        Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter, RaftCommand,
-        SignificantMsg, SignificantRouter, StoreMsg, StoreRouter, Transport,
-    },
-    DiscardReason, Error, Result as RaftStoreResult, Result,
+use raftstore::router::{LocalReadRouter, RaftStoreRouter};
+use raftstore::store::{
+    Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter, RaftCommand, SignificantMsg,
+    StoreMsg, StoreRouter, Transport,
 };
-use tikv_util::{time::ThreadReadId, Either, HandyRwLock};
+use raftstore::Result as RaftStoreResult;
+use raftstore::{DiscardReason, Error, Result};
+use tikv_util::time::ThreadReadId;
+use tikv_util::{Either, HandyRwLock};
 
 pub fn check_messages(msgs: &[RaftMessage]) -> Result<()> {
     if msgs.is_empty() {
@@ -201,10 +200,6 @@ impl<C: Transport> Transport for SimulateTransport<C> {
         filter_send(&self.filters, m, |m| ch.send(m))
     }
 
-    fn set_store_allowlist(&mut self, allowlist: Vec<u64>) {
-        self.ch.set_store_allowlist(allowlist);
-    }
-
     fn need_flush(&self) -> bool {
         self.ch.need_flush()
     }
@@ -235,15 +230,13 @@ impl<C: RaftStoreRouter<RocksEngine>> CasualRouter<RocksEngine> for SimulateTran
     }
 }
 
-impl<C: RaftStoreRouter<RocksEngine>> SignificantRouter<RocksEngine> for SimulateTransport<C> {
-    fn significant_send(&self, region_id: u64, msg: SignificantMsg<RocksSnapshot>) -> Result<()> {
-        self.ch.significant_send(region_id, msg)
-    }
-}
-
 impl<C: RaftStoreRouter<RocksEngine>> RaftStoreRouter<RocksEngine> for SimulateTransport<C> {
     fn send_raft_msg(&self, msg: RaftMessage) -> Result<()> {
         filter_send(&self.filters, msg, |m| self.ch.send_raft_msg(m))
+    }
+
+    fn significant_send(&self, region_id: u64, msg: SignificantMsg<RocksSnapshot>) -> Result<()> {
+        self.ch.significant_send(region_id, msg)
     }
 
     fn broadcast_normal(&self, _: impl FnMut() -> PeerMsg<RocksEngine>) {}
@@ -439,44 +432,37 @@ impl RegionPacketFilter {
         }
     }
 
-    #[must_use]
     pub fn direction(mut self, direction: Direction) -> RegionPacketFilter {
         self.direction = direction;
         self
     }
 
     // TODO: rename it to `drop`.
-    #[must_use]
     pub fn msg_type(mut self, m_type: MessageType) -> RegionPacketFilter {
         self.drop_type.push(m_type);
         self
     }
 
-    #[must_use]
     pub fn skip(mut self, m_type: MessageType) -> RegionPacketFilter {
         self.skip_type.push(m_type);
         self
     }
 
-    #[must_use]
     pub fn allow(mut self, number: usize) -> RegionPacketFilter {
         self.block = Either::Left(Arc::new(AtomicUsize::new(number)));
         self
     }
 
-    #[must_use]
     pub fn when(mut self, condition: Arc<AtomicBool>) -> RegionPacketFilter {
         self.block = Either::Right(condition);
         self
     }
 
-    #[must_use]
     pub fn reserve_dropped(mut self, dropped: Arc<Mutex<Vec<RaftMessage>>>) -> RegionPacketFilter {
         self.dropped_messages = Some(dropped);
         self
     }
 
-    #[must_use]
     pub fn set_msg_callback(
         mut self,
         cb: Arc<dyn Fn(&RaftMessage) + Send + Sync>,

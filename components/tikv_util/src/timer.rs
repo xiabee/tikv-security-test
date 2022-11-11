@@ -1,24 +1,15 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp::{Ord, Ordering, Reverse},
-    collections::BinaryHeap,
-    sync::{mpsc, Arc},
-    thread::Builder,
-    time::Duration,
-};
-
+use crate::time::{monotonic_raw_now, Instant};
 use lazy_static::lazy_static;
+use std::cmp::{Ord, Ordering, Reverse};
+use std::collections::BinaryHeap;
+use std::sync::{mpsc, Arc};
+use std::thread::Builder;
+use std::time::Duration;
 use time::Timespec;
 use tokio_executor::park::ParkThread;
-use tokio_timer::{
-    self,
-    clock::{Clock, Now},
-    timer::Handle,
-    Delay,
-};
-
-use crate::time::{monotonic_raw_now, Instant};
+use tokio_timer::{self, clock::Clock, clock::Now, timer::Handle, Delay};
 
 pub struct Timer<T> {
     pending: BinaryHeap<Reverse<TimeoutTask<T>>>,
@@ -214,9 +205,9 @@ fn start_global_steady_timer() -> SteadyTimer {
 
 #[cfg(test)]
 mod tests {
-    use futures::{compat::Future01CompatExt, executor::block_on};
-
     use super::*;
+    use futures::compat::Future01CompatExt;
+    use futures::executor::block_on;
 
     #[derive(Debug, PartialEq, Eq, Copy, Clone)]
     enum Task {
@@ -259,17 +250,9 @@ mod tests {
     #[test]
     fn test_global_steady_timer() {
         let t = SteadyTimer::default();
-        let start = t.clock.now();
+        let timer = t.clock.now();
         let delay = t.delay(Duration::from_millis(100));
         block_on(delay.compat()).unwrap();
-        let end = t.clock.now();
-        let elapsed = end.duration_since(start);
-        assert!(
-            elapsed >= Duration::from_millis(100),
-            "{:?} {:?} {:?}",
-            start,
-            end,
-            elapsed
-        );
+        assert!(timer.elapsed() >= Duration::from_millis(100));
     }
 }

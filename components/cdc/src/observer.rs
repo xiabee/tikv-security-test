@@ -7,15 +7,15 @@ use engine_traits::KvEngine;
 use fail::fail_point;
 use kvproto::metapb::{Peer, Region};
 use raft::StateRole;
-use raftstore::{coprocessor::*, store::RegionSnapshot, Error as RaftStoreError};
-use tikv::storage::Statistics;
-use tikv_util::{error, warn, worker::Scheduler};
+use raftstore::coprocessor::*;
+use raftstore::store::RegionSnapshot;
+use raftstore::Error as RaftStoreError;
+use tikv_util::worker::Scheduler;
+use tikv_util::{error, warn};
 
-use crate::{
-    endpoint::{Deregister, Task},
-    old_value::{self, OldValueCache},
-    Error as CdcError,
-};
+use crate::endpoint::{Deregister, Task};
+use crate::old_value::{self, OldValueCache, OldValueReader};
+use crate::Error as CdcError;
 
 /// An Observer for CDC.
 ///
@@ -59,7 +59,7 @@ impl CdcObserver {
     /// Subscribe an region, the observer will sink events of the region into
     /// its scheduler.
     ///
-    /// Return previous ObserveID if there is one.
+    /// Return pervious ObserveID if there is one.
     pub fn subscribe_region(&self, region_id: u64, observe_id: ObserveID) -> Option<ObserveID> {
         self.observe_regions
             .write()
@@ -119,11 +119,9 @@ impl<E: KvEngine> CmdObserver<E> for CdcObserver {
         // Create a snapshot here for preventing the old value was GC-ed.
         // TODO: only need it after enabling old value, may add a flag to indicate whether to get it.
         let snapshot = RegionSnapshot::from_snapshot(Arc::new(engine.snapshot()), Arc::new(region));
-        let get_old_value = move |key,
-                                  query_ts,
-                                  old_value_cache: &mut OldValueCache,
-                                  statistics: &mut Statistics| {
-            old_value::get_old_value(&snapshot, key, query_ts, old_value_cache, statistics)
+        let reader = OldValueReader::new(snapshot);
+        let get_old_value = move |key, query_ts, old_value_cache: &mut OldValueCache| {
+            old_value::get_old_value(&reader, key, query_ts, old_value_cache)
         };
         if let Err(e) = self.sched.schedule(Task::MultiBatch {
             multi: cmd_batches,
@@ -194,24 +192,19 @@ impl RegionChangeObserver for CdcObserver {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use super::*;
     use engine_rocks::RocksEngine;
     use kvproto::metapb::Region;
-    use raftstore::{coprocessor::RoleChange, store::util::new_peer};
+    use raftstore::coprocessor::RoleChange;
+    use raftstore::store::util::new_peer;
+    use std::time::Duration;
     use tikv::storage::kv::TestEngineBuilder;
-
-    use super::*;
 
     #[test]
     fn test_register_and_deregister() {
         let (scheduler, mut rx) = tikv_util::worker::dummy_scheduler();
         let observer = CdcObserver::new(scheduler);
-        let observe_info = CmdObserveInfo::from_handle(
-            ObserveHandle::new(),
-            ObserveHandle::new(),
-            ObserveHandle::new(),
-        );
+        let observe_info = CmdObserveInfo::from_handle(ObserveHandle::new(), ObserveHandle::new());
         let engine = TestEngineBuilder::new().build().unwrap().get_rocksdb();
 
         let mut cb = CmdBatch::new(&observe_info, 0);
@@ -232,7 +225,6 @@ mod tests {
 
         // Stop observing cmd
         observe_info.cdc_id.stop_observing();
-        observe_info.pitr_id.stop_observing();
         let mut cb = CmdBatch::new(&observe_info, 0);
         cb.push(&observe_info, 0, Cmd::default());
         <CdcObserver as CmdObserver<RocksEngine>>::on_flush_applied_cmd_batch(
@@ -243,7 +235,7 @@ mod tests {
         );
         match rx.recv_timeout(Duration::from_millis(10)) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            any => panic!("unexpected result: {:?}", any),
+            _ => panic!("unexpected result"),
         };
 
         // Does not send unsubscribed region events.

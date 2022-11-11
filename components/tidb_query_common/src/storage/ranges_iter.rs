@@ -68,9 +68,10 @@ impl RangesIterator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic;
+    use super::super::range::IntervalRange;
+    use super::*;
 
-    use super::{super::range::IntervalRange, *};
+    use std::sync::atomic;
 
     static RANGE_INDEX: atomic::AtomicU64 = atomic::AtomicU64::new(1);
 

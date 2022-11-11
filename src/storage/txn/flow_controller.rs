@@ -1,19 +1,15 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::{
-    cmp::PartialOrd,
-    collections::VecDeque,
-    ops::{Add, AddAssign, Sub, SubAssign},
-    sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
-        Arc,
-    },
-    thread::{Builder, JoinHandle},
-    time::Duration,
-    u64,
-};
+use std::cmp::PartialOrd;
+use std::collections::VecDeque;
+use std::ops::{Add, AddAssign, Sub, SubAssign};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
+use std::thread::{Builder, JoinHandle};
+use std::time::Duration;
+use std::{mem, u64};
 
 use collections::HashMap;
 use engine_rocks::FlowInfo;
@@ -22,7 +18,8 @@ use num_traits::cast::{AsPrimitive, FromPrimitive};
 use rand::Rng;
 use tikv_util::time::{Instant, Limiter};
 
-use crate::storage::{config::FlowControlConfig, metrics::*};
+use crate::storage::config::FlowControlConfig;
+use crate::storage::metrics::*;
 
 const TICK_DURATION: Duration = Duration::from_millis(1000);
 
@@ -70,7 +67,7 @@ pub struct FlowController {
     discard_ratio: Arc<AtomicU32>,
     limiter: Arc<Limiter>,
     enabled: Arc<AtomicBool>,
-    tx: Option<SyncSender<Msg>>,
+    tx: SyncSender<Msg>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -87,13 +84,14 @@ impl Drop for FlowController {
             return;
         }
 
-        if let Some(Err(e)) = self.tx.as_ref().map(|tx| tx.send(Msg::Close)) {
+        if let Err(e) = self.tx.send(Msg::Close) {
             error!("send quit message for flow controller failed"; "err" => ?e);
             return;
         }
 
         if let Err(e) = h.unwrap().join() {
             error!("join flow controller failed"; "err" => ?e);
+            return;
         }
     }
 }
@@ -101,11 +99,14 @@ impl Drop for FlowController {
 impl FlowController {
     // only for test
     pub fn empty() -> Self {
+        let (tx, rx) = mpsc::sync_channel(2);
+        mem::forget(rx);
+
         Self {
             discard_ratio: Arc::new(AtomicU32::new(0)),
             limiter: Arc::new(Limiter::new(f64::INFINITY)),
             enabled: Arc::new(AtomicBool::new(false)),
-            tx: None,
+            tx,
             handle: None,
         }
     }
@@ -135,7 +136,7 @@ impl FlowController {
             discard_ratio,
             limiter,
             enabled: Arc::new(AtomicBool::new(config.enable)),
-            tx: Some(tx),
+            tx,
             handle: Some(checker.start(rx, flow_info_receiver)),
         }
     }
@@ -166,12 +167,10 @@ impl FlowController {
 
     pub fn enable(&self, enable: bool) {
         self.enabled.store(enable, Ordering::Relaxed);
-        if let Some(tx) = &self.tx {
-            if enable {
-                tx.send(Msg::Enable).unwrap();
-            } else {
-                tx.send(Msg::Disable).unwrap();
-            }
+        if enable {
+            self.tx.send(Msg::Enable).unwrap();
+        } else {
+            self.tx.send(Msg::Disable).unwrap();
         }
     }
 
@@ -189,11 +188,10 @@ impl FlowController {
     }
 }
 
-const SMOOTHER_STALE_RECORD_THRESHOLD: u64 = 300; // 5min
-const SMOOTHER_TIME_RANGE_THRESHOLD: u64 = 60; // 1min
+const SMOOTHER_STALE_RECORD_THRESHOLD: f64 = 300.0; // 5min
 
 // Smoother is a sliding window used to provide steadier flow statistics.
-struct Smoother<T, const CAP: usize, const STALE_DUR: u64, const MIN_TIME_SPAN: u64>
+struct Smoother<T, const CAP: usize>
 where
     T: Default
         + Add<Output = T>
@@ -208,8 +206,7 @@ where
     total: T,
 }
 
-impl<T, const CAP: usize, const STALE_DUR: u64, const MIN_TIME_SPAN: u64> Default
-    for Smoother<T, CAP, STALE_DUR, MIN_TIME_SPAN>
+impl<T, const CAP: usize> Default for Smoother<T, CAP>
 where
     T: Default
         + Add<Output = T>
@@ -228,8 +225,7 @@ where
     }
 }
 
-impl<T, const CAP: usize, const STALE_DUR: u64, const MIN_TIME_SPAN: u64>
-    Smoother<T, CAP, STALE_DUR, MIN_TIME_SPAN>
+impl<T, const CAP: usize> Smoother<T, CAP>
 where
     T: Default
         + Add<Output = T>
@@ -241,10 +237,6 @@ where
         + FromPrimitive,
 {
     pub fn observe(&mut self, record: T) {
-        self.observe_with_time(record, Instant::now_coarse());
-    }
-
-    pub fn observe_with_time(&mut self, record: T, time: Instant) {
         if self.records.len() == CAP {
             let v = self.records.pop_front().unwrap().0;
             self.total -= v;
@@ -252,14 +244,16 @@ where
 
         self.total += record;
 
-        self.records.push_back((record, time));
+        self.records.push_back((record, Instant::now_coarse()));
         self.remove_stale_records();
     }
 
     fn remove_stale_records(&mut self) {
         // make sure there are two records left at least
         while self.records.len() > 2 {
-            if self.records.front().unwrap().1.saturating_elapsed_secs() > STALE_DUR as f64 {
+            if self.records.front().unwrap().1.saturating_elapsed_secs()
+                > SMOOTHER_STALE_RECORD_THRESHOLD
+            {
                 let v = self.records.pop_front().unwrap().0;
                 self.total -= v;
             } else {
@@ -307,58 +301,27 @@ where
             return Trend::NoTrend;
         }
 
-        // If the lastest record is too old, no trend
-        if self.records.back().unwrap().1.saturating_elapsed_secs() > STALE_DUR as f64 {
-            return Trend::NoTrend;
+        // calculate the average of left and right parts
+        let half = self.records.len() / 2;
+        let mut left = T::default();
+        let mut right = T::default();
+        for (i, r) in self.records.iter().enumerate() {
+            if i < half {
+                left += r.0;
+            } else if self.records.len() - i - 1 < half {
+                right += r.0;
+            }
         }
 
-        let (mut left, mut left_cnt) = (T::default(), 0);
-        let (mut right, mut right_cnt) = (T::default(), 0);
-
-        // The time span matters
-        if MIN_TIME_SPAN > 0 {
-            // If the records doesn't cover a enough time span, no trend
-            let time_span = self.records.front().unwrap().1.saturating_elapsed_secs()
-                - self.records.back().unwrap().1.saturating_elapsed_secs();
-            if time_span < MIN_TIME_SPAN as f64 {
-                return Trend::NoTrend;
-            }
-
-            // Split the record into left and right by the middle of time range
-            for (_, r) in self.records.iter().enumerate() {
-                let elapsed_secs = r.1.saturating_elapsed_secs();
-                if elapsed_secs > time_span / 2.0 {
-                    left += r.0;
-                    left_cnt += 1;
-                } else {
-                    right += r.0;
-                    right_cnt += 1;
-                }
-            }
+        // decide if there is a trend by the two averages
+        // adding 2 here is to give a tolerance
+        if right > left + FromPrimitive::from_u64(2).unwrap() {
+            Trend::Increasing
+        } else if left > right + FromPrimitive::from_u64(2).unwrap() {
+            Trend::Decreasing
         } else {
-            let half = self.records.len() / 2;
-            for (i, r) in self.records.iter().enumerate() {
-                if i < half {
-                    left += r.0;
-                    left_cnt += 1;
-                } else {
-                    right += r.0;
-                    right_cnt += 1;
-                }
-            }
+            Trend::NoTrend
         }
-
-        // Decide if there is a trend by the two averages.
-        // Adding 2 here is to give a tolerance
-        let (l_avg, r_avg) = (left.as_() / left_cnt as f64, right.as_() / right_cnt as f64);
-        if r_avg > l_avg + 2.0 {
-            return Trend::Increasing;
-        }
-        if l_avg > r_avg + 2.0 {
-            return Trend::Decreasing;
-        }
-
-        Trend::NoTrend
     }
 }
 
@@ -372,7 +335,7 @@ where
 // And all of them are collected from the hook of RocksDB's event listener.
 struct CFFlowChecker {
     // Memtable related
-    last_num_memtables: Smoother<u64, 20, SMOOTHER_STALE_RECORD_THRESHOLD, 0>,
+    last_num_memtables: Smoother<u64, 20>,
     memtable_debt: f64,
     memtable_init_speed: bool,
 
@@ -383,23 +346,20 @@ struct CFFlowChecker {
     // considering L0 compactions nearly includes all L0 files in a round.
     // So to evaluate the accumulation of L0 files, here only records the number
     // of L0 files right after L0 compactions.
-    long_term_num_l0_files: Smoother<u64, 20, SMOOTHER_STALE_RECORD_THRESHOLD, 0>,
+    long_term_num_l0_files: Smoother<u64, 20>,
 
     // L0 production flow related
     last_flush_bytes: u64,
     last_flush_bytes_time: Instant,
-    short_term_l0_production_flow: Smoother<u64, 10, SMOOTHER_STALE_RECORD_THRESHOLD, 0>,
+    short_term_l0_production_flow: Smoother<u64, 10>,
 
     // L0 consumption flow related
     last_l0_bytes: u64,
     last_l0_bytes_time: Instant,
-    short_term_l0_consumption_flow: Smoother<u64, 3, SMOOTHER_STALE_RECORD_THRESHOLD, 0>,
+    short_term_l0_consumption_flow: Smoother<u64, 3>,
 
     // Pending compaction bytes related
-    // When the write flow is about 100MB/s, we observed that the compaction ops
-    // is about 2.5, it means there are 750 compaction events in 5 minutes.
-    long_term_pending_bytes:
-        Smoother<f64, 1024, SMOOTHER_STALE_RECORD_THRESHOLD, SMOOTHER_TIME_RANGE_THRESHOLD>,
+    long_term_pending_bytes: Smoother<f64, 60>,
     pending_bytes_before_unsafe_destroy_range: Option<f64>,
 
     // On start related markers. Because after restart, the memtable, l0 files
@@ -454,7 +414,7 @@ struct FlowChecker<E: CFNamesExt + FlowControlFactorsExt + Send + 'static> {
     engine: E,
     limiter: Arc<Limiter>,
     // Records the foreground write flow at scheduler level of last few seconds.
-    write_flow_recorder: Smoother<u64, 30, SMOOTHER_STALE_RECORD_THRESHOLD, 0>,
+    write_flow_recorder: Smoother<u64, 30>,
 
     last_record_time: Instant,
     last_speed: f64,
@@ -957,11 +917,9 @@ impl<E: CFNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
-
-    use engine_traits::Result;
-
     use super::*;
+    use engine_traits::Result;
+    use std::sync::atomic::AtomicU64;
 
     #[derive(Clone)]
     struct EngineStub(Arc<EngineStubInner>);
@@ -1210,7 +1168,7 @@ mod tests {
 
     #[test]
     fn test_smoother() {
-        let mut smoother = Smoother::<u64, 5, SMOOTHER_STALE_RECORD_THRESHOLD, 0>::default();
+        let mut smoother = Smoother::<u64, 5>::default();
         smoother.observe(1);
         smoother.observe(6);
         smoother.observe(2);
@@ -1225,7 +1183,7 @@ mod tests {
         assert_eq!(smoother.get_percentile_90(), 4);
         assert_eq!(smoother.trend(), Trend::NoTrend);
 
-        let mut smoother = Smoother::<f64, 5, SMOOTHER_STALE_RECORD_THRESHOLD, 0>::default();
+        let mut smoother = Smoother::<f64, 5>::default();
         smoother.observe(1.0);
         smoother.observe(6.0);
         smoother.observe(2.0);
@@ -1238,100 +1196,5 @@ mod tests {
         assert!((smoother.get_max() - 9.0).abs() < f64::EPSILON);
         assert!((smoother.get_percentile_90() - 5.0).abs() < f64::EPSILON);
         assert_eq!(smoother.trend(), Trend::Increasing);
-    }
-
-    #[test]
-    fn test_smoother_trend() {
-        // The time range is not enough
-        let mut smoother = Smoother::<
-            u64,
-            6,
-            SMOOTHER_STALE_RECORD_THRESHOLD,
-            SMOOTHER_TIME_RANGE_THRESHOLD,
-        >::default();
-        let now = Instant::now_coarse();
-        smoother.observe_with_time(
-            1,
-            now.sub(Duration::from_secs(SMOOTHER_TIME_RANGE_THRESHOLD - 1)),
-        );
-        smoother.observe_with_time(
-            1,
-            now.sub(Duration::from_secs(SMOOTHER_TIME_RANGE_THRESHOLD - 2)),
-        );
-        smoother.observe_with_time(
-            1,
-            now.sub(Duration::from_secs(SMOOTHER_TIME_RANGE_THRESHOLD - 3)),
-        );
-        smoother.observe_with_time(4, now.sub(Duration::from_secs(2)));
-        smoother.observe_with_time(4, now.sub(Duration::from_secs(1)));
-        smoother.observe_with_time(4, now);
-        assert_eq!(smoother.trend(), Trend::NoTrend);
-
-        // Incresing trend, the left range contains 3 records, the right range contains 1 records.
-        let mut smoother = Smoother::<
-            f64,
-            6,
-            SMOOTHER_STALE_RECORD_THRESHOLD,
-            SMOOTHER_TIME_RANGE_THRESHOLD,
-        >::default();
-        smoother.observe_with_time(
-            1.0,
-            now.sub(Duration::from_secs(SMOOTHER_TIME_RANGE_THRESHOLD + 1)),
-        );
-        smoother.observe_with_time(
-            1.0,
-            now.sub(Duration::from_secs(SMOOTHER_TIME_RANGE_THRESHOLD)),
-        );
-        smoother.observe_with_time(
-            1.0,
-            now.sub(Duration::from_secs(SMOOTHER_TIME_RANGE_THRESHOLD - 1)),
-        );
-        smoother.observe_with_time(4.0, now);
-        assert_eq!(smoother.trend(), Trend::Increasing);
-
-        // Decreasing trend, the left range contains 1 records, the right range contains 3 records.
-        let mut smoother = Smoother::<
-            f32,
-            6,
-            SMOOTHER_STALE_RECORD_THRESHOLD,
-            SMOOTHER_TIME_RANGE_THRESHOLD,
-        >::default();
-        smoother.observe_with_time(
-            4.0,
-            now.sub(Duration::from_secs(SMOOTHER_TIME_RANGE_THRESHOLD + 1)),
-        );
-        smoother.observe_with_time(1.0, now.sub(Duration::from_secs(2)));
-        smoother.observe_with_time(2.0, now.sub(Duration::from_secs(1)));
-        smoother.observe_with_time(1.0, now);
-        assert_eq!(smoother.trend(), Trend::Decreasing);
-
-        // No trend, the left range contains 1 records, the right range contains 3 records.
-        let mut smoother = Smoother::<
-            f32,
-            6,
-            SMOOTHER_STALE_RECORD_THRESHOLD,
-            SMOOTHER_TIME_RANGE_THRESHOLD,
-        >::default();
-        smoother.observe_with_time(
-            1.0,
-            now.sub(Duration::from_secs(SMOOTHER_TIME_RANGE_THRESHOLD + 1)),
-        );
-        smoother.observe_with_time(1.0, now.sub(Duration::from_secs(2)));
-        smoother.observe_with_time(3.0, now.sub(Duration::from_secs(1)));
-        smoother.observe_with_time(2.0, now);
-        assert_eq!(smoother.trend(), Trend::NoTrend);
-
-        // No trend, because the latest record is too old
-        let mut smoother = Smoother::<
-            u32,
-            6,
-            SMOOTHER_STALE_RECORD_THRESHOLD,
-            SMOOTHER_TIME_RANGE_THRESHOLD,
-        >::default();
-        smoother.observe_with_time(
-            1,
-            now.sub(Duration::from_secs(SMOOTHER_STALE_RECORD_THRESHOLD + 1)),
-        );
-        assert_eq!(smoother.trend(), Trend::NoTrend);
     }
 }

@@ -2,10 +2,13 @@
 
 use std::convert::TryFrom;
 
-use tidb_query_common::Result;
-use tidb_query_datatype::{builder::FieldTypeBuilder, EvalType, FieldTypeAccessor, FieldTypeTp};
-use tidb_query_expr::{impl_cast::get_cast_fn_rpn_node, RpnExpression, RpnExpressionBuilder};
+use tidb_query_datatype::builder::FieldTypeBuilder;
+use tidb_query_datatype::{EvalType, FieldTypeAccessor, FieldTypeTp};
 use tipb::{Expr, FieldType};
+
+use tidb_query_common::Result;
+use tidb_query_expr::impl_cast::get_cast_fn_rpn_node;
+use tidb_query_expr::{RpnExpression, RpnExpressionBuilder};
 
 /// Checks whether or not there is only one child and the child expression is supported.
 pub fn check_aggr_exp_supported_one_child(aggr_def: &Expr) -> Result<()> {
@@ -36,22 +39,10 @@ pub fn rewrite_exp_for_sum_avg(schema: &[FieldType], exp: &mut RpnExpression) ->
             // No need to cast. Return directly without changing anything.
             return Ok(());
         }
-        EvalType::Int => {
-            // For type MysqlBit, the aggregation return type should be Double
-            // which is also defined in in TiDB typeInfer4Sum() and typeInfer4Avg()
-            if ret_field_type.tp() == FieldTypeTp::Bit {
-                FieldTypeBuilder::new()
-                    .tp(FieldTypeTp::Double)
-                    .flen(tidb_query_datatype::MAX_REAL_WIDTH)
-                    .decimal(tidb_query_datatype::UNSPECIFIED_LENGTH)
-                    .build()
-            } else {
-                FieldTypeBuilder::new()
-                    .tp(FieldTypeTp::NewDecimal)
-                    .flen(tidb_query_datatype::MAX_DECIMAL_WIDTH)
-                    .build()
-            }
-        }
+        EvalType::Int => FieldTypeBuilder::new()
+            .tp(FieldTypeTp::NewDecimal)
+            .flen(tidb_query_datatype::MAX_DECIMAL_WIDTH)
+            .build(),
         _ => FieldTypeBuilder::new()
             .tp(FieldTypeTp::Double)
             .flen(tidb_query_datatype::MAX_REAL_WIDTH)

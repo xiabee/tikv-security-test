@@ -3,13 +3,11 @@
 #[macro_use]
 extern crate serde_derive;
 
-use std::{
-    error::Error,
-    fs::{self, File},
-    io::Read,
-    sync::{Arc, Mutex},
-    time::SystemTime,
-};
+use std::error::Error;
+use std::fs::{self, File};
+use std::io::Read;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use collections::HashSet;
 use encryption::EncryptionConfig;
@@ -19,7 +17,7 @@ use grpcio::{
     ServerCredentialsFetcher,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct SecurityConfig {
@@ -33,6 +31,20 @@ pub struct SecurityConfig {
     pub cert_allowed_cn: HashSet<String>,
     pub redact_info_log: Option<bool>,
     pub encryption: EncryptionConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> SecurityConfig {
+        SecurityConfig {
+            ca_path: String::new(),
+            cert_path: String::new(),
+            key_path: String::new(),
+            override_ssl_target: String::new(),
+            cert_allowed_cn: HashSet::default(),
+            redact_info_log: None,
+            encryption: EncryptionConfig::default(),
+        }
+    }
 }
 
 /// Checks and opens key file. Returns `Ok(None)` if the path is empty.
@@ -171,7 +183,7 @@ struct CNChecker {
 }
 
 impl ServerChecker for CNChecker {
-    fn check(&mut self, ctx: &RpcContext<'_>) -> CheckResult {
+    fn check(&mut self, ctx: &RpcContext) -> CheckResult {
         match check_common_name(&self.allowed_cn, ctx) {
             Ok(()) => CheckResult::Continue,
             Err(reason) => CheckResult::Abort(RpcStatus::with_message(
@@ -222,10 +234,7 @@ impl ServerCredentialsFetcher for Fetcher {
 /// Check peer CN with cert-allowed-cn field.
 /// Return true when the match is successful (support wildcard pattern).
 /// Skip the check when the secure channel is not used.
-fn check_common_name(
-    cert_allowed_cn: &HashSet<String>,
-    ctx: &RpcContext<'_>,
-) -> Result<(), String> {
+fn check_common_name(cert_allowed_cn: &HashSet<String>, ctx: &RpcContext) -> Result<(), String> {
     if let Some(auth_ctx) = ctx.auth_context() {
         if let Some(auth_property) = auth_ctx
             .into_iter()
@@ -257,11 +266,11 @@ pub fn match_peer_names(allowed_cn: &HashSet<String>, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write};
-
-    use tempfile::Builder;
-
     use super::*;
+
+    use std::fs;
+    use std::io::Write;
+    use tempfile::Builder;
 
     #[test]
     fn test_security() {
@@ -293,7 +302,7 @@ mod tests {
         let example_ca = temp.path().join("ca");
         let example_cert = temp.path().join("cert");
         let example_key = temp.path().join("key");
-        for (id, f) in [&example_ca, &example_cert, &example_key]
+        for (id, f) in (&[&example_ca, &example_cert, &example_key])
             .iter()
             .enumerate()
         {

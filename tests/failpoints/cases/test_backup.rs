@@ -3,14 +3,15 @@
 use std::{thread, time::Duration};
 
 use futures::{executor::block_on, StreamExt};
-use kvproto::{brpb::Error_oneof_detail, kvrpcpb::*};
+use kvproto::brpb::Error_oneof_detail;
+use kvproto::kvrpcpb::*;
 use tempfile::Builder;
 use test_backup::*;
 use txn_types::TimeStamp;
 
 #[test]
 fn backup_blocked_by_memory_lock() {
-    let suite = TestSuite::new(1, 144 * 1024 * 1024, ApiVersion::V1);
+    let suite = TestSuite::new(1, 144 * 1024 * 1024);
 
     fail::cfg("raftkv_async_write_finish", "pause").unwrap();
     let tikv_cli = suite.tikv_cli.clone();

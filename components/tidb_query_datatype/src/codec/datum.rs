@@ -1,34 +1,25 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    borrow::Cow,
-    cmp::Ordering,
-    fmt::{self, Debug, Display, Formatter},
-    i64, str,
-};
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::{i64, str};
 
-use codec::{
-    byte::{CompactByteCodec, MemComparableByteCodec},
-    number::{self, NumberCodec},
-    prelude::*,
-};
-use tikv_util::{codec::BytesSlice, escape};
+use crate::FieldTypeTp;
+use tikv_util::codec::BytesSlice;
+use tikv_util::escape;
 
-use super::{
-    mysql::{
-        self, parse_json_path_expr, Decimal, DecimalDecoder, DecimalEncoder, Duration, Enum, Json,
-        JsonDecoder, JsonEncoder, PathExpression, Set, Time, DEFAULT_FSP, MAX_FSP,
-    },
-    Result,
+use super::mysql::{
+    self, parse_json_path_expr, Decimal, DecimalDecoder, DecimalEncoder, Duration, Enum, Json,
+    JsonDecoder, JsonEncoder, PathExpression, Set, Time, DEFAULT_FSP, MAX_FSP,
 };
-use crate::{
-    codec::{
-        convert::{ConvertTo, ToInt},
-        data_type::AsMySQLBool,
-    },
-    expr::EvalContext,
-    FieldTypeTp,
-};
+use super::Result;
+use crate::codec::convert::{ConvertTo, ToInt};
+use crate::codec::data_type::AsMySQLBool;
+use crate::expr::EvalContext;
+use codec::byte::{CompactByteCodec, MemComparableByteCodec};
+use codec::number::{self, NumberCodec};
+use codec::prelude::*;
 
 pub const NIL_FLAG: u8 = 0;
 pub const BYTES_FLAG: u8 = 1;
@@ -140,9 +131,9 @@ impl Display for Datum {
             Datum::Bytes(ref bs) => write!(f, "Bytes(\"{}\")", escape(bs)),
             Datum::Dec(ref d) => write!(f, "Dec({})", d),
             Datum::Time(t) => write!(f, "Time({})", t),
-            Datum::Json(ref j) => write!(f, "Json({})", j),
-            Datum::Enum(ref e) => write!(f, "Enum({})", e),
-            Datum::Set(ref s) => write!(f, "Set({})", s),
+            Datum::Json(ref j) => write!(f, "Json({})", j.to_string()),
+            Datum::Enum(ref e) => write!(f, "Enum({})", e.to_string()),
+            Datum::Set(ref s) => write!(f, "Set({})", s.to_string()),
             Datum::Min => write!(f, "MIN"),
             Datum::Max => write!(f, "MAX"),
         }
@@ -1153,16 +1144,15 @@ pub fn skip_n(buf: &mut &[u8], n: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cmp::Ordering, i16, i32, i64, i8, slice::from_ref, str::FromStr, sync::Arc, u16, u32, u64,
-        u8,
-    };
-
     use super::*;
-    use crate::{
-        codec::mysql::{Decimal, Duration, Time, MAX_FSP},
-        expr::{EvalConfig, EvalContext},
-    };
+    use crate::codec::mysql::{Decimal, Duration, Time, MAX_FSP};
+    use crate::expr::{EvalConfig, EvalContext};
+
+    use std::cmp::Ordering;
+    use std::slice::from_ref;
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::{i16, i32, i64, i8, u16, u32, u64, u8};
 
     fn same_type(l: &Datum, r: &Datum) -> bool {
         match (l, r) {

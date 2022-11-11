@@ -3,16 +3,17 @@
 use std::marker::PhantomData;
 
 use criterion::measurement::Measurement;
+
 use kvproto::coprocessor::KeyRange;
-use test_coprocessor::*;
-use tidb_query_executors::interface::*;
-use tikv::{
-    coprocessor::RequestHandler,
-    storage::{RocksEngine, Store as TxnStore},
-};
 use tipb::ColumnInfo;
 
-use crate::util::{bencher::Bencher, store::StoreDescriber};
+use test_coprocessor::*;
+use tidb_query_executors::interface::*;
+use tikv::coprocessor::RequestHandler;
+use tikv::storage::{RocksEngine, Store as TxnStore};
+
+use crate::util::bencher::Bencher;
+use crate::util::store::StoreDescriber;
 
 pub trait ScanExecutorBuilder: 'static {
     type T: TxnStore + 'static;
@@ -48,7 +49,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         columns: &[ColumnInfo],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,
@@ -101,7 +102,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         columns: &[ColumnInfo],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,
@@ -151,7 +152,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         columns: &[ColumnInfo],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,

@@ -1,17 +1,16 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    future::Future,
-    marker::PhantomData,
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::future::FutureExt;
 use pin_project::pin_project;
-use tikv_util::time::Instant;
 use tokio::sync::{Semaphore, SemaphorePermit};
+
+use tikv_util::time::Instant;
 
 use crate::coprocessor::metrics::*;
 
@@ -80,7 +79,7 @@ where
 {
     type Output = F::Output;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.project();
         match this.state {
             LimitationState::NotLimited if this.execution_time > this.time_limit_without_permit => {
@@ -126,15 +125,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread};
-
-    use futures::future::FutureExt;
-    use tokio::{
-        task::yield_now,
-        time::{sleep, timeout},
-    };
-
     use super::*;
+    use futures::future::FutureExt;
+    use std::sync::Arc;
+    use std::thread;
+    use tokio::task::yield_now;
+    use tokio::time::{sleep, timeout};
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_limit_concurrency() {

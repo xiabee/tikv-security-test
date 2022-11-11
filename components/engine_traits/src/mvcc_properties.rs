@@ -1,7 +1,6 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cmp;
-
 use txn_types::TimeStamp;
 
 #[derive(Clone, Debug)]

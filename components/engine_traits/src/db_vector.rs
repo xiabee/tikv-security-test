@@ -1,6 +1,7 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{fmt::Debug, ops::Deref};
+use std::fmt::Debug;
+use std::ops::Deref;
 
 /// A type that holds buffers queried from the database.
 ///

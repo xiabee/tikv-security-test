@@ -9,19 +9,13 @@ supports closed detection and try operations.
 */
 pub mod batch;
 
-use std::{
-    cell::Cell,
-    sync::{
-        atomic::{AtomicBool, AtomicIsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
-
 use crossbeam::channel::{
     self, RecvError, RecvTimeoutError, SendError, TryRecvError, TrySendError,
 };
-use fail::fail_point;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 struct State {
     sender_cnt: AtomicIsize,
@@ -240,11 +234,7 @@ impl<T> LooseBoundedSender<T> {
     #[inline]
     pub fn try_send(&self, t: T) -> Result<(), TrySendError<T>> {
         let cnt = self.tried_cnt.get();
-        let check_interval = || {
-            fail_point!("loose_bounded_sender_check_interval", |_| 0);
-            CHECK_INTERVAL
-        };
-        if cnt < check_interval() {
+        if cnt < CHECK_INTERVAL {
             self.tried_cnt.set(cnt + 1);
         } else if self.len() < self.limit {
             self.tried_cnt.set(1);
@@ -297,11 +287,10 @@ pub fn loose_bounded<T>(cap: usize) -> (LooseBoundedSender<T>, Receiver<T>) {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
-
-    use crossbeam::channel::*;
-
     use crate::time::Instant;
+    use crossbeam::channel::*;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_bounded() {

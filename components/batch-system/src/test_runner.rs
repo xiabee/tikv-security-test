@@ -2,19 +2,13 @@
 
 //! A sample Handler for test and micro-benchmark purpose.
 
-use std::{
-    borrow::Cow,
-    ops::DerefMut,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-};
-
-use derive_more::{Add, AddAssign};
-use tikv_util::mpsc;
-
 use crate::*;
+use derive_more::{Add, AddAssign};
+use std::borrow::Cow;
+use std::ops::DerefMut;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tikv_util::mpsc;
 
 /// Message `Runner` can accepts.
 pub enum Message {
@@ -113,10 +107,7 @@ impl Handler {
 }
 
 impl PollHandler<Runner, Runner> for Handler {
-    fn begin<F>(&mut self, _batch_size: usize, _update_cfg: F)
-    where
-        for<'a> F: FnOnce(&'a Config),
-    {
+    fn begin(&mut self, _batch_size: usize) {
         self.local.begin += 1;
     }
 
@@ -148,18 +139,12 @@ pub struct Builder {
     pub pause_counter: Arc<AtomicUsize>,
 }
 
-impl Default for Builder {
-    fn default() -> Builder {
+impl Builder {
+    pub fn new() -> Builder {
         Builder {
             metrics: Arc::default(),
             pause_counter: Arc::new(AtomicUsize::new(0)),
         }
-    }
-}
-
-impl Builder {
-    pub fn new() -> Self {
-        Builder::default()
     }
 }
 

@@ -2,10 +2,8 @@
 
 use collections::HashMap;
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
-use kvproto::{
-    errorpb,
-    raft_cmdpb::{AdminCmdType, CmdType, Request},
-};
+use kvproto::errorpb;
+use kvproto::raft_cmdpb::{AdminCmdType, CmdType, Request};
 use raftstore::coprocessor::{Cmd, CmdBatch, ObserveLevel};
 use txn_types::{
     Key, Lock, LockType, TimeStamp, Value, Write, WriteBatchFlags, WriteRef, WriteType,
@@ -35,7 +33,6 @@ pub enum ChangeRow {
     },
 }
 
-#[allow(clippy::large_enum_variant)]
 pub enum ChangeLog {
     Error(errorpb::Error),
     Rows { index: u64, rows: Vec<ChangeRow> },
@@ -74,7 +71,7 @@ impl ChangeLog {
     fn encode_rows(changes: HashMap<Key, RowChange>, is_one_pc: bool) -> Vec<ChangeRow> {
         changes
             .into_iter()
-            .filter_map(|(key, row)| match (row.write, row.lock, row.default) {
+            .map(|(key, row)| match (row.write, row.lock, row.default) {
                 (Some(KeyOp::Put(mut commit_ts, write)), _, default) => {
                     decode_write(key.as_encoded(), &write, true).map(|write| {
                         let Write {
@@ -128,6 +125,7 @@ impl ChangeLog {
                 }),
                 other => panic!("unexpected row pattern {:?}", other),
             })
+            .flatten()
             .collect()
     }
 }
@@ -283,17 +281,14 @@ pub fn lock_only_filter(mut cmd_batch: CmdBatch) -> Option<CmdBatch> {
 #[cfg(test)]
 mod tests {
     use concurrency_manager::ConcurrencyManager;
-    use kvproto::kvrpcpb::AssertionLevel;
-    use tikv::storage::{
-        kv::{MockEngineBuilder, TestEngineBuilder},
-        lock_manager::DummyLockManager,
-        mvcc::{tests::write, Mutation, MvccTxn, SnapshotReader},
-        txn::{
-            commands::one_pc_commit_ts, prewrite, tests::*, CommitKind, TransactionKind,
-            TransactionProperties,
-        },
-        Engine,
-    };
+    use tikv::server::raftkv::modifies_to_requests;
+    use tikv::storage::kv::{MockEngineBuilder, TestEngineBuilder};
+    use tikv::storage::lock_manager::DummyLockManager;
+    use tikv::storage::mvcc::{tests::write, Mutation, MvccTxn, SnapshotReader};
+    use tikv::storage::txn::commands::one_pc_commit_ts;
+    use tikv::storage::txn::tests::*;
+    use tikv::storage::txn::{prewrite, CommitKind, TransactionKind, TransactionProperties};
+    use tikv::storage::Engine;
     use tikv_kv::Modify;
     use txn_types::{Key, LockType, WriteType};
 
@@ -304,7 +299,11 @@ mod tests {
         let rocks_engine = TestEngineBuilder::new().build().unwrap();
         let engine = MockEngineBuilder::from_rocks_engine(rocks_engine).build();
 
-        let reqs = vec![Modify::Put("default", Key::from_raw(b"k1"), b"v1".to_vec()).into()];
+        let reqs = modifies_to_requests(vec![Modify::Put(
+            "default",
+            Key::from_raw(b"k1"),
+            b"v1".to_vec(),
+        )]);
         assert!(ChangeLog::encode_rows(group_row_changes(reqs), false).is_empty());
 
         must_prewrite_put(&engine, b"k1", b"v1", b"k1", 1);
@@ -324,7 +323,7 @@ mod tests {
             .take_last_modifies()
             .into_iter()
             .flat_map(|m| {
-                let reqs = m.into_iter().map(Into::into).collect();
+                let reqs = modifies_to_requests(m);
                 ChangeLog::encode_rows(group_row_changes(reqs), false)
             })
             .collect();
@@ -398,9 +397,8 @@ mod tests {
                 min_commit_ts: 10.into(),
                 need_old_value: false,
                 is_retry_request: false,
-                assertion_level: AssertionLevel::Off,
             },
-            Mutation::make_put(k1.clone(), b"v4".to_vec()),
+            Mutation::Put((k1.clone(), b"v4".to_vec())),
             &None,
             false,
         )
@@ -411,7 +409,7 @@ mod tests {
             .take_last_modifies()
             .into_iter()
             .flat_map(|m| {
-                let reqs = m.into_iter().map(Into::into).collect();
+                let reqs = modifies_to_requests(m);
                 ChangeLog::encode_rows(group_row_changes(reqs), true)
             })
             .last()

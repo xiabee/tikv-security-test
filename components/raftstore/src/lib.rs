@@ -2,11 +2,10 @@
 
 #![cfg_attr(test, feature(test))]
 #![feature(cell_update)]
+#![feature(shrink_to)]
 #![feature(div_duration)]
 #![feature(min_specialization)]
 #![feature(box_patterns)]
-#![feature(hash_drain_filter)]
-#![feature(vec_retain_mut)]
 #![recursion_limit = "256"]
 
 #[cfg(test)]
@@ -18,14 +17,19 @@ pub mod coprocessor;
 pub mod errors;
 pub mod router;
 pub mod store;
-pub use self::{
-    coprocessor::{RegionInfo, RegionInfoAccessor, SeekRegionCallback},
-    errors::{DiscardReason, Error, Result},
-};
+pub use self::coprocessor::{RegionInfo, RegionInfoAccessor, SeekRegionCallback};
+pub use self::errors::{DiscardReason, Error, Result};
 
-// `bytes::Bytes` is generated for `bytes` in protobuf.
+// With feature protobuf-codec, `bytes::Bytes` is generated for `bytes` in protobuf.
+#[cfg(feature = "protobuf-codec")]
 fn bytes_capacity(b: &bytes::Bytes) -> usize {
     // NOTE: For deserialized raft messages, `len` equals capacity.
     // This is used to report memory usage to metrics.
     b.len()
+}
+
+// Currently `bytes::Bytes` are not available for prost-codec.
+#[cfg(feature = "prost-codec")]
+fn bytes_capacity(b: &Vec<u8>) -> usize {
+    b.capacity()
 }

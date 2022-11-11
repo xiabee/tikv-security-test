@@ -1,10 +1,9 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::{atomic::AtomicU64, Arc},
-    thread,
-    time::Duration,
-};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use collections::HashMap;
 use engine_traits::Peekable;
@@ -15,16 +14,12 @@ use raftstore::coprocessor::{
     RegionInfo, RegionInfoCallback, RegionInfoProvider, Result as CopResult, SeekRegionCallback,
 };
 use test_raftstore::*;
-use tikv::{
-    server::gc_worker::{
-        AutoGcConfig, GcSafePointProvider, GcTask, Result as GcWorkerResult, TestGCRunner,
-    },
-    storage::{
-        kv::TestEngineBuilder,
-        mvcc::tests::must_get_none,
-        txn::tests::{must_commit, must_prewrite_delete, must_prewrite_put},
-    },
+use tikv::server::gc_worker::{
+    AutoGcConfig, GcSafePointProvider, GcTask, Result as GcWorkerResult, TestGCRunner,
 };
+use tikv::storage::kv::TestEngineBuilder;
+use tikv::storage::mvcc::tests::must_get_none;
+use tikv::storage::txn::tests::{must_commit, must_prewrite_delete, must_prewrite_put};
 use tikv_util::HandyRwLock;
 use txn_types::{Key, TimeStamp};
 

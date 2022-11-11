@@ -12,8 +12,8 @@ define_error_codes!(
     KEY_TOO_LARGE => ("KeyTooLarge", "", ""),
     INVALID_CF => ("InvalidCF", "", ""),
     CF_DEPRECATED => ("CFDeprecated", "", ""),
-    TTL_NOT_ENABLED => ("TtlNotEnabled", "", ""),
-    TTL_LEN_NOT_EQUALS_TO_PAIRS => ("TtlLenNotEqualsToPairs", "", ""),
+    TTL_NOT_ENABLED => ("TTLNotEnabled", "", ""),
+    TTLS_LEN_NOT_EQUALS_TO_PAIRS => ("TTLsLenNotEqualsToPairs", "", ""),
     PROTOBUF => ("Protobuf", "", ""),
     INVALID_TXN_TSO => ("INVALIDTXNTSO", "", ""),
     INVALID_REQ_RANGE => ("InvalidReqRange", "", ""),
@@ -23,7 +23,6 @@ define_error_codes!(
     MAX_TIMESTAMP_NOT_SYNCED => ("MaxTimestampNotSynced", "", ""),
     DEADLINE_EXCEEDED => ("DeadlineExceeded", "", ""),
     API_VERSION_NOT_MATCHED => ("ApiVersionNotMatched", "", ""),
-    INVALID_KEY_MODE => ("InvalidKeyMode", "", ""),
 
     COMMITTED => ("Committed", "", ""),
     PESSIMISTIC_LOCK_ROLLED_BACK => ("PessimisticLockRolledBack", "", ""),
@@ -38,8 +37,6 @@ define_error_codes!(
     KEY_VERSION => ("KeyVersion", "",""),
     PESSIMISTIC_LOCK_NOT_FOUND => ("PessimisticLockNotFound", "", ""),
     COMMIT_TS_TOO_LARGE => ("CommitTsTooLarge", "", ""),
-
-    ASSERTION_FAILED => ("AssertionFailed", "", ""),
 
     UNKNOWN => ("Unknown", "", "")
 );

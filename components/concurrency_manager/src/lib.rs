@@ -15,20 +15,17 @@ use fail::fail_point;
 mod key_handle;
 mod lock_table;
 
+pub use self::key_handle::{KeyHandle, KeyHandleGuard};
+pub use self::lock_table::LockTable;
+
 use std::{
-    mem::MaybeUninit,
+    mem::{self, MaybeUninit},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
-
 use txn_types::{Key, Lock, TimeStamp};
-
-pub use self::{
-    key_handle::{KeyHandle, KeyHandleGuard},
-    lock_table::LockTable,
-};
 
 // Pay attention that the async functions of ConcurrencyManager should not hold
 // the mutex.
@@ -81,7 +78,10 @@ impl ConcurrencyManager {
         for (index, key) in keys_with_index {
             result[index] = MaybeUninit::new(self.lock_table.lock_key(key).await);
         }
-        unsafe { tikv_util::memory::vec_transmute(result) }
+        #[allow(clippy::unsound_collection_transmute)]
+        unsafe {
+            mem::transmute(result)
+        }
     }
 
     /// Checks if there is a memory lock of the key which blocks the read.
@@ -128,9 +128,8 @@ impl ConcurrencyManager {
 
 #[cfg(test)]
 mod tests {
-    use txn_types::LockType;
-
     use super::*;
+    use txn_types::LockType;
 
     #[tokio::test]
     async fn test_lock_keys_order() {

@@ -1,12 +1,13 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use criterion::{black_box, measurement::Measurement};
+use criterion::black_box;
+use criterion::measurement::Measurement;
 use futures::executor::block_on;
 use tidb_query_executors::interface::*;
 use tikv::coprocessor::RequestHandler;
 
 pub trait Bencher {
-    fn bench<M>(&mut self, b: &mut criterion::Bencher<'_, M>)
+    fn bench<M>(&mut self, b: &mut criterion::Bencher<M>)
     where
         M: Measurement;
 }
@@ -23,7 +24,7 @@ impl<E: BatchExecutor, F: FnMut() -> E> BatchNext1024Bencher<E, F> {
 }
 
 impl<E: BatchExecutor, F: FnMut() -> E> Bencher for BatchNext1024Bencher<E, F> {
-    fn bench<M>(&mut self, b: &mut criterion::Bencher<'_, M>)
+    fn bench<M>(&mut self, b: &mut criterion::Bencher<M>)
     where
         M: Measurement,
     {
@@ -53,7 +54,7 @@ impl<E: BatchExecutor, F: FnMut() -> E> BatchNextAllBencher<E, F> {
 }
 
 impl<E: BatchExecutor, F: FnMut() -> E> Bencher for BatchNextAllBencher<E, F> {
-    fn bench<M>(&mut self, b: &mut criterion::Bencher<'_, M>)
+    fn bench<M>(&mut self, b: &mut criterion::Bencher<M>)
     where
         M: Measurement,
     {
@@ -87,7 +88,7 @@ impl<F: FnMut() -> Box<dyn RequestHandler>> DAGHandleBencher<F> {
 }
 
 impl<F: FnMut() -> Box<dyn RequestHandler>> Bencher for DAGHandleBencher<F> {
-    fn bench<M>(&mut self, b: &mut criterion::Bencher<'_, M>)
+    fn bench<M>(&mut self, b: &mut criterion::Bencher<M>)
     where
         M: Measurement,
     {

@@ -2,23 +2,23 @@
 
 use std::str::FromStr;
 
-use criterion::measurement::Measurement;
-use rand::{seq::SliceRandom, Rng, SeedableRng};
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use rand_xorshift::XorShiftRng;
+
+use criterion::measurement::Measurement;
+
 use test_coprocessor::*;
+use tidb_query_datatype::FieldTypeTp;
+use tipb::FieldType;
+
 use tidb_query_common::storage::IntervalRange;
-use tidb_query_datatype::{
-    codec::{
-        batch::{LazyBatchColumn, LazyBatchColumnVec},
-        data_type::Decimal,
-        datum::{Datum, DatumEncoder},
-    },
-    expr::{EvalContext, EvalWarnings},
-    FieldTypeTp,
-};
+use tidb_query_datatype::codec::batch::{LazyBatchColumn, LazyBatchColumnVec};
+use tidb_query_datatype::codec::data_type::Decimal;
+use tidb_query_datatype::codec::datum::{Datum, DatumEncoder};
+use tidb_query_datatype::expr::{EvalContext, EvalWarnings};
 use tidb_query_executors::interface::*;
 use tikv::storage::{RocksEngine, Statistics};
-use tipb::FieldType;
 
 use crate::util::bencher::Bencher;
 
@@ -329,7 +329,7 @@ impl BatchExecutor for BatchFixtureExecutor {
 
 /// Benches the performance of the batch fixture executor itself. When using it as the source
 /// executor in other benchmarks, we need to take out these costs.
-fn bench_util_batch_fixture_executor_next_1024<M>(b: &mut criterion::Bencher<'_, M>)
+fn bench_util_batch_fixture_executor_next_1024<M>(b: &mut criterion::Bencher<M>)
 where
     M: Measurement,
 {

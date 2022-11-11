@@ -1,11 +1,13 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use collections::HashMap;
 use kvproto::raft_cmdpb::{CmdType, RaftCmdRequest, Request};
-use protobuf::{self, Message};
 use raft::eraftpb::Entry;
+
+use protobuf::{self, Message};
 use rand::{thread_rng, RngCore};
 use test::Bencher;
+
+use collections::HashMap;
 
 #[inline]
 fn gen_rand_str(len: usize) -> Vec<u8> {

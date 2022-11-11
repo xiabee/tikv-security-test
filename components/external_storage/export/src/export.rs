@@ -3,46 +3,44 @@
 //! To use External storage with protobufs as an application, import this module.
 //! external_storage contains the actual library code
 //! Cloud provider backends are under components/cloud
-use std::{
-    io::{self, Write},
-    path::Path,
-    sync::Arc,
-};
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::Arc;
 
-use async_trait::async_trait;
 #[cfg(feature = "cloud-aws")]
 pub use aws::{Config as S3Config, S3Storage};
-#[cfg(feature = "cloud-azure")]
-pub use azure::{AzureStorage, Config as AzureConfig};
+use engine_traits::FileEncryptionInfo;
+#[cfg(feature = "cloud-gcp")]
+pub use gcp::{Config as GCSConfig, GCSStorage};
+
+#[cfg(feature = "prost-codec")]
+pub use kvproto::brpb::storage_backend::Backend;
+use kvproto::brpb::CloudDynamic;
+#[cfg(feature = "protobuf-codec")]
+pub use kvproto::brpb::StorageBackend_oneof_backend as Backend;
+#[cfg(any(feature = "cloud-gcp", feature = "cloud-aws"))]
+use kvproto::brpb::{Gcs, S3};
+
+#[cfg(feature = "cloud-storage-dylib")]
+use crate::dylib;
 #[cfg(any(feature = "cloud-storage-dylib", feature = "cloud-storage-grpc"))]
 use cloud::blob::BlobConfig;
-use cloud::blob::{BlobStorage, PutResource};
+use cloud::blob::BlobStorage;
 use encryption::DataKeyManager;
-use engine_traits::FileEncryptionInfo;
 #[cfg(feature = "cloud-storage-dylib")]
 use external_storage::dylib_client;
 #[cfg(feature = "cloud-storage-grpc")]
 use external_storage::grpc_client;
 use external_storage::{encrypt_wrap_reader, record_storage_create, BackendConfig, HdfsStorage};
 pub use external_storage::{
-    read_external_storage_into_file, ExternalStorage, LocalStorage, NoopStorage, UnpinReader,
+    read_external_storage_into_file, ExternalStorage, LocalStorage, NoopStorage,
 };
 use futures_io::AsyncRead;
-#[cfg(feature = "cloud-gcp")]
-pub use gcp::{Config as GCSConfig, GCSStorage};
-pub use kvproto::brpb::StorageBackend_oneof_backend as Backend;
-#[cfg(any(feature = "cloud-gcp", feature = "cloud-aws", feature = "cloud-azure"))]
-use kvproto::brpb::{AzureBlobStorage, Gcs, S3};
-use kvproto::brpb::{CloudDynamic, Noop, StorageBackend};
+use kvproto::brpb::{Noop, StorageBackend};
+use tikv_util::stream::block_on_external_io;
+use tikv_util::time::{Instant, Limiter};
 #[cfg(feature = "cloud-storage-dylib")]
 use tikv_util::warn;
-use tikv_util::{
-    stream::block_on_external_io,
-    time::{Instant, Limiter},
-};
-
-#[cfg(feature = "cloud-storage-dylib")]
-use crate::dylib;
 
 pub fn create_storage(
     storage_backend: &StorageBackend,
@@ -83,7 +81,7 @@ fn bad_backend(backend: Backend) -> io::Error {
     bad_storage_backend(&storage_backend)
 }
 
-#[cfg(any(feature = "cloud-gcp", feature = "cloud-aws", feature = "cloud-azure"))]
+#[cfg(any(feature = "cloud-gcp", feature = "cloud-aws"))]
 fn blob_store<Blob: BlobStorage>(store: Blob) -> Box<dyn ExternalStorage> {
     Box::new(BlobStore::new(store)) as Box<dyn ExternalStorage>
 }
@@ -141,11 +139,6 @@ fn create_config(backend: &Backend) -> Option<io::Result<Box<dyn BlobConfig>>> {
             let conf = GCSConfig::from_input(config.clone());
             Some(conf.map(|c| Box::new(c) as Box<dyn BlobConfig>))
         }
-        #[cfg(feature = "cloud-azure")]
-        Backend::AzureBlobStorage(config) => {
-            let conf = AzureConfig::from_input(config.clone());
-            Some(conf.map(|c| Box::new(c) as Box<dyn BlobConfig>))
-        }
         Backend::CloudDynamic(dyn_backend) => match dyn_backend.provider_name.as_str() {
             #[cfg(feature = "cloud-aws")]
             "aws" | "s3" => {
@@ -155,11 +148,6 @@ fn create_config(backend: &Backend) -> Option<io::Result<Box<dyn BlobConfig>>> {
             #[cfg(feature = "cloud-gcp")]
             "gcp" | "gcs" => {
                 let conf = GCSConfig::from_cloud_dynamic(&dyn_backend);
-                Some(conf.map(|c| Box::new(c) as Box<dyn BlobConfig>))
-            }
-            #[cfg(feature = "cloud-azure")]
-            "azure" | "azblob" => {
-                let conf = AzureConfig::from_cloud_dynamic(&dyn_backend);
                 Some(conf.map(|c| Box::new(c) as Box<dyn BlobConfig>))
             }
             _ => None,
@@ -191,20 +179,16 @@ fn create_backend_inner(
         }
         #[cfg(feature = "cloud-gcp")]
         Backend::Gcs(config) => blob_store(GCSStorage::from_input(config.clone())?),
-        #[cfg(feature = "cloud-azure")]
-        Backend::AzureBlobStorage(config) => blob_store(AzureStorage::from_input(config.clone())?),
         Backend::CloudDynamic(dyn_backend) => match dyn_backend.provider_name.as_str() {
             #[cfg(feature = "cloud-aws")]
             "aws" | "s3" => blob_store(S3Storage::from_cloud_dynamic(dyn_backend)?),
             #[cfg(feature = "cloud-gcp")]
             "gcp" | "gcs" => blob_store(GCSStorage::from_cloud_dynamic(dyn_backend)?),
-            #[cfg(feature = "cloud-azure")]
-            "azure" | "azblob" => blob_store(AzureStorage::from_cloud_dynamic(dyn_backend)?),
             _ => {
                 return Err(bad_backend(Backend::CloudDynamic(dyn_backend.clone())));
             }
         },
-        #[allow(unreachable_patterns)]
+        #[cfg(not(any(feature = "cloud-gcp", feature = "cloud-aws")))]
         _ => return Err(bad_backend(backend.clone())),
     };
     record_storage_create(start, &*storage);
@@ -214,57 +198,103 @@ fn create_backend_inner(
 #[cfg(feature = "cloud-aws")]
 // Creates a S3 `StorageBackend`
 pub fn make_s3_backend(config: S3) -> StorageBackend {
-    let mut backend = StorageBackend::default();
-    backend.set_s3(config);
-    backend
+    #[cfg(feature = "prost-codec")]
+    {
+        StorageBackend {
+            backend: Some(Backend::S3(config)),
+        }
+    }
+    #[cfg(feature = "protobuf-codec")]
+    {
+        let mut backend = StorageBackend::default();
+        backend.set_s3(config);
+        backend
+    }
 }
 
 pub fn make_local_backend(path: &Path) -> StorageBackend {
     let path = path.display().to_string();
-    let mut backend = StorageBackend::default();
-    backend.mut_local().set_path(path);
-    backend
+    #[cfg(feature = "prost-codec")]
+    {
+        StorageBackend {
+            backend: Some(Backend::Local(Local { path })),
+        }
+    }
+    #[cfg(feature = "protobuf-codec")]
+    {
+        let mut backend = StorageBackend::default();
+        backend.mut_local().set_path(path);
+        backend
+    }
 }
 
 pub fn make_hdfs_backend(remote: String) -> StorageBackend {
-    let mut backend = StorageBackend::default();
-    backend.mut_hdfs().set_remote(remote);
-    backend
+    #[cfg(feature = "prost-codec")]
+    {
+        StorageBackend {
+            backend: Some(Backend::Hdfs(HDFS { remote })),
+        }
+    }
+    #[cfg(feature = "protobuf-codec")]
+    {
+        let mut backend = StorageBackend::default();
+        backend.mut_hdfs().set_remote(remote);
+        backend
+    }
 }
 
 /// Creates a noop `StorageBackend`.
 pub fn make_noop_backend() -> StorageBackend {
     let noop = Noop::default();
-    let mut backend = StorageBackend::default();
-    backend.set_noop(noop);
-    backend
+    #[cfg(feature = "prost-codec")]
+    {
+        StorageBackend {
+            backend: Some(Backend::Noop(noop)),
+        }
+    }
+    #[cfg(feature = "protobuf-codec")]
+    {
+        let mut backend = StorageBackend::default();
+        backend.set_noop(noop);
+        backend
+    }
 }
 
 #[cfg(feature = "cloud-gcp")]
 pub fn make_gcs_backend(config: Gcs) -> StorageBackend {
-    let mut backend = StorageBackend::default();
-    backend.set_gcs(config);
-    backend
-}
-
-#[cfg(feature = "cloud-azure")]
-pub fn make_azblob_backend(config: AzureBlobStorage) -> StorageBackend {
-    let mut backend = StorageBackend::default();
-    backend.set_azure_blob_storage(config);
-    backend
+    #[cfg(feature = "prost-codec")]
+    {
+        StorageBackend {
+            backend: Some(Backend::Gcs(config)),
+        }
+    }
+    #[cfg(feature = "protobuf-codec")]
+    {
+        let mut backend = StorageBackend::default();
+        backend.set_gcs(config);
+        backend
+    }
 }
 
 pub fn make_cloud_backend(config: CloudDynamic) -> StorageBackend {
-    let mut backend = StorageBackend::default();
-    backend.set_cloud_dynamic(config);
-    backend
+    #[cfg(feature = "prost-codec")]
+    {
+        StorageBackend {
+            backend: Some(Backend::CloudDynamic(config)),
+        }
+    }
+    #[cfg(feature = "protobuf-codec")]
+    {
+        let mut backend = StorageBackend::default();
+        backend.set_cloud_dynamic(config);
+        backend
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use tempfile::Builder;
-
     use super::*;
+    use tempfile::Builder;
 
     #[test]
     fn test_create_storage() {
@@ -309,7 +339,6 @@ pub struct EncryptedExternalStorage {
     pub storage: Box<dyn ExternalStorage>,
 }
 
-#[async_trait]
 impl ExternalStorage for EncryptedExternalStorage {
     fn name(&self) -> &'static str {
         self.storage.name()
@@ -317,8 +346,13 @@ impl ExternalStorage for EncryptedExternalStorage {
     fn url(&self) -> io::Result<url::Url> {
         self.storage.url()
     }
-    async fn write(&self, name: &str, reader: UnpinReader, content_length: u64) -> io::Result<()> {
-        self.storage.write(name, reader, content_length).await
+    fn write(
+        &self,
+        name: &str,
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+        content_length: u64,
+    ) -> io::Result<()> {
+        self.storage.write(name, reader, content_length)
     }
     fn read(&self, name: &str) -> Box<dyn AsyncRead + Unpin + '_> {
         self.storage.read(name)
@@ -328,7 +362,6 @@ impl ExternalStorage for EncryptedExternalStorage {
         storage_name: &str,
         restore_name: std::path::PathBuf,
         expected_length: u64,
-        expected_sha256: Option<Vec<u8>>,
         speed_limiter: &Limiter,
         file_crypter: Option<FileEncryptionInfo>,
     ) -> io::Result<()> {
@@ -343,13 +376,11 @@ impl ExternalStorage for EncryptedExternalStorage {
             file_writer,
             speed_limiter,
             expected_length,
-            expected_sha256,
             min_read_speed,
         ))
     }
 }
 
-#[async_trait]
 impl<Blob: BlobStorage> ExternalStorage for BlobStore<Blob> {
     fn name(&self) -> &'static str {
         (**self).config().name()
@@ -357,10 +388,13 @@ impl<Blob: BlobStorage> ExternalStorage for BlobStore<Blob> {
     fn url(&self) -> io::Result<url::Url> {
         (**self).config().url()
     }
-    async fn write(&self, name: &str, reader: UnpinReader, content_length: u64) -> io::Result<()> {
-        (**self)
-            .put(name, PutResource(reader.0), content_length)
-            .await
+    fn write(
+        &self,
+        name: &str,
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+        content_length: u64,
+    ) -> io::Result<()> {
+        (**self).put(name, reader, content_length)
     }
 
     fn read(&self, name: &str) -> Box<dyn AsyncRead + Unpin + '_> {

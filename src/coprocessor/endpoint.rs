@@ -1,33 +1,41 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{borrow::Cow, future::Future, marker::PhantomData, sync::Arc, time::Duration};
+use std::future::Future;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::{borrow::Cow, time::Duration};
 
 use async_stream::try_stream;
-use concurrency_manager::ConcurrencyManager;
-use engine_traits::PerfLevel;
-use futures::{channel::mpsc, prelude::*};
-use kvproto::{coprocessor as coppb, errorpb, kvrpcpb};
-use protobuf::{CodedInputStream, Message};
-use resource_metering::{FutureExt, ResourceTagFactory, StreamExt};
+use futures::channel::mpsc;
+use futures::prelude::*;
 use tidb_query_common::execute_stats::ExecSummary;
-use tikv_alloc::trace::MemoryTraceGuard;
-use tikv_kv::SnapshotExt;
-use tikv_util::{quota_limiter::QuotaLimiter, time::Instant};
-use tipb::{AnalyzeReq, AnalyzeType, ChecksumRequest, ChecksumScanOn, DagRequest, ExecType};
 use tokio::sync::Semaphore;
-use txn_types::Lock;
 
-use crate::{
-    coprocessor::{cache::CachedRequestHandler, interceptors::*, metrics::*, tracker::Tracker, *},
-    read_pool::ReadPoolHandle,
-    server::Config,
-    storage::{
-        self,
-        kv::{self, with_tls_engine, SnapContext},
-        mvcc::Error as MvccError,
-        need_check_locks, need_check_locks_in_replica_read, Engine, Snapshot, SnapshotStore,
-    },
-};
+use kvproto::kvrpcpb::{self, IsolationLevel};
+use kvproto::{coprocessor as coppb, errorpb};
+#[cfg(feature = "protobuf-codec")]
+use protobuf::CodedInputStream;
+use protobuf::Message;
+use tipb::{AnalyzeReq, AnalyzeType, ChecksumRequest, ChecksumScanOn, DagRequest, ExecType};
+
+use crate::server::Config;
+use crate::storage::kv::PerfStatisticsInstant;
+use crate::storage::kv::{self, with_tls_engine};
+use crate::storage::mvcc::Error as MvccError;
+use crate::storage::{self, need_check_locks_in_replica_read, Engine, Snapshot, SnapshotStore};
+use crate::{read_pool::ReadPoolHandle, storage::kv::SnapContext};
+
+use crate::coprocessor::cache::CachedRequestHandler;
+use crate::coprocessor::interceptors::*;
+use crate::coprocessor::metrics::*;
+use crate::coprocessor::tracker::Tracker;
+use crate::coprocessor::*;
+use concurrency_manager::ConcurrencyManager;
+use engine_rocks::PerfLevel;
+use resource_metering::{FutureExt, ResourceMeteringTag, StreamExt};
+use tikv_alloc::trace::MemoryTraceGuard;
+use tikv_util::time::Instant;
+use txn_types::Lock;
 
 /// Requests that need time of less than `LIGHT_TASK_THRESHOLD` is considered as light ones,
 /// which means they don't need a permit from the semaphore before execution.
@@ -47,9 +55,9 @@ pub struct Endpoint<E: Engine> {
     // Perf stats level
     perf_level: PerfLevel,
 
-    resource_tag_factory: ResourceTagFactory,
-
     /// The recursion limit when parsing Coprocessor Protobuf requests.
+    ///
+    /// Note that this limit is ignored if we are using Prost.
     recursion_limit: u32,
 
     batch_row_limit: usize,
@@ -62,8 +70,6 @@ pub struct Endpoint<E: Engine> {
     slow_log_threshold: Duration,
 
     _phantom: PhantomData<E>,
-
-    quota_limiter: Arc<QuotaLimiter>,
 }
 
 impl<E: Engine> tikv_util::AssertSend for Endpoint<E> {}
@@ -73,8 +79,7 @@ impl<E: Engine> Endpoint<E> {
         cfg: &Config,
         read_pool: ReadPoolHandle,
         concurrency_manager: ConcurrencyManager,
-        resource_tag_factory: ResourceTagFactory,
-        quota_limiter: Arc<QuotaLimiter>,
+        perf_level: PerfLevel,
     ) -> Self {
         // FIXME: When yatp is used, we need to limit coprocessor requests in progress to avoid
         // using too much memory. However, if there are a number of large requests, small requests
@@ -89,8 +94,7 @@ impl<E: Engine> Endpoint<E> {
             read_pool,
             semaphore,
             concurrency_manager,
-            perf_level: cfg.end_point_perf_level,
-            resource_tag_factory,
+            perf_level,
             recursion_limit: cfg.end_point_recursion_limit,
             batch_row_limit: cfg.end_point_batch_row_limit,
             stream_batch_row_limit: cfg.end_point_stream_batch_row_limit,
@@ -98,7 +102,6 @@ impl<E: Engine> Endpoint<E> {
             max_handle_duration: cfg.end_point_request_max_handle_duration.0,
             slow_log_threshold: cfg.end_point_slow_log_threshold.0,
             _phantom: Default::default(),
-            quota_limiter,
         }
     }
 
@@ -107,7 +110,7 @@ impl<E: Engine> Endpoint<E> {
         if !req_ctx.context.get_stale_read() {
             self.concurrency_manager.update_max_ts(start_ts);
         }
-        if need_check_locks(req_ctx.context.get_isolation_level()) {
+        if req_ctx.context.get_isolation_level() == IsolationLevel::Si {
             let begin_instant = Instant::now();
             for range in &req_ctx.ranges {
                 let start_key = txn_types::Key::from_raw_maybe_unbounded(range.get_start());
@@ -119,7 +122,6 @@ impl<E: Engine> Endpoint<E> {
                             key,
                             start_ts,
                             &req_ctx.bypass_locks,
-                            req_ctx.context.get_isolation_level(),
                         )
                     })
                     .map_err(|e| {
@@ -146,6 +148,45 @@ impl<E: Engine> Endpoint<E> {
         peer: Option<String>,
         is_streaming: bool,
     ) -> Result<(RequestHandlerBuilder<E::Snap>, ReqContext)> {
+        // This `Parser` is here because rust-proto supports customising its
+        // recursion limit and Prost does not. Therefore we end up doing things
+        // a bit differently for the two codecs.
+        #[cfg(feature = "protobuf-codec")]
+        struct Parser<'a> {
+            input: CodedInputStream<'a>,
+        }
+
+        #[cfg(feature = "protobuf-codec")]
+        impl<'a> Parser<'a> {
+            fn new(data: &'a [u8], recursion_limit: u32) -> Parser<'a> {
+                let mut input = CodedInputStream::from_bytes(data);
+                input.set_recursion_limit(recursion_limit);
+                Parser { input }
+            }
+
+            fn merge_to(&mut self, target: &mut impl Message) -> Result<()> {
+                box_try!(target.merge_from(&mut self.input));
+                Ok(())
+            }
+        }
+
+        #[cfg(feature = "prost-codec")]
+        struct Parser<'a> {
+            input: &'a [u8],
+        }
+
+        #[cfg(feature = "prost-codec")]
+        impl<'a> Parser<'a> {
+            fn new(input: &'a [u8], _: u32) -> Parser<'a> {
+                Parser { input }
+            }
+
+            fn merge_to(&self, target: &mut impl Message) -> Result<()> {
+                box_try!(target.merge_from_bytes(&self.input));
+                Ok(())
+            }
+        }
+
         fail_point!("coprocessor_parse_request", |_| Err(box_err!(
             "unsupported tp (failpoint)"
         )));
@@ -162,15 +203,16 @@ impl<E: Engine> Endpoint<E> {
             None
         };
 
-        let mut input = CodedInputStream::from_bytes(&data);
-        input.set_recursion_limit(self.recursion_limit);
+        // Prost and rust-proto require different mutability.
+        #[allow(unused_mut)]
+        let mut parser = Parser::new(&data, self.recursion_limit);
         let req_ctx: ReqContext;
         let builder: RequestHandlerBuilder<E::Snap>;
 
         match req.get_tp() {
             REQ_TYPE_DAG => {
                 let mut dag = DagRequest::default();
-                box_try!(dag.merge_from(&mut input));
+                parser.merge_to(&mut dag)?;
                 let mut table_scan = false;
                 let mut is_desc_scan = false;
                 if let Some(scan) = dag.get_executors().iter().next() {
@@ -205,22 +247,16 @@ impl<E: Engine> Endpoint<E> {
                 self.check_memory_locks(&req_ctx)?;
 
                 let batch_row_limit = self.get_batch_row_limit(is_streaming);
-                let quota_limiter = self.quota_limiter.clone();
                 builder = Box::new(move |snap, req_ctx| {
-                    let data_version = snap.ext().get_data_version();
+                    let data_version = snap.get_data_version();
                     let store = SnapshotStore::new(
                         snap,
                         start_ts.into(),
                         req_ctx.context.get_isolation_level(),
                         !req_ctx.context.get_not_fill_cache(),
                         req_ctx.bypass_locks.clone(),
-                        req_ctx.access_locks.clone(),
                         req.get_is_cache_enabled(),
                     );
-                    let paging_size = match req.get_paging_size() {
-                        0 => None,
-                        i => Some(i),
-                    };
                     dag::DagHandlerBuilder::new(
                         dag,
                         req_ctx.ranges.clone(),
@@ -229,8 +265,6 @@ impl<E: Engine> Endpoint<E> {
                         batch_row_limit,
                         is_streaming,
                         req.get_is_cache_enabled(),
-                        paging_size,
-                        quota_limiter,
                     )
                     .data_version(data_version)
                     .build()
@@ -238,7 +272,7 @@ impl<E: Engine> Endpoint<E> {
             }
             REQ_TYPE_ANALYZE => {
                 let mut analyze = AnalyzeReq::default();
-                box_try!(analyze.merge_from(&mut input));
+                parser.merge_to(&mut analyze)?;
                 if start_ts == 0 {
                     start_ts = analyze.get_start_ts_fallback();
                 }
@@ -262,7 +296,6 @@ impl<E: Engine> Endpoint<E> {
                 );
 
                 self.check_memory_locks(&req_ctx)?;
-                let quota_limiter = self.quota_limiter.clone();
 
                 builder = Box::new(move |snap, req_ctx| {
                     statistics::analyze::AnalyzeContext::new(
@@ -271,14 +304,13 @@ impl<E: Engine> Endpoint<E> {
                         start_ts,
                         snap,
                         req_ctx,
-                        quota_limiter,
                     )
                     .map(|h| h.into_boxed())
                 });
             }
             REQ_TYPE_CHECKSUM => {
                 let mut checksum = ChecksumRequest::default();
-                box_try!(checksum.merge_from(&mut input));
+                parser.merge_to(&mut checksum)?;
                 let table_scan = checksum.get_scan_on() == ChecksumScanOn::Table;
                 if start_ts == 0 {
                     start_ts = checksum.get_start_ts_fallback();
@@ -376,11 +408,9 @@ impl<E: Engine> Endpoint<E> {
         // When snapshot is retrieved, deadline may exceed.
         tracker.on_snapshot_finished();
         tracker.req_ctx.deadline.check()?;
-        tracker.buckets = snapshot.ext().get_buckets();
-        let buckets_version = tracker.buckets.as_ref().map_or(0, |b| b.version);
 
         let mut handler = if tracker.req_ctx.cache_match_version.is_some()
-            && tracker.req_ctx.cache_match_version == snapshot.ext().get_data_version()
+            && tracker.req_ctx.cache_match_version == snapshot.get_data_version()
         {
             // Build a cached request handler instead if cache version is matching.
             CachedRequestHandler::builder()(snapshot, &tracker.req_ctx)?
@@ -421,7 +451,6 @@ impl<E: Engine> Endpoint<E> {
         };
         resp.set_exec_details(exec_details);
         resp.set_exec_details_v2(exec_details_v2);
-        resp.set_latest_buckets_version(buckets_version);
         Ok(resp)
     }
 
@@ -436,14 +465,7 @@ impl<E: Engine> Endpoint<E> {
     ) -> impl Future<Output = Result<MemoryTraceGuard<coppb::Response>>> {
         let priority = req_ctx.context.get_priority();
         let task_id = req_ctx.build_task_id();
-        let key_ranges = req_ctx
-            .ranges
-            .iter()
-            .map(|key_range| (key_range.get_start().to_vec(), key_range.get_end().to_vec()))
-            .collect();
-        let resource_tag = self
-            .resource_tag_factory
-            .new_tag_with_key_ranges(&req_ctx.context, key_ranges);
+        let resource_tag = ResourceMeteringTag::from_rpc_context(&req_ctx.context);
         // box the tracker so that moving it is cheap.
         let tracker = Box::new(Tracker::new(req_ctx, self.slow_log_threshold));
 
@@ -521,12 +543,14 @@ impl<E: Engine> Endpoint<E> {
             loop {
                 let result = {
                     tracker.on_begin_item();
+                    let perf_statistics_instant = PerfStatisticsInstant::new();
 
                     let result = handler.handle_streaming_request();
 
                     let mut storage_stats = Statistics::default();
                     handler.collect_scan_statistics(&mut storage_stats);
-                    tracker.on_finish_item(Some(storage_stats));
+                    let perf_statistics = perf_statistics_instant.delta();
+                    tracker.on_finish_item(Some(storage_stats), perf_statistics);
 
                     result
                 };
@@ -568,14 +592,7 @@ impl<E: Engine> Endpoint<E> {
     ) -> Result<impl futures::stream::Stream<Item = Result<coppb::Response>>> {
         let (tx, rx) = mpsc::channel::<Result<coppb::Response>>(self.stream_channel_size);
         let priority = req_ctx.context.get_priority();
-        let key_ranges = req_ctx
-            .ranges
-            .iter()
-            .map(|key_range| (key_range.get_start().to_vec(), key_range.get_end().to_vec()))
-            .collect();
-        let resource_tag = self
-            .resource_tag_factory
-            .new_tag_with_key_ranges(&req_ctx.context, key_ranges);
+        let resource_tag = ResourceMeteringTag::from_rpc_context(&req_ctx.context);
         let task_id = req_ctx.build_task_id();
         let tracker = Box::new(Tracker::new(req_ctx, self.slow_log_threshold));
 
@@ -657,24 +674,25 @@ fn make_error_response(e: Error) -> coppb::Response {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{atomic, mpsc},
-        thread, vec,
-    };
+    use super::*;
+
+    use std::sync::{atomic, mpsc};
+    use std::thread;
+    use std::vec;
 
     use futures::executor::{block_on, block_on_stream};
-    use kvproto::kvrpcpb::IsolationLevel;
-    use protobuf::Message;
-    use tipb::{Executor, Expr};
-    use txn_types::{Key, LockType};
 
-    use super::*;
-    use crate::{
-        config::CoprReadPoolConfig,
-        coprocessor::readpool_impl::build_read_pool_for_test,
-        read_pool::ReadPool,
-        storage::{kv::RocksEngine, TestEngineBuilder},
-    };
+    use tipb::Executor;
+    use tipb::Expr;
+
+    use crate::config::CoprReadPoolConfig;
+    use crate::coprocessor::readpool_impl::build_read_pool_for_test;
+    use crate::read_pool::ReadPool;
+    use crate::storage::kv::RocksEngine;
+    use crate::storage::TestEngineBuilder;
+    use engine_rocks::PerfLevel;
+    use protobuf::Message;
+    use txn_types::{Key, LockType};
 
     /// A unary `RequestHandler` that always produces a fixture.
     struct UnaryFixture {
@@ -831,8 +849,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         // a normal request
@@ -872,13 +889,14 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
         copr.recursion_limit = 100;
 
         let req = {
             let mut expr = Expr::default();
+            // The recursion limit in Prost and rust-protobuf (by default) is 100 (for rust-protobuf,
+            // that limit is set to 1000 as a configuration default).
             for _ in 0..101 {
                 let mut e = Expr::default();
                 e.mut_children().push(expr);
@@ -910,8 +928,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         let mut req = coppb::Request::default();
@@ -933,8 +950,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         let mut req = coppb::Request::default();
@@ -947,11 +963,9 @@ mod tests {
 
     #[test]
     fn test_full() {
-        use std::sync::Mutex;
-
-        use tikv_util::yatp_pool::{DefaultTicker, YatpPoolBuilder};
-
         use crate::storage::kv::{destroy_tls_engine, set_tls_engine};
+        use std::sync::Mutex;
+        use tikv_util::yatp_pool::{DefaultTicker, YatpPoolBuilder};
 
         let engine = TestEngineBuilder::new().build().unwrap();
 
@@ -981,8 +995,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         let (tx, rx) = mpsc::channel();
@@ -1029,8 +1042,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         let handler_builder =
@@ -1054,8 +1066,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         // Fail immediately
@@ -1107,8 +1118,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         let handler_builder = Box::new(|_, _: &_| Ok(StreamFixture::new(vec![]).into_boxed()));
@@ -1135,8 +1145,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         // handler returns `finished == true` should not be called again.
@@ -1234,8 +1243,7 @@ mod tests {
             },
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         let counter = Arc::new(atomic::AtomicIsize::new(0));
@@ -1298,13 +1306,8 @@ mod tests {
         };
 
         let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &config,
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
+        let copr =
+            Endpoint::<RocksEngine>::new(&config, read_pool.handle(), cm, PerfLevel::EnableCount);
 
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -1630,8 +1633,7 @@ mod tests {
             &Config::default(),
             read_pool.handle(),
             cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
 
         {
@@ -1689,13 +1691,9 @@ mod tests {
         });
 
         let config = Config::default();
-        let copr = Endpoint::<RocksEngine>::new(
-            &config,
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
+        let copr =
+            Endpoint::<RocksEngine>::new(&config, read_pool.handle(), cm, PerfLevel::EnableCount);
+
         let mut req = coppb::Request::default();
         req.mut_context().set_isolation_level(IsolationLevel::Si);
         req.set_start_ts(100);

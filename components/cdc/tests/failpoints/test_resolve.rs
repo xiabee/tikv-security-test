@@ -1,24 +1,22 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
-use std::time::Duration;
-
-use api_version::{test_kv_format_impl, KvFormat};
-use futures::{executor::block_on, sink::SinkExt};
+use crate::{new_event_feed, TestSuite, TestSuiteBuilder};
+use futures::executor::block_on;
+use futures::sink::SinkExt;
 use grpcio::WriteFlags;
-use kvproto::{cdcpb::*, kvrpcpb::*};
+#[cfg(feature = "prost-codec")]
+use kvproto::cdcpb::event::{Event as Event_oneof_event, LogType as EventLogType};
+#[cfg(not(feature = "prost-codec"))]
+use kvproto::cdcpb::*;
+use kvproto::kvrpcpb::*;
 use pd_client::PdClient;
 use raft::eraftpb::ConfChangeType;
+use std::time::Duration;
 use test_raftstore::*;
 use tikv_util::config::*;
 
-use crate::{new_event_feed, TestSuite, TestSuiteBuilder};
-
 #[test]
 fn test_stale_resolver() {
-    test_kv_format_impl!(test_stale_resolver_impl<ApiV1 ApiV2>);
-}
-
-fn test_stale_resolver_impl<F: KvFormat>() {
-    let mut suite = TestSuite::new(3, F::TAG);
+    let mut suite = TestSuite::new(3);
 
     let fp = "before_schedule_resolver_ready";
     fail::cfg(fp, "pause").unwrap();
@@ -32,8 +30,7 @@ fn test_stale_resolver_impl<F: KvFormat>() {
     // Sleep for a while to wait the scan is done
     sleep_ms(200);
 
-    // If tikv enable ApiV2, txn key needs to start with 'x';
-    let (k, v) = ("xkey1".to_owned(), "value".to_owned());
+    let (k, v) = ("key1".to_owned(), "value".to_owned());
     // Prewrite
     let start_ts = block_on(suite.cluster.pd_client.get_tso()).unwrap();
     let mut mutation = Mutation::default();

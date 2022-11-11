@@ -1,6 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::{bit_vec::BitVec, ChunkRef, ChunkedVec, Evaluable, EvaluableRet, UnsafeRefInto};
+use super::bit_vec::BitVec;
+use super::{ChunkRef, ChunkedVec, Evaluable, EvaluableRet, UnsafeRefInto};
 use crate::impl_chunked_vec_common;
 
 /// A vector storing `Option<T>` with a compact layout.
@@ -137,8 +138,8 @@ mod tests {
             Real::new(1.01001).ok(),
             Real::new(-0.01).ok(),
             Real::new(1.02001).ok(),
-            Real::new(f64::MIN).ok(),
-            Real::new(f64::MAX).ok(),
+            Real::new(std::f64::MIN).ok(),
+            Real::new(std::f64::MAX).ok(),
             None,
         ];
         assert_eq!(
@@ -212,8 +213,8 @@ mod tests {
             Real::new(1.01001).ok(),
             Real::new(-0.01).ok(),
             Real::new(1.02001).ok(),
-            Real::new(f64::MIN).ok(),
-            Real::new(f64::MAX).ok(),
+            Real::new(std::f64::MIN).ok(),
+            Real::new(std::f64::MAX).ok(),
             None,
         ];
         let mut chunked_vec = ChunkedVecSized::<Real>::from_slice(test_real);
@@ -233,8 +234,8 @@ mod tests {
         let test_real_1: &[Option<Real>] = &[None, Real::new(1.01001).ok(), Real::new(-0.01).ok()];
         let test_real_2: &[Option<Real>] = &[
             Real::new(1.02001).ok(),
-            Real::new(f64::MIN).ok(),
-            Real::new(f64::MAX).ok(),
+            Real::new(std::f64::MIN).ok(),
+            Real::new(std::f64::MAX).ok(),
             None,
         ];
         let mut chunked_vec_1 = ChunkedVecSized::<Real>::from_slice(test_real_1);
@@ -249,8 +250,8 @@ mod tests {
                 Real::new(1.01001).ok(),
                 Real::new(-0.01).ok(),
                 Real::new(1.02001).ok(),
-                Real::new(f64::MIN).ok(),
-                Real::new(f64::MAX).ok(),
+                Real::new(std::f64::MIN).ok(),
+                Real::new(std::f64::MAX).ok(),
                 None,
             ]
         );

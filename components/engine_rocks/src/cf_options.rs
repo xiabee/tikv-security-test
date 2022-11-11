@@ -1,13 +1,12 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{CFOptionsExt, ColumnFamilyOptions, Result, SstPartitionerFactory};
+use crate::engine::RocksEngine;
+use crate::util;
+use crate::{db_options::RocksTitanDBOptions, sst_partitioner::RocksSstPartitionerFactory};
+use engine_traits::{CFOptionsExt, Result};
+use engine_traits::{ColumnFamilyOptions, SstPartitionerFactory};
 use rocksdb::ColumnFamilyOptions as RawCFOptions;
 use tikv_util::box_err;
-
-use crate::{
-    db_options::RocksTitanDBOptions, engine::RocksEngine,
-    sst_partitioner::RocksSstPartitionerFactory, util,
-};
 
 impl CFOptionsExt for RocksEngine {
     type ColumnFamilyOptions = RocksColumnFamilyOptions;

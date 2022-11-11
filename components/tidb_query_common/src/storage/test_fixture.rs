@@ -1,11 +1,10 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    collections::{btree_map, BTreeMap},
-    sync::Arc,
-};
+use std::collections::{btree_map, BTreeMap};
+use std::sync::Arc;
 
-use super::{range::*, Result};
+use super::range::*;
+use super::Result;
 
 type ErrorBuilder = Box<dyn Send + Sync + Fn() -> crate::error::StorageError>;
 

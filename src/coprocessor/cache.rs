@@ -3,12 +3,10 @@
 use async_trait::async_trait;
 use kvproto::coprocessor::Response;
 use tikv_alloc::trace::MemoryTraceGuard;
-use tikv_kv::SnapshotExt;
 
-use crate::{
-    coprocessor::{RequestHandler, *},
-    storage::Snapshot,
-};
+use crate::coprocessor::RequestHandler;
+use crate::coprocessor::*;
+use crate::storage::Snapshot;
 
 pub struct CachedRequestHandler {
     data_version: Option<u64>,
@@ -17,7 +15,7 @@ pub struct CachedRequestHandler {
 impl CachedRequestHandler {
     pub fn new<S: Snapshot>(snap: S) -> Self {
         Self {
-            data_version: snap.ext().get_data_version(),
+            data_version: snap.get_data_version(),
         }
     }
 

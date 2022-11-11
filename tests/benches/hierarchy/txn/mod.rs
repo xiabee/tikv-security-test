@@ -2,16 +2,16 @@
 
 use concurrency_manager::ConcurrencyManager;
 use criterion::{black_box, BatchSize, Bencher, Criterion};
-use kvproto::kvrpcpb::{AssertionLevel, Context};
+use kvproto::kvrpcpb::Context;
 use test_util::KvGenerator;
-use tikv::storage::{
-    kv::{Engine, WriteData},
-    mvcc::{self, MvccTxn, SnapshotReader},
-    txn::{cleanup, commit, prewrite, CommitKind, TransactionKind, TransactionProperties},
-};
+use tikv::storage::kv::{Engine, WriteData};
+use tikv::storage::mvcc::{self, MvccTxn, SnapshotReader};
 use txn_types::{Key, Mutation, TimeStamp};
 
 use super::{BenchConfig, EngineFactory, DEFAULT_ITERATIONS};
+use tikv::storage::txn::{
+    cleanup, commit, prewrite, CommitKind, TransactionKind, TransactionProperties,
+};
 
 fn setup_prewrite<E, F>(
     engine: &E,
@@ -42,13 +42,12 @@ where
             min_commit_ts: TimeStamp::default(),
             need_old_value: false,
             is_retry_request: false,
-            assertion_level: AssertionLevel::Off,
         };
         prewrite(
             &mut txn,
             &mut reader,
             &txn_props,
-            Mutation::make_put(Key::from_raw(k), v.clone()),
+            Mutation::Put((Key::from_raw(k), v.clone())),
             &None,
             false,
         )
@@ -60,7 +59,7 @@ where
     keys
 }
 
-fn txn_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &BenchConfig<F>) {
+fn txn_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher, config: &BenchConfig<F>) {
     let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
@@ -70,7 +69,7 @@ fn txn_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &Be
                 KvGenerator::new(config.key_length, config.value_length)
                     .generate(DEFAULT_ITERATIONS)
                     .iter()
-                    .map(|(k, v)| (Mutation::make_put(Key::from_raw(k), v.clone()), k.clone()))
+                    .map(|(k, v)| (Mutation::Put((Key::from_raw(k), v.clone())), k.clone()))
                     .collect();
             mutations
         },
@@ -89,7 +88,6 @@ fn txn_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &Be
                     min_commit_ts: TimeStamp::default(),
                     need_old_value: false,
                     is_retry_request: false,
-                    assertion_level: AssertionLevel::Off,
                 };
                 prewrite(&mut txn, &mut reader, &txn_props, mutation, &None, false).unwrap();
                 let write_data = WriteData::from_modifies(txn.into_modifies());
@@ -100,7 +98,7 @@ fn txn_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &Be
     )
 }
 
-fn txn_commit<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &BenchConfig<F>) {
+fn txn_commit<E: Engine, F: EngineFactory<E>>(b: &mut Bencher, config: &BenchConfig<F>) {
     let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
@@ -120,10 +118,7 @@ fn txn_commit<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &Benc
     );
 }
 
-fn txn_rollback_prewrote<E: Engine, F: EngineFactory<E>>(
-    b: &mut Bencher<'_>,
-    config: &BenchConfig<F>,
-) {
+fn txn_rollback_prewrote<E: Engine, F: EngineFactory<E>>(b: &mut Bencher, config: &BenchConfig<F>) {
     let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
@@ -143,10 +138,7 @@ fn txn_rollback_prewrote<E: Engine, F: EngineFactory<E>>(
     )
 }
 
-fn txn_rollback_conflict<E: Engine, F: EngineFactory<E>>(
-    b: &mut Bencher<'_>,
-    config: &BenchConfig<F>,
-) {
+fn txn_rollback_conflict<E: Engine, F: EngineFactory<E>>(b: &mut Bencher, config: &BenchConfig<F>) {
     let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
@@ -167,7 +159,7 @@ fn txn_rollback_conflict<E: Engine, F: EngineFactory<E>>(
 }
 
 fn txn_rollback_non_prewrote<E: Engine, F: EngineFactory<E>>(
-    b: &mut Bencher<'_>,
+    b: &mut Bencher,
     config: &BenchConfig<F>,
 ) {
     let engine = config.engine_factory.build();

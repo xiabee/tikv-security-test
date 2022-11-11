@@ -1,17 +1,16 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{thread, time::Duration};
-
-use kvproto::{
-    disk_usage::DiskUsage,
-    kvrpcpb::{DiskFullOpt, Op},
-    metapb::Region,
-    raft_cmdpb::*,
-};
+use kvproto::disk_usage::DiskUsage;
+use kvproto::kvrpcpb::{DiskFullOpt, Op};
+use kvproto::metapb::Region;
+use kvproto::raft_cmdpb::*;
 use raft::eraftpb::MessageType;
 use raftstore::store::msg::*;
+use std::thread;
+use std::time::Duration;
 use test_raftstore::*;
-use tikv_util::{config::ReadableDuration, time::Instant};
+use tikv_util::config::ReadableDuration;
+use tikv_util::time::Instant;
 
 fn assert_disk_full(resp: &RaftCmdResponse) {
     assert!(resp.get_header().get_error().has_disk_full());
@@ -501,14 +500,7 @@ fn test_almost_and_already_full_behavior() {
     let index_3 = cluster.raft_local_state(1, 3).last_index;
     let index_4 = cluster.raft_local_state(1, 4).last_index;
     let index_5 = cluster.raft_local_state(1, 5).last_index;
-    assert!(
-        index_1 >= index_2
-            && index_1 >= index_3
-            && index_2 > index_4
-            && index_2 > index_5
-            && index_3 > index_4
-            && index_3 > index_5
-    );
+    assert!(index_1 == index_2 && index_1 == index_3 && index_1 > index_4 && index_1 > index_5);
 
     for i in [2u64, 3] {
         fail::remove(get_fp(DiskUsage::AlmostFull, i));

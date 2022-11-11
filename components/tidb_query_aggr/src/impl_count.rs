@@ -1,14 +1,15 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use tidb_query_codegen::AggrFunction;
-use tidb_query_common::Result;
-use tidb_query_datatype::{
-    builder::FieldTypeBuilder, codec::data_type::*, expr::EvalContext, FieldTypeFlag, FieldTypeTp,
-};
-use tidb_query_expr::RpnExpression;
+use tidb_query_datatype::builder::FieldTypeBuilder;
+use tidb_query_datatype::{FieldTypeFlag, FieldTypeTp};
 use tipb::{Expr, ExprType, FieldType};
 
 use super::*;
+use tidb_query_common::Result;
+use tidb_query_datatype::codec::data_type::*;
+use tidb_query_datatype::expr::EvalContext;
+use tidb_query_expr::RpnExpression;
 
 /// The parser for COUNT aggregate function.
 pub struct AggrFnDefinitionParserCount;
@@ -139,7 +140,8 @@ mod tests {
     use tidb_query_datatype::EvalType;
     use tikv_util::buffer_vec::BufferVec;
 
-    use super::{super::AggrFunction, *};
+    use super::super::AggrFunction;
+    use super::*;
 
     #[test]
     fn test_update() {
@@ -174,7 +176,7 @@ mod tests {
         assert_eq!(result[0].to_int_vec(), &[Some(6)]);
 
         let chunked_vec: ChunkedVecSized<Int> = vec![Some(1i64), None, Some(-1i64)].into();
-        update_vector!(state, &mut ctx, chunked_vec, &[1, 2]).unwrap();
+        update_vector!(state, &mut ctx, &chunked_vec, &[1, 2]).unwrap();
 
         result[0].clear();
         state.push_result(&mut ctx, &mut result).unwrap();

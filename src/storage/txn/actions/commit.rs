@@ -1,15 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use txn_types::{Key, TimeStamp, Write, WriteType};
-
-use crate::storage::{
-    mvcc::{
-        metrics::{MVCC_CONFLICT_COUNTER, MVCC_DUPLICATE_CMD_COUNTER_VEC},
-        ErrorInner, LockType, MvccTxn, ReleasedLock, Result as MvccResult, SnapshotReader,
-    },
-    Snapshot,
+use crate::storage::mvcc::{
+    metrics::{MVCC_CONFLICT_COUNTER, MVCC_DUPLICATE_CMD_COUNTER_VEC},
+    ErrorInner, LockType, MvccTxn, ReleasedLock, Result as MvccResult, SnapshotReader,
 };
+use crate::storage::Snapshot;
+use txn_types::{Key, TimeStamp, Write, WriteType};
 
 pub fn commit<S: Snapshot>(
     txn: &mut MvccTxn,
@@ -105,23 +102,23 @@ pub fn commit<S: Snapshot>(
 }
 
 pub mod tests {
+    use super::*;
+    use crate::storage::mvcc::tests::*;
+    use crate::storage::mvcc::MvccTxn;
+    use crate::storage::Engine;
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
     use txn_types::TimeStamp;
 
-    use super::*;
     #[cfg(test)]
     use crate::storage::txn::tests::{
         must_acquire_pessimistic_lock_for_large_txn, must_prewrite_delete, must_prewrite_lock,
         must_prewrite_put, must_prewrite_put_for_large_txn, must_prewrite_put_impl, must_rollback,
     };
+
     #[cfg(test)]
     use crate::storage::{
         mvcc::SHORT_VALUE_MAX_LEN, txn::commands::check_txn_status, TestEngineBuilder, TxnStatus,
-    };
-    use crate::storage::{
-        mvcc::{tests::*, MvccTxn},
-        Engine,
     };
 
     pub fn must_succeed<E: Engine>(
@@ -281,8 +278,6 @@ pub mod tests {
             ts(60, 1),
             TimeStamp::zero(),
             false,
-            kvproto::kvrpcpb::Assertion::None,
-            kvproto::kvrpcpb::AssertionLevel::Off,
         );
         // The min_commit_ts is ts(70, 0) other than ts(60, 1) in prewrite request.
         must_large_txn_locked(&engine, k, ts(60, 0), 100, ts(70, 1), false);

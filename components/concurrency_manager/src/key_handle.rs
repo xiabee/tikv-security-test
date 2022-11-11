@@ -1,12 +1,10 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{cell::UnsafeCell, mem, sync::Arc};
-
+use super::lock_table::LockTable;
 use parking_lot::Mutex;
+use std::{cell::UnsafeCell, mem, sync::Arc};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use txn_types::{Key, Lock};
-
-use super::lock_table::LockTable;
 
 /// An entry in the in-memory table providing functions related to a specific
 /// key.
@@ -99,14 +97,12 @@ impl Drop for KeyHandleGuard {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
-
     use tokio::time::sleep;
-
-    use super::*;
 
     #[tokio::test]
     async fn test_key_mutex() {

@@ -135,12 +135,12 @@ fn test_serving_status() {
     thread::sleep(Duration::from_millis(500));
     assert_eq!(check(), ServingStatus::Serving);
 
-    fail::cfg("pause_on_peer_collect_message", "pause").unwrap();
+    fail::cfg("on_peer_handle_control_1", "pause").unwrap();
 
     thread::sleep(Duration::from_secs(1));
     assert_eq!(check(), ServingStatus::ServiceUnknown);
 
-    fail::remove("pause_on_peer_collect_message");
+    fail::remove("on_peer_handle_control_1");
 
     // It should recover within one round.
     thread::sleep(Duration::from_millis(200));

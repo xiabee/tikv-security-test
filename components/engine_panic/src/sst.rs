@@ -1,13 +1,11 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::path::PathBuf;
-
+use crate::engine::PanicEngine;
 use engine_traits::{
     CfName, ExternalSstFileInfo, IterOptions, Iterable, Iterator, Result, SeekKey,
     SstCompressionType, SstExt, SstReader, SstWriter, SstWriterBuilder,
 };
-
-use crate::engine::PanicEngine;
+use std::path::PathBuf;
 
 impl SstExt for PanicEngine {
     type SstReader = PanicSstReader;
@@ -43,10 +41,10 @@ impl Iterable for PanicSstReader {
 pub struct PanicSstReaderIterator;
 
 impl Iterator for PanicSstReaderIterator {
-    fn seek(&mut self, key: SeekKey<'_>) -> Result<bool> {
+    fn seek(&mut self, key: SeekKey) -> Result<bool> {
         panic!()
     }
-    fn seek_for_prev(&mut self, key: SeekKey<'_>) -> Result<bool> {
+    fn seek_for_prev(&mut self, key: SeekKey) -> Result<bool> {
         panic!()
     }
 

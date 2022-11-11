@@ -1,16 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::ptr;
-
+use super::super::Result;
+use super::constants::*;
+use super::json_extract::extract_json;
+use super::path_expr::{PathExpression, PathLeg};
+use super::{Json, JsonRef, JsonType};
 use codec::number::NumberCodec;
-
-use super::{
-    super::Result,
-    constants::*,
-    json_extract::extract_json,
-    path_expr::{PathExpression, PathLeg},
-    Json, JsonRef, JsonType,
-};
+use std::ptr;
 
 /// A helper struct that derives a new JSON by combining and manipulating
 /// the encoded bytes directly. Only used by `json_replace`, `json_set`,
