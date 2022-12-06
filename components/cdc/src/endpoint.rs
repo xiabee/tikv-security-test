@@ -1,84 +1,87 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cmp::Reverse;
-use std::cmp::{Ord, Ordering as CmpOrdering, PartialOrd};
-use std::collections::BinaryHeap;
-use std::f64::INFINITY;
-use std::fmt;
-use std::marker::PhantomData;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::{
+    cmp::{Ord, Ordering as CmpOrdering, PartialOrd, Reverse},
+    collections::BinaryHeap,
+    fmt,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
-use collections::{HashMap, HashSet};
+use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
+use collections::{HashMap, HashMapEntry, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use crossbeam::atomic::AtomicCell;
-use engine_traits::{KvEngine, Snapshot as EngineSnapshot};
+use engine_traits::KvEngine;
 use fail::fail_point;
 use futures::compat::Future01CompatExt;
 use grpcio::Environment;
-use kvproto::cdcpb::{
-    ChangeDataRequest, ClusterIdMismatch as ErrorClusterIdMismatch,
-    DuplicateRequest as ErrorDuplicateRequest, Error as EventError, Event, Event_oneof_event,
-    ResolvedTs,
+use kvproto::{
+    cdcpb::{
+        ChangeDataRequest, ClusterIdMismatch as ErrorClusterIdMismatch,
+        Compatibility as ErrorCompatibility, DuplicateRequest as ErrorDuplicateRequest,
+        Error as EventError, Event, Event_oneof_event, ResolvedTs,
+    },
+    kvrpcpb::ApiVersion,
+    metapb::Region,
 };
-use kvproto::kvrpcpb::ExtraOp as TxnExtraOp;
-use kvproto::metapb::{Region, RegionEpoch};
-use kvproto::tikvpb::TikvClient;
 use online_config::{ConfigChange, OnlineConfig};
 use pd_client::{Feature, PdClient};
-use raftstore::coprocessor::CmdBatch;
-use raftstore::coprocessor::ObserveID;
-use raftstore::router::RaftStoreRouter;
-use raftstore::store::fsm::{ChangeObserver, StoreMeta};
-use raftstore::store::msg::{Callback, ReadResponse, SignificantMsg};
-use raftstore::store::RegionReadProgressRegistry;
-use resolved_ts::Resolver;
-use security::SecurityManager;
-use tikv::config::CdcConfig;
-use tikv::storage::kv::{PerfStatisticsInstant, Snapshot};
-use tikv::storage::mvcc::{DeltaScanner, ScannerBuilder};
-use tikv::storage::txn::TxnEntry;
-use tikv::storage::txn::TxnEntryScanner;
-use tikv_kv::PerfStatisticsDelta;
-use tikv_util::sys::inspector::{self_thread_inspector, ThreadInspector};
-use tikv_util::time::{Instant, Limiter};
-use tikv_util::timer::SteadyTimer;
-use tikv_util::worker::{Runnable, RunnableWithTimer, ScheduleError, Scheduler};
-use tikv_util::{box_err, debug, error, impl_display_as_debug, info, warn};
-use tokio::runtime::{Builder, Runtime};
-use tokio::sync::{Mutex, Semaphore};
-use txn_types::{Key, Lock, LockType, TimeStamp, TxnExtra, TxnExtraScheduler};
-
-use crate::channel::{CdcEvent, MemoryQuota, SendError};
-use crate::delegate::{
-    on_init_downstream, post_init_downstream, Delegate, Downstream, DownstreamID, DownstreamState,
+use raftstore::{
+    coprocessor::{CmdBatch, ObserveId},
+    router::RaftStoreRouter,
+    store::fsm::{ChangeObserver, StoreMeta},
 };
-use crate::metrics::*;
-use crate::old_value::{OldValueCache, OldValueCallback};
-use crate::service::{Conn, ConnID, FeatureGate};
-use crate::{CdcObserver, Error, Result};
+use resolved_ts::{LeadershipResolver, Resolver};
+use security::SecurityManager;
+use tikv::{config::CdcConfig, storage::Statistics};
+use tikv_util::{
+    debug, defer, error, impl_display_as_debug, info,
+    mpsc::bounded,
+    slow_log,
+    sys::thread::ThreadBuildWrapper,
+    time::{Instant, Limiter, SlowTimer},
+    timer::SteadyTimer,
+    warn,
+    worker::{Runnable, RunnableWithTimer, ScheduleError, Scheduler},
+};
+use tokio::{
+    runtime::{Builder, Runtime},
+    sync::Semaphore,
+};
+use txn_types::{TimeStamp, TxnExtra, TxnExtraScheduler};
+
+use crate::{
+    channel::{CdcEvent, MemoryQuota, SendError},
+    delegate::{on_init_downstream, Delegate, Downstream, DownstreamId, DownstreamState},
+    initializer::Initializer,
+    metrics::*,
+    old_value::{OldValueCache, OldValueCallback},
+    service::{Conn, ConnId, FeatureGate},
+    CdcObserver, Error,
+};
 
 const FEATURE_RESOLVED_TS_STORE: Feature = Feature::require(5, 0, 0);
-const METRICS_FLUSH_INTERVAL: u64 = 10_000; // 10s
+const METRICS_FLUSH_INTERVAL: u64 = 1_000; // 1s
 // 10 minutes, it's the default gc life time of TiDB
 // and is long enough for most transactions.
 const WARN_RESOLVED_TS_LAG_THRESHOLD: Duration = Duration::from_secs(600);
-// Suppress repeat resolved ts lag warnning.
+// Suppress repeat resolved ts lag warning.
 const WARN_RESOLVED_TS_COUNT_THRESHOLD: usize = 10;
 
 pub enum Deregister {
     Downstream {
         region_id: u64,
-        downstream_id: DownstreamID,
-        conn_id: ConnID,
+        downstream_id: DownstreamId,
+        conn_id: ConnId,
         err: Option<Error>,
     },
     Delegate {
         region_id: u64,
-        observe_id: ObserveID,
+        observe_id: ObserveId,
         err: Error,
     },
-    Conn(ConnID),
+    Conn(ConnId),
 }
 
 impl_display_as_debug!(Deregister);
@@ -128,7 +131,7 @@ pub enum Task {
     Register {
         request: ChangeDataRequest,
         downstream: Downstream,
-        conn_id: ConnID,
+        conn_id: ConnId,
         version: semver::Version,
     },
     Deregister(Deregister),
@@ -139,21 +142,26 @@ pub enum Task {
         multi: Vec<CmdBatch>,
         old_value_cb: OldValueCallback,
     },
-    MinTS {
+    MinTs {
         regions: Vec<u64>,
         min_ts: TimeStamp,
+        current_ts: TimeStamp,
     },
     ResolverReady {
-        observe_id: ObserveID,
+        observe_id: ObserveId,
         region: Region,
         resolver: Resolver,
     },
-    RegisterMinTsEvent,
+    RegisterMinTsEvent {
+        leader_resolver: LeadershipResolver,
+        // The time at which the event actually occurred.
+        event_time: Instant,
+    },
     // The result of ChangeCmd should be returned from CDC Endpoint to ensure
     // the downstream switches to Normal after the previous commands was sunk.
     InitDownstream {
         region_id: u64,
-        downstream_id: DownstreamID,
+        downstream_id: DownstreamId,
         downstream_state: Arc<AtomicCell<DownstreamState>>,
         // `incremental_scan_barrier` will be sent into `sink` to ensure all delta changes
         // are delivered to the downstream. And then incremental scan can start.
@@ -195,12 +203,18 @@ impl fmt::Debug for Task {
                 .field("conn_id", &conn.get_id())
                 .finish(),
             Task::MultiBatch { multi, .. } => de
-                .field("type", &"multibatch")
-                .field("multibatch", &multi.len())
+                .field("type", &"multi_batch")
+                .field("multi_batch", &multi.len())
                 .finish(),
-            Task::MinTS { ref min_ts, .. } => {
-                de.field("type", &"mit_ts").field("min_ts", min_ts).finish()
-            }
+            Task::MinTs {
+                ref min_ts,
+                ref current_ts,
+                ..
+            } => de
+                .field("type", &"mit_ts")
+                .field("current_ts", current_ts)
+                .field("min_ts", min_ts)
+                .finish(),
             Task::ResolverReady {
                 ref observe_id,
                 ref region,
@@ -210,7 +224,9 @@ impl fmt::Debug for Task {
                 .field("observe_id", &observe_id)
                 .field("region_id", &region.get_id())
                 .finish(),
-            Task::RegisterMinTsEvent => de.field("type", &"register_min_ts").finish(),
+            Task::RegisterMinTsEvent { ref event_time, .. } => {
+                de.field("event_time", &event_time).finish()
+            }
             Task::InitDownstream {
                 ref region_id,
                 ref downstream_id,
@@ -233,7 +249,7 @@ impl fmt::Debug for Task {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResolvedRegion {
     region_id: u64,
     resolved_ts: TimeStamp,
@@ -307,21 +323,22 @@ pub struct Endpoint<T, E> {
     cluster_id: u64,
 
     capture_regions: HashMap<u64, Delegate>,
-    connections: HashMap<ConnID, Conn>,
+    connections: HashMap<ConnId, Conn>,
     scheduler: Scheduler<Task>,
     raft_router: T,
-    engine: PhantomData<E>,
+    engine: E,
     observer: CdcObserver,
 
     pd_client: Arc<dyn PdClient>,
     timer: SteadyTimer,
     tso_worker: Runtime,
     store_meta: Arc<StdMutex<StoreMeta>>,
-    /// The concurrency manager for transactions. It's needed for CDC to check locks when
-    /// calculating resolved_ts.
+    /// The concurrency manager for transactions. It's needed for CDC to check
+    /// locks when calculating resolved_ts.
     concurrency_manager: ConcurrencyManager,
 
     config: CdcConfig,
+    api_version: ApiVersion,
 
     // Incremental scan
     workers: Runtime,
@@ -334,14 +351,10 @@ pub struct Endpoint<T, E> {
     old_value_cache: OldValueCache,
     resolved_region_heap: ResolvedRegionHeap,
 
-    // Check leader
-    // store_id -> client
-    tikv_clients: Arc<Mutex<HashMap<u64, TikvClient>>>,
-    env: Arc<Environment>,
-    security_mgr: Arc<SecurityManager>,
-    region_read_progress: RegionReadProgressRegistry,
+    causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
 
     // Metrics and logging.
+    current_ts: TimeStamp,
     min_resolved_ts: TimeStamp,
     min_ts_region_id: u64,
     resolved_region_count: usize,
@@ -353,36 +366,44 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
     pub fn new(
         cluster_id: u64,
         config: &CdcConfig,
+        api_version: ApiVersion,
         pd_client: Arc<dyn PdClient>,
         scheduler: Scheduler<Task>,
         raft_router: T,
+        engine: E,
         observer: CdcObserver,
         store_meta: Arc<StdMutex<StoreMeta>>,
         concurrency_manager: ConcurrencyManager,
         env: Arc<Environment>,
         security_mgr: Arc<SecurityManager>,
         sink_memory_quota: MemoryQuota,
+        causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
     ) -> Endpoint<T, E> {
         let workers = Builder::new_multi_thread()
             .thread_name("cdcwkr")
             .worker_threads(config.incremental_scan_threads)
+            .after_start_wrapper(|| {})
+            .before_stop_wrapper(|| {})
             .build()
             .unwrap();
         let tso_worker = Builder::new_multi_thread()
             .thread_name("tso")
-            .worker_threads(1)
+            .worker_threads(config.tso_worker_threads)
             .enable_time()
+            .after_start_wrapper(|| {})
+            .before_stop_wrapper(|| {})
             .build()
             .unwrap();
 
-        // Initialized for the first time, subsequent adjustments will be made based on configuration updates.
+        // Initialized for the first time, subsequent adjustments will be made based on
+        // configuration updates.
         let scan_concurrency_semaphore =
             Arc::new(Semaphore::new(config.incremental_scan_concurrency));
         let old_value_cache = OldValueCache::new(config.old_value_cache_memory_quota);
         let speed_limiter = Limiter::new(if config.incremental_scan_speed_limit.0 > 0 {
             config.incremental_scan_speed_limit.0 as f64
         } else {
-            INFINITY
+            f64::INFINITY
         });
 
         CDC_SINK_CAP.set(sink_memory_quota.capacity() as i64);
@@ -392,10 +413,17 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         let max_scan_batch_size = 1024;
 
         let region_read_progress = store_meta.lock().unwrap().region_read_progress.clone();
-        let ep = Endpoint {
-            cluster_id,
+        let store_resolver_gc_interval = Duration::from_secs(60);
+        let leader_resolver = LeadershipResolver::new(
+            store_meta.lock().unwrap().store_id.unwrap(),
+            pd_client.clone(),
             env,
             security_mgr,
+            region_read_progress,
+            store_resolver_gc_interval,
+        );
+        let ep = Endpoint {
+            cluster_id,
             capture_regions: HashMap::default(),
             connections: HashMap::default(),
             scheduler,
@@ -406,10 +434,11 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             max_scan_batch_bytes,
             max_scan_batch_size,
             config: config.clone(),
+            api_version,
             workers,
             scan_concurrency_semaphore,
             raft_router,
-            engine: PhantomData,
+            engine,
             observer,
             store_meta,
             concurrency_manager,
@@ -422,31 +451,35 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             resolved_region_count: 0,
             unresolved_region_count: 0,
             sink_memory_quota,
-            tikv_clients: Arc::new(Mutex::new(HashMap::default())),
-            region_read_progress,
-            // Log the first resolved ts warnning.
+            // Log the first resolved ts warning.
             warn_resolved_ts_repeat_count: WARN_RESOLVED_TS_COUNT_THRESHOLD,
+            current_ts: TimeStamp::zero(),
+            causal_ts_provider,
         };
-        ep.register_min_ts_event();
+        ep.register_min_ts_event(leader_resolver, Instant::now());
         ep
     }
 
     fn on_change_cfg(&mut self, change: ConfigChange) {
         // Validate first.
         let mut validate_cfg = self.config.clone();
-        validate_cfg.update(change.clone());
+        if let Err(e) = validate_cfg.update(change) {
+            warn!("cdc config update failed"; "error" => ?e);
+            return;
+        }
         if let Err(e) = validate_cfg.validate() {
             warn!("cdc config update failed"; "error" => ?e);
             return;
         }
-
+        let change = self.config.diff(&validate_cfg);
         info!(
             "cdc config updated";
             "current config" => ?self.config,
             "change" => ?change
         );
-        // Update the config here. The following adjustments will all use the new values.
-        self.config.update(change.clone());
+        // Update the config here. The following adjustments will all use the new
+        // values.
+        self.config.update(change.clone()).unwrap();
 
         // Maybe the cache will be lost due to smaller capacity,
         // but it is acceptable.
@@ -455,8 +488,8 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 .resize(self.config.old_value_cache_memory_quota);
         }
 
-        // Maybe the limit will be exceeded for a while after the concurrency becomes smaller,
-        // but it is acceptable.
+        // Maybe the limit will be exceeded for a while after the concurrency becomes
+        // smaller, but it is acceptable.
         if change.get("incremental_scan_concurrency").is_some() {
             self.scan_concurrency_semaphore =
                 Arc::new(Semaphore::new(self.config.incremental_scan_concurrency))
@@ -472,7 +505,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             let new_speed_limit = if self.config.incremental_scan_speed_limit.0 > 0 {
                 self.config.incremental_scan_speed_limit.0 as f64
             } else {
-                INFINITY
+                f64::INFINITY
             };
 
             self.scan_speed_limiter.set_speed_limit(new_speed_limit);
@@ -507,15 +540,12 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 }
                 if is_last {
                     let delegate = self.capture_regions.remove(&region_id).unwrap();
-                    if let Some(reader) = self.store_meta.lock().unwrap().readers.get(&region_id) {
-                        reader.txn_extra_op.store(TxnExtraOp::Noop);
-                    }
                     // Do not continue to observe the events of the region.
                     let id = delegate.handle.id;
                     let oid = self.observer.unsubscribe_region(region_id, id);
                     assert!(
                         oid.is_some(),
-                        "unsubscribe region {} failed, ObserveID {:?}",
+                        "unsubscribe region {} failed, ObserveId {:?}",
                         region_id,
                         id
                     );
@@ -528,7 +558,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             } => {
                 // Something went wrong, deregister all downstreams of the region.
 
-                // To avoid ABA problem, we must check the unique ObserveID.
+                // To avoid ABA problem, we must check the unique ObserveId.
                 let need_remove = self
                     .capture_regions
                     .get(&region_id)
@@ -536,9 +566,6 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 if need_remove {
                     if let Some(mut delegate) = self.capture_regions.remove(&region_id) {
                         delegate.stop(err);
-                    }
-                    if let Some(reader) = self.store_meta.lock().unwrap().readers.get(&region_id) {
-                        reader.txn_extra_op.store(TxnExtraOp::Noop);
                     }
                     self.connections
                         .iter_mut()
@@ -549,7 +576,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 assert_eq!(
                     need_remove,
                     oid.is_some(),
-                    "unsubscribe region {} failed, ObserveID {:?}",
+                    "unsubscribe region {} failed, ObserveId {:?}",
                     region_id,
                     observe_id
                 );
@@ -560,14 +587,15 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                     conn.take_downstreams().into_iter().for_each(
                         |(region_id, (downstream_id, _))| {
                             if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
-                                if delegate.unsubscribe(downstream_id, None) {
+                                delegate.unsubscribe(downstream_id, None);
+                                if delegate.downstreams().is_empty() {
                                     let delegate = self.capture_regions.remove(&region_id).unwrap();
                                     // Do not continue to observe the events of the region.
                                     let id = delegate.handle.id;
                                     let oid = self.observer.unsubscribe_region(region_id, id);
                                     assert!(
                                         oid.is_some(),
-                                        "unsubscribe region {} failed, ObserveID {:?}",
+                                        "unsubscribe region {} failed, ObserveId {:?}",
                                         region_id,
                                         id
                                     );
@@ -584,20 +612,18 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         &mut self,
         mut request: ChangeDataRequest,
         mut downstream: Downstream,
-        conn_id: ConnID,
+        conn_id: ConnId,
         version: semver::Version,
     ) {
         let region_id = request.region_id;
+        let kv_api = request.get_kv_api();
+        let api_version = self.api_version;
         let downstream_id = downstream.get_id();
         let downstream_state = downstream.get_state();
-        let conn = match self.connections.get_mut(&conn_id) {
-            Some(conn) => conn,
-            None => {
-                error!("cdc register for a nonexistent connection";
-                    "region_id" => region_id, "conn_id" => ?conn_id);
-                return;
-            }
-        };
+        let filter_loop = downstream.get_filter_loop();
+
+        // Register must follow OpenConn, so the connection must be available.
+        let conn = self.connections.get_mut(&conn_id).unwrap();
         downstream.set_sink(conn.get_sink().clone());
 
         // Check if the cluster id matches.
@@ -605,7 +631,6 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         if version >= FeatureGate::validate_cluster_id() && self.cluster_id != request_cluster_id {
             let mut err_event = EventError::default();
             let mut err = ErrorClusterIdMismatch::default();
-
             err.set_current(self.cluster_id);
             err.set_request(request_cluster_id);
             err_event.set_cluster_id_mismatch(err);
@@ -613,6 +638,26 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             let _ = downstream.sink_error_event(region_id, err_event);
             return;
         }
+
+        if !FeatureGate::validate_kv_api(kv_api, api_version) {
+            error!("cdc RawKv is supported by api-version 2 only. TxnKv is not supported now.");
+            let mut err_event = EventError::default();
+            let mut err = ErrorCompatibility::default();
+            err.set_required_version("6.2.0".to_string());
+            err_event.set_compatibility(err);
+
+            let _ = downstream.sink_error_event(region_id, err_event);
+            return;
+        }
+
+        let txn_extra_op = match self.store_meta.lock().unwrap().readers.get(&region_id) {
+            Some(reader) => reader.txn_extra_op.clone(),
+            None => {
+                error!("cdc register for a not found region"; "region_id" => region_id);
+                let _ = downstream.sink_region_not_found(region_id);
+                return;
+            }
+        };
 
         // TODO: Add a new task to close incompatible features.
         if let Some(e) = conn.check_version_and_set_feature(version) {
@@ -622,6 +667,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             let _ = downstream.sink_error_event(region_id, err_event);
             return;
         }
+
         if !conn.subscribe(region_id, downstream_id, downstream_state) {
             let mut err_event = EventError::default();
             let mut err = ErrorDuplicateRequest::default();
@@ -637,11 +683,14 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         }
 
         let mut is_new_delegate = false;
-        let delegate = self.capture_regions.entry(region_id).or_insert_with(|| {
-            let d = Delegate::new(region_id);
-            is_new_delegate = true;
-            d
-        });
+        let delegate = match self.capture_regions.entry(region_id) {
+            HashMapEntry::Occupied(e) => e.into_mut(),
+            HashMapEntry::Vacant(e) => {
+                is_new_delegate = true;
+                e.insert(Delegate::new(region_id, txn_extra_op))
+            }
+        };
+
         let observe_id = delegate.handle.id;
         info!("cdc register region";
             "region_id" => region_id,
@@ -670,22 +719,18 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             let old_observe_id = self.observer.subscribe_region(region_id, observe_id);
             assert!(
                 old_observe_id.is_none(),
-                "region {} must not be observed twice, old ObserveID {:?}, new ObserveID {:?}",
+                "region {} must not be observed twice, old ObserveId {:?}, new ObserveId {:?}",
                 region_id,
                 old_observe_id,
                 observe_id
             );
         };
+
         let change_cmd = ChangeObserver::from_cdc(region_id, delegate.handle.clone());
-        let txn_extra_op = request.get_extra_op();
-        if txn_extra_op != TxnExtraOp::Noop {
-            delegate.txn_extra_op = request.get_extra_op();
-            if let Some(reader) = self.store_meta.lock().unwrap().readers.get(&region_id) {
-                reader.txn_extra_op.store(txn_extra_op);
-            }
-        }
+
         let region_epoch = request.take_region_epoch();
         let mut init = Initializer {
+            engine: self.engine.clone(),
             sched,
             region_id,
             region_epoch,
@@ -694,13 +739,15 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             sink: conn.get_sink().clone(),
             request_id: request.get_request_id(),
             downstream_state,
-            txn_extra_op: delegate.txn_extra_op,
             speed_limiter: self.scan_speed_limiter.clone(),
             max_scan_batch_bytes: self.max_scan_batch_bytes,
             max_scan_batch_size: self.max_scan_batch_size,
             observe_id,
             checkpoint_ts: checkpoint_ts.into(),
             build_resolver: is_new_delegate,
+            ts_filter_ratio: self.config.incremental_scan_ts_filter_ratio,
+            kv_api,
+            filter_loop,
         };
 
         let raft_router = self.raft_router.clone();
@@ -716,6 +763,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 }
                 Err(e) => {
                     CDC_SCAN_TASKS.with_label_values(&["abort"]).inc();
+                    error!("cdc initialize fail: {}", e; "region_id" => region_id);
                     init.deregister_downstream(e)
                 }
             }
@@ -724,6 +772,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
 
     pub fn on_multi_batch(&mut self, multi: Vec<CmdBatch>, old_value_cb: OldValueCallback) {
         fail_point!("cdc_before_handle_multi_batch", |_| {});
+        let mut statistics = Statistics::default();
         for batch in multi {
             let region_id = batch.region_id;
             let mut deregister = None;
@@ -732,7 +781,12 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                     // Skip the batch if the delegate has failed.
                     continue;
                 }
-                if let Err(e) = delegate.on_batch(batch, &old_value_cb, &mut self.old_value_cache) {
+                if let Err(e) = delegate.on_batch(
+                    batch,
+                    &old_value_cb,
+                    &mut self.old_value_cache,
+                    &mut statistics,
+                ) {
                     assert!(delegate.has_failed());
                     // Delegate has error, deregister the delegate.
                     deregister = Some(Deregister::Delegate {
@@ -746,24 +800,22 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 self.on_deregister(deregister);
             }
         }
+        flush_oldvalue_stats(&statistics, TAG_DELTA_CHANGE);
     }
 
-    fn on_region_ready(&mut self, observe_id: ObserveID, resolver: Resolver, region: Region) {
+    fn on_region_ready(&mut self, observe_id: ObserveId, resolver: Resolver, region: Region) {
         let region_id = region.get_id();
         let mut failed_downstreams = Vec::new();
         if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
             if delegate.handle.id == observe_id {
-                for downstream in delegate.on_region_ready(resolver, region) {
-                    let conn_id = downstream.get_conn_id();
-                    let downstream_id = downstream.get_id();
-                    if let Err(err) = delegate.subscribe(downstream) {
-                        failed_downstreams.push(Deregister::Downstream {
-                            region_id,
-                            downstream_id,
-                            conn_id,
-                            err: Some(err),
-                        });
-                    }
+                let region_id = delegate.region_id;
+                for (downstream, e) in delegate.on_region_ready(resolver, region) {
+                    failed_downstreams.push(Deregister::Downstream {
+                        region_id,
+                        downstream_id: downstream.get_id(),
+                        conn_id: downstream.get_conn_id(),
+                        err: Some(e),
+                    });
                 }
             } else {
                 debug!("cdc stale region ready";
@@ -782,7 +834,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         }
     }
 
-    fn on_min_ts(&mut self, regions: Vec<u64>, min_ts: TimeStamp) {
+    fn on_min_ts(&mut self, regions: Vec<u64>, min_ts: TimeStamp, current_ts: TimeStamp) {
         // Reset resolved_regions to empty.
         let resolved_regions = &mut self.resolved_region_heap;
         resolved_regions.clear();
@@ -808,7 +860,6 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                         self.min_ts_region_id = region_id;
                     }
                     resolved_regions.push(region_id, resolved_ts);
-
                     if resolved_ts == old_resolved_ts {
                         advance_failed_same += 1;
                     } else {
@@ -819,6 +870,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 }
             }
         }
+        self.current_ts = current_ts;
         let lag_millis = min_ts
             .physical()
             .saturating_sub(self.min_resolved_ts.physical());
@@ -839,7 +891,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         self.resolved_region_count = resolved_regions.heap.len();
         self.unresolved_region_count = total_region_count - self.resolved_region_count;
 
-        // Separate broadcasing outlier regions and normal regions,
+        // Separate broadcasting outlier regions and normal regions,
         // so 1) downstreams know where they should send resolve lock requests,
         // and 2) resolved ts of normal regions does not fallback.
         //
@@ -934,6 +986,10 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 return;
             }
         };
+        if !downstream.get_state().load().ready_for_advancing_ts() {
+            // Only send resolved timestamp if the downstream is ready.
+            return;
+        }
         let resolved_ts_event = Event {
             region_id,
             event: Some(Event_oneof_event::ResolvedTs(resolved_ts)),
@@ -945,35 +1001,45 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         let _ = downstream.sink_event(resolved_ts_event, force_send);
     }
 
-    fn register_min_ts_event(&self) {
-        let timeout = self.timer.delay(self.config.min_ts_interval.0);
+    fn register_min_ts_event(&self, mut leader_resolver: LeadershipResolver, event_time: Instant) {
+        // Try to keep advance resolved ts every `min_ts_interval`, thus
+        // the actual wait interval = `min_ts_interval` - the last register min_ts event
+        // time.
+        let interval = self
+            .config
+            .min_ts_interval
+            .0
+            .checked_sub(event_time.saturating_elapsed());
+        let timeout = self.timer.delay(interval.unwrap_or_default());
         let pd_client = self.pd_client.clone();
         let scheduler = self.scheduler.clone();
         let raft_router = self.raft_router.clone();
-        let regions: Vec<(u64, ObserveID)> = self
-            .capture_regions
-            .iter()
-            .map(|(region_id, delegate)| (*region_id, delegate.handle.id))
-            .collect();
+        let regions: Vec<u64> = self.capture_regions.keys().copied().collect();
         let cm: ConcurrencyManager = self.concurrency_manager.clone();
-        let env = self.env.clone();
-        let security_mgr = self.security_mgr.clone();
-        let store_meta = self.store_meta.clone();
-        let tikv_clients = self.tikv_clients.clone();
         let hibernate_regions_compatible = self.config.hibernate_regions_compatible;
-        let region_read_progress = self.region_read_progress.clone();
+        let causal_ts_provider = self.causal_ts_provider.clone();
+        // We use channel to deliver leader_resolver in async block.
+        let (leader_resolver_tx, leader_resolver_rx) = bounded(1);
 
         let fut = async move {
             let _ = timeout.compat().await;
             // Ignore get tso errors since we will retry every `min_ts_interval`.
-            let min_ts_pd = pd_client.get_tso().await.unwrap_or_default();
+            let min_ts_pd = match causal_ts_provider {
+                // TiKV API v2 is enabled when causal_ts_provider is Some.
+                // In this scenario, get TSO from causal_ts_provider to make sure that
+                // RawKV write requests will get larger TSO after this point.
+                // RawKV CDC's resolved_ts is guaranteed by ConcurrencyManager::global_min_lock_ts,
+                // which lock flying keys's ts in raw put and delete interfaces in `Storage`.
+                Some(provider) => provider.async_get_ts().await.unwrap_or_default(),
+                None => pd_client.get_tso().await.unwrap_or_default(),
+            };
             let mut min_ts = min_ts_pd;
             let mut min_ts_min_lock = min_ts_pd;
 
-            // Sync with concurrency manager so that it can work correctly when optimizations
-            // like async commit is enabled.
-            // Note: This step must be done before scheduling `Task::MinTS` task, and the
-            // resolver must be checked in or after `Task::MinTS`' execution.
+            // Sync with concurrency manager so that it can work correctly when
+            // optimizations like async commit is enabled.
+            // Note: This step must be done before scheduling `Task::MinTs` task, and the
+            // resolver must be checked in or after `Task::MinTs`' execution.
             cm.update_max_ts(min_ts);
             if let Some(min_mem_lock_ts) = cm.global_min_lock_ts() {
                 if min_mem_lock_ts < min_ts {
@@ -982,42 +1048,49 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 min_ts_min_lock = min_mem_lock_ts;
             }
 
-            match scheduler.schedule(Task::RegisterMinTsEvent) {
-                Ok(_) | Err(ScheduleError::Stopped(_)) => (),
-                // Must schedule `RegisterMinTsEvent` event otherwise resolved ts can not
-                // advance normally.
-                Err(err) => panic!("failed to regiester min ts event, error: {:?}", err),
-            }
+            let slow_timer = SlowTimer::default();
+            defer!({
+                slow_log!(T slow_timer, "cdc resolve region leadership");
+                if let Ok(leader_resolver) = leader_resolver_rx.try_recv() {
+                    match scheduler.schedule(Task::RegisterMinTsEvent {
+                        leader_resolver,
+                        event_time: Instant::now(),
+                    }) {
+                        Ok(_) | Err(ScheduleError::Stopped(_)) => (),
+                        // Must schedule `RegisterMinTsEvent` event otherwise resolved ts can not
+                        // advance normally.
+                        Err(err) => panic!("failed to regiester min ts event, error: {:?}", err),
+                    }
+                } else {
+                    // During shutdown, tso runtime drops future immediately,
+                    // leader_resolver may be lost when this future drops before
+                    // delivering leader_resolver.
+                    warn!("cdc leader resolver is lost, are we shutdown?");
+                }
+            });
 
+            // Check region peer leadership, make sure they are leaders.
             let gate = pd_client.feature_gate();
-
             let regions =
                 if hibernate_regions_compatible && gate.can_enable(FEATURE_RESOLVED_TS_STORE) {
                     CDC_RESOLVED_TS_ADVANCE_METHOD.set(1);
-                    let regions = regions
-                        .into_iter()
-                        .map(|(region_id, _)| region_id)
-                        .collect();
-                    resolved_ts::region_resolved_ts_store(
-                        regions,
-                        store_meta,
-                        region_read_progress,
-                        pd_client,
-                        security_mgr,
-                        env,
-                        tikv_clients,
-                        min_ts,
-                    )
-                    .await
+                    leader_resolver.resolve(regions, min_ts).await
                 } else {
                     CDC_RESOLVED_TS_ADVANCE_METHOD.set(0);
-                    Self::region_resolved_ts_raft(regions, &scheduler, raft_router, min_ts).await
+                    leader_resolver
+                        .resolve_by_raft(regions, min_ts, raft_router)
+                        .await
                 };
+            leader_resolver_tx.send(leader_resolver).unwrap();
 
             if !regions.is_empty() {
-                match scheduler.schedule(Task::MinTS { regions, min_ts }) {
+                match scheduler.schedule(Task::MinTs {
+                    regions,
+                    min_ts,
+                    current_ts: min_ts_pd,
+                }) {
                     Ok(_) | Err(ScheduleError::Stopped(_)) => (),
-                    // Must schedule `RegisterMinTsEvent` event otherwise resolved ts can not
+                    // Must schedule `MinTS` event otherwise resolved ts can not
                     // advance normally.
                     Err(err) => panic!("failed to schedule min ts event, error: {:?}", err),
                 }
@@ -1033,421 +1106,9 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         self.tso_worker.spawn(fut);
     }
 
-    async fn region_resolved_ts_raft(
-        regions: Vec<(u64, ObserveID)>,
-        scheduler: &Scheduler<Task>,
-        raft_router: T,
-        min_ts: TimeStamp,
-    ) -> Vec<u64> {
-        // TODO: send a message to raftstore would consume too much cpu time,
-        // try to handle it outside raftstore.
-        let regions: Vec<_> = regions
-            .iter()
-            .copied()
-            .map(|(region_id, observe_id)| {
-                let scheduler_clone = scheduler.clone();
-                let raft_router_clone = raft_router.clone();
-                async move {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    if let Err(e) = raft_router_clone.significant_send(
-                        region_id,
-                        SignificantMsg::LeaderCallback(Callback::Read(Box::new(move |resp| {
-                            let resp = if resp.response.get_header().has_error() {
-                                None
-                            } else {
-                                Some(region_id)
-                            };
-                            if tx.send(resp).is_err() {
-                                error!("cdc send tso response failed"; "region_id" => region_id);
-                            }
-                        }))),
-                    ) {
-                        warn!("cdc send LeaderCallback failed"; "err" => ?e, "min_ts" => min_ts);
-                        let deregister = Deregister::Delegate {
-                            observe_id,
-                            region_id,
-                            err: Error::request(e.into()),
-                        };
-                        if let Err(e) = scheduler_clone.schedule(Task::Deregister(deregister)) {
-                            error!("cdc schedule cdc task failed"; "error" => ?e);
-                        }
-                        return None;
-                    }
-                    rx.await.unwrap_or(None)
-                }
-            })
-            .collect();
-        let resps = futures::future::join_all(regions).await;
-        resps.into_iter().flatten().collect::<Vec<u64>>()
-    }
-
     fn on_open_conn(&mut self, conn: Conn) {
         self.connections.insert(conn.get_id(), conn);
     }
-}
-
-struct Initializer {
-    sched: Scheduler<Task>,
-    sink: crate::channel::Sink,
-
-    region_id: u64,
-    region_epoch: RegionEpoch,
-    observe_id: ObserveID,
-    downstream_id: DownstreamID,
-    downstream_state: Arc<AtomicCell<DownstreamState>>,
-    conn_id: ConnID,
-    request_id: u64,
-    checkpoint_ts: TimeStamp,
-    txn_extra_op: TxnExtraOp,
-
-    speed_limiter: Limiter,
-    max_scan_batch_bytes: usize,
-    max_scan_batch_size: usize,
-
-    build_resolver: bool,
-}
-
-impl Initializer {
-    async fn initialize<T: 'static + RaftStoreRouter<E>, E: KvEngine>(
-        &mut self,
-        change_cmd: ChangeObserver,
-        raft_router: T,
-        concurrency_semaphore: Arc<Semaphore>,
-    ) -> Result<()> {
-        fail_point!("cdc_before_initialize");
-        let _permit = concurrency_semaphore.acquire().await;
-
-        // When downstream_state is Stopped, it means the corresponding delegate
-        // is stopped. The initialization can be safely canceled.
-        //
-        // Acquiring a permit may take some time, it is possiable that
-        // initialization can be canceled.
-        if self.downstream_state.load() == DownstreamState::Stopped {
-            info!("cdc async incremental scan canceled";
-                "region_id" => self.region_id,
-                "downstream_id" => ?self.downstream_id,
-                "observe_id" => ?self.observe_id,
-                "conn_id" => ?self.conn_id);
-            return Err(box_err!("scan canceled"));
-        }
-
-        CDC_SCAN_TASKS.with_label_values(&["ongoing"]).inc();
-        tikv_util::defer!({
-            CDC_SCAN_TASKS.with_label_values(&["ongoing"]).dec();
-        });
-
-        // To avoid holding too many snapshots and holding them too long,
-        // we need to acquire scan concurrency permit before taking snapshot.
-        let sched = self.sched.clone();
-        let region_id = self.region_id;
-        let region_epoch = self.region_epoch.clone();
-        let downstream_id = self.downstream_id;
-        let downstream_state = self.downstream_state.clone();
-        let (cb, fut) = tikv_util::future::paired_future_callback();
-        let sink = self.sink.clone();
-        let (incremental_scan_barrier_cb, incremental_scan_barrier_fut) =
-            tikv_util::future::paired_future_callback();
-        let barrier = CdcEvent::Barrier(Some(incremental_scan_barrier_cb));
-        if let Err(e) = raft_router.significant_send(
-            self.region_id,
-            SignificantMsg::CaptureChange {
-                cmd: change_cmd,
-                region_epoch,
-                callback: Callback::Read(Box::new(move |resp| {
-                    if let Err(e) = sched.schedule(Task::InitDownstream {
-                        region_id,
-                        downstream_id,
-                        downstream_state,
-                        sink,
-                        incremental_scan_barrier: barrier,
-                        cb: Box::new(move || cb(resp)),
-                    }) {
-                        error!("cdc schedule cdc task failed"; "error" => ?e);
-                    }
-                })),
-            },
-        ) {
-            warn!("cdc send capture change cmd failed";
-            "region_id" => self.region_id, "error" => ?e);
-            return Err(Error::request(e.into()));
-        }
-
-        // Wait all delta changes earlier than the incremental scan snapshot be
-        // sent to the downstream, so that they must be consumed before the
-        // incremental scan result.
-        if let Err(e) = incremental_scan_barrier_fut.await {
-            return Err(Error::Other(box_err!(e)));
-        }
-
-        match fut.await {
-            Ok(resp) => self.on_change_cmd_response(resp).await,
-            Err(e) => Err(Error::Other(box_err!(e))),
-        }
-    }
-
-    async fn on_change_cmd_response(
-        &mut self,
-        mut resp: ReadResponse<impl EngineSnapshot>,
-    ) -> Result<()> {
-        if let Some(region_snapshot) = resp.snapshot {
-            assert_eq!(self.region_id, region_snapshot.get_region().get_id());
-            let region = region_snapshot.get_region().clone();
-            self.async_incremental_scan(region_snapshot, region).await
-        } else {
-            assert!(
-                resp.response.get_header().has_error(),
-                "no snapshot and no error? {:?}",
-                resp.response
-            );
-            let err = resp.response.take_header().take_error();
-            Err(Error::request(err))
-        }
-    }
-
-    async fn async_incremental_scan<S: Snapshot + 'static>(
-        &mut self,
-        snap: S,
-        region: Region,
-    ) -> Result<()> {
-        let downstream_id = self.downstream_id;
-        let region_id = region.get_id();
-        let observe_id = self.observe_id;
-        debug!("cdc async incremental scan";
-            "region_id" => region_id,
-            "downstream_id" => ?downstream_id,
-            "observe_id" => ?self.observe_id);
-
-        let mut resolver = if self.build_resolver {
-            Some(Resolver::new(region_id))
-        } else {
-            None
-        };
-
-        fail_point!("cdc_incremental_scan_start");
-
-        // Time range: (checkpoint_ts, current]
-        let current = TimeStamp::max();
-        let mut scanner = ScannerBuilder::new(snap, current)
-            .fill_cache(false)
-            .range(None, None)
-            .build_delta_scanner(self.checkpoint_ts, self.txn_extra_op)
-            .unwrap();
-        let conn_id = self.conn_id;
-        let mut done = false;
-        let start = Instant::now_coarse();
-
-        let curr_state = self.downstream_state.load();
-        assert!(matches!(
-            curr_state,
-            DownstreamState::Initializing | DownstreamState::Stopped
-        ));
-        let on_cancel = || -> Result<()> {
-            info!("cdc async incremental scan canceled";
-                "region_id" => region_id,
-                "downstream_id" => ?downstream_id,
-                "observe_id" => ?observe_id,
-                "conn_id" => ?conn_id);
-            Err(box_err!("scan canceled"))
-        };
-
-        while !done {
-            // When downstream_state is Stopped, it means the corresponding
-            // delegate is stopped. The initialization can be safely canceled.
-            if self.downstream_state.load() == DownstreamState::Stopped {
-                return on_cancel();
-            }
-            let entries = self.scan_batch(&mut scanner, resolver.as_mut()).await?;
-            // If the last element is None, it means scanning is finished.
-            if let Some(None) = entries.last() {
-                done = true;
-            }
-            debug!("cdc scan entries"; "len" => entries.len(), "region_id" => region_id);
-            fail_point!("before_schedule_incremental_scan");
-            self.sink_scan_events(entries, done).await?;
-        }
-
-        if !post_init_downstream(&self.downstream_state) {
-            return on_cancel();
-        }
-        let takes = start.saturating_elapsed();
-        info!("cdc async incremental scan finished";
-            "region_id" => region.get_id(),
-            "conn_id" => ?self.conn_id,
-            "downstream_id" => ?self.downstream_id,
-            "takes" => ?takes,
-        );
-
-        if let Some(resolver) = resolver {
-            self.finish_building_resolver(resolver, region);
-        }
-
-        CDC_SCAN_DURATION_HISTOGRAM.observe(takes.as_secs_f64());
-        Ok(())
-    }
-
-    // It's extracted from `Initializer::scan_batch` to avoid becoming an asynchronous block,
-    // so that we can limit scan speed based on the thread disk I/O or RocksDB block read bytes.
-    fn do_scan<S: Snapshot>(
-        &self,
-        scanner: &mut DeltaScanner<S>,
-        entries: &mut Vec<Option<TxnEntry>>,
-    ) -> Result<ScanStat> {
-        let mut total_bytes = 0;
-        let mut total_size = 0;
-
-        // This code block shouldn't be switched to other threads.
-        let perf_instant = PerfStatisticsInstant::new();
-        let inspector = self_thread_inspector().ok();
-        let old_io_stat = inspector.as_ref().and_then(|x| x.io_stat().unwrap_or(None));
-        while total_bytes <= self.max_scan_batch_bytes && total_size < self.max_scan_batch_size {
-            total_size += 1;
-            match scanner.next_entry()? {
-                Some(entry) => {
-                    total_bytes += entry.size();
-                    entries.push(Some(entry));
-                }
-                None => {
-                    entries.push(None);
-                    break;
-                }
-            }
-        }
-        let new_io_stat = inspector.as_ref().and_then(|x| x.io_stat().unwrap_or(None));
-        let disk_read = match (old_io_stat, new_io_stat) {
-            (Some(s1), Some(s2)) => Some((s2.read - s1.read) as usize),
-            _ => None,
-        };
-        let perf_delta = perf_instant.delta();
-        let emit = total_bytes;
-        Ok(ScanStat {
-            emit,
-            disk_read,
-            perf_delta,
-        })
-    }
-
-    async fn scan_batch<S: Snapshot>(
-        &self,
-        scanner: &mut DeltaScanner<S>,
-        resolver: Option<&mut Resolver>,
-    ) -> Result<Vec<Option<TxnEntry>>> {
-        let mut entries = Vec::with_capacity(self.max_scan_batch_size);
-        let ScanStat {
-            emit,
-            disk_read,
-            perf_delta,
-        } = self.do_scan(scanner, &mut entries)?;
-
-        CDC_SCAN_BYTES.inc_by(emit as _);
-        TLS_CDC_PERF_STATS.with(|x| *x.borrow_mut() += perf_delta);
-        tls_flush_perf_stats();
-        let require = if let Some(bytes) = disk_read {
-            CDC_SCAN_DISK_READ_BYTES.inc_by(bytes as _);
-            bytes
-        } else {
-            perf_delta.0.block_read_byte
-        };
-        self.speed_limiter.consume(require).await;
-
-        if let Some(resolver) = resolver {
-            // Track the locks.
-            for entry in entries.iter().flatten() {
-                if let TxnEntry::Prewrite { lock, .. } = entry {
-                    let (encoded_key, value) = lock;
-                    let key = Key::from_encoded_slice(encoded_key).into_raw().unwrap();
-                    let lock = Lock::parse(value)?;
-                    match lock.lock_type {
-                        LockType::Put | LockType::Delete => resolver.track_lock(lock.ts, key, None),
-                        _ => (),
-                    };
-                }
-            }
-        }
-        Ok(entries)
-    }
-
-    async fn sink_scan_events(&mut self, entries: Vec<Option<TxnEntry>>, done: bool) -> Result<()> {
-        let mut barrier = None;
-        let mut events = Delegate::convert_to_grpc_events(self.region_id, self.request_id, entries);
-        if done {
-            let (cb, fut) = tikv_util::future::paired_future_callback();
-            events.push(CdcEvent::Barrier(Some(cb)));
-            barrier = Some(fut);
-        }
-        if let Err(e) = self.sink.send_all(events).await {
-            error!("cdc send scan event failed"; "req_id" => ?self.request_id);
-            return Err(Error::Sink(e));
-        }
-
-        if let Some(barrier) = barrier {
-            // CDC needs to make sure resovled ts events can only be sent after
-            // incremental scan is finished.
-            // Wait the barrier to ensure tikv sends out all scan events.
-            let _ = barrier.await;
-        }
-
-        Ok(())
-    }
-
-    fn finish_building_resolver(&self, mut resolver: Resolver, region: Region) {
-        let observe_id = self.observe_id;
-        let rts = resolver.resolve(TimeStamp::zero());
-        info!(
-            "cdc resolver initialized and schedule resolver ready";
-            "region_id" => region.get_id(),
-            "conn_id" => ?self.conn_id,
-            "downstream_id" => ?self.downstream_id,
-            "resolved_ts" => rts,
-            "lock_count" => resolver.locks().len(),
-            "observe_id" => ?observe_id,
-        );
-
-        fail_point!("before_schedule_resolver_ready");
-        if let Err(e) = self.sched.schedule(Task::ResolverReady {
-            observe_id,
-            resolver,
-            region,
-        }) {
-            error!("cdc schedule task failed"; "error" => ?e);
-        }
-    }
-
-    // Deregister downstream when the Initializer fails to initialize.
-    fn deregister_downstream(&self, err: Error) {
-        let deregister = if self.build_resolver || err.has_region_error() {
-            // Deregister delegate on the conditions,
-            // * It fails to build a resolver. A delegate requires a resolver
-            //   to advance resolved ts.
-            // * A region error. It usually mean a peer is not leader or
-            //   a leader meets an error and can not serve.
-            Deregister::Delegate {
-                region_id: self.region_id,
-                observe_id: self.observe_id,
-                err,
-            }
-        } else {
-            Deregister::Downstream {
-                region_id: self.region_id,
-                downstream_id: self.downstream_id,
-                conn_id: self.conn_id,
-                err: Some(err),
-            }
-        };
-
-        if let Err(e) = self.sched.schedule(Task::Deregister(deregister)) {
-            error!("cdc schedule cdc task failed"; "error" => ?e);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ScanStat {
-    // Fetched bytes to the scanner.
-    emit: usize,
-    // Bytes from the device, `None` if not possible to get it.
-    disk_read: Option<usize>,
-    // Perf delta for RocksDB.
-    perf_delta: PerfStatisticsDelta,
 }
 
 impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Runnable for Endpoint<T, E> {
@@ -1457,7 +1118,11 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Runnable for Endpoint<T, E> {
         debug!("cdc run task"; "task" => %task);
 
         match task {
-            Task::MinTS { regions, min_ts } => self.on_min_ts(regions, min_ts),
+            Task::MinTs {
+                regions,
+                min_ts,
+                current_ts,
+            } => self.on_min_ts(regions, min_ts, current_ts),
             Task::Register {
                 request,
                 downstream,
@@ -1475,7 +1140,10 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Runnable for Endpoint<T, E> {
                 old_value_cb,
             } => self.on_multi_batch(multi, old_value_cb),
             Task::OpenConn { conn } => self.on_open_conn(conn),
-            Task::RegisterMinTsEvent => self.register_min_ts_event(),
+            Task::RegisterMinTsEvent {
+                leader_resolver,
+                event_time,
+            } => self.register_min_ts_event(leader_resolver, event_time),
             Task::InitDownstream {
                 region_id,
                 downstream_id,
@@ -1503,7 +1171,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Runnable for Endpoint<T, E> {
             }
             Task::TxnExtra(txn_extra) => {
                 for (k, v) in txn_extra.old_values {
-                    self.old_value_cache.cache.insert(k, v);
+                    self.old_value_cache.insert(k, v);
                 }
             }
             Task::Validate(validate) => match validate {
@@ -1521,6 +1189,8 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Runnable for Endpoint<T, E> {
 
 impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> RunnableWithTimer for Endpoint<T, E> {
     fn on_timeout(&mut self) {
+        CDC_ENDPOINT_PENDING_TASKS.set(self.scheduler.pending_tasks() as _);
+
         // Reclaim resolved_region_heap memory.
         self.resolved_region_heap
             .reset_and_shrink_to(self.capture_regions.len());
@@ -1535,19 +1205,23 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> RunnableWithTimer for Endpoin
         if self.min_resolved_ts != TimeStamp::max() {
             CDC_MIN_RESOLVED_TS_REGION.set(self.min_ts_region_id as i64);
             CDC_MIN_RESOLVED_TS.set(self.min_resolved_ts.physical() as i64);
+            CDC_MIN_RESOLVED_TS_LAG.set(
+                self.current_ts
+                    .physical()
+                    .saturating_sub(self.min_resolved_ts.physical()) as i64,
+            );
+            CDC_RESOLVED_TS_GAP_HISTOGRAM.observe(
+                self.current_ts
+                    .physical()
+                    .saturating_sub(self.min_resolved_ts.physical()) as f64
+                    / 1000f64,
+            );
         }
         self.min_resolved_ts = TimeStamp::max();
+        self.current_ts = TimeStamp::max();
         self.min_ts_region_id = 0;
 
-        let cache_size = self.old_value_cache.cache.size();
-        CDC_OLD_VALUE_CACHE_BYTES.set(cache_size as i64);
-        CDC_OLD_VALUE_CACHE_ACCESS.add(self.old_value_cache.access_count as i64);
-        CDC_OLD_VALUE_CACHE_MISS.add(self.old_value_cache.miss_count as i64);
-        CDC_OLD_VALUE_CACHE_MISS_NONE.add(self.old_value_cache.miss_none_count as i64);
-        CDC_OLD_VALUE_CACHE_LEN.set(self.old_value_cache.cache.len() as i64);
-        self.old_value_cache.access_count = 0;
-        self.old_value_cache.miss_count = 0;
-        self.old_value_cache.miss_none_count = 0;
+        self.old_value_cache.flush_metrics();
         CDC_SINK_BYTES.set(self.sink_memory_quota.in_use() as i64);
     }
 
@@ -1577,353 +1251,288 @@ impl TxnExtraScheduler for CdcTxnExtraScheduler {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::fmt::Display;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender};
+    use std::ops::{Deref, DerefMut};
 
-    use collections::HashSet;
     use engine_rocks::RocksEngine;
-    use engine_traits::DATA_CFS;
     use futures::executor::block_on;
-    use futures::StreamExt;
-    use kvproto::cdcpb::Header;
-    #[cfg(feature = "prost-codec")]
-    use kvproto::cdcpb::{event::Event as Event_oneof_event, Header};
-    use kvproto::errorpb::Error as ErrorHeader;
-    use raftstore::coprocessor::ObserveHandle;
-    use raftstore::errors::Error as RaftStoreError;
-    use raftstore::store::msg::CasualMessage;
-    use raftstore::store::util::RegionReadProgress;
-    use raftstore::store::{ReadDelegate, RegionSnapshot, TrackVer};
-    use tempfile::TempDir;
-    use test_raftstore::{MockRaftStoreRouter, TestPdClient};
-    use tikv::server::DEFAULT_CLUSTER_ID;
-    use tikv::storage::kv::Engine;
-    use tikv::storage::txn::tests::{must_acquire_pessimistic_lock, must_prewrite_put};
-    use tikv::storage::TestEngineBuilder;
-    use tikv_util::config::{ReadableDuration, ReadableSize};
-    use tikv_util::worker::{dummy_scheduler, LazyWorker, ReceiverWrapper};
-    use time::Timespec;
+    use kvproto::{
+        cdcpb::{ChangeDataRequestKvApi, Header},
+        errorpb::Error as ErrorHeader,
+    };
+    use raftstore::{
+        errors::{DiscardReason, Error as RaftStoreError},
+        store::{msg::CasualMessage, PeerMsg, ReadDelegate},
+    };
+    use test_pd_client::TestPdClient;
+    use test_raftstore::MockRaftStoreRouter;
+    use tikv::{
+        server::DEFAULT_CLUSTER_ID,
+        storage::{kv::Engine, TestEngineBuilder},
+    };
+    use tikv_util::{
+        config::{ReadableDuration, ReadableSize},
+        worker::{dummy_scheduler, ReceiverWrapper},
+    };
 
     use super::*;
     use crate::{channel, recv_timeout};
 
-    struct ReceiverRunnable<T: Display + Send> {
-        tx: Sender<T>,
+    struct TestEndpointSuite {
+        // The order must ensure `endpoint` be dropped before other fields.
+        endpoint: Endpoint<MockRaftStoreRouter, RocksEngine>,
+        raft_router: MockRaftStoreRouter,
+        task_rx: ReceiverWrapper<Task>,
+        raft_rxs: HashMap<u64, tikv_util::mpsc::Receiver<PeerMsg<RocksEngine>>>,
+        leader_resolver: Option<LeadershipResolver>,
     }
 
-    impl<T: Display + Send + 'static> Runnable for ReceiverRunnable<T> {
-        type Task = T;
+    impl TestEndpointSuite {
+        // It's important to matain raft receivers in `raft_rxs`, otherwise all cases
+        // need to drop `endpoint` and `rx` in order manually.
+        fn add_region(&mut self, region_id: u64, cap: usize) {
+            let rx = self.raft_router.add_region(region_id, cap);
+            self.raft_rxs.insert(region_id, rx);
+            self.add_local_reader(region_id);
+        }
 
-        fn run(&mut self, task: T) {
-            let _ = self.tx.send(task);
+        fn add_local_reader(&self, region_id: u64) {
+            self.store_meta
+                .lock()
+                .unwrap()
+                .readers
+                .insert(region_id, ReadDelegate::mock(region_id));
+        }
+
+        fn fill_raft_rx(&self, region_id: u64) {
+            let router = &self.raft_router;
+            loop {
+                match router.send_casual_msg(region_id, CasualMessage::ClearRegionSize) {
+                    Ok(_) => continue,
+                    Err(RaftStoreError::Transport(DiscardReason::Full)) => break,
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        fn raft_rx(&self, region_id: u64) -> &tikv_util::mpsc::Receiver<PeerMsg<RocksEngine>> {
+            self.raft_rxs.get(&region_id).unwrap()
         }
     }
 
-    fn new_receiver_worker<T: Display + Send + 'static>() -> (LazyWorker<T>, Receiver<T>) {
-        let (tx, rx) = channel();
-        let runnable = ReceiverRunnable { tx };
-        let mut worker = LazyWorker::new("test-receiver-worker");
-        worker.start(runnable);
-        (worker, rx)
+    impl Deref for TestEndpointSuite {
+        type Target = Endpoint<MockRaftStoreRouter, RocksEngine>;
+        fn deref(&self) -> &Self::Target {
+            &self.endpoint
+        }
     }
 
-    fn mock_initializer(
-        speed_limit: usize,
-        buffer: usize,
-    ) -> (
-        LazyWorker<Task>,
-        Runtime,
-        Initializer,
-        Receiver<Task>,
-        crate::channel::Drain,
-    ) {
-        let (receiver_worker, rx) = new_receiver_worker();
-        let quota = crate::channel::MemoryQuota::new(usize::MAX);
-        let (sink, drain) = crate::channel::channel(buffer, quota);
-
-        let pool = Builder::new_multi_thread()
-            .thread_name("test-initializer-worker")
-            .worker_threads(4)
-            .build()
-            .unwrap();
-        let downstream_state = Arc::new(AtomicCell::new(DownstreamState::Initializing));
-        let initializer = Initializer {
-            sched: receiver_worker.scheduler(),
-            sink,
-
-            region_id: 1,
-            region_epoch: RegionEpoch::default(),
-            observe_id: ObserveID::new(),
-            downstream_id: DownstreamID::new(),
-            downstream_state,
-            conn_id: ConnID::new(),
-            request_id: 0,
-            checkpoint_ts: 1.into(),
-            speed_limiter: Limiter::new(speed_limit as _),
-            max_scan_batch_bytes: 1024 * 1024,
-            max_scan_batch_size: 1024,
-            txn_extra_op: TxnExtraOp::Noop,
-            build_resolver: true,
-        };
-
-        (receiver_worker, pool, initializer, rx, drain)
+    impl DerefMut for TestEndpointSuite {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.endpoint
+        }
     }
 
     fn mock_endpoint(
         cfg: &CdcConfig,
-    ) -> (
-        Endpoint<MockRaftStoreRouter, RocksEngine>,
-        MockRaftStoreRouter,
-        ReceiverWrapper<Task>,
-    ) {
-        let mut region = Region::default();
-        region.set_id(1);
-        let store_meta = Arc::new(StdMutex::new(StoreMeta::new(0)));
-        let read_delegate = ReadDelegate {
-            tag: String::new(),
-            region: Arc::new(region),
-            peer_id: 2,
-            term: 1,
-            applied_index_term: 1,
-            leader_lease: None,
-            last_valid_ts: Timespec::new(0, 0),
-            txn_extra_op: Arc::new(AtomicCell::new(TxnExtraOp::default())),
-            max_ts_sync_status: Arc::new(AtomicU64::new(0)),
-            track_ver: TrackVer::new(),
-            read_progress: Arc::new(RegionReadProgress::new(
-                &Region::default(),
-                0,
-                0,
-                "".to_owned(),
-            )),
-        };
-        store_meta.lock().unwrap().readers.insert(1, read_delegate);
+        engine: Option<RocksEngine>,
+        api_version: ApiVersion,
+    ) -> TestEndpointSuite {
+        mock_endpoint_with_ts_provider(cfg, engine, api_version, None)
+    }
+
+    fn mock_endpoint_with_ts_provider(
+        cfg: &CdcConfig,
+        engine: Option<RocksEngine>,
+        api_version: ApiVersion,
+        causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
+    ) -> TestEndpointSuite {
         let (task_sched, task_rx) = dummy_scheduler();
         let raft_router = MockRaftStoreRouter::new();
-        let observer = CdcObserver::new(task_sched.clone());
+        let mut store_meta = StoreMeta::new(0);
+        store_meta.store_id = Some(1);
+        let region_read_progress = store_meta.region_read_progress.clone();
         let pd_client = Arc::new(TestPdClient::new(0, true));
         let env = Arc::new(Environment::new(1));
         let security_mgr = Arc::new(SecurityManager::default());
+        let store_resolver_gc_interval = Duration::from_secs(60);
+        let leader_resolver = LeadershipResolver::new(
+            1,
+            pd_client.clone(),
+            env.clone(),
+            security_mgr.clone(),
+            region_read_progress,
+            store_resolver_gc_interval,
+        );
         let ep = Endpoint::new(
             DEFAULT_CLUSTER_ID,
             cfg,
+            api_version,
             pd_client,
-            task_sched,
+            task_sched.clone(),
             raft_router.clone(),
-            observer,
-            store_meta,
+            engine.unwrap_or_else(|| {
+                TestEngineBuilder::new()
+                    .build_without_cache()
+                    .unwrap()
+                    .kv_engine()
+                    .unwrap()
+            }),
+            CdcObserver::new(task_sched),
+            Arc::new(StdMutex::new(store_meta)),
             ConcurrencyManager::new(1.into()),
             env,
             security_mgr,
             MemoryQuota::new(usize::MAX),
+            causal_ts_provider,
         );
-        (ep, raft_router, task_rx)
+
+        TestEndpointSuite {
+            endpoint: ep,
+            raft_router,
+            task_rx,
+            raft_rxs: HashMap::default(),
+            leader_resolver: Some(leader_resolver),
+        }
     }
 
     #[test]
-    fn test_initializer_build_resolver() {
-        let temp = TempDir::new().unwrap();
-        let engine = TestEngineBuilder::new()
-            .path(temp.path())
-            .cfs(DATA_CFS)
-            .build()
+    fn test_api_version_check() {
+        let mut cfg = CdcConfig::default();
+        // To make the case more stable.
+        cfg.min_ts_interval = ReadableDuration(Duration::from_secs(1));
+
+        let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
+        suite.add_region(1, 100);
+        let quota = crate::channel::MemoryQuota::new(usize::MAX);
+        let (tx, mut rx) = channel::channel(1, quota);
+        let mut rx = rx.drain();
+
+        let conn = Conn::new(tx, String::new());
+        let conn_id = conn.get_id();
+        suite.run(Task::OpenConn { conn });
+        let mut req_header = Header::default();
+        req_header.set_cluster_id(0);
+        let mut req = ChangeDataRequest::default();
+        req.set_region_id(1);
+        req.set_kv_api(ChangeDataRequestKvApi::TiDb);
+        let region_epoch = req.get_region_epoch().clone();
+        let version = FeatureGate::batch_resolved_ts();
+
+        // Compatibility error.
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            1,
+            conn_id,
+            ChangeDataRequestKvApi::RawKv,
+            false,
+        );
+        req.set_kv_api(ChangeDataRequestKvApi::RawKv);
+        suite.run(Task::Register {
+            request: req.clone(),
+            downstream,
+            conn_id,
+            version: version.clone(),
+        });
+        let cdc_event = channel::recv_timeout(&mut rx, Duration::from_millis(500))
+            .unwrap()
             .unwrap();
-
-        let mut expected_locks = BTreeMap::<TimeStamp, HashSet<Arc<[u8]>>>::new();
-
-        let mut total_bytes = 0;
-        // Pessimistic locks should not be tracked
-        for i in 0..10 {
-            let k = &[b'k', i];
-            total_bytes += k.len();
-            let ts = TimeStamp::new(i as _);
-            must_acquire_pessimistic_lock(&engine, k, k, ts, ts);
-        }
-
-        for i in 10..100 {
-            let (k, v) = (&[b'k', i], &[b'v', i]);
-            total_bytes += k.len();
-            total_bytes += v.len();
-            let ts = TimeStamp::new(i as _);
-            must_prewrite_put(&engine, k, v, k, ts);
-            expected_locks
-                .entry(ts)
-                .or_default()
-                .insert(k.to_vec().into());
-        }
-
-        let region = Region::default();
-        let snap = engine.snapshot(Default::default()).unwrap();
-        // Buffer must be large enough to unblock async incremental scan.
-        let buffer = 1000;
-        let (mut worker, pool, mut initializer, rx, mut drain) =
-            mock_initializer(total_bytes, buffer);
-        let check_result = || loop {
-            let task = rx.recv().unwrap();
-            match task {
-                Task::ResolverReady { resolver, .. } => {
-                    assert_eq!(resolver.locks(), &expected_locks);
-                    return;
+        if let CdcEvent::Event(mut e) = cdc_event.0 {
+            assert_eq!(e.region_id, 1);
+            let event = e.event.take().unwrap();
+            match event {
+                Event_oneof_event::Error(err) => {
+                    assert!(err.has_compatibility());
                 }
-                t => panic!("unexpected task {} received", t),
+                other => panic!("unknown event {:?}", other),
             }
-        };
-        // To not block test by barrier.
-        pool.spawn(async move {
-            let mut d = drain.drain();
-            while d.next().await.is_some() {}
+        } else {
+            panic!("unknown cdc event {:?}", cdc_event);
+        }
+        suite
+            .task_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_err();
+
+        // Compatibility error.
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            2,
+            conn_id,
+            ChangeDataRequestKvApi::TxnKv,
+            false,
+        );
+        req.set_kv_api(ChangeDataRequestKvApi::TxnKv);
+        suite.run(Task::Register {
+            request: req.clone(),
+            downstream,
+            conn_id,
+            version: version.clone(),
         });
-
-        block_on(initializer.async_incremental_scan(snap.clone(), region.clone())).unwrap();
-        check_result();
-
-        initializer
-            .downstream_state
-            .store(DownstreamState::Initializing);
-        initializer.max_scan_batch_bytes = total_bytes;
-        block_on(initializer.async_incremental_scan(snap.clone(), region.clone())).unwrap();
-        check_result();
-
-        initializer
-            .downstream_state
-            .store(DownstreamState::Initializing);
-        initializer.build_resolver = false;
-        block_on(initializer.async_incremental_scan(snap.clone(), region.clone())).unwrap();
-
-        loop {
-            let task = rx.recv_timeout(Duration::from_millis(100));
-            match task {
-                Ok(t) => panic!("unexpected task {} received", t),
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(e) => panic!("unexpected err {:?}", e),
+        let cdc_event = channel::recv_timeout(&mut rx, Duration::from_millis(500))
+            .unwrap()
+            .unwrap();
+        if let CdcEvent::Event(mut e) = cdc_event.0 {
+            assert_eq!(e.region_id, 1);
+            let event = e.event.take().unwrap();
+            match event {
+                Event_oneof_event::Error(err) => {
+                    assert!(err.has_compatibility());
+                }
+                other => panic!("unknown event {:?}", other),
             }
+        } else {
+            panic!("unknown cdc event {:?}", cdc_event);
         }
+        suite
+            .task_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_err();
 
-        // Test cancellation.
-        initializer.downstream_state.store(DownstreamState::Stopped);
-        block_on(initializer.async_incremental_scan(snap.clone(), region)).unwrap_err();
-
-        // Cancel error should trigger a deregsiter.
-        let mut region = Region::default();
-        region.set_id(initializer.region_id);
-        region.mut_peers().push(Default::default());
-        let snapshot = Some(RegionSnapshot::from_snapshot(snap, Arc::new(region)));
-        let resp = ReadResponse {
-            snapshot,
-            response: Default::default(),
-            txn_extra_op: Default::default(),
-        };
-        block_on(initializer.on_change_cmd_response(resp.clone())).unwrap_err();
-
-        // Disconnect sink by dropping runtime (it also drops drain).
-        drop(pool);
-        initializer
-            .downstream_state
-            .store(DownstreamState::Initializing);
-        block_on(initializer.on_change_cmd_response(resp)).unwrap_err();
-
-        worker.stop();
-    }
-
-    #[test]
-    fn test_initializer_deregister_downstream() {
-        let total_bytes = 1;
-        let buffer = 1;
-        let (mut worker, _pool, mut initializer, rx, _drain) =
-            mock_initializer(total_bytes, buffer);
-
-        // Errors reported by region should deregister region.
-        initializer.build_resolver = false;
-        initializer.deregister_downstream(Error::request(ErrorHeader::default()));
-        let task = rx.recv_timeout(Duration::from_millis(100));
-        match task {
-            Ok(Task::Deregister(Deregister::Delegate { region_id, .. })) => {
-                assert_eq!(region_id, initializer.region_id);
-            }
-            Ok(other) => panic!("unexpected task {:?}", other),
-            Err(e) => panic!("unexpected err {:?}", e),
-        }
-
-        initializer.build_resolver = false;
-        initializer.deregister_downstream(Error::Other(box_err!("test")));
-        let task = rx.recv_timeout(Duration::from_millis(100));
-        match task {
-            Ok(Task::Deregister(Deregister::Downstream { region_id, .. })) => {
-                assert_eq!(region_id, initializer.region_id);
-            }
-            Ok(other) => panic!("unexpected task {:?}", other),
-            Err(e) => panic!("unexpected err {:?}", e),
-        }
-
-        // Test deregister region when resolver fails to build.
-        initializer.build_resolver = true;
-        initializer.deregister_downstream(Error::Other(box_err!("test")));
-        let task = rx.recv_timeout(Duration::from_millis(100));
-        match task {
-            Ok(Task::Deregister(Deregister::Delegate { region_id, .. })) => {
-                assert_eq!(region_id, initializer.region_id);
-            }
-            Ok(other) => panic!("unexpected task {:?}", other),
-            Err(e) => panic!("unexpected err {:?}", e),
-        }
-
-        worker.stop();
-    }
-
-    #[test]
-    fn test_initializer_initialize() {
-        let total_bytes = 1;
-        let buffer = 1;
-        let (mut worker, pool, mut initializer, _rx, _drain) =
-            mock_initializer(total_bytes, buffer);
-
-        let change_cmd = ChangeObserver::from_cdc(1, ObserveHandle::new());
-        let raft_router = MockRaftStoreRouter::new();
-        let concurrency_semaphore = Arc::new(Semaphore::new(1));
-
-        initializer.downstream_state.store(DownstreamState::Stopped);
-        block_on(initializer.initialize(
-            change_cmd,
-            raft_router.clone(),
-            concurrency_semaphore.clone(),
-        ))
-        .unwrap_err();
-
-        let (tx, rx) = sync_channel(1);
-        let concurrency_semaphore_ = concurrency_semaphore.clone();
-        pool.spawn(async move {
-            let _permit = concurrency_semaphore_.acquire().await;
-            tx.send(()).unwrap();
-            tx.send(()).unwrap();
-            tx.send(()).unwrap();
+        suite.api_version = ApiVersion::V2;
+        // Compatibility error.
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch,
+            3,
+            conn_id,
+            ChangeDataRequestKvApi::TxnKv,
+            false,
+        );
+        req.set_kv_api(ChangeDataRequestKvApi::TxnKv);
+        suite.run(Task::Register {
+            request: req,
+            downstream,
+            conn_id,
+            version,
         });
-        rx.recv_timeout(Duration::from_millis(200)).unwrap();
-
-        let (tx1, rx1) = sync_channel(1);
-        let change_cmd = ChangeObserver::from_cdc(1, ObserveHandle::new());
-        pool.spawn(async move {
-            let res = initializer
-                .initialize(change_cmd, raft_router, concurrency_semaphore)
-                .await;
-            tx1.send(res).unwrap();
-        });
-        // Must timeout because there is no enough permit.
-        rx1.recv_timeout(Duration::from_millis(200)).unwrap_err();
-
-        // Release the permit
-        rx.recv_timeout(Duration::from_millis(200)).unwrap();
-        let res = rx1.recv_timeout(Duration::from_millis(200)).unwrap();
-        res.unwrap_err();
-
-        worker.stop();
+        let cdc_event = channel::recv_timeout(&mut rx, Duration::from_millis(500))
+            .unwrap()
+            .unwrap();
+        if let CdcEvent::Event(mut e) = cdc_event.0 {
+            assert_eq!(e.region_id, 1);
+            let event = e.event.take().unwrap();
+            match event {
+                Event_oneof_event::Error(err) => {
+                    assert!(err.has_compatibility());
+                }
+                other => panic!("unknown event {:?}", other),
+            }
+        } else {
+            panic!("unknown cdc event {:?}", cdc_event);
+        }
+        suite
+            .task_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_err();
     }
 
     #[test]
     fn test_change_endpoint_cfg() {
         let cfg = CdcConfig::default();
-        let (mut ep, _raft_router, mut _task_rx) = mock_endpoint(&cfg);
+        let mut suite = mock_endpoint(&cfg, None, ApiVersion::V2);
+        let ep = &mut suite.endpoint;
 
         // Modify min_ts_interval and hibernate_regions_compatible.
         {
@@ -1934,7 +1543,7 @@ mod tests {
             }
             let diff = cfg.diff(&updated_cfg);
             ep.run(Task::ChangeConfig(diff));
-            assert_eq!(ep.config.min_ts_interval, ReadableDuration::secs(1));
+            assert_eq!(ep.config.min_ts_interval, ReadableDuration::millis(200));
             assert_eq!(ep.config.hibernate_regions_compatible, true);
 
             {
@@ -1980,13 +1589,14 @@ mod tests {
             let mut updated_cfg = cfg.clone();
             {
                 // Update it to be smaller than incremental_scan_threads,
-                // which will be an invalid change and will be lost.
+                // which will be an invalid change and will modified to
+                // incremental_scan_threads.
                 updated_cfg.incremental_scan_concurrency = 2;
             }
             let diff = cfg.diff(&updated_cfg);
             ep.run(Task::ChangeConfig(diff));
-            assert_eq!(ep.config.incremental_scan_concurrency, 6);
-            assert_eq!(ep.scan_concurrency_semaphore.available_permits(), 6);
+            assert_eq!(ep.config.incremental_scan_concurrency, 4);
+            assert_eq!(ep.scan_concurrency_semaphore.available_permits(), 4);
 
             {
                 // Correct update.
@@ -2047,43 +1657,41 @@ mod tests {
     fn test_raftstore_is_busy() {
         let quota = crate::channel::MemoryQuota::new(usize::MAX);
         let (tx, _rx) = channel::channel(1, quota);
-        let (mut ep, raft_router, mut task_rx) = mock_endpoint(&CdcConfig::default());
+        let mut suite = mock_endpoint(&CdcConfig::default(), None, ApiVersion::V1);
+
         // Fill the channel.
-        let _raft_rx = raft_router.add_region(1 /* region id */, 1 /* cap */);
-        loop {
-            if let Err(RaftStoreError::Transport(_)) =
-                raft_router.send_casual_msg(1, CasualMessage::ClearRegionSize)
-            {
-                break;
-            }
-        }
-        // Make sure channel is full.
-        raft_router
-            .send_casual_msg(1, CasualMessage::ClearRegionSize)
-            .unwrap_err();
+        suite.add_region(1 /* region id */, 1 /* cap */);
+        suite.fill_raft_rx(1);
 
         let conn = Conn::new(tx, String::new());
         let conn_id = conn.get_id();
-        ep.run(Task::OpenConn { conn });
+        suite.run(Task::OpenConn { conn });
         let mut req_header = Header::default();
         req_header.set_cluster_id(0);
         let mut req = ChangeDataRequest::default();
         req.set_region_id(1);
         let region_epoch = req.get_region_epoch().clone();
-        let downstream = Downstream::new("".to_string(), region_epoch, 0, conn_id, true);
-        ep.run(Task::Register {
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch,
+            0,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
+        suite.run(Task::Register {
             request: req,
             downstream,
             conn_id,
             version: semver::Version::new(0, 0, 0),
         });
-        assert_eq!(ep.capture_regions.len(), 1);
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
 
         for _ in 0..5 {
             if let Ok(Some(Task::Deregister(Deregister::Downstream {
                 err: Some(Error::Request(err)),
                 ..
-            }))) = task_rx.recv_timeout(Duration::from_secs(1))
+            }))) = suite.task_rx.recv_timeout(Duration::from_secs(1))
             {
                 assert!(!err.has_server_is_busy());
             }
@@ -2092,40 +1700,56 @@ mod tests {
 
     #[test]
     fn test_register() {
-        let (mut ep, raft_router, mut task_rx) = mock_endpoint(&CdcConfig {
+        let cfg = CdcConfig {
             min_ts_interval: ReadableDuration(Duration::from_secs(60)),
             ..Default::default()
-        });
-        let _raft_rx = raft_router.add_region(1 /* region id */, 100 /* cap */);
+        };
+        let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
+        suite.add_region(1, 100);
         let quota = crate::channel::MemoryQuota::new(usize::MAX);
         let (tx, mut rx) = channel::channel(1, quota);
         let mut rx = rx.drain();
 
         let conn = Conn::new(tx, String::new());
         let conn_id = conn.get_id();
-        ep.run(Task::OpenConn { conn });
+        suite.run(Task::OpenConn { conn });
         let mut req_header = Header::default();
         req_header.set_cluster_id(0);
         let mut req = ChangeDataRequest::default();
         req.set_region_id(1);
         let region_epoch = req.get_region_epoch().clone();
-        let downstream = Downstream::new("".to_string(), region_epoch.clone(), 1, conn_id, true);
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            1,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
         // Enable batch resolved ts in the test.
         let version = FeatureGate::batch_resolved_ts();
-        ep.run(Task::Register {
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id,
             version: version.clone(),
         });
-        assert_eq!(ep.capture_regions.len(), 1);
-        task_rx
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
+        suite
+            .task_rx
             .recv_timeout(Duration::from_millis(100))
             .unwrap_err();
 
         // duplicate request error.
-        let downstream = Downstream::new("".to_string(), region_epoch.clone(), 2, conn_id, true);
-        ep.run(Task::Register {
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            2,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id,
@@ -2147,14 +1771,22 @@ mod tests {
         } else {
             panic!("unknown cdc event {:?}", cdc_event);
         }
-        assert_eq!(ep.capture_regions.len(), 1);
-        task_rx
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
+        suite
+            .task_rx
             .recv_timeout(Duration::from_millis(100))
             .unwrap_err();
 
         // Compatibility error.
-        let downstream = Downstream::new("".to_string(), region_epoch, 3, conn_id, true);
-        ep.run(Task::Register {
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch,
+            3,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
+        suite.run(Task::Register {
             request: req,
             downstream,
             conn_id,
@@ -2177,8 +1809,9 @@ mod tests {
         } else {
             panic!("unknown cdc event {:?}", cdc_event);
         }
-        assert_eq!(ep.capture_regions.len(), 1);
-        task_rx
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
+        suite
+            .task_rx
             .recv_timeout(Duration::from_millis(100))
             .unwrap_err();
 
@@ -2190,16 +1823,27 @@ mod tests {
         let mut req = ChangeDataRequest::default();
         req.set_region_id(100);
         let region_epoch = req.get_region_epoch().clone();
-        let downstream = Downstream::new("".to_string(), region_epoch.clone(), 1, conn_id, true);
-        ep.run(Task::Register {
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            1,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
+        suite.add_local_reader(100);
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id,
             version: version.clone(),
         });
         // Region 100 is inserted into capture_regions.
-        assert_eq!(ep.capture_regions.len(), 2);
-        let task = task_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(suite.endpoint.capture_regions.len(), 2);
+        let task = suite
+            .task_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
         match task.unwrap() {
             Task::Deregister(Deregister::Delegate { region_id, err, .. }) => {
                 assert_eq!(region_id, 100);
@@ -2210,18 +1854,26 @@ mod tests {
 
         // Test errors on CaptureChange message.
         req.set_region_id(101);
-        let raft_rx = raft_router.add_region(101 /* region id */, 100 /* cap */);
-        let downstream = Downstream::new("".to_string(), region_epoch, 1, conn_id, true);
-        ep.run(Task::Register {
+        suite.add_region(101, 100);
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch,
+            1,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
+        suite.run(Task::Register {
             request: req,
             downstream,
             conn_id,
             version,
         });
         // Drop CaptureChange message, it should cause scan task failure.
-        let _ = raft_rx.recv_timeout(Duration::from_millis(100)).unwrap();
-        assert_eq!(ep.capture_regions.len(), 3);
-        let task = task_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        let timeout = Duration::from_millis(100);
+        let _ = suite.raft_rx(101).recv_timeout(timeout).unwrap();
+        assert_eq!(suite.endpoint.capture_regions.len(), 3);
+        let task = suite.task_rx.recv_timeout(timeout).unwrap();
         match task.unwrap() {
             Task::Deregister(Deregister::Delegate { region_id, err, .. }) => {
                 assert_eq!(region_id, 101);
@@ -2232,12 +1884,39 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_causal_min_ts() {
+        let sleep_interval = Duration::from_secs(1);
+        let cfg = CdcConfig {
+            min_ts_interval: ReadableDuration(sleep_interval),
+            ..Default::default()
+        };
+        let ts_provider: Arc<CausalTsProviderImpl> =
+            Arc::new(causal_ts::tests::TestProvider::default().into());
+        let start_ts = block_on(ts_provider.async_get_ts()).unwrap();
+        let mut suite =
+            mock_endpoint_with_ts_provider(&cfg, None, ApiVersion::V2, Some(ts_provider.clone()));
+        let leader_resolver = suite.leader_resolver.take().unwrap();
+        suite.run(Task::RegisterMinTsEvent {
+            leader_resolver,
+            event_time: Instant::now(),
+        });
+        suite
+            .task_rx
+            .recv_timeout(Duration::from_millis(1500))
+            .unwrap()
+            .unwrap();
+        let end_ts = block_on(ts_provider.async_get_ts()).unwrap();
+        assert!(end_ts.into_inner() > start_ts.next().into_inner()); // may trigger more than once.
+    }
+
+    #[test]
     fn test_feature_gate() {
-        let (mut ep, raft_router, _task_rx) = mock_endpoint(&CdcConfig {
+        let cfg = CdcConfig {
             min_ts_interval: ReadableDuration(Duration::from_secs(60)),
             ..Default::default()
-        });
-        let _raft_rx = raft_router.add_region(1 /* region id */, 100 /* cap */);
+        };
+        let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
+        suite.add_region(1, 100);
 
         let quota = crate::channel::MemoryQuota::new(usize::MAX);
         let (tx, mut rx) = channel::channel(1, quota);
@@ -2246,28 +1925,36 @@ mod tests {
         region.set_id(1);
         let conn = Conn::new(tx, String::new());
         let conn_id = conn.get_id();
-        ep.run(Task::OpenConn { conn });
+        suite.run(Task::OpenConn { conn });
         let mut req_header = Header::default();
         req_header.set_cluster_id(0);
         let mut req = ChangeDataRequest::default();
         req.set_region_id(1);
         let region_epoch = req.get_region_epoch().clone();
-        let downstream = Downstream::new("".to_string(), region_epoch.clone(), 0, conn_id, true);
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            0,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
         downstream.get_state().store(DownstreamState::Normal);
         // Enable batch resolved ts in the test.
         let version = FeatureGate::batch_resolved_ts();
-        ep.run(Task::Register {
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id,
             version: version.clone(),
         });
         let resolver = Resolver::new(1);
-        let observe_id = ep.capture_regions[&1].handle.id;
-        ep.on_region_ready(observe_id, resolver, region.clone());
-        ep.run(Task::MinTS {
+        let observe_id = suite.endpoint.capture_regions[&1].handle.id;
+        suite.on_region_ready(observe_id, resolver, region.clone());
+        suite.run(Task::MinTs {
             regions: vec![1],
             min_ts: TimeStamp::from(1),
+            current_ts: TimeStamp::zero(),
         });
         let cdc_event = channel::recv_timeout(&mut rx, Duration::from_millis(500))
             .unwrap()
@@ -2281,9 +1968,17 @@ mod tests {
 
         // Register region 2 to the conn.
         req.set_region_id(2);
-        let downstream = Downstream::new("".to_string(), region_epoch.clone(), 0, conn_id, true);
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            0,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
         downstream.get_state().store(DownstreamState::Normal);
-        ep.run(Task::Register {
+        suite.add_region(2, 100);
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id,
@@ -2291,11 +1986,12 @@ mod tests {
         });
         let resolver = Resolver::new(2);
         region.set_id(2);
-        let observe_id = ep.capture_regions[&2].handle.id;
-        ep.on_region_ready(observe_id, resolver, region);
-        ep.run(Task::MinTS {
+        let observe_id = suite.endpoint.capture_regions[&2].handle.id;
+        suite.on_region_ready(observe_id, resolver, region);
+        suite.run(Task::MinTs {
             regions: vec![1, 2],
             min_ts: TimeStamp::from(2),
+            current_ts: TimeStamp::zero(),
         });
         let cdc_event = channel::recv_timeout(&mut rx, Duration::from_millis(500))
             .unwrap()
@@ -2316,11 +2012,19 @@ mod tests {
         region.set_id(3);
         let conn = Conn::new(tx, String::new());
         let conn_id = conn.get_id();
-        ep.run(Task::OpenConn { conn });
+        suite.run(Task::OpenConn { conn });
         req.set_region_id(3);
-        let downstream = Downstream::new("".to_string(), region_epoch, 3, conn_id, true);
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch,
+            3,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
         downstream.get_state().store(DownstreamState::Normal);
-        ep.run(Task::Register {
+        suite.add_region(3, 100);
+        suite.run(Task::Register {
             request: req,
             downstream,
             conn_id,
@@ -2328,11 +2032,12 @@ mod tests {
         });
         let resolver = Resolver::new(3);
         region.set_id(3);
-        let observe_id = ep.capture_regions[&3].handle.id;
-        ep.on_region_ready(observe_id, resolver, region);
-        ep.run(Task::MinTS {
+        let observe_id = suite.endpoint.capture_regions[&3].handle.id;
+        suite.on_region_ready(observe_id, resolver, region);
+        suite.run(Task::MinTs {
             regions: vec![1, 2, 3],
             min_ts: TimeStamp::from(3),
+            current_ts: TimeStamp::zero(),
         });
         let cdc_event = channel::recv_timeout(&mut rx, Duration::from_millis(500))
             .unwrap()
@@ -2366,29 +2071,36 @@ mod tests {
 
     #[test]
     fn test_deregister() {
-        let (mut ep, raft_router, _task_rx) = mock_endpoint(&CdcConfig::default());
-        let _raft_rx = raft_router.add_region(1 /* region id */, 100 /* cap */);
+        let mut suite = mock_endpoint(&CdcConfig::default(), None, ApiVersion::V1);
+        suite.add_region(1, 100);
         let quota = crate::channel::MemoryQuota::new(usize::MAX);
         let (tx, mut rx) = channel::channel(1, quota);
         let mut rx = rx.drain();
 
         let conn = Conn::new(tx, String::new());
         let conn_id = conn.get_id();
-        ep.run(Task::OpenConn { conn });
+        suite.run(Task::OpenConn { conn });
         let mut req_header = Header::default();
         req_header.set_cluster_id(0);
         let mut req = ChangeDataRequest::default();
         req.set_region_id(1);
         let region_epoch = req.get_region_epoch().clone();
-        let downstream = Downstream::new("".to_string(), region_epoch.clone(), 0, conn_id, true);
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            0,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
         let downstream_id = downstream.get_id();
-        ep.run(Task::Register {
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id,
             version: semver::Version::new(0, 0, 0),
         });
-        assert_eq!(ep.capture_regions.len(), 1);
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
 
         let mut err_header = ErrorHeader::default();
         err_header.set_not_leader(Default::default());
@@ -2398,7 +2110,7 @@ mod tests {
             conn_id,
             err: Some(Error::request(err_header.clone())),
         };
-        ep.run(Task::Deregister(deregister));
+        suite.run(Task::Deregister(deregister));
         loop {
             let cdc_event = channel::recv_timeout(&mut rx, Duration::from_millis(500))
                 .unwrap()
@@ -2414,17 +2126,24 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ep.capture_regions.len(), 0);
+        assert_eq!(suite.endpoint.capture_regions.len(), 0);
 
-        let downstream = Downstream::new("".to_string(), region_epoch.clone(), 0, conn_id, true);
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch.clone(),
+            0,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
         let new_downstream_id = downstream.get_id();
-        ep.run(Task::Register {
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id,
             version: semver::Version::new(0, 0, 0),
         });
-        assert_eq!(ep.capture_regions.len(), 1);
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
 
         let deregister = Deregister::Downstream {
             region_id: 1,
@@ -2432,9 +2151,9 @@ mod tests {
             conn_id,
             err: Some(Error::request(err_header.clone())),
         };
-        ep.run(Task::Deregister(deregister));
-        assert!(channel::recv_timeout(&mut rx, Duration::from_millis(200)).is_err());
-        assert_eq!(ep.capture_regions.len(), 1);
+        suite.run(Task::Deregister(deregister));
+        channel::recv_timeout(&mut rx, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
 
         let deregister = Deregister::Downstream {
             region_id: 1,
@@ -2442,7 +2161,7 @@ mod tests {
             conn_id,
             err: Some(Error::request(err_header.clone())),
         };
-        ep.run(Task::Deregister(deregister));
+        suite.run(Task::Deregister(deregister));
         let cdc_event = channel::recv_timeout(&mut rx, Duration::from_millis(500))
             .unwrap()
             .unwrap();
@@ -2458,73 +2177,84 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ep.capture_regions.len(), 0);
+        assert_eq!(suite.endpoint.capture_regions.len(), 0);
 
         // Stale deregister should be filtered.
-        let downstream = Downstream::new("".to_string(), region_epoch, 0, conn_id, true);
-        ep.run(Task::Register {
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch,
+            0,
+            conn_id,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
+        suite.run(Task::Register {
             request: req,
             downstream,
             conn_id,
             version: semver::Version::new(0, 0, 0),
         });
-        assert_eq!(ep.capture_regions.len(), 1);
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
         let deregister = Deregister::Delegate {
             region_id: 1,
-            // A stale ObserveID (different from the actual one).
-            observe_id: ObserveID::new(),
+            // A stale ObserveId (different from the actual one).
+            observe_id: ObserveId::new(),
             err: Error::request(err_header),
         };
-        ep.run(Task::Deregister(deregister));
+        suite.run(Task::Deregister(deregister));
         match channel::recv_timeout(&mut rx, Duration::from_millis(500)) {
             Err(_) => (),
             Ok(other) => panic!("unknown event {:?}", other),
         }
-        assert_eq!(ep.capture_regions.len(), 1);
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
     }
 
     #[test]
     fn test_broadcast_resolved_ts() {
-        let (mut ep, raft_router, _task_rx) = mock_endpoint(&CdcConfig {
+        let cfg = CdcConfig {
             min_ts_interval: ReadableDuration(Duration::from_secs(60)),
             ..Default::default()
-        });
+        };
+        let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
 
         // Open two connections a and b, registers region 1, 2 to conn a and
         // region 3 to conn b.
         let mut conn_rxs = vec![];
         let quota = channel::MemoryQuota::new(usize::MAX);
-        // Hold raft_rxs to avoid SendError panic.
-        let mut raft_rxs = vec![];
         for region_ids in vec![vec![1, 2], vec![3]] {
             let (tx, rx) = channel::channel(1, quota.clone());
             conn_rxs.push(rx);
             let conn = Conn::new(tx, String::new());
             let conn_id = conn.get_id();
-            ep.run(Task::OpenConn { conn });
+            suite.run(Task::OpenConn { conn });
 
             for region_id in region_ids {
-                let raft_rx = raft_router.add_region(region_id, 100 /* cap */);
-                raft_rxs.push(raft_rx);
+                suite.add_region(region_id, 100);
                 let mut req_header = Header::default();
                 req_header.set_cluster_id(0);
                 let mut req = ChangeDataRequest::default();
                 req.set_region_id(region_id);
                 let region_epoch = req.get_region_epoch().clone();
-                let downstream =
-                    Downstream::new("".to_string(), region_epoch.clone(), 0, conn_id, true);
+                let downstream = Downstream::new(
+                    "".to_string(),
+                    region_epoch.clone(),
+                    0,
+                    conn_id,
+                    ChangeDataRequestKvApi::TiDb,
+                    false,
+                );
                 downstream.get_state().store(DownstreamState::Normal);
-                ep.run(Task::Register {
+                suite.run(Task::Register {
                     request: req.clone(),
                     downstream,
                     conn_id,
                     version: FeatureGate::batch_resolved_ts(),
                 });
                 let resolver = Resolver::new(region_id);
-                let observe_id = ep.capture_regions[&region_id].handle.id;
+                let observe_id = suite.endpoint.capture_regions[&region_id].handle.id;
                 let mut region = Region::default();
                 region.set_id(region_id);
-                ep.on_region_ready(observe_id, resolver, region);
+                suite.on_region_ready(observe_id, resolver, region);
             }
         }
 
@@ -2542,9 +2272,10 @@ mod tests {
             }
         };
 
-        ep.run(Task::MinTS {
+        suite.run(Task::MinTs {
             regions: vec![1],
             min_ts: TimeStamp::from(1),
+            current_ts: TimeStamp::zero(),
         });
         // conn a must receive a resolved ts that only contains region 1.
         assert_batch_resolved_ts(conn_rxs.get_mut(0).unwrap(), vec![1], 1);
@@ -2555,9 +2286,10 @@ mod tests {
         )
         .unwrap_err();
 
-        ep.run(Task::MinTS {
+        suite.run(Task::MinTs {
             regions: vec![1, 2],
             min_ts: TimeStamp::from(2),
+            current_ts: TimeStamp::zero(),
         });
         // conn a must receive a resolved ts that contains region 1 and region 2.
         assert_batch_resolved_ts(conn_rxs.get_mut(0).unwrap(), vec![1, 2], 2);
@@ -2568,18 +2300,20 @@ mod tests {
         )
         .unwrap_err();
 
-        ep.run(Task::MinTS {
+        suite.run(Task::MinTs {
             regions: vec![1, 2, 3],
             min_ts: TimeStamp::from(3),
+            current_ts: TimeStamp::zero(),
         });
         // conn a must receive a resolved ts that contains region 1 and region 2.
         assert_batch_resolved_ts(conn_rxs.get_mut(0).unwrap(), vec![1, 2], 3);
         // conn b must receive a resolved ts that contains region 3.
         assert_batch_resolved_ts(conn_rxs.get_mut(1).unwrap(), vec![3], 3);
 
-        ep.run(Task::MinTS {
+        suite.run(Task::MinTs {
             regions: vec![1, 3],
             min_ts: TimeStamp::from(4),
+            current_ts: TimeStamp::zero(),
         });
         // conn a must receive a resolved ts that only contains region 1.
         assert_batch_resolved_ts(conn_rxs.get_mut(0).unwrap(), vec![1], 4);
@@ -2595,22 +2329,22 @@ mod tests {
     // too, because epoch not match.
     #[test]
     fn test_deregister_conn_then_delegate() {
-        let (mut ep, raft_router, _task_rx) = mock_endpoint(&CdcConfig::default());
-        let _raft_rx = raft_router.add_region(1 /* region id */, 100 /* cap */);
+        let mut suite = mock_endpoint(&CdcConfig::default(), None, ApiVersion::V1);
+        suite.add_region(1, 100);
         let quota = crate::channel::MemoryQuota::new(usize::MAX);
 
         // Open conn a
         let (tx1, _rx1) = channel::channel(1, quota.clone());
         let conn_a = Conn::new(tx1, String::new());
         let conn_id_a = conn_a.get_id();
-        ep.run(Task::OpenConn { conn: conn_a });
+        suite.run(Task::OpenConn { conn: conn_a });
 
         // Open conn b
         let (tx2, mut rx2) = channel::channel(1, quota);
         let mut rx2 = rx2.drain();
         let conn_b = Conn::new(tx2, String::new());
         let conn_id_b = conn_b.get_id();
-        ep.run(Task::OpenConn { conn: conn_b });
+        suite.run(Task::OpenConn { conn: conn_b });
 
         // Register region 1 (epoch 2) at conn a.
         let mut req_header = Header::default();
@@ -2619,16 +2353,22 @@ mod tests {
         req.set_region_id(1);
         req.mut_region_epoch().set_version(2);
         let region_epoch_2 = req.get_region_epoch().clone();
-        let downstream =
-            Downstream::new("".to_string(), region_epoch_2.clone(), 0, conn_id_a, true);
-        ep.run(Task::Register {
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch_2.clone(),
+            0,
+            conn_id_a,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id: conn_id_a,
             version: semver::Version::new(0, 0, 0),
         });
-        assert_eq!(ep.capture_regions.len(), 1);
-        let observe_id = ep.capture_regions[&1].handle.id;
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
+        let observe_id = suite.endpoint.capture_regions[&1].handle.id;
 
         // Register region 1 (epoch 1) at conn b.
         let mut req_header = Header::default();
@@ -2637,24 +2377,31 @@ mod tests {
         req.set_region_id(1);
         req.mut_region_epoch().set_version(1);
         let region_epoch_1 = req.get_region_epoch().clone();
-        let downstream = Downstream::new("".to_string(), region_epoch_1, 0, conn_id_b, true);
-        ep.run(Task::Register {
+        let downstream = Downstream::new(
+            "".to_string(),
+            region_epoch_1,
+            0,
+            conn_id_b,
+            ChangeDataRequestKvApi::TiDb,
+            false,
+        );
+        suite.run(Task::Register {
             request: req.clone(),
             downstream,
             conn_id: conn_id_b,
             version: semver::Version::new(0, 0, 0),
         });
-        assert_eq!(ep.capture_regions.len(), 1);
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
 
         // Deregister conn a.
-        ep.run(Task::Deregister(Deregister::Conn(conn_id_a)));
-        assert_eq!(ep.capture_regions.len(), 1);
+        suite.run(Task::Deregister(Deregister::Conn(conn_id_a)));
+        assert_eq!(suite.endpoint.capture_regions.len(), 1);
 
         // Schedule resolver ready (resolver is built by conn a).
         let mut region = Region::default();
         region.id = 1;
         region.set_region_epoch(region_epoch_2);
-        ep.run(Task::ResolverReady {
+        suite.run(Task::ResolverReady {
             observe_id,
             region: region.clone(),
             resolver: Resolver::new(1),
@@ -2666,12 +2413,12 @@ mod tests {
             .mut_epoch_not_match()
             .mut_current_regions()
             .push(region);
-        ep.run(Task::Deregister(Deregister::Delegate {
+        suite.run(Task::Deregister(Deregister::Delegate {
             region_id: 1,
             observe_id,
             err: Error::request(epoch_not_match),
         }));
-        assert_eq!(ep.capture_regions.len(), 0);
+        assert_eq!(suite.endpoint.capture_regions.len(), 0);
 
         let event = recv_timeout(&mut rx2, Duration::from_millis(100))
             .unwrap()

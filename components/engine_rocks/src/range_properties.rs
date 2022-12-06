@@ -1,15 +1,19 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::engine::RocksEngine;
-use crate::properties::{get_range_entries_and_versions, RangeProperties};
+use std::path::Path;
+
 use engine_traits::{
     MiscExt, Range, RangePropertiesExt, Result, CF_DEFAULT, CF_LOCK, CF_WRITE, LARGE_CFS,
 };
-use std::path::Path;
 use tikv_util::{box_err, box_try, debug, info};
 
+use crate::{
+    engine::RocksEngine,
+    properties::{get_range_entries_and_versions, RangeProperties},
+};
+
 impl RangePropertiesExt for RocksEngine {
-    fn get_range_approximate_keys(&self, range: Range, large_threshold: u64) -> Result<u64> {
+    fn get_range_approximate_keys(&self, range: Range<'_>, large_threshold: u64) -> Result<u64> {
         // try to get from RangeProperties first.
         match self.get_range_approximate_keys_cf(CF_WRITE, range, large_threshold) {
             Ok(v) => {
@@ -31,7 +35,7 @@ impl RangePropertiesExt for RocksEngine {
     fn get_range_approximate_keys_cf(
         &self,
         cfname: &str,
-        range: Range,
+        range: Range<'_>,
         large_threshold: u64,
     ) -> Result<u64> {
         let start_key = &range.start_key;
@@ -54,10 +58,10 @@ impl RangePropertiesExt for RocksEngine {
                     let keys = props.get_approximate_keys_in_range(start_key, end_key);
                     format!(
                         "{}:{}",
-                        Path::new(&*k)
+                        Path::new(k)
                             .file_name()
                             .map(|f| f.to_str().unwrap())
-                            .unwrap_or(&*k),
+                            .unwrap_or(k),
                         keys
                     )
                 })
@@ -76,7 +80,7 @@ impl RangePropertiesExt for RocksEngine {
         Ok(total_keys)
     }
 
-    fn get_range_approximate_size(&self, range: Range, large_threshold: u64) -> Result<u64> {
+    fn get_range_approximate_size(&self, range: Range<'_>, large_threshold: u64) -> Result<u64> {
         let mut size = 0;
         for cfname in LARGE_CFS {
             size += self
@@ -91,7 +95,7 @@ impl RangePropertiesExt for RocksEngine {
     fn get_range_approximate_size_cf(
         &self,
         cfname: &str,
-        range: Range,
+        range: Range<'_>,
         large_threshold: u64,
     ) -> Result<u64> {
         let start_key = &range.start_key;
@@ -114,10 +118,10 @@ impl RangePropertiesExt for RocksEngine {
                     let size = props.get_approximate_size_in_range(start_key, end_key);
                     format!(
                         "{}:{}",
-                        Path::new(&*k)
+                        Path::new(k)
                             .file_name()
                             .map(|f| f.to_str().unwrap())
-                            .unwrap_or(&*k),
+                            .unwrap_or(k),
                         size
                     )
                 })
@@ -138,7 +142,7 @@ impl RangePropertiesExt for RocksEngine {
 
     fn get_range_approximate_split_keys(
         &self,
-        range: Range,
+        range: Range<'_>,
         key_count: usize,
     ) -> Result<Vec<Vec<u8>>> {
         let get_cf_size = |cf: &str| self.get_range_approximate_size_cf(cf, range, 0);
@@ -163,7 +167,7 @@ impl RangePropertiesExt for RocksEngine {
     fn get_range_approximate_split_keys_cf(
         &self,
         cfname: &str,
-        range: Range,
+        range: Range<'_>,
         key_count: usize,
     ) -> Result<Vec<Vec<u8>>> {
         let start_key = &range.start_key;
@@ -187,8 +191,8 @@ impl RangePropertiesExt for RocksEngine {
 
         const SAMPLING_THRESHOLD: usize = 20000;
         const SAMPLE_RATIO: usize = 1000;
-        // If there are too many keys, reduce its amount before sorting, or it may take too much
-        // time to sort the keys.
+        // If there are too many keys, reduce its amount before sorting, or it may take
+        // too much time to sort the keys.
         if keys.len() > SAMPLING_THRESHOLD {
             let len = keys.len();
             keys = keys.into_iter().step_by(len / SAMPLE_RATIO).collect();
@@ -200,7 +204,8 @@ impl RangePropertiesExt for RocksEngine {
             return Ok(keys);
         }
 
-        // Find `key_count` keys which divides the whole range into `parts` parts evenly.
+        // Find `key_count` keys which divides the whole range into `parts` parts
+        // evenly.
         let mut res = Vec::with_capacity(key_count);
         let section_len = (keys.len() as f64) / ((key_count + 1) as f64);
         for i in 1..=key_count {

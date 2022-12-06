@@ -1,10 +1,18 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::cell::RefCell;
+
+use engine_rocks::ReadPerfContext;
 use lazy_static::*;
 use prometheus::*;
 use prometheus_static_metric::*;
-use std::cell::RefCell;
-use tikv::storage::kv::PerfStatisticsDelta;
+use tikv::storage::Statistics;
+
+/// Installing a new capture contains 2 phases, one for incremental scanning and
+/// one for fetching delta changes from raftstore. They can share some similar
+/// metrics, in which case we can use this tag to distinct them.
+pub const TAG_DELTA_CHANGE: &str = "delta_change";
+pub const TAG_INCREMENTAL_SCAN: &str = "incremental_scan";
 
 make_auto_flush_static_metric! {
     pub label_enum PerfMetric {
@@ -64,6 +72,10 @@ make_auto_flush_static_metric! {
 }
 
 lazy_static! {
+    pub static ref CDC_ENDPOINT_PENDING_TASKS: IntGauge = register_int_gauge!(
+        "tikv_cdc_endpoint_pending_tasks",
+        "CDC endpoint pending tasks"
+    ).unwrap();
     pub static ref CDC_RESOLVED_TS_GAP_HISTOGRAM: Histogram = register_histogram!(
         "tikv_cdc_resolved_ts_gap_seconds",
         "Bucketed histogram of the gap between cdc resolved ts and current tso",
@@ -96,6 +108,10 @@ lazy_static! {
         "The region which has minimal resolved ts"
     )
     .unwrap();
+    pub static ref CDC_MIN_RESOLVED_TS_LAG: IntGauge = register_int_gauge!(
+        "tikv_cdc_min_resolved_ts_lag",
+        "The lag between the minimal resolved ts and the current ts"
+    ).unwrap();
     pub static ref CDC_MIN_RESOLVED_TS: IntGauge = register_int_gauge!(
         "tikv_cdc_min_resolved_ts",
         "The minimal resolved ts for current regions"
@@ -159,7 +175,8 @@ lazy_static! {
     pub static ref CDC_OLD_VALUE_SCAN_DETAILS: IntCounterVec = register_int_counter_vec!(
         "tikv_cdc_old_value_scan_details",
         "Bucketed counter of scan details for old value",
-        &["cf", "tag"]
+        // Two types: `incremental_scan` and `delta_change`.
+        &["cf", "tag", "type"]
     )
     .unwrap();
     pub static ref CDC_OLD_VALUE_DURATION_HISTOGRAM: HistogramVec = register_histogram_vec!(
@@ -188,19 +205,26 @@ lazy_static! {
     )
     .unwrap();
 
+    pub static ref CDC_RAW_OUTLIER_RESOLVED_TS_GAP: Histogram = register_histogram!(
+        "tikv_cdc_raw_outlier_resolved_ts_gap_seconds",
+        "Bucketed histogram of the gap between cdc raw outlier resolver_ts and current tso",
+        exponential_buckets(1.0, 2.0, 15).unwrap() // outlier threshold is 60s by default.
+    )
+    .unwrap();
+
     pub static ref CDC_ROCKSDB_PERF_COUNTER_STATIC: PerfCounter =
         auto_flush_from!(CDC_ROCKSDB_PERF_COUNTER, PerfCounter);
 }
 
 thread_local! {
-    pub static TLS_CDC_PERF_STATS: RefCell<PerfStatisticsDelta> = RefCell::new(PerfStatisticsDelta::default());
+    pub static TLS_CDC_PERF_STATS: RefCell<ReadPerfContext> = RefCell::new(ReadPerfContext::default());
 }
 
 macro_rules! tls_flush_perf_stat {
     ($local_stats:ident, $stat:ident) => {
         CDC_ROCKSDB_PERF_COUNTER_STATIC
             .$stat
-            .inc_by($local_stats.0.$stat as u64);
+            .inc_by($local_stats.$stat as u64);
     };
 }
 
@@ -256,4 +280,14 @@ pub fn tls_flush_perf_stats() {
         tls_flush_perf_stat!(perf_stats, encrypt_data_nanos);
         tls_flush_perf_stat!(perf_stats, decrypt_data_nanos);
     });
+}
+
+pub fn flush_oldvalue_stats(stats: &Statistics, typ: &'static str) {
+    for (cf, cf_details) in stats.details().iter() {
+        for (tag, count) in cf_details.iter() {
+            CDC_OLD_VALUE_SCAN_DETAILS
+                .with_label_values(&[*cf, *tag, typ])
+                .inc_by(*count as u64);
+        }
+    }
 }

@@ -1,12 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{
+    collections::{HashMap, HashSet},
+    fs::read_to_string,
+    mem::MaybeUninit,
+    num::IntErrorKind,
+    path::{Path, PathBuf},
+};
+
 use num_traits::Bounded;
 use procfs::process::{MountInfo, Process};
-use std::collections::{HashMap, HashSet};
-use std::fs::read_to_string;
-use std::mem::MaybeUninit;
-use std::num::IntErrorKind;
-use std::path::{Component, Path, PathBuf};
 
 // ## Differences between cgroup v1 and v2:
 // ### memory subsystem, memory limitation
@@ -34,18 +37,20 @@ use std::path::{Component, Path, PathBuf};
 // For more details about cgrop v2, PTAL
 // https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html.
 //
-// The above examples are implicitly based on a premise that paths in `/proc/self/cgroup`
-// can be appended to `/sys/fs/cgroup` directly to get the final paths. Generally it's
-// correct for Linux hosts but maybe wrong for containers. For containers, cgroup file systems
-// can be based on other mount points. For example:
+// The above examples are implicitly based on a premise that paths in
+// `/proc/self/cgroup` can be appended to `/sys/fs/cgroup` directly to get the
+// final paths. Generally it's correct for Linux hosts but maybe wrong for
+// containers. For containers, cgroup file systems can be based on other mount
+// points. For example:
 //
 // /proc/self/cgroup:
 //   4:memory:/path/to/the/controller
 // /proc/self/mountinfo:
-//   34 25 0:30 /path/to/the/controller /sys/fs/cgroup/memory relatime - cgroup cgroup memory
-// `path/to/the/controller` is possible to be not accessable in the container. However from the
-// `mountinfo` file we can know the path is mounted on `sys/fs/cgroup/memory`, then we can build
-// the absolute path based on the mountinfo file.
+//   34 25 0:30 /path/to/the/controller /sys/fs/cgroup/memory relatime - cgroup
+// cgroup memory `path/to/the/controller` is possible to be not accessable in
+// the container. However from the `mountinfo` file we can know the path is
+// mounted on `sys/fs/cgroup/memory`, then we can build the absolute path based
+// on the mountinfo file.
 //
 // For the format of the mountinfo file, PTAL https://man7.org/linux/man-pages/man5/proc.5.html.
 
@@ -89,13 +94,13 @@ impl CGroupSys {
                     } else {
                         format!("{}/memory.limit_in_bytes", path.to_str().unwrap())
                     };
-                    return read_to_string(&path)
+                    return read_to_string(path)
                         .map(|x| parse_memory_max(x.trim()))
                         .ok()
                         .flatten();
                 }
             } else {
-                warn!("Cgroup memory controller found but not mounted.");
+                warn!("cgroup memory controller found but not mounted.");
             }
         }
         None
@@ -107,12 +112,12 @@ impl CGroupSys {
             if let Some((root, mount_point)) = self.mount_points.get(component) {
                 if let Some(path) = build_path(group, root, mount_point) {
                     let path = format!("{}/cpuset.cpus", path.to_str().unwrap());
-                    if let Ok(s) = read_to_string(&path) {
+                    if let Ok(s) = read_to_string(path) {
                         return parse_cpu_cores(s.trim());
                     }
                 }
             } else {
-                warn!("Cgroup cpuset controller found but not mounted.");
+                warn!("cgroup cpuset controller found but not mounted.");
             }
         }
         Default::default()
@@ -126,21 +131,21 @@ impl CGroupSys {
                 if let Some(path) = build_path(group, root, mount_point) {
                     if self.is_v2 {
                         let path = format!("{}/cpu.max", path.to_str().unwrap());
-                        if let Ok(buffer) = read_to_string(&path) {
+                        if let Ok(buffer) = read_to_string(path) {
                             return parse_cpu_quota_v2(buffer.trim());
                         }
                     } else {
                         let path1 = format!("{}/cpu.cfs_quota_us", path.to_str().unwrap());
                         let path2 = format!("{}/cpu.cfs_period_us", path.to_str().unwrap());
                         if let (Ok(buffer1), Ok(buffer2)) =
-                            (read_to_string(&path1), read_to_string(&path2))
+                            (read_to_string(path1), read_to_string(path2))
                         {
                             return parse_cpu_quota_v1(buffer1.trim(), buffer2.trim());
                         }
                     }
                 }
             } else {
-                warn!("Cgroup cpu controller found but not mounted.");
+                warn!("cgroup cpu controller found but not mounted.");
             }
         }
         None
@@ -172,10 +177,12 @@ fn is_cgroup2_unified_mode() -> Result<bool, String> {
 }
 
 // From cgroup spec:
-// "/proc/$PID/cgroup" lists a process’s cgroup membership. If legacy cgroup is in use in
-// the system, this file may contain multiple lines, one for each hierarchy.
+// "/proc/$PID/cgroup" lists a process’s cgroup membership. If legacy cgroup is
+// in use in the system, this file may contain multiple lines, one for each
+// hierarchy.
 //
-// The format is "<id>:<hierarchy>:<path>". For example, "10:cpuset:/test-cpuset".
+// The format is "<id>:<hierarchy>:<path>". For example,
+// "10:cpuset:/test-cpuset".
 fn parse_proc_cgroup_v1(lines: &str) -> HashMap<String, String> {
     let mut subsystems = HashMap::new();
     for line in lines.lines().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -248,11 +255,18 @@ fn cgroup_mountinfos_v2() -> HashMap<String, (String, PathBuf)> {
 }
 
 fn parse_mountinfos_v2(infos: Vec<MountInfo>) -> HashMap<String, (String, PathBuf)> {
-    let mut ret = HashMap::new();
-    let mut cg_infos = infos.into_iter().filter(|x| x.fs_type == "cgroup2");
-    if let Some(cg_info) = cg_infos.next() {
-        assert!(cg_infos.next().is_none()); // Only one item for cgroup-2.
-        ret.insert("".to_string(), (cg_info.root, cg_info.mount_point));
+    let mut ret: HashMap<String, (String, PathBuf)> = HashMap::new();
+    let cg_infos = infos.into_iter().filter(|x| x.fs_type == "cgroup2");
+    for info in cg_infos {
+        // Should only be one item for cgroup-2.
+        if let Some((root, mount_point)) = ret.insert("".to_string(), (info.root, info.mount_point))
+        {
+            warn!(
+                "Found multiple cgroup2 mountinfos, dropping {} {}",
+                root,
+                mount_point.display()
+            );
+        }
     }
     ret
 }
@@ -260,7 +274,7 @@ fn parse_mountinfos_v2(infos: Vec<MountInfo>) -> HashMap<String, (String, PathBu
 // `root` is mounted on `mount_point`. `path` is a sub path of `root`.
 // This is used to build an absolute path starts with `mount_point`.
 fn build_path(path: &str, root: &str, mount_point: &Path) -> Option<PathBuf> {
-    let abs_root = normalize_path(Path::new(root));
+    let abs_root = super::super::config::normalize_path(Path::new(root));
     let root = abs_root.to_str().unwrap();
     if path.starts_with('/') && root.starts_with('/') {
         if let Some(relative) = path.strip_prefix(root) {
@@ -278,44 +292,13 @@ fn build_path(path: &str, root: &str, mount_point: &Path) -> Option<PathBuf> {
     None
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut components = path.components().peekable();
-    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
-        components.next();
-        PathBuf::from(c.as_os_str())
-    } else {
-        PathBuf::new()
-    };
-
-    for component in components {
-        match component {
-            Component::Prefix(..) => unreachable!(),
-            Component::RootDir => {
-                ret.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                ret.pop();
-            }
-            Component::Normal(c) => {
-                ret.push(c);
-            }
-        }
-    }
-    ret
-}
-
 fn parse_memory_max(line: &str) -> Option<u64> {
-    if line == "max" {
-        return None;
-    }
-    match line.parse::<u64>() {
-        Ok(x) => Some(x),
-        Err(e) if matches!(e.kind(), IntErrorKind::PosOverflow) => Some(u64::MAX),
-        Err(e) => {
-            warn!("parse uint: {}", e);
-            None
-        }
+    if line != "max" {
+        capping_parse_int::<u64>(line)
+            .map_err(|e| warn!("fail to parse memory max"; "line" => %line, "err" => %e))
+            .ok()
+    } else {
+        None
     }
 }
 
@@ -373,7 +356,7 @@ fn parse_cpu_quota_v1(line1: &str, line2: &str) -> Option<f64> {
         if max > 0.0 {
             if let Ok(period) = line2.parse::<f64>() {
                 if period > 0.0 {
-                    return Some(max as f64 / period as f64);
+                    return Some(max / period);
                 }
             }
         } else {
@@ -386,9 +369,9 @@ fn parse_cpu_quota_v1(line1: &str, line2: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs::OpenOptions, io::Write};
+
     use super::*;
-    use std::fs::OpenOptions;
-    use std::io::Write;
 
     #[test]
     fn test_defult_cgroup_sys() {
@@ -402,11 +385,11 @@ mod tests {
     fn test_parse_mountinfos_without_cgroup() {
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path().to_str().unwrap();
-        std::fs::copy("/proc/self/stat", &format!("{}/stat", dir)).unwrap();
+        std::fs::copy("/proc/self/stat", format!("{}/stat", dir)).unwrap();
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&format!("{}/mountinfo", dir))
+            .open(format!("{}/mountinfo", dir))
             .unwrap();
         f.write_all(b"").unwrap();
 
@@ -419,12 +402,12 @@ mod tests {
     fn test_cpuset_cpu_cpuacct() {
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path().to_str().unwrap();
-        std::fs::copy("/proc/self/stat", &format!("{}/stat", dir)).unwrap();
+        std::fs::copy("/proc/self/stat", format!("{}/stat", dir)).unwrap();
 
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&format!("{}/mountinfo", dir))
+            .open(format!("{}/mountinfo", dir))
             .unwrap();
         f.write_all(b"30 26 0:27 / /sys/fs/cgroup/cpuset,cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:11 - cgroup cgroup rw,cpuset,cpu,cpuacct\n").unwrap();
 
@@ -449,14 +432,44 @@ mod tests {
     fn test_mountinfo_with_relative_path() {
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path().to_str().unwrap();
-        std::fs::copy("/proc/self/stat", &format!("{}/stat", dir)).unwrap();
+        std::fs::copy("/proc/self/stat", format!("{}/stat", dir)).unwrap();
 
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&format!("{}/mountinfo", dir))
+            .open(format!("{}/mountinfo", dir))
             .unwrap();
         f.write_all(b"1663 1661 0:27 /../../../../../.. /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n").unwrap();
+
+        let cgroups = parse_proc_cgroup_v2("0::/\n");
+        let mount_points = {
+            let infos = Process::new_with_root(PathBuf::from(dir))
+                .and_then(|x| x.mountinfo())
+                .unwrap();
+            parse_mountinfos_v2(infos)
+        };
+        let cgroup_sys = CGroupSys {
+            cgroups,
+            mount_points,
+            is_v2: true,
+        };
+
+        assert_eq!(cgroup_sys.memory_limit_in_bytes(), None);
+    }
+
+    #[test]
+    fn test_conflicting_mountinfo() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        std::fs::copy("/proc/self/stat", format!("{}/stat", dir)).unwrap();
+
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(format!("{}/mountinfo", dir))
+            .unwrap();
+        f.write_all(b"1663 1661 0:27 /../../../../../.. /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw
+        1663 1661 0:27 /../../../../../.. /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw").unwrap();
 
         let cgroups = parse_proc_cgroup_v2("0::/\n");
         let mount_points = {
@@ -478,12 +491,12 @@ mod tests {
     fn test_cgroup_without_mountinfo() {
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path().to_str().unwrap();
-        std::fs::copy("/proc/self/stat", &format!("{}/stat", dir)).unwrap();
+        std::fs::copy("/proc/self/stat", format!("{}/stat", dir)).unwrap();
 
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&format!("{}/mountinfo", dir))
+            .open(format!("{}/mountinfo", dir))
             .unwrap();
         f.write_all(b"1663 1661 0:27 /../../../../../.. /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw\n").unwrap();
 
@@ -537,23 +550,18 @@ mod tests {
 
     #[test]
     fn test_parse_memory_max() {
-        let contents = vec![
-            "max",
-            "-1",
-            "9223372036854771712",
-            "21474836480",
-            "19446744073709551610",
-            "-18446744073709551610",
+        let cases = vec![
+            ("max", None),
+            ("-1", None),
+            ("9223372036854771712", Some(9223372036854771712)),
+            ("21474836480", Some(21474836480)),
+            // Malformed.
+            ("19446744073709551610", Some(u64::MAX)),
+            ("-18446744073709551610", None), // Raise InvalidDigit instead of NegOverflow.
+            ("0.1", None),
         ];
-        let expects = vec![
-            None,
-            None,
-            Some(9223372036854771712),
-            Some(21474836480),
-            Some(u64::MAX),
-            None,
-        ];
-        for (content, expect) in contents.into_iter().zip(expects) {
+        println!("{:?}", "-18446744073709551610".parse::<u64>());
+        for (content, expect) in cases.into_iter() {
             let limit = parse_memory_max(content);
             assert_eq!(limit, expect);
         }

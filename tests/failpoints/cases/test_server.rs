@@ -9,10 +9,10 @@ use raft::eraftpb::MessageType;
 use test_raftstore::*;
 use tikv_util::{config::ReadableDuration, HandyRwLock};
 
-/// When encountering raft/batch_raft mismatch store id error, the service is expected
-/// to drop connections in order to let raft_client re-resolve store address from PD
-/// This will make the mismatch error be automatically corrected.
-/// Ths test verified this case.
+/// When encountering raft/batch_raft mismatch store id error, the service is
+/// expected to drop connections in order to let raft_client re-resolve store
+/// address from PD This will make the mismatch error be automatically
+/// corrected. Ths test verified this case.
 #[test]
 fn test_mismatch_store_node() {
     let count = 3;
@@ -135,12 +135,12 @@ fn test_serving_status() {
     thread::sleep(Duration::from_millis(500));
     assert_eq!(check(), ServingStatus::Serving);
 
-    fail::cfg("on_peer_handle_control_1", "pause").unwrap();
+    fail::cfg("pause_on_peer_collect_message", "pause").unwrap();
 
     thread::sleep(Duration::from_secs(1));
     assert_eq!(check(), ServingStatus::ServiceUnknown);
 
-    fail::remove("on_peer_handle_control_1");
+    fail::remove("pause_on_peer_collect_message");
 
     // It should recover within one round.
     thread::sleep(Duration::from_millis(200));

@@ -1,16 +1,13 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    io, path,
-    process::{Command, Stdio},
-};
+use std::{io, path, process::Stdio};
 
-use futures::io::AllowStdIo;
-use futures_executor::block_on;
-use futures_util::io::copy;
+use async_trait::async_trait;
+use tokio::{io as async_io, process::Command};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use url::Url;
 
-use crate::ExternalStorage;
+use crate::{ExternalData, ExternalStorage, UnpinReader};
 
 /// Convert `hdfs:///path` to `/path`
 fn try_convert_to_path(url: &Url) -> &str {
@@ -69,6 +66,7 @@ impl HdfsStorage {
 
 const STORAGE_NAME: &str = "hdfs";
 
+#[async_trait]
 impl ExternalStorage for HdfsStorage {
     fn name(&self) -> &'static str {
         STORAGE_NAME
@@ -78,12 +76,7 @@ impl ExternalStorage for HdfsStorage {
         Ok(self.remote.clone())
     }
 
-    fn write(
-        &self,
-        name: &str,
-        reader: Box<dyn futures::AsyncRead + Send + Unpin>,
-        _content_length: u64,
-    ) -> io::Result<()> {
+    async fn write(&self, name: &str, reader: UnpinReader, _content_length: u64) -> io::Result<()> {
         if name.contains(path::MAIN_SEPARATOR) {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -108,17 +101,17 @@ impl ExternalStorage for HdfsStorage {
         }
         cmd_with_args.extend([&cmd_path, "dfs", "-put", "-", path]);
         info!("calling hdfs"; "cmd" => ?cmd_with_args);
-        let mut hdfs_cmd = Command::new(&cmd_with_args[0])
+        let mut hdfs_cmd = Command::new(cmd_with_args[0])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .args(&cmd_with_args[1..])
             .spawn()?;
-        let stdin = hdfs_cmd.stdin.take().unwrap();
+        let mut stdin = hdfs_cmd.stdin.take().unwrap();
 
-        block_on(copy(reader, &mut AllowStdIo::new(stdin)))?;
+        async_io::copy(&mut reader.0.compat(), &mut stdin).await?;
 
-        let output = hdfs_cmd.wait_with_output()?;
+        let output = hdfs_cmd.wait_with_output().await?;
         if output.status.success() {
             debug!("save file to hdfs"; "path" => ?path);
             Ok(())
@@ -138,7 +131,11 @@ impl ExternalStorage for HdfsStorage {
         }
     }
 
-    fn read(&self, _name: &str) -> Box<dyn futures::AsyncRead + Unpin + '_> {
+    fn read(&self, _name: &str) -> ExternalData<'_> {
+        unimplemented!("currently only HDFS export is implemented")
+    }
+
+    fn read_part(&self, _name: &str, _off: u64, _len: u64) -> ExternalData<'_> {
         unimplemented!("currently only HDFS export is implemented")
     }
 }

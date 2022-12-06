@@ -6,22 +6,22 @@ pub mod fixture;
 pub mod scan_bencher;
 pub mod store;
 
-pub use self::fixture::FixtureBuilder;
+use std::{marker::PhantomData, sync::Arc};
 
-use criterion::black_box;
-use criterion::measurement::Measurement;
-
+use criterion::{black_box, measurement::Measurement};
 use kvproto::coprocessor::KeyRange;
+use test_coprocessor::*;
+use tikv::{
+    coprocessor::RequestHandler,
+    storage::{RocksEngine, Store as TxnStore},
+};
+use tikv_util::quota_limiter::QuotaLimiter;
 use tipb::Executor as PbExecutor;
 
-use test_coprocessor::*;
-use tikv::coprocessor::RequestHandler;
-use tikv::storage::{RocksEngine, Store as TxnStore};
+pub use self::fixture::FixtureBuilder;
 
-use std::marker::PhantomData;
-
-/// Gets the value of `TIKV_BENCH_LEVEL`. The larger value it is, the more comprehensive benchmarks
-/// will be.
+/// Gets the value of `TIKV_BENCH_LEVEL`. The larger value it is, the more
+/// comprehensive benchmarks will be.
 pub fn bench_level() -> usize {
     if let Ok(s) = std::env::var("TIKV_BENCH_LEVEL") {
         s.parse::<usize>().unwrap()
@@ -49,6 +49,8 @@ pub fn build_dag_handler<TargetTxnStore: TxnStore + 'static>(
         64,
         false,
         false,
+        None,
+        Arc::new(QuotaLimiter::default()),
     )
     .build()
     .unwrap()
@@ -57,7 +59,7 @@ pub fn build_dag_handler<TargetTxnStore: TxnStore + 'static>(
 pub struct InnerBenchCase<I, M, F>
 where
     M: Measurement + 'static,
-    F: Fn(&mut criterion::Bencher<M>, &I) + Copy + 'static,
+    F: Fn(&mut criterion::Bencher<'_, M>, &I) + Copy + 'static,
 {
     pub _phantom_input: PhantomData<I>,
     pub _phantom_measurement: PhantomData<M>,
@@ -65,7 +67,7 @@ where
     pub f: F,
 }
 
-type BenchFn<M, I> = Box<dyn Fn(&mut criterion::Bencher<M>, &I) + 'static>;
+type BenchFn<M, I> = Box<dyn Fn(&mut criterion::Bencher<'_, M>, &I) + 'static>;
 
 pub trait IBenchCase {
     type M: Measurement + 'static;
@@ -79,7 +81,7 @@ pub trait IBenchCase {
 impl<I, M, F> IBenchCase for InnerBenchCase<I, M, F>
 where
     M: Measurement + 'static,
-    F: Fn(&mut criterion::Bencher<M>, &I) + Copy + 'static,
+    F: Fn(&mut criterion::Bencher<'_, M>, &I) + Copy + 'static,
 {
     type M = M;
     type I = I;
@@ -107,7 +109,7 @@ where
 {
     pub fn new<F>(name: &'static str, f: F) -> Self
     where
-        F: Fn(&mut criterion::Bencher<M>, &I) + Copy + 'static,
+        F: Fn(&mut criterion::Bencher<'_, M>, &I) + Copy + 'static,
     {
         Self {
             inner: Box::new(InnerBenchCase {
