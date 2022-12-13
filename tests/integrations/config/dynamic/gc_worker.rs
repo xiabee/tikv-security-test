@@ -1,17 +1,16 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::{mpsc::channel, Arc},
-    time::Duration,
-};
-
-use raftstore::coprocessor::region_info_accessor::MockRegionInfoProvider;
-use tikv::{
-    config::{ConfigController, Module, TikvConfig},
-    server::gc_worker::{GcConfig, GcTask, GcWorker},
-    storage::kv::TestEngineBuilder,
-};
-use tikv_util::{config::ReadableSize, time::Limiter, worker::Scheduler};
+use raftstore::router::RaftStoreBlackHole;
+use std::f64::INFINITY;
+use std::sync::mpsc::channel;
+use std::time::Duration;
+use tikv::config::{ConfigController, Module, TiKvConfig};
+use tikv::server::gc_worker::GcConfig;
+use tikv::server::gc_worker::{GcTask, GcWorker};
+use tikv::storage::kv::TestEngineBuilder;
+use tikv_util::config::ReadableSize;
+use tikv_util::time::Limiter;
+use tikv_util::worker::Scheduler;
 
 #[test]
 fn test_gc_config_validate() {
@@ -20,22 +19,23 @@ fn test_gc_config_validate() {
 
     let mut invalid_cfg = GcConfig::default();
     invalid_cfg.batch_keys = 0;
-    invalid_cfg.validate().unwrap_err();
+    assert!(invalid_cfg.validate().is_err());
 }
 
 fn setup_cfg_controller(
-    cfg: TikvConfig,
-) -> (GcWorker<tikv::storage::kv::RocksEngine>, ConfigController) {
+    cfg: TiKvConfig,
+) -> (
+    GcWorker<tikv::storage::kv::RocksEngine, RaftStoreBlackHole>,
+    ConfigController,
+) {
     let engine = TestEngineBuilder::new().build().unwrap();
-    let (tx, _rx) = std::sync::mpsc::channel();
     let mut gc_worker = GcWorker::new(
         engine,
-        tx,
+        RaftStoreBlackHole,
         cfg.gc.clone(),
         Default::default(),
-        Arc::new(MockRegionInfoProvider::new(Vec::new())),
     );
-    gc_worker.start(0).unwrap();
+    gc_worker.start().unwrap();
 
     let cfg_controller = ConfigController::new(cfg);
     cfg_controller.register(Module::Gc, Box::new(gc_worker.get_config_manager()));
@@ -43,7 +43,7 @@ fn setup_cfg_controller(
     (gc_worker, cfg_controller)
 }
 
-fn validate<F>(scheduler: &Scheduler<GcTask<engine_rocks::RocksEngine>>, f: F)
+fn validate<F>(scheduler: &Scheduler<GcTask>, f: F)
 where
     F: FnOnce(&GcConfig, &Limiter) + Send + 'static,
 {
@@ -62,7 +62,7 @@ where
 #[allow(clippy::float_cmp)]
 #[test]
 fn test_gc_worker_config_update() {
-    let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
     cfg.validate().unwrap();
     let (gc_worker, cfg_controller) = setup_cfg_controller(cfg);
     let scheduler = gc_worker.scheduler();
@@ -96,13 +96,13 @@ fn test_gc_worker_config_update() {
 #[test]
 #[allow(clippy::float_cmp)]
 fn test_change_io_limit_by_config_manager() {
-    let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
     cfg.validate().unwrap();
     let (gc_worker, cfg_controller) = setup_cfg_controller(cfg);
     let scheduler = gc_worker.scheduler();
 
     validate(&scheduler, move |_, limiter: &Limiter| {
-        assert_eq!(limiter.speed_limit(), f64::INFINITY);
+        assert_eq!(limiter.speed_limit(), INFINITY);
     });
 
     // Enable io iolimit
@@ -126,7 +126,7 @@ fn test_change_io_limit_by_config_manager() {
         .update_config("gc.max-write-bytes-per-sec", "0")
         .unwrap();
     validate(&scheduler, move |_, limiter: &Limiter| {
-        assert_eq!(limiter.speed_limit(), f64::INFINITY);
+        assert_eq!(limiter.speed_limit(), INFINITY);
     });
 }
 
@@ -134,40 +134,31 @@ fn test_change_io_limit_by_config_manager() {
 #[allow(clippy::float_cmp)]
 fn test_change_io_limit_by_debugger() {
     // Debugger use GcWorkerConfigManager to change io limit
-    let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
     cfg.validate().unwrap();
     let (gc_worker, _) = setup_cfg_controller(cfg);
     let scheduler = gc_worker.scheduler();
     let config_manager = gc_worker.get_config_manager();
 
     validate(&scheduler, move |_, limiter: &Limiter| {
-        assert_eq!(limiter.speed_limit(), f64::INFINITY);
+        assert_eq!(limiter.speed_limit(), INFINITY);
     });
 
     // Enable io iolimit
-    let _ = config_manager.update(|cfg: &mut GcConfig| -> Result<(), ()> {
-        cfg.max_write_bytes_per_sec = ReadableSize(1024);
-        Ok(())
-    });
+    config_manager.update(|cfg: &mut GcConfig| cfg.max_write_bytes_per_sec = ReadableSize(1024));
     validate(&scheduler, move |_, limiter: &Limiter| {
         assert_eq!(limiter.speed_limit(), 1024.0);
     });
 
     // Change io iolimit
-    let _ = config_manager.update(|cfg: &mut GcConfig| -> Result<(), ()> {
-        cfg.max_write_bytes_per_sec = ReadableSize(2048);
-        Ok(())
-    });
+    config_manager.update(|cfg: &mut GcConfig| cfg.max_write_bytes_per_sec = ReadableSize(2048));
     validate(&scheduler, move |_, limiter: &Limiter| {
         assert_eq!(limiter.speed_limit(), 2048.0);
     });
 
     // Disable io iolimit
-    let _ = config_manager.update(|cfg: &mut GcConfig| -> Result<(), ()> {
-        cfg.max_write_bytes_per_sec = ReadableSize(0);
-        Ok(())
-    });
+    config_manager.update(|cfg: &mut GcConfig| cfg.max_write_bytes_per_sec = ReadableSize(0));
     validate(&scheduler, move |_, limiter: &Limiter| {
-        assert_eq!(limiter.speed_limit(), f64::INFINITY);
+        assert_eq!(limiter.speed_limit(), INFINITY);
     });
 }

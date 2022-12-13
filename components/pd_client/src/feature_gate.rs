@@ -1,14 +1,11 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
-
 use semver::{SemVerError, Version};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-/// The function assumes only major, minor and patch are considered, and they
-/// are all less than u16::MAX, which is 65535.
+/// The function assumes only major, minor and patch are considered, and they are
+/// all less than u16::MAX, which is 65535.
 const fn ver_to_val(major: u64, minor: u64, patch: u64) -> u64 {
     major << 32 | minor << 16 | patch
 }
@@ -45,8 +42,8 @@ impl FeatureGate {
     ///
     /// # Safety
     ///
-    /// Correctness in FeatureGate depends on monotonic increasing of version
-    /// number, should use `set_version` instead.
+    /// Correctness in FeatureGate depends on monotonic increasing of version number,
+    /// should use `set_version` instead.
     pub unsafe fn reset_version(&self, version: &str) -> Result<(), SemVerError> {
         let new = Version::parse(version)?;
         let val = ver_to_val(new.major, new.minor, new.patch);

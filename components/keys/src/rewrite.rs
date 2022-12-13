@@ -1,14 +1,12 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath] Common key utitlies.
-
 //! Key rewriting
 
 use std::ops::Bound::{self, *};
 
 /// An error indicating the key cannot be rewritten because it does not start
 /// with the given prefix.
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct WrongPrefix;
 
 /// Rewrites the prefix of a byte array.

@@ -3,14 +3,11 @@
 mod chunk;
 
 use test::Bencher;
-use tidb_query_datatype::{
-    codec::{
-        chunk::{Chunk, ChunkEncoder},
-        datum::Datum,
-        mysql::*,
-    },
-    FieldTypeTp,
-};
+
+use tidb_query_datatype::codec::chunk::{Chunk, ChunkEncoder};
+use tidb_query_datatype::codec::datum::Datum;
+use tidb_query_datatype::codec::mysql::*;
+use tidb_query_datatype::FieldTypeTp;
 use tipb::FieldType;
 
 #[bench]
@@ -22,7 +19,7 @@ fn bench_encode_chunk(b: &mut Bencher) {
         FieldTypeTp::VarChar.into(),
         FieldTypeTp::VarChar.into(),
         FieldTypeTp::NewDecimal.into(),
-        FieldTypeTp::Json.into(),
+        FieldTypeTp::JSON.into(),
     ];
     let mut chunk = Chunk::new(&fields, rows);
     for row_id in 0..rows {

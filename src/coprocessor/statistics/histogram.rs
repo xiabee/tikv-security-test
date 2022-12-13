@@ -29,7 +29,7 @@ impl Bucket {
             upper_bound,
             lower_bound,
             repeats,
-            ndv: with_ndv as u64,
+            ndv: if with_ndv { 1 } else { 0 },
         }
     }
 
@@ -175,14 +175,13 @@ impl Histogram {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use std::iter::repeat;
 
-    use tidb_query_datatype::{
-        codec::{datum, datum::Datum},
-        expr::EvalContext,
-    };
-
-    use super::*;
+    use tidb_query_datatype::codec::datum;
+    use tidb_query_datatype::codec::datum::Datum;
+    use tidb_query_datatype::expr::EvalContext;
 
     #[test]
     fn test_histogram() {

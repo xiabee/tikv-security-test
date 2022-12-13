@@ -1,25 +1,29 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{fmt, marker::PhantomData, sync::Arc};
+use std::fmt;
+use std::sync::Arc;
 
-use engine_traits::KvEngine;
 use kvproto::import_sstpb::SstMeta;
-use pd_client::PdClient;
-use sst_importer::SstImporter;
-use tikv_util::{error, worker::Runnable};
 
-use crate::store::{util::is_epoch_stale, StoreMsg, StoreRouter};
+use crate::store::util::is_epoch_stale;
+use crate::store::{StoreMsg, StoreRouter};
+use engine_traits::KvEngine;
+use pd_client::PdClient;
+use sst_importer::SSTImporter;
+use std::marker::PhantomData;
+use tikv_util::error;
+use tikv_util::worker::Runnable;
 
 pub enum Task {
-    DeleteSst { ssts: Vec<SstMeta> },
-    ValidateSst { ssts: Vec<SstMeta> },
+    DeleteSST { ssts: Vec<SstMeta> },
+    ValidateSST { ssts: Vec<SstMeta> },
 }
 
 impl fmt::Display for Task {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Task::DeleteSst { ref ssts } => write!(f, "Delete {} ssts", ssts.len()),
-            Task::ValidateSst { ref ssts } => write!(f, "Validate {} ssts", ssts.len()),
+            Task::DeleteSST { ref ssts } => write!(f, "Delete {} ssts", ssts.len()),
+            Task::ValidateSST { ref ssts } => write!(f, "Validate {} ssts", ssts.len()),
         }
     }
 }
@@ -31,7 +35,7 @@ where
 {
     store_id: u64,
     store_router: S,
-    importer: Arc<SstImporter>,
+    importer: Arc<SSTImporter>,
     pd_client: Arc<C>,
     _engine: PhantomData<EK>,
 }
@@ -45,7 +49,7 @@ where
     pub fn new(
         store_id: u64,
         store_router: S,
-        importer: Arc<SstImporter>,
+        importer: Arc<SSTImporter>,
         pd_client: Arc<C>,
     ) -> Runner<EK, C, S> {
         Runner {
@@ -95,7 +99,7 @@ where
         // We need to send back the result to check for the stale
         // peer, which may ingest the stale SST before it is
         // destroyed.
-        let msg = StoreMsg::ValidateSstResult { invalid_ssts };
+        let msg = StoreMsg::ValidateSSTResult { invalid_ssts };
         if let Err(e) = self.store_router.send(msg) {
             error!(%e; "send validate sst result failed");
         }
@@ -112,10 +116,10 @@ where
 
     fn run(&mut self, task: Task) {
         match task {
-            Task::DeleteSst { ssts } => {
+            Task::DeleteSST { ssts } => {
                 self.handle_delete_sst(ssts);
             }
-            Task::ValidateSst { ssts } => {
+            Task::ValidateSST { ssts } => {
                 self.handle_validate_sst(ssts);
             }
         }

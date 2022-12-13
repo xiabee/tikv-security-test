@@ -3,6 +3,7 @@
 mod util;
 
 use criterion::measurement::Measurement;
+
 use tidb_query_datatype::FieldTypeTp;
 use tipb::ScalarFuncSig;
 use tipb_helper::ExprDefBuilder;
@@ -10,7 +11,7 @@ use tipb_helper::ExprDefBuilder;
 use crate::util::{BenchCase, FixtureBuilder};
 
 /// For SQLs like `WHERE column`.
-fn bench_selection_column<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_selection_column<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -20,7 +21,7 @@ where
 }
 
 /// For SQLs like `WHERE a > b`.
-fn bench_selection_binary_func_column_column<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_selection_binary_func_column_column<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -35,10 +36,8 @@ where
 }
 
 /// For SQLS like `WHERE a > 1`.
-fn bench_selection_binary_func_column_constant<M>(
-    b: &mut criterion::Bencher<'_, M>,
-    input: &Input<M>,
-) where
+fn bench_selection_binary_func_column_constant<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
+where
     M: Measurement,
 {
     let fb = FixtureBuilder::new(input.src_rows).push_column_f64_random();
@@ -50,7 +49,7 @@ fn bench_selection_binary_func_column_constant<M>(
 }
 
 /// For SQLs like `WHERE a > 1 AND b > 2`.
-fn bench_selection_multiple_predicate<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_selection_multiple_predicate<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {

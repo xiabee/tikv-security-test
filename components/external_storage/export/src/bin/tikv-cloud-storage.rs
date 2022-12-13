@@ -33,19 +33,16 @@ fn main() {
 #[cfg(unix)]
 mod wait {
     use libc::c_int;
-    use signal_hook::{
-        consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2},
-        iterator::Signals,
-        Signals,
-    };
+    use nix::sys::signal::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
+    use signal::trap::Trap;
     use slog_global::info;
 
     pub fn for_signal() {
-        let mut signals = Signals::new(&[SIGTERM, SIGINT, SIGHUP]).unwrap();
-        for signal in &mut signals {
-            match signal {
-                SIGTERM | SIGINT | SIGHUP => {
-                    info!("receive signal {}, stopping server...", signal);
+        let trap = Trap::trap(&[SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2]);
+        for sig in trap {
+            match sig {
+                SIGUSR1 | SIGTERM | SIGINT | SIGHUP => {
+                    info!("receive signal {}, stopping server...", sig as c_int);
                     break;
                 }
                 // TODO: handle more signals

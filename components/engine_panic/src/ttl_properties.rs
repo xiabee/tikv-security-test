@@ -1,8 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{Result, TtlProperties, TtlPropertiesExt};
-
 use crate::engine::PanicEngine;
+use engine_traits::{Result, TtlProperties, TtlPropertiesExt};
 
 impl TtlPropertiesExt for PanicEngine {
     fn get_range_ttl_properties_cf(

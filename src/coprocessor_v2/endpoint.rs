@@ -1,16 +1,17 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{future::Future, sync::Arc};
-
-use api_version::KvFormat;
 use coprocessor_plugin_api::*;
 use kvproto::kvrpcpb;
 use semver::VersionReq;
+use std::future::Future;
+use std::ops::Not;
+use std::sync::Arc;
 
-use super::{config::Config, plugin_registry::PluginRegistry, raw_storage_impl::RawStorageImpl};
+use super::config::Config;
+use super::plugin_registry::PluginRegistry;
+use super::raw_storage_impl::RawStorageImpl;
 use crate::storage::{self, lock_manager::LockManager, Engine, Storage};
 
-#[allow(clippy::large_enum_variant)]
 enum CoprocessorError {
     RegionError(kvproto::errorpb::Error),
     Other(String),
@@ -19,43 +20,38 @@ enum CoprocessorError {
 /// A pool to build and run Coprocessor request handlers.
 #[derive(Clone)]
 pub struct Endpoint {
-    plugin_registry: Option<Arc<PluginRegistry>>,
+    plugin_registry: Arc<PluginRegistry>,
 }
 
 impl tikv_util::AssertSend for Endpoint {}
 
 impl Endpoint {
     pub fn new(copr_cfg: &Config) -> Self {
-        let plugin_registry =
-            copr_cfg
-                .coprocessor_plugin_directory
-                .as_ref()
-                .map(|plugin_directory| {
-                    let mut plugin_registry = PluginRegistry::new();
+        let mut plugin_registry = PluginRegistry::new();
 
-                    if let Err(err) = plugin_registry.start_hot_reloading(plugin_directory) {
-                        warn!(
-                            "unable to start hot-reloading for coprocessor plugins.";
-                            "coprocessor_directory" => plugin_directory.display(),
-                            "error" => ?err
-                        );
-                    }
+        // Enable hot-reloading of plugins if the user configured a directory.
+        if let Some(plugin_directory) = &copr_cfg.coprocessor_plugin_directory {
+            let r = plugin_registry.start_hot_reloading(plugin_directory);
+            if let Err(err) = r {
+                warn!("unable to start hot-reloading for coprocessor plugins.";
+                    "coprocessor_directory" => plugin_directory.display(),
+                    "error" => ?err);
+            }
+        }
 
-                    Arc::new(plugin_registry)
-                });
-
-        Self { plugin_registry }
+        Self {
+            plugin_registry: Arc::new(plugin_registry),
+        }
     }
 
     /// Handles a request to the coprocessor framework.
     ///
-    /// Each request is dispatched to the corresponding coprocessor plugin based
-    /// on it's `copr_name` field. A plugin with a matching name must be loaded
-    /// by TiKV, otherwise an error is returned.
+    /// Each request is dispatched to the corresponding coprocessor plugin based on it's `copr_name`
+    /// field. A plugin with a matching name must be loaded by TiKV, otherwise an error is returned.
     #[inline]
-    pub fn handle_request<E: Engine, L: LockManager, F: KvFormat>(
+    pub fn handle_request<E: Engine, L: LockManager>(
         &self,
-        storage: &Storage<E, L, F>,
+        storage: &Storage<E, L>,
         req: kvrpcpb::RawCoprocessorRequest,
     ) -> impl Future<Output = kvrpcpb::RawCoprocessorResponse> {
         let mut response = kvrpcpb::RawCoprocessorResponse::default();
@@ -72,36 +68,37 @@ impl Endpoint {
     }
 
     #[inline]
-    fn handle_request_impl<E: Engine, L: LockManager, F: KvFormat>(
+    fn handle_request_impl<E: Engine, L: LockManager>(
         &self,
-        storage: &Storage<E, L, F>,
+        storage: &Storage<E, L>,
         mut req: kvrpcpb::RawCoprocessorRequest,
     ) -> Result<RawResponse, CoprocessorError> {
-        let plugin_registry = self
+        let plugin = self
             .plugin_registry
-            .as_ref()
-            .ok_or_else(|| CoprocessorError::Other("Coprocessor plugin is disabled!".to_owned()))?;
-
-        let plugin = plugin_registry.get_plugin(&req.copr_name).ok_or_else(|| {
-            CoprocessorError::Other(format!(
-                "No registered coprocessor with name '{}'",
-                req.copr_name
-            ))
-        })?;
+            .get_plugin(&req.copr_name)
+            .ok_or_else(|| {
+                CoprocessorError::Other(format!(
+                    "No registered coprocessor with name '{}'",
+                    req.copr_name
+                ))
+            })?;
 
         // Check whether the found plugin satisfies the version constraint.
         let version_req = VersionReq::parse(&req.copr_version_req)
             .map_err(|e| CoprocessorError::Other(format!("{}", e)))?;
         let plugin_version = plugin.version();
-
-        if !version_req.matches(plugin_version) {
-            return Err(CoprocessorError::Other(format!(
-                "The plugin '{}' with version '{}' does not satisfy the version constraint '{}'",
-                plugin.name(),
-                plugin_version,
-                version_req,
-            )));
-        }
+        version_req
+            .matches(&plugin_version)
+            .not()
+            .then(|| {})
+            .ok_or_else(|| {
+                CoprocessorError::Other(format!(
+                    "The plugin '{}' with version '{}' does not satisfy the version constraint '{}'",
+                    plugin.name(),
+                    plugin_version,
+                    version_req,
+                ))
+            })?;
 
         let raw_storage_api = RawStorageImpl::new(req.take_context(), storage);
         let ranges = req
@@ -124,7 +121,7 @@ impl Endpoint {
 
 fn extract_region_error(error: &PluginError) -> Option<kvproto::errorpb::Error> {
     match error {
-        PluginError::Other(_, other_err) => other_err
+        PluginError::Other(other_err) => other_err
             .downcast_ref::<storage::Result<()>>()
             .and_then(|e| storage::errors::extract_region_error::<()>(e)),
         _ => None,

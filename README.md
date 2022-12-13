@@ -2,18 +2,17 @@
 
 ## [Website](https://tikv.org) | [Documentation](https://tikv.org/docs/latest/concepts/overview/) | [Community Chat](https://tikv.org/chat)
 
-[![Build Status](https://ci.pingcap.net/buildStatus/icon?job=tikv_ghpr_build_master)](https://ci.pingcap.net/blue/organizations/jenkins/tikv_ghpr_build_master/activity)
+[![Build Status](https://internal.pingcap.net/idc-jenkins/buildStatus/icon?job=build_tikv_multi_branch%2Fmaster)](https://internal.pingcap.net/idc-jenkins/job/build_tikv_multi_branch/)
 [![Coverage Status](https://codecov.io/gh/tikv/tikv/branch/master/graph/badge.svg)](https://codecov.io/gh/tikv/tikv)
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/2574/badge)](https://bestpractices.coreinfrastructure.org/projects/2574)
 
-TiKV is an open-source, distributed, and transactional key-value database. Unlike other traditional NoSQL systems, TiKV not only provides classical key-value APIs, but also transactional APIs with ACID compliance. Built in Rust and powered by Raft, TiKV was originally created by [PingCAP](https://en.pingcap.com) to complement [TiDB](https://github.com/pingcap/tidb), a distributed HTAP database compatible with the MySQL protocol.
+TiKV is an open-source, distributed, and transactional key-value database. Unlike other traditional NoSQL systems, TiKV not only provides classical key-value APIs, but also transactional APIs with ACID compliance. Built in Rust and powered by Raft, TiKV was originally created to complement [TiDB](https://github.com/pingcap/tidb), a distributed HTAP database compatible with the MySQL protocol.
 
 The design of TiKV ('Ti' stands for titanium) is inspired by some great distributed systems from Google, such as BigTable, Spanner, and Percolator, and some of the latest achievements in academia in recent years, such as the Raft consensus algorithm.
 
 If you're interested in contributing to TiKV, or want to build it from source, see [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-![cncf_logo](images/cncf.png#gh-light-mode-only)
-![cncf_logo](images/cncf-white.png#gh-dark-mode-only)
+![cncf_logo](images/cncf.png)
 
 TiKV is a graduated project of the [Cloud Native Computing Foundation](https://cncf.io/) (CNCF). If you are an organization that wants to help shape the evolution of technologies that are container-packaged, dynamically-scheduled and microservices-oriented, consider joining the CNCF. For details about who's involved and how TiKV plays a role, read the CNCF [announcement](https://www.cncf.io/announcements/2020/09/02/cloud-native-computing-foundation-announces-tikv-graduation/).
 
@@ -59,6 +58,10 @@ For instructions on deployment, configuration, and maintenance of TiKV,see TiKV 
 
 You can view the list of [TiKV Adopters](https://tikv.org/adopters/).
 
+## TiKV roadmap
+
+You can see the [TiKV Roadmap](docs/ROADMAP.md).
+
 ## TiKV software stack
 
 ![The TiKV software stack](images/tikv_stack.png)
@@ -80,7 +83,7 @@ You can see [this page](https://docs.pingcap.com/tidb/stable/quick-start-with-ti
 
 ### Deploy a playground with binary
 
-TiKV is able to run separately with PD, which is the minimal deployment required.
+TiKV is able to run separatedly with PD, which is the minimal deployment required.
 
 1. Download and extract binaries.
 
@@ -134,6 +137,10 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## Client drivers
 
+Currently, the interfaces to TiKV are the [TiDB Go client](https://github.com/pingcap/tidb/tree/master/store/tikv) and the [TiSpark Java client](https://github.com/pingcap/tispark/tree/master/tikv-client/src/main/java/com/pingcap/tikv).
+
+These are the clients for TiKV:
+
 - [Go](https://github.com/tikv/client-go) (The most stable and widely used)
 - [Java](https://github.com/tikv/client-java)
 - [Rust](https://github.com/tikv/client-rust)
@@ -175,6 +182,16 @@ appearance, race, religion, or sexual identity and orientation.
 
 Join the TiKV community on [Slack](https://slack.tidb.io/invite?team=tikv-wg&channel=general) - Sign up and join channels on TiKV topics that interest you.
 
+### WeChat
+
+The TiKV community is also available on WeChat. If you want to join our WeChat group, send a request mail to [zhangyanqing@pingcap.com](mailto:zhangyanqing@pingcap.com), with your personal information that includes the following:
+
+- WeChat ID (**Required**)
+- A contribution you've made to TiKV, such as a PR (**Required**)
+- Other basic information
+
+We will invite you in right away.
+
 ## License
 
 TiKV is under the Apache 2.0 license. See the [LICENSE](./LICENSE) file for details.
@@ -183,4 +200,4 @@ TiKV is under the Apache 2.0 license. See the [LICENSE](./LICENSE) file for deta
 
 - Thanks [etcd](https://github.com/coreos/etcd) for providing some great open source tools.
 - Thanks [RocksDB](https://github.com/facebook/rocksdb) for their powerful storage engines.
-- Thanks [rust-clippy](https://github.com/rust-lang/rust-clippy). We do love the great project.
+- Thanks [rust-clippy](https://github.com/Manishearth/rust-clippy). We do love the great project.

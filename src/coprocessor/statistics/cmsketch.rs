@@ -6,7 +6,6 @@ use murmur3::murmur3_x64_128;
 /// Refer:[Count-Min Sketch](https://en.wikipedia.org/wiki/Count-min_sketch)
 #[derive(Clone)]
 pub struct CmSketch {
-    #[allow(dead_code)]
     depth: usize,
     width: usize,
     count: u32,
@@ -36,8 +35,8 @@ impl CmSketch {
     }
 
     // `insert` inserts the data into cm sketch. For each row i, the position at
-    // (h1 + h2*i) % width will be incremented by one, where the (h1, h2) is the
-    // hash value of data.
+    // (h1 + h2*i) % width will be incremented by one, where the (h1, h2) is the hash value
+    // of data.
     pub fn insert(&mut self, bytes: &[u8]) {
         self.count = self.count.wrapping_add(1);
         let (h1, h2) = CmSketch::hash(bytes);
@@ -89,17 +88,20 @@ impl CmSketch {
 
 #[cfg(test)]
 mod tests {
-    use std::{cmp::min, slice::from_ref};
+    use super::*;
 
-    use collections::HashMap;
-    use rand::{distributions::Distribution, rngs::StdRng, SeedableRng};
-    use tidb_query_datatype::{
-        codec::{datum, datum::Datum},
-        expr::EvalContext,
-    };
+    use std::cmp::min;
+    use std::slice::from_ref;
+
+    use rand::distributions::Distribution;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
     use zipf::ZipfDistribution;
 
-    use super::*;
+    use collections::HashMap;
+    use tidb_query_datatype::codec::datum;
+    use tidb_query_datatype::codec::datum::Datum;
+    use tidb_query_datatype::expr::EvalContext;
 
     impl CmSketch {
         fn query(&self, bytes: &[u8]) -> u32 {

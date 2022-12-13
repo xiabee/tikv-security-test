@@ -1,18 +1,19 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::ops::{Deref, DerefMut};
-
-use engine_traits::{DbOptions, DbOptionsExt, Result, TitanCfOptions};
-use rocksdb::{DBOptions as RawDBOptions, TitanDBOptions as RawTitanDBOptions};
+use crate::engine::RocksEngine;
+use engine_traits::DBOptions;
+use engine_traits::DBOptionsExt;
+use engine_traits::Result;
+use engine_traits::TitanDBOptions;
+use rocksdb::DBOptions as RawDBOptions;
+use rocksdb::TitanDBOptions as RawTitanDBOptions;
 use tikv_util::box_err;
 
-use crate::engine::RocksEngine;
+impl DBOptionsExt for RocksEngine {
+    type DBOptions = RocksDBOptions;
 
-impl DbOptionsExt for RocksEngine {
-    type DbOptions = RocksDbOptions;
-
-    fn get_db_options(&self) -> Self::DbOptions {
-        RocksDbOptions::from_raw(self.as_inner().get_db_options())
+    fn get_db_options(&self) -> Self::DBOptions {
+        RocksDBOptions::from_raw(self.as_inner().get_db_options())
     }
     fn set_db_options(&self, options: &[(&str, &str)]) -> Result<()> {
         self.as_inner()
@@ -21,12 +22,11 @@ impl DbOptionsExt for RocksEngine {
     }
 }
 
-#[derive(Default)]
-pub struct RocksDbOptions(RawDBOptions);
+pub struct RocksDBOptions(RawDBOptions);
 
-impl RocksDbOptions {
-    pub fn from_raw(raw: RawDBOptions) -> RocksDbOptions {
-        RocksDbOptions(raw)
+impl RocksDBOptions {
+    pub fn from_raw(raw: RawDBOptions) -> RocksDBOptions {
+        RocksDBOptions(raw)
     }
 
     pub fn into_raw(self) -> RawDBOptions {
@@ -38,27 +38,11 @@ impl RocksDbOptions {
     }
 }
 
-impl Deref for RocksDbOptions {
-    type Target = RawDBOptions;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for RocksDbOptions {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl DbOptions for RocksDbOptions {
-    type TitanDbOptions = RocksTitanDbOptions;
+impl DBOptions for RocksDBOptions {
+    type TitanDBOptions = RocksTitanDBOptions;
 
     fn new() -> Self {
-        RocksDbOptions::from_raw(RawDBOptions::new())
+        RocksDBOptions::from_raw(RawDBOptions::new())
     }
 
     fn get_max_background_jobs(&self) -> i32 {
@@ -85,16 +69,16 @@ impl DbOptions for RocksDbOptions {
             .map_err(|e| box_err!(e))
     }
 
-    fn set_titandb_options(&mut self, opts: &Self::TitanDbOptions) {
+    fn set_titandb_options(&mut self, opts: &Self::TitanDBOptions) {
         self.0.set_titandb_options(opts.as_raw())
     }
 }
 
-pub struct RocksTitanDbOptions(RawTitanDBOptions);
+pub struct RocksTitanDBOptions(RawTitanDBOptions);
 
-impl RocksTitanDbOptions {
-    pub fn from_raw(raw: RawTitanDBOptions) -> RocksTitanDbOptions {
-        RocksTitanDbOptions(raw)
+impl RocksTitanDBOptions {
+    pub fn from_raw(raw: RawTitanDBOptions) -> RocksTitanDBOptions {
+        RocksTitanDBOptions(raw)
     }
 
     pub fn as_raw(&self) -> &RawTitanDBOptions {
@@ -102,25 +86,9 @@ impl RocksTitanDbOptions {
     }
 }
 
-impl Deref for RocksTitanDbOptions {
-    type Target = RawTitanDBOptions;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for RocksTitanDbOptions {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl TitanCfOptions for RocksTitanDbOptions {
+impl TitanDBOptions for RocksTitanDBOptions {
     fn new() -> Self {
-        RocksTitanDbOptions::from_raw(RawTitanDBOptions::new())
+        RocksTitanDBOptions::from_raw(RawTitanDBOptions::new())
     }
 
     fn set_min_blob_size(&mut self, size: u64) {

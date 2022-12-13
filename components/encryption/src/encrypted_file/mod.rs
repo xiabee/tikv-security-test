@@ -1,18 +1,17 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    io::{Read, Write},
-    path::Path,
-};
+use std::io::{Read, Write};
+use std::path::Path;
 
 use file_system::{rename, File, OpenOptions};
 use kvproto::encryptionpb::EncryptedContent;
 use protobuf::Message;
 use rand::{thread_rng, RngCore};
-use slog_global::error;
 use tikv_util::time::Instant;
 
-use crate::{master_key::*, metrics::*, Result};
+use crate::master_key::*;
+use crate::metrics::*;
+use crate::Result;
 
 mod header;
 pub use header::*;
@@ -34,8 +33,8 @@ impl<'a> EncryptedFile<'a> {
         EncryptedFile { base, name }
     }
 
-    /// Read and decrypt the file. Caller need to handle the NotFound io error
-    /// in case file not exists.
+    /// Read and decrypt the file. Caller need to handle the NotFound io error in case file not
+    /// exists.
     pub fn read(&self, master_key: &dyn Backend) -> Result<Vec<u8>> {
         let start = Instant::now();
         let res = OpenOptions::new()
@@ -64,25 +63,18 @@ impl<'a> EncryptedFile<'a> {
         let start = Instant::now();
         // Write to a tmp file.
         // TODO what if a tmp file already exists?
-        let origin_path = self.base.join(self.name);
+        let origin_path = self.base.join(&self.name);
         let mut tmp_path = origin_path.clone();
         tmp_path.set_extension(format!("{}.{}", thread_rng().next_u64(), TMP_FILE_SUFFIX));
         let mut tmp_file = OpenOptions::new()
             .create(true)
             .write(true)
             .open(&tmp_path)
-            .map_err(|e| {
-                error!(
-                    "EncryptedFile::write open failed";
-                    "path" => %tmp_path.display(),
-                    "error" => %e,
-                );
-                e
-            })?;
+            .unwrap_or_else(|_| panic!("EncryptedFile::write {}", &tmp_path.to_str().unwrap()));
 
         // Encrypt the content.
         let encrypted_content = master_key
-            .encrypt(plaintext_content)?
+            .encrypt(&plaintext_content)?
             .write_to_bytes()
             .unwrap();
         let header = Header::new(&encrypted_content, Version::V1);
@@ -92,7 +84,7 @@ impl<'a> EncryptedFile<'a> {
 
         // Replace old file with the tmp file aomticlly.
         rename(tmp_path, origin_path)?;
-        let base_dir = File::open(self.base)?;
+        let base_dir = File::open(&self.base)?;
         base_dir.sync_all()?;
 
         ENCRYPT_DECRPTION_FILE_HISTOGRAM
@@ -106,12 +98,11 @@ impl<'a> EncryptedFile<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
-
-    use matches::assert_matches;
-
     use super::*;
     use crate::Error;
+
+    use matches::assert_matches;
+    use std::io::ErrorKind;
 
     #[test]
     fn test_open_write() {
@@ -127,6 +118,7 @@ mod tests {
 
         let content = b"test content";
         file.write(content, &PlaintextBackend::default()).unwrap();
+        drop(file);
 
         let file = EncryptedFile::new(tmp.path(), "encrypted");
         assert_eq!(file.read(&PlaintextBackend::default()).unwrap(), content);

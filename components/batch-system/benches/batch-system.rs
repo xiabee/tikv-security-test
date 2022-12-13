@@ -2,10 +2,13 @@
 
 #![feature(test)]
 
-use std::sync::{atomic::*, Arc};
+extern crate test;
 
-use batch_system::{test_runner::*, *};
+use batch_system::test_runner::*;
+use batch_system::*;
 use criterion::*;
+use std::sync::atomic::*;
+use std::sync::Arc;
 
 fn end_hook(tx: &std::sync::mpsc::Sender<()>) -> Message {
     let tx = tx.clone();
@@ -85,8 +88,8 @@ fn bench_imbalance(c: &mut Criterion) {
     system.shutdown();
 }
 
-/// Bench how it performs when scheduling a lot of quick tasks during an
-/// long-polling tasks.
+/// Bench how it performs when scheduling a lot of quick tasks during an long-polling
+/// tasks.
 ///
 /// A good scheduling algorithm should not starve the quick tasks.
 fn bench_fairness(c: &mut Criterion) {

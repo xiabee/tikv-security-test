@@ -1,12 +1,9 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    hash::Hash,
-    mem::MaybeUninit,
-    ptr::{self, NonNull},
-};
-
 use collections::{HashMap, HashMapEntry};
+use std::hash::Hash;
+use std::mem::MaybeUninit;
+use std::ptr::{self, NonNull};
 
 struct Record<K> {
     prev: NonNull<Record<K>>,
@@ -20,39 +17,37 @@ struct ValueEntry<K, V> {
 }
 
 struct Trace<K> {
-    head: NonNull<Record<K>>,
-    tail: NonNull<Record<K>>,
+    head: Box<Record<K>>,
+    tail: Box<Record<K>>,
     tick: usize,
     sample_mask: usize,
 }
 
 #[inline]
-unsafe fn suture<K>(mut leading: NonNull<Record<K>>, mut following: NonNull<Record<K>>) {
-    leading.as_mut().next = following;
-    following.as_mut().prev = leading;
+unsafe fn suture<K>(leading: &mut Record<K>, following: &mut Record<K>) {
+    leading.next = NonNull::new_unchecked(following);
+    following.prev = NonNull::new_unchecked(leading);
 }
 
 #[inline]
-unsafe fn cut_out<K>(record: NonNull<Record<K>>) {
-    suture(record.as_ref().prev, record.as_ref().next)
+unsafe fn cut_out<K>(record: &mut Record<K>) {
+    suture(record.prev.as_mut(), record.next.as_mut())
 }
 
 impl<K> Trace<K> {
     fn new(sample_mask: usize) -> Trace<K> {
         unsafe {
-            let head = Box::leak(Box::new(Record {
-                prev: NonNull::dangling(),
-                next: NonNull::dangling(),
+            let mut head = Box::new(Record {
+                prev: NonNull::new_unchecked(1usize as _),
+                next: NonNull::new_unchecked(1usize as _),
                 key: MaybeUninit::uninit(),
-            }))
-            .into();
-            let tail = Box::leak(Box::new(Record {
-                prev: NonNull::dangling(),
-                next: NonNull::dangling(),
+            });
+            let mut tail = Box::new(Record {
+                prev: NonNull::new_unchecked(1usize as _),
+                next: NonNull::new_unchecked(1usize as _),
                 key: MaybeUninit::uninit(),
-            }))
-            .into();
-            suture(head, tail);
+            });
+            suture(&mut head, &mut tail);
 
             Trace {
                 head,
@@ -71,17 +66,17 @@ impl<K> Trace<K> {
         }
     }
 
-    fn promote(&mut self, record: NonNull<Record<K>>) {
+    fn promote(&mut self, mut record: NonNull<Record<K>>) {
         unsafe {
-            cut_out(record);
-            suture(record, self.head.as_ref().next);
-            suture(self.head, record);
+            cut_out(record.as_mut());
+            suture(record.as_mut(), &mut self.head.next.as_mut());
+            suture(&mut self.head, record.as_mut());
         }
     }
 
-    fn delete(&mut self, record: NonNull<Record<K>>) {
+    fn delete(&mut self, mut record: NonNull<Record<K>>) {
         unsafe {
-            cut_out(record);
+            cut_out(record.as_mut());
 
             ptr::drop_in_place(Box::from_raw(record.as_ptr()).key.as_mut_ptr());
         }
@@ -89,24 +84,24 @@ impl<K> Trace<K> {
 
     fn create(&mut self, key: K) -> NonNull<Record<K>> {
         let record = Box::leak(Box::new(Record {
-            prev: self.head,
-            next: unsafe { self.head.as_ref().next },
+            prev: unsafe { NonNull::new_unchecked(&mut *self.head) },
+            next: self.head.next,
             key: MaybeUninit::new(key),
         }))
         .into();
         unsafe {
-            self.head.as_mut().next.as_mut().prev = record;
-            self.head.as_mut().next = record;
+            self.head.next.as_mut().prev = record;
+            self.head.next = record;
         }
         record
     }
 
     fn reuse_tail(&mut self, key: K) -> (K, NonNull<Record<K>>) {
         unsafe {
-            let mut record = self.tail.as_ref().prev;
-            cut_out(record);
-            suture(record, self.head.as_ref().next);
-            suture(self.head, record);
+            let mut record = self.tail.prev;
+            cut_out(record.as_mut());
+            suture(record.as_mut(), self.head.next.as_mut());
+            suture(&mut self.head, record.as_mut());
 
             let old_key = record.as_mut().key.as_ptr().read();
             record.as_mut().key = MaybeUninit::new(key);
@@ -115,33 +110,24 @@ impl<K> Trace<K> {
     }
 
     fn clear(&mut self) {
+        let mut cur = self.head.next;
         unsafe {
-            let mut cur = self.head.as_ref().next;
-            while cur != self.tail {
-                let tmp = cur.as_ref().next;
+            while cur.as_ptr() != &mut *self.tail {
+                let tmp = cur.as_mut().next;
                 ptr::drop_in_place(Box::from_raw(cur.as_ptr()).key.as_mut_ptr());
                 cur = tmp;
             }
-            suture(self.head, self.tail);
+            suture(&mut self.head, &mut self.tail);
         }
     }
 
     fn remove_tail(&mut self) -> K {
         unsafe {
-            let record = self.tail.as_ref().prev;
-            cut_out(record);
+            let mut record = self.tail.prev;
+            cut_out(record.as_mut());
 
             let r = Box::from_raw(record.as_ptr());
             r.key.as_ptr().read()
-        }
-    }
-}
-
-impl<K> Drop for Trace<K> {
-    fn drop(&mut self) {
-        unsafe {
-            drop(Box::from_raw(self.head.as_ptr()));
-            drop(Box::from_raw(self.tail.as_ptr()));
         }
     }
 }
@@ -153,7 +139,6 @@ pub trait SizePolicy<K, V> {
     fn on_reset(&mut self, val: usize);
 }
 
-#[derive(Default)]
 pub struct CountTracker(usize);
 
 impl<K, V> SizePolicy<K, V> for CountTracker {
@@ -171,6 +156,12 @@ impl<K, V> SizePolicy<K, V> for CountTracker {
 
     fn on_reset(&mut self, val: usize) {
         self.0 = val;
+    }
+}
+
+impl Default for CountTracker {
+    fn default() -> Self {
+        Self(0)
     }
 }
 
@@ -304,7 +295,7 @@ where
         }
     }
 
-    pub fn iter(&self) -> Iter<'_, K, V> {
+    pub fn iter(&self) -> Iter<K, V> {
         Iter {
             base: self.map.iter(),
         }
@@ -352,7 +343,7 @@ where
     }
 }
 
-pub struct Iter<'a, K, V> {
+pub struct Iter<'a, K: 'a, V: 'a> {
     base: std::collections::hash_map::Iter<'a, K, ValueEntry<K, V>>,
 }
 

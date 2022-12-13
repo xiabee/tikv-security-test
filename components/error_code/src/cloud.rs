@@ -3,8 +3,8 @@
 define_error_codes!(
     "KV:Cloud:",
 
-    IO => ("Io", "", ""),
-    SSL => ("Ssl", "", ""),
+    IO => ("IO", "", ""),
+    SSL => ("SSL", "", ""),
     PROTO => ("Proto", "", ""),
     UNKNOWN => ("Unknown", "", ""),
     TIMEOUT => ("Timeout", "", ""),

@@ -1,8 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{KvEngine, MiscExt, Peekable, SyncMutable};
-
 use super::default_engine;
+use engine_traits::{KvEngine, MiscExt, Peekable, SyncMutable};
 
 #[test]
 fn sync_basic() {

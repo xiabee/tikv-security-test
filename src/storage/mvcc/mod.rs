@@ -1,6 +1,5 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath]
 //! Multi-version concurrency control functionality.
 
 mod consistency_check;
@@ -8,28 +7,28 @@ pub(super) mod metrics;
 pub(crate) mod reader;
 pub(super) mod txn;
 
-use std::{error, io};
-
-use error_code::{self, ErrorCode, ErrorCodeExt};
-use kvproto::kvrpcpb::{self, Assertion, IsolationLevel};
-use thiserror::Error;
-use tikv_util::{metrics::CRITICAL_ERROR, panic_when_unexpected_key_or_data, set_panic_mark};
+pub use self::consistency_check::{Mvcc as MvccConsistencyCheckObserver, MvccInfoIterator};
+pub use self::metrics::{GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VERSIONS_HISTOGRAM};
+pub use self::reader::*;
+pub use self::txn::{GcInfo, MvccTxn, ReleasedLock, MAX_TXN_WRITE_SIZE};
 pub use txn_types::{
     Key, Lock, LockType, Mutation, TimeStamp, Value, Write, WriteRef, WriteType,
     SHORT_VALUE_MAX_LEN,
 };
 
-pub use self::{
-    consistency_check::{Mvcc as MvccConsistencyCheckObserver, MvccInfoIterator},
-    metrics::{GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VERSIONS_HISTOGRAM},
-    reader::*,
-    txn::{GcInfo, MvccTxn, ReleasedLock, MAX_TXN_WRITE_SIZE},
-};
+use std::error;
+use std::io;
+
+use error_code::{self, ErrorCode, ErrorCodeExt};
+use thiserror::Error;
+
+use tikv_util::metrics::CRITICAL_ERROR;
+use tikv_util::{panic_when_unexpected_key_or_data, set_panic_mark};
 
 #[derive(Debug, Error)]
 pub enum ErrorInner {
     #[error("{0}")]
-    Kv(#[from] crate::storage::kv::Error),
+    Engine(#[from] crate::storage::kv::Error),
 
     #[error("{0}")]
     Io(#[from] io::Error),
@@ -83,9 +82,9 @@ pub enum ErrorInner {
     },
 
     #[error(
-        "write conflict, start_ts:{}, conflict_start_ts:{}, conflict_commit_ts:{}, key:{}, primary:{}, reason: {:?}",
+        "write conflict, start_ts:{}, conflict_start_ts:{}, conflict_commit_ts:{}, key:{}, primary:{}",
         .start_ts, .conflict_start_ts, .conflict_commit_ts,
-        log_wrappers::Value::key(.key), log_wrappers::Value::key(.primary), .reason
+        log_wrappers::Value::key(.key), log_wrappers::Value::key(.primary)
     )]
     WriteConflict {
         start_ts: TimeStamp,
@@ -93,7 +92,6 @@ pub enum ErrorInner {
         conflict_commit_ts: TimeStamp,
         key: Vec<u8>,
         primary: Vec<u8>,
-        reason: kvrpcpb::WriteConflictReason,
     },
 
     #[error(
@@ -147,24 +145,6 @@ pub enum ErrorInner {
         max_commit_ts: TimeStamp,
     },
 
-    #[error(
-        "assertion on data failed, start_ts:{}, key:{}, assertion:{:?}, existing_start_ts:{}, existing_commit_ts:{}",
-        .start_ts, log_wrappers::Value::key(.key), .assertion, .existing_start_ts, .existing_commit_ts
-    )]
-    AssertionFailed {
-        start_ts: TimeStamp,
-        key: Vec<u8>,
-        assertion: Assertion,
-        existing_start_ts: TimeStamp,
-        existing_commit_ts: TimeStamp,
-    },
-
-    #[error(
-        "Lock_only_if_exists of a pessimistic lock request is set to true, but return_value is not, start_ts:{}, key:{}",
-        .start_ts, log_wrappers::Value::key(.key)
-    )]
-    LockIfExistsFailed { start_ts: TimeStamp, key: Vec<u8> },
-
     #[error("{0:?}")]
     Other(#[from] Box<dyn error::Error + Sync + Send>),
 }
@@ -172,7 +152,7 @@ pub enum ErrorInner {
 impl ErrorInner {
     pub fn maybe_clone(&self) -> Option<ErrorInner> {
         match self {
-            ErrorInner::Kv(e) => e.maybe_clone().map(ErrorInner::Kv),
+            ErrorInner::Engine(e) => e.maybe_clone().map(ErrorInner::Engine),
             ErrorInner::Codec(e) => e.maybe_clone().map(ErrorInner::Codec),
             ErrorInner::KeyIsLocked(info) => Some(ErrorInner::KeyIsLocked(info.clone())),
             ErrorInner::BadFormat(e) => e.maybe_clone().map(ErrorInner::BadFormat),
@@ -204,14 +184,12 @@ impl ErrorInner {
                 conflict_commit_ts,
                 key,
                 primary,
-                reason,
             } => Some(ErrorInner::WriteConflict {
                 start_ts: *start_ts,
                 conflict_start_ts: *conflict_start_ts,
                 conflict_commit_ts: *conflict_commit_ts,
                 key: key.to_owned(),
                 primary: primary.to_owned(),
-                reason: reason.to_owned(),
             }),
             ErrorInner::Deadlock {
                 start_ts,
@@ -272,25 +250,6 @@ impl ErrorInner {
                 min_commit_ts: *min_commit_ts,
                 max_commit_ts: *max_commit_ts,
             }),
-            ErrorInner::AssertionFailed {
-                start_ts,
-                key,
-                assertion,
-                existing_start_ts,
-                existing_commit_ts,
-            } => Some(ErrorInner::AssertionFailed {
-                start_ts: *start_ts,
-                key: key.clone(),
-                assertion: *assertion,
-                existing_start_ts: *existing_start_ts,
-                existing_commit_ts: *existing_commit_ts,
-            }),
-            ErrorInner::LockIfExistsFailed { start_ts, key } => {
-                Some(ErrorInner::LockIfExistsFailed {
-                    start_ts: *start_ts,
-                    key: key.clone(),
-                })
-            }
             ErrorInner::Io(_) | ErrorInner::Other(_) => None,
         }
     }
@@ -345,21 +304,6 @@ impl From<txn_types::Error> for ErrorInner {
             txn_types::Error(box txn_types::ErrorInner::KeyIsLocked(lock_info)) => {
                 ErrorInner::KeyIsLocked(lock_info)
             }
-            txn_types::Error(box txn_types::ErrorInner::WriteConflict {
-                start_ts,
-                conflict_start_ts,
-                conflict_commit_ts,
-                key,
-                primary,
-                reason,
-            }) => ErrorInner::WriteConflict {
-                start_ts,
-                conflict_start_ts,
-                conflict_commit_ts,
-                key,
-                primary,
-                reason,
-            },
         }
     }
 }
@@ -369,7 +313,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl ErrorCodeExt for Error {
     fn error_code(&self) -> ErrorCode {
         match self.0.as_ref() {
-            ErrorInner::Kv(e) => e.error_code(),
+            ErrorInner::Engine(e) => e.error_code(),
             ErrorInner::Io(_) => error_code::storage::IO,
             ErrorInner::Codec(e) => e.error_code(),
             ErrorInner::KeyIsLocked(_) => error_code::storage::KEY_IS_LOCKED,
@@ -391,8 +335,6 @@ impl ErrorCodeExt for Error {
                 error_code::storage::PESSIMISTIC_LOCK_NOT_FOUND
             }
             ErrorInner::CommitTsTooLarge { .. } => error_code::storage::COMMIT_TS_TOO_LARGE,
-            ErrorInner::AssertionFailed { .. } => error_code::storage::ASSERTION_FAILED,
-            ErrorInner::LockIfExistsFailed { .. } => error_code::storage::LOCK_IF_EXISTS_FAILED,
             ErrorInner::Other(_) => error_code::storage::UNKNOWN,
         }
     }
@@ -422,14 +364,12 @@ pub fn default_not_found_error(key: Vec<u8>, hint: &str) -> Error {
 }
 
 pub mod tests {
-    use std::borrow::Cow;
-
-    use engine_traits::CF_WRITE;
-    use kvproto::kvrpcpb::Context;
-    use txn_types::Key;
-
     use super::*;
     use crate::storage::kv::{Engine, Modify, ScanMode, SnapContext, Snapshot, WriteData};
+    use engine_traits::CF_WRITE;
+    use kvproto::kvrpcpb::Context;
+    use std::borrow::Cow;
+    use txn_types::Key;
 
     pub fn write<E: Engine>(engine: &E, ctx: &Context, modifies: Vec<Modify>) {
         if !modifies.is_empty() {
@@ -439,42 +379,10 @@ pub mod tests {
         }
     }
 
-    pub fn must_get<E: Engine>(
-        engine: &mut E,
-        key: &[u8],
-        ts: impl Into<TimeStamp>,
-        expect: &[u8],
-    ) {
-        must_get_impl(engine, None, key, ts, expect);
-    }
-
-    pub fn must_get_on_region<E: Engine>(
-        engine: &mut E,
-        region_id: u64,
-        key: &[u8],
-        ts: impl Into<TimeStamp>,
-        expect: &[u8],
-    ) {
-        must_get_impl(engine, Some(region_id), key, ts, expect);
-    }
-
-    fn must_get_impl<E: Engine>(
-        engine: &mut E,
-        region_id: Option<u64>,
-        key: &[u8],
-        ts: impl Into<TimeStamp>,
-        expect: &[u8],
-    ) {
+    pub fn must_get<E: Engine>(engine: &E, key: &[u8], ts: impl Into<TimeStamp>, expect: &[u8]) {
         let ts = ts.into();
-        let mut ctx = Context::default();
-        if let Some(region_id) = region_id {
-            ctx.region_id = region_id;
-        }
-        let snap_ctx = SnapContext {
-            pb_ctx: &ctx,
-            ..Default::default()
-        };
-        let snapshot = engine.snapshot(snap_ctx).unwrap();
+        let ctx = SnapContext::default();
+        let snapshot = engine.snapshot(ctx).unwrap();
         let mut reader = SnapshotReader::new(ts, snapshot, true);
         let key = &Key::from_raw(key);
 
@@ -483,7 +391,7 @@ pub mod tests {
     }
 
     pub fn must_get_no_lock_check<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         ts: impl Into<TimeStamp>,
         expect: &[u8],
@@ -506,55 +414,25 @@ pub mod tests {
         ts: TimeStamp,
     ) -> Result<()> {
         if let Some(lock) = reader.load_lock(key)? {
-            if let Err(e) = Lock::check_ts_conflict(
-                Cow::Owned(lock),
-                key,
-                ts,
-                &Default::default(),
-                IsolationLevel::Si,
-            ) {
+            if let Err(e) = Lock::check_ts_conflict(Cow::Owned(lock), key, ts, &Default::default())
+            {
                 return Err(e.into());
             }
         }
         Ok(())
     }
 
-    pub fn must_get_none<E: Engine>(engine: &mut E, key: &[u8], ts: impl Into<TimeStamp>) {
-        must_get_none_impl(engine, key, ts, None);
-    }
-
-    pub fn must_get_none_on_region<E: Engine>(
-        engine: &mut E,
-        region_id: u64,
-        key: &[u8],
-        ts: impl Into<TimeStamp>,
-    ) {
-        must_get_none_impl(engine, key, ts, Some(region_id));
-    }
-
-    fn must_get_none_impl<E: Engine>(
-        engine: &mut E,
-        key: &[u8],
-        ts: impl Into<TimeStamp>,
-        region_id: Option<u64>,
-    ) {
-        let mut ctx = Context::default();
-        if let Some(region_id) = region_id {
-            ctx.region_id = region_id;
-        }
-        let snap_ctx = SnapContext {
-            pb_ctx: &ctx,
-            ..Default::default()
-        };
-        let snapshot = engine.snapshot(snap_ctx).unwrap();
+    pub fn must_get_none<E: Engine>(engine: &E, key: &[u8], ts: impl Into<TimeStamp>) {
         let ts = ts.into();
+        let ctx = SnapContext::default();
+        let snapshot = engine.snapshot(ctx).unwrap();
         let mut reader = SnapshotReader::new(ts, snapshot, true);
         let key = &Key::from_raw(key);
         check_lock(&mut reader, key, ts).unwrap();
         assert!(reader.get(key, ts).unwrap().is_none());
     }
 
-    pub fn must_get_err<E: Engine>(engine: &mut E, key: &[u8], ts: impl Into<TimeStamp>) {
+    pub fn must_get_err<E: Engine>(engine: &E, key: &[u8], ts: impl Into<TimeStamp>) {
         let ts = ts.into();
         let ctx = SnapContext::default();
         let snapshot = engine.snapshot(ctx).unwrap();
@@ -563,14 +441,10 @@ pub mod tests {
         if check_lock(&mut reader, key, ts).is_err() {
             return;
         }
-        reader.get(key, ts).unwrap_err();
+        assert!(reader.get(key, ts).is_err());
     }
 
-    pub fn must_locked<E: Engine>(
-        engine: &mut E,
-        key: &[u8],
-        start_ts: impl Into<TimeStamp>,
-    ) -> Lock {
+    pub fn must_locked<E: Engine>(engine: &E, key: &[u8], start_ts: impl Into<TimeStamp>) -> Lock {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut reader = MvccReader::new(snapshot, None, true);
         let lock = reader.load_lock(&Key::from_raw(key)).unwrap().unwrap();
@@ -580,7 +454,7 @@ pub mod tests {
     }
 
     pub fn must_locked_with_ttl<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         start_ts: impl Into<TimeStamp>,
         ttl: u64,
@@ -594,7 +468,7 @@ pub mod tests {
     }
 
     pub fn must_large_txn_locked<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         start_ts: impl Into<TimeStamp>,
         ttl: u64,
@@ -614,14 +488,14 @@ pub mod tests {
         }
     }
 
-    pub fn must_unlocked<E: Engine>(engine: &mut E, key: &[u8]) {
+    pub fn must_unlocked<E: Engine>(engine: &E, key: &[u8]) {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut reader = MvccReader::new(snapshot, None, true);
         assert!(reader.load_lock(&Key::from_raw(key)).unwrap().is_none());
     }
 
     pub fn must_written<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         start_ts: impl Into<TimeStamp>,
         commit_ts: impl Into<TimeStamp>,
@@ -637,7 +511,7 @@ pub mod tests {
     }
 
     pub fn must_have_write<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         commit_ts: impl Into<TimeStamp>,
     ) -> Write {
@@ -648,18 +522,14 @@ pub mod tests {
         write.to_owned()
     }
 
-    pub fn must_not_have_write<E: Engine>(
-        engine: &mut E,
-        key: &[u8],
-        commit_ts: impl Into<TimeStamp>,
-    ) {
+    pub fn must_not_have_write<E: Engine>(engine: &E, key: &[u8], commit_ts: impl Into<TimeStamp>) {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let k = Key::from_raw(key).append_ts(commit_ts.into());
         let v = snapshot.get_cf(CF_WRITE, &k).unwrap();
         assert!(v.is_none());
     }
 
-    pub fn must_seek_write_none<E: Engine>(engine: &mut E, key: &[u8], ts: impl Into<TimeStamp>) {
+    pub fn must_seek_write_none<E: Engine>(engine: &E, key: &[u8], ts: impl Into<TimeStamp>) {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut reader = MvccReader::new(snapshot, None, true);
         assert!(
@@ -671,7 +541,7 @@ pub mod tests {
     }
 
     pub fn must_seek_write<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         ts: impl Into<TimeStamp>,
         start_ts: impl Into<TimeStamp>,
@@ -690,7 +560,7 @@ pub mod tests {
     }
 
     pub fn must_get_commit_ts<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         start_ts: impl Into<TimeStamp>,
         commit_ts: impl Into<TimeStamp>,
@@ -706,26 +576,17 @@ pub mod tests {
         assert_eq!(ts, commit_ts.into());
     }
 
-    pub fn must_get_txn_source<E: Engine>(engine: &mut E, key: &[u8], ts: u64, txn_source: u64) {
-        let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut reader = SnapshotReader::new(TimeStamp::from(ts), snapshot, true);
-        let write = reader
-            .get_write(&Key::from_raw(key), TimeStamp::from(ts))
-            .unwrap()
-            .unwrap();
-        assert_eq!(write.txn_source, txn_source);
-    }
-
     pub fn must_get_commit_ts_none<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         start_ts: impl Into<TimeStamp>,
     ) {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut reader = SnapshotReader::new(start_ts.into(), snapshot, true);
 
-        let ret = reader.get_txn_commit_record(&Key::from_raw(key)).unwrap();
-        match ret.info() {
+        let ret = reader.get_txn_commit_record(&Key::from_raw(key));
+        assert!(ret.is_ok());
+        match ret.unwrap().info() {
             None => {}
             Some((_, write_type)) => {
                 assert_eq!(write_type, WriteType::Rollback);
@@ -733,11 +594,7 @@ pub mod tests {
         }
     }
 
-    pub fn must_get_rollback_ts<E: Engine>(
-        engine: &mut E,
-        key: &[u8],
-        start_ts: impl Into<TimeStamp>,
-    ) {
+    pub fn must_get_rollback_ts<E: Engine>(engine: &E, key: &[u8], start_ts: impl Into<TimeStamp>) {
         let start_ts = start_ts.into();
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut reader = SnapshotReader::new(start_ts, snapshot, true);
@@ -752,7 +609,7 @@ pub mod tests {
     }
 
     pub fn must_get_rollback_ts_none<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         start_ts: impl Into<TimeStamp>,
     ) {
@@ -767,7 +624,7 @@ pub mod tests {
     }
 
     pub fn must_get_rollback_protected<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         start_ts: impl Into<TimeStamp>,
         protected: bool,
@@ -786,7 +643,7 @@ pub mod tests {
     }
 
     pub fn must_get_overlapped_rollback<E: Engine, T: Into<TimeStamp>>(
-        engine: &mut E,
+        engine: &E,
         key: &[u8],
         start_ts: T,
         overlapped_start_ts: T,
@@ -810,7 +667,7 @@ pub mod tests {
     }
 
     pub fn must_scan_keys<E: Engine>(
-        engine: &mut E,
+        engine: &E,
         start: Option<&[u8]>,
         limit: usize,
         keys: Vec<&[u8]>,

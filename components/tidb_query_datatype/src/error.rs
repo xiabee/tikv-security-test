@@ -9,7 +9,4 @@ pub enum DataTypeError {
 
     #[error("Unsupported collation code: {code}")]
     UnsupportedCollation { code: i32 },
-
-    #[error("Unsupported charset : {name}")]
-    UnsupportedCharset { name: String },
 }

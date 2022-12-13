@@ -1,12 +1,11 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{intrinsics::unlikely, io::Read};
+use std::intrinsics::unlikely;
+use std::io::Read;
 
-use crate::{
-    buffer::BufferReader,
-    number::{self, NumberCodec, NumberDecoder, NumberEncoder},
-    ErrorInner, Result,
-};
+use crate::buffer::BufferReader;
+use crate::number::{self, NumberCodec, NumberDecoder, NumberEncoder};
+use crate::{ErrorInner, Result};
 
 const MEMCMP_GROUP_SIZE: usize = 8;
 const MEMCMP_PAD_BYTE: u8 = 0;
@@ -21,9 +20,9 @@ impl MemComparableByteCodec {
         (src_len / MEMCMP_GROUP_SIZE + 1) * (MEMCMP_GROUP_SIZE + 1)
     }
 
-    /// Gets the length of the first encoded byte sequence in the given buffer,
-    /// which is encoded in the memory-comparable format. If the buffer is
-    /// not complete, the length of buffer will be returned.
+    /// Gets the length of the first encoded byte sequence in the given buffer, which is encoded in
+    /// the memory-comparable format. If the buffer is not complete, the length of buffer will be
+    /// returned.
     #[inline]
     fn get_first_encoded_len_internal<T: MemComparableCodecHelper>(encoded: &[u8]) -> usize {
         let mut idx = MEMCMP_GROUP_SIZE;
@@ -39,25 +38,23 @@ impl MemComparableByteCodec {
         }
     }
 
-    /// Gets the length of the first encoded byte sequence in the given buffer,
-    /// which is encoded in the ascending memory-comparable format.
+    /// Gets the length of the first encoded byte sequence in the given buffer, which is encoded in
+    /// the ascending memory-comparable format.
     pub fn get_first_encoded_len(encoded: &[u8]) -> usize {
-        Self::get_first_encoded_len_internal::<Ascending>(encoded)
+        Self::get_first_encoded_len_internal::<AscendingMemComparableCodecHelper>(encoded)
     }
 
-    /// Gets the length of the first encoded byte sequence in the given buffer,
-    /// which is encoded in the descending memory-comparable format.
+    /// Gets the length of the first encoded byte sequence in the given buffer, which is encoded in
+    /// the descending memory-comparable format.
     pub fn get_first_encoded_len_desc(encoded: &[u8]) -> usize {
-        Self::get_first_encoded_len_internal::<Descending>(encoded)
+        Self::get_first_encoded_len_internal::<DescendingMemComparableCodecHelper>(encoded)
     }
 
-    /// Encodes all bytes in the `src` into `dest` in ascending
-    /// memory-comparable format.
+    /// Encodes all bytes in the `src` into `dest` in ascending memory-comparable format.
     ///
     /// Returns the number of bytes encoded.
     ///
-    /// `dest` must not overlaps `src`, otherwise encoded results will be
-    /// incorrect.
+    /// `dest` must not overlaps `src`, otherwise encoded results will be incorrect.
     ///
     /// # Panics
     ///
@@ -101,8 +98,7 @@ impl MemComparableByteCodec {
         }
     }
 
-    /// Encodes the bytes `src[..len]` in ascending memory-comparable format in
-    /// place.
+    /// Encodes the bytes `src[..len]` in ascending memory-comparable format in place.
     ///
     /// Returns the number of bytes encoded.
     ///
@@ -162,13 +158,11 @@ impl MemComparableByteCodec {
         }
     }
 
-    /// Encodes all bytes in the `src` into `dest` in descending
-    /// memory-comparable format.
+    /// Encodes all bytes in the `src` into `dest` in descending memory-comparable format.
     ///
     /// Returns the number of bytes encoded.
     ///
-    /// `dest` must not overlaps `src`, otherwise encoded results will be
-    /// incorrect.
+    /// `dest` must not overlaps `src`, otherwise encoded results will be incorrect.
     ///
     /// # Panics
     ///
@@ -181,8 +175,7 @@ impl MemComparableByteCodec {
         encoded_len
     }
 
-    /// Encodes the bytes `src[..len]` in descending memory-comparable format in
-    /// place.
+    /// Encodes the bytes `src[..len]` in descending memory-comparable format in place.
     ///
     /// Returns the number of bytes encoded.
     ///
@@ -195,25 +188,21 @@ impl MemComparableByteCodec {
         encoded_len
     }
 
-    /// Decodes bytes in ascending memory-comparable format in the `src` into
-    /// `dest`.
+    /// Decodes bytes in ascending memory-comparable format in the `src` into `dest`.
     ///
-    /// If there are multiple encoded byte slices in `src`, only the first one
-    /// will be decoded.
+    /// If there are multiple encoded byte slices in `src`, only the first one will be decoded.
     ///
-    /// Returns `(read_bytes, written_bytes)` where `read_bytes` is the number
-    /// of bytes read in `src` and `written_bytes` is the number of bytes
-    /// written in `dest`.
+    /// Returns `(read_bytes, written_bytes)` where `read_bytes` is the number of bytes read in
+    /// `src` and `written_bytes` is the number of bytes written in `dest`.
     ///
-    /// Note that actual written data may be larger than `written_bytes`. Bytes
-    /// more than `written_bytes` are junk and should be ignored.
+    /// Note that actual written data may be larger than `written_bytes`. Bytes more than
+    /// `written_bytes` are junk and should be ignored.
     ///
     /// If `src == dest`, please use `try_decode_first_in_place`.
     ///
     /// # Panics
     ///
-    /// Panics if `dest.len() < src.len()`, although actual written data may be
-    /// less.
+    /// Panics if `dest.len() < src.len()`, although actual written data may be less.
     ///
     /// When there is a panic, `dest` may contain partially written data.
     ///
@@ -225,33 +214,30 @@ impl MemComparableByteCodec {
     ///
     /// When there is an error, `dest` may contain partially written data.
     pub fn try_decode_first(src: &[u8], dest: &mut [u8]) -> Result<(usize, usize)> {
-        Self::try_decode_first_internal::<Ascending>(
+        Self::try_decode_first_internal(
             src.as_ptr(),
             src.len(),
             dest.as_mut_ptr(),
             dest.len(),
+            AscendingMemComparableCodecHelper,
         )
     }
 
-    /// Decodes bytes in descending memory-comparable format in the `src` into
-    /// `dest`.
+    /// Decodes bytes in descending memory-comparable format in the `src` into `dest`.
     ///
-    /// If there are multiple encoded byte slices in `src`, only the first one
-    /// will be decoded.
+    /// If there are multiple encoded byte slices in `src`, only the first one will be decoded.
     ///
-    /// Returns `(read_bytes, written_bytes)` where `read_bytes` is the number
-    /// of bytes read in `src` and `written_bytes` is the number of bytes
-    /// written in `dest`.
+    /// Returns `(read_bytes, written_bytes)` where `read_bytes` is the number of bytes read in
+    /// `src` and `written_bytes` is the number of bytes written in `dest`.
     ///
-    /// Note that actual written data may be larger than `written_bytes`. Bytes
-    /// more than `written_bytes` are junk and should be ignored.
+    /// Note that actual written data may be larger than `written_bytes`. Bytes more than
+    /// `written_bytes` are junk and should be ignored.
     ///
     /// If `src == dest`, please use `try_decode_first_in_place_desc`.
     ///
     /// # Panics
     ///
-    /// Panics if `dest.len() < src.len()`, although actual written data may be
-    /// less.
+    /// Panics if `dest.len() < src.len()`, although actual written data may be less.
     ///
     /// When there is a panic, `dest` may contain partially written data.
     ///
@@ -263,27 +249,27 @@ impl MemComparableByteCodec {
     ///
     /// When there is an error, `dest` may contain partially written data.
     pub fn try_decode_first_desc(src: &[u8], dest: &mut [u8]) -> Result<(usize, usize)> {
-        let (read_bytes, written_bytes) = Self::try_decode_first_internal::<Descending>(
+        let (read_bytes, written_bytes) = Self::try_decode_first_internal(
             src.as_ptr(),
             src.len(),
             dest.as_mut_ptr(),
             dest.len(),
+            DescendingMemComparableCodecHelper,
         )?;
         Self::flip_bytes_in_place(dest, written_bytes);
         Ok((read_bytes, written_bytes))
     }
 
-    /// Decodes bytes in ascending memory-comparable format in place, i.e.
-    /// decoded data will overwrite the encoded data.
+    /// Decodes bytes in ascending memory-comparable format in place, i.e. decoded data will
+    /// overwrite the encoded data.
     ///
-    /// If there are multiple encoded byte slices in `buffer`, only the first
-    /// one will be decoded.
+    /// If there are multiple encoded byte slices in `buffer`, only the first one will be decoded.
     ///
-    /// Returns `(read_bytes, written_bytes)` where `read_bytes` is the number
-    /// of bytes read and `written_bytes` is the number of bytes written.
+    /// Returns `(read_bytes, written_bytes)` where `read_bytes` is the number of bytes read
+    /// and `written_bytes` is the number of bytes written.
     ///
-    /// Note that actual written data may be larger than `written_bytes`. Bytes
-    /// more than `written_bytes` are junk and should be ignored.
+    /// Note that actual written data may be larger than `written_bytes`. Bytes more than
+    /// `written_bytes` are junk and should be ignored.
     ///
     /// # Errors
     ///
@@ -293,25 +279,25 @@ impl MemComparableByteCodec {
     ///
     /// When there is an error, `dest` may contain partially written data.
     pub fn try_decode_first_in_place(buffer: &mut [u8]) -> Result<(usize, usize)> {
-        Self::try_decode_first_internal::<Ascending>(
+        Self::try_decode_first_internal(
             buffer.as_ptr(),
             buffer.len(),
             buffer.as_mut_ptr(),
             buffer.len(),
+            AscendingMemComparableCodecHelper,
         )
     }
 
-    /// Decodes bytes in descending memory-comparable format in place, i.e.
-    /// decoded data will overwrite the encoded data.
+    /// Decodes bytes in descending memory-comparable format in place, i.e. decoded data will
+    /// overwrite the encoded data.
     ///
-    /// If there are multiple encoded byte slices in `buffer`, only the first
-    /// one will be decoded.
+    /// If there are multiple encoded byte slices in `buffer`, only the first one will be decoded.
     ///
-    /// Returns `(read_bytes, written_bytes)` where `read_bytes` is the number
-    /// of bytes read and `written_bytes` is the number of bytes written.
+    /// Returns `(read_bytes, written_bytes)` where `read_bytes` is the number of bytes read
+    /// and `written_bytes` is the number of bytes written.
     ///
-    /// Note that actual written data may be larger than `written_bytes`. Bytes
-    /// more than `written_bytes` are junk and should be ignored.
+    /// Note that actual written data may be larger than `written_bytes`. Bytes more than
+    /// `written_bytes` are junk and should be ignored.
     ///
     /// # Errors
     ///
@@ -321,11 +307,12 @@ impl MemComparableByteCodec {
     ///
     /// When there is an error, `dest` may contain partially written data.
     pub fn try_decode_first_in_place_desc(buffer: &mut [u8]) -> Result<(usize, usize)> {
-        let (read_bytes, written_bytes) = Self::try_decode_first_internal::<Descending>(
+        let (read_bytes, written_bytes) = Self::try_decode_first_internal(
             buffer.as_ptr(),
             buffer.len(),
             buffer.as_mut_ptr(),
             buffer.len(),
+            DescendingMemComparableCodecHelper,
         )?;
         Self::flip_bytes_in_place(buffer, written_bytes);
         Ok((read_bytes, written_bytes))
@@ -339,18 +326,17 @@ impl MemComparableByteCodec {
     ///
     /// This function uses pointers to accept the scenario that `src == dest`.
     ///
-    /// This function also uses generics to specialize different code path for
-    /// ascending and descending decoding, which performs better than
-    /// inlining a flag.
+    /// This function also uses generics to specialize different code path for ascending and
+    /// descending decoding, which performs better than inlining a flag.
     ///
-    /// Please refer to `try_decode_first` for the meaning of return values,
-    /// panics and errors.
+    /// Please refer to `try_decode_first` for the meaning of return values, panics and errors.
     #[inline]
     fn try_decode_first_internal<T: MemComparableCodecHelper>(
         mut src_ptr: *const u8,
         src_len: usize,
         mut dest_ptr: *mut u8,
         dest_len: usize,
+        _helper: T,
     ) -> Result<(usize, usize)> {
         assert!(dest_len >= src_len);
 
@@ -386,10 +372,7 @@ impl MemComparableByteCodec {
                     // is faster than checking pad bytes one by one, since it will compare multiple
                     // bytes at once.
                     let base_padding_ptr = dest_ptr.sub(padding_size);
-                    // Force a compile time check to ensure safety. The check will be optimized away
-                    // if PADDING's size is larger than MEMCMP_GROUP_SIZE, because it's checked
-                    // aboved that padding_size <= MEMCMP_GROUP_SIZE.
-                    let expected_padding_ptr = T::PADDING[..padding_size].as_ptr();
+                    let expected_padding_ptr = T::get_raw_padding_ptr();
                     let cmp_result = libc::memcmp(
                         base_padding_ptr as *const libc::c_void,
                         expected_padding_ptr as *const libc::c_void,
@@ -413,30 +396,42 @@ impl MemComparableByteCodec {
 trait MemComparableCodecHelper {
     const PADDING: [u8; MEMCMP_GROUP_SIZE];
 
-    /// Given a raw padding size byte, interprets the padding size according to
-    /// correct order.
+    /// Given a raw padding size byte, interprets the padding size according to correct order.
     fn parse_padding_size(raw_marker: u8) -> usize;
+
+    /// Returns a pointer to the raw padding bytes in 8 bytes for current ordering.
+    fn get_raw_padding_ptr() -> *const u8;
 }
 
-struct Ascending;
+struct AscendingMemComparableCodecHelper;
 
-struct Descending;
+struct DescendingMemComparableCodecHelper;
 
-impl MemComparableCodecHelper for Ascending {
+impl MemComparableCodecHelper for AscendingMemComparableCodecHelper {
     const PADDING: [u8; MEMCMP_GROUP_SIZE] = [MEMCMP_PAD_BYTE; MEMCMP_GROUP_SIZE];
 
     #[inline]
     fn parse_padding_size(raw_marker: u8) -> usize {
         (!raw_marker) as usize
     }
+
+    #[inline]
+    fn get_raw_padding_ptr() -> *const u8 {
+        Self::PADDING.as_ptr()
+    }
 }
 
-impl MemComparableCodecHelper for Descending {
+impl MemComparableCodecHelper for DescendingMemComparableCodecHelper {
     const PADDING: [u8; MEMCMP_GROUP_SIZE] = [!MEMCMP_PAD_BYTE; MEMCMP_GROUP_SIZE];
 
     #[inline]
     fn parse_padding_size(raw_marker: u8) -> usize {
         raw_marker as usize
+    }
+
+    #[inline]
+    fn get_raw_padding_ptr() -> *const u8 {
+        Self::PADDING.as_ptr()
     }
 }
 
@@ -495,9 +490,8 @@ impl<T: BufferReader> MemComparableByteDecoder for T {}
 pub struct CompactByteCodec;
 
 impl CompactByteCodec {
-    /// Gets the length of the first encoded byte sequence in the given buffer,
-    /// which is encoded in the compact format. If the buffer is not complete,
-    /// the length of buffer will be returned.
+    /// Gets the length of the first encoded byte sequence in the given buffer, which is encoded in
+    /// the compact format. If the buffer is not complete, the length of buffer will be returned.
     pub fn get_first_encoded_len(encoded: &[u8]) -> usize {
         let result = NumberCodec::try_decode_var_i64(encoded);
         match result {
@@ -759,7 +753,7 @@ mod tests {
         for (exp, encoded) in cases {
             let mut path = env::temp_dir();
             path.push("read-compact-codec-file");
-            fs::write(&path, encoded).unwrap();
+            fs::write(&path, &encoded).unwrap();
             let f = File::open(&path).unwrap();
             let mut rdr = BufReader::new(f);
             let decoded = rdr.read_compact_bytes().unwrap();
@@ -971,7 +965,7 @@ mod tests {
             let result = panic_hook::recover_safe(move || {
                 let _ = MemComparableByteCodec::encode_all(src.as_slice(), dest.as_mut_slice());
             });
-            result.unwrap_err();
+            assert!(result.is_err());
 
             let mut src_in_place = vec![0; dest_len];
             let result = panic_hook::recover_safe(move || {
@@ -980,7 +974,7 @@ mod tests {
                     src_len,
                 );
             });
-            result.unwrap_err();
+            assert!(result.is_err());
         }
     }
 
@@ -988,9 +982,8 @@ mod tests {
     fn test_memcmp_try_decode_first() {
         use super::MEMCMP_GROUP_SIZE as N;
 
-        // We have ensured correctness in `test_memcmp_encode_all`, so we use
-        // `encode_all` to generate fixtures in different length, used for
-        // decoding.
+        // We have ensured correctness in `test_memcmp_encode_all`, so we use `encode_all` to
+        // generate fixtures in different length, used for decoding.
 
         fn do_test(
             is_desc: bool,
@@ -1141,7 +1134,7 @@ mod tests {
                 invalid_src.as_slice(),
                 dest.as_mut_slice(),
             );
-            result.unwrap_err();
+            assert!(result.is_err());
         }
     }
 
@@ -1162,7 +1155,7 @@ mod tests {
                         dest.as_mut_slice(),
                     );
                 });
-                result.unwrap_err();
+                assert!(result.is_err());
             }
             {
                 let mut dest = vec![0; src.len()];
