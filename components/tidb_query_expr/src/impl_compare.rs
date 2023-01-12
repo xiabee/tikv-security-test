@@ -103,10 +103,10 @@ impl<F: CmpOp> Comparer for UintIntComparer<F> {
             (None, None) => F::compare_null(),
             (None, _) | (_, None) => F::compare_partial_null(),
             (Some(lhs), Some(rhs)) => {
-                let ordering = if *rhs < 0 || *lhs as u64 > std::i64::MAX as u64 {
+                let ordering = if *rhs < 0 || *lhs as u64 > i64::MAX as u64 {
                     Ordering::Greater
                 } else {
-                    lhs.cmp(&rhs)
+                    lhs.cmp(rhs)
                 };
                 Some(F::compare_order(ordering) as i64)
             }
@@ -127,10 +127,10 @@ impl<F: CmpOp> Comparer for IntUintComparer<F> {
             (None, None) => F::compare_null(),
             (None, _) | (_, None) => F::compare_partial_null(),
             (Some(lhs), Some(rhs)) => {
-                let ordering = if *lhs < 0 || *rhs as u64 > std::i64::MAX as u64 {
+                let ordering = if *lhs < 0 || *rhs as u64 > i64::MAX as u64 {
                     Ordering::Less
                 } else {
-                    lhs.cmp(&rhs)
+                    lhs.cmp(rhs)
                 };
                 Some(F::compare_order(ordering) as i64)
             }
@@ -353,7 +353,7 @@ pub fn greatest_time(ctx: &mut EvalContext, args: &[Option<BytesRef>]) -> Result
                             .map(|_| Ok(None))?;
                     }
                 };
-                match Time::parse_datetime(ctx, &s, Time::parse_fsp(&s), true) {
+                match Time::parse_datetime(ctx, s, Time::parse_fsp(s), true) {
                     Ok(t) => greatest = max(greatest, Some(t)),
                     Err(_) => {
                         return ctx
@@ -392,7 +392,7 @@ pub fn least_time(mut ctx: &mut EvalContext, args: &[Option<BytesRef>]) -> Resul
                             .map(|_| Ok(None))?;
                     }
                 };
-                match Time::parse_datetime(ctx, &s, Time::parse_fsp(&s), true) {
+                match Time::parse_datetime(ctx, s, Time::parse_fsp(s), true) {
                     Ok(t) => least = min(least, Some(t)),
                     Err(_) => {
                         return ctx
@@ -768,44 +768,32 @@ mod tests {
     fn test_compare_int_2() {
         let test_cases = vec![
             (Some(5), false, Some(3), false, Ordering::Greater),
+            (Some(u64::MAX as i64), false, Some(5), false, Ordering::Less),
             (
-                Some(std::u64::MAX as i64),
-                false,
-                Some(5),
-                false,
-                Ordering::Less,
-            ),
-            (
-                Some(std::u64::MAX as i64),
+                Some(u64::MAX as i64),
                 true,
-                Some((std::u64::MAX - 1) as i64),
+                Some((u64::MAX - 1) as i64),
                 true,
                 Ordering::Greater,
             ),
             (
-                Some(std::u64::MAX as i64),
+                Some(u64::MAX as i64),
                 true,
                 Some(5),
                 true,
                 Ordering::Greater,
             ),
-            (Some(5), true, Some(std::i64::MIN), false, Ordering::Greater),
+            (Some(5), true, Some(i64::MIN), false, Ordering::Greater),
             (
-                Some(std::u64::MAX as i64),
+                Some(u64::MAX as i64),
                 true,
-                Some(std::i64::MIN),
+                Some(i64::MIN),
                 false,
                 Ordering::Greater,
             ),
             (Some(5), true, Some(3), false, Ordering::Greater),
-            (Some(std::i64::MIN), false, Some(3), true, Ordering::Less),
-            (
-                Some(5),
-                false,
-                Some(std::u64::MAX as i64),
-                true,
-                Ordering::Less,
-            ),
+            (Some(i64::MIN), false, Some(3), true, Ordering::Less),
+            (Some(5), false, Some(u64::MAX as i64), true, Ordering::Less),
             (Some(5), false, Some(3), true, Ordering::Greater),
         ];
         for (lhs, lhs_is_unsigned, rhs, rhs_is_unsigned, ordering) in test_cases {

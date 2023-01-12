@@ -12,9 +12,7 @@ use engine_rocks::raw::{
     new_compaction_filter_raw, CompactionFilter, CompactionFilterContext, CompactionFilterDecision,
     CompactionFilterFactory, CompactionFilterValueType, DBCompactionFilter,
 };
-use engine_rocks::{
-    RocksEngine, RocksMvccProperties, RocksUserCollectedPropertiesNoRc, RocksWriteBatch,
-};
+use engine_rocks::{RocksEngine, RocksMvccProperties, RocksWriteBatch};
 use engine_traits::{
     KvEngine, MiscExt, Mutable, MvccProperties, WriteBatch, WriteBatchExt, WriteOptions,
 };
@@ -38,14 +36,14 @@ const DEFAULT_DELETE_BATCH_COUNT: usize = 128;
 const COMPACTION_FILTER_GC_FEATURE: Feature = Feature::require(5, 0, 0);
 
 // Global context to create a compaction filter for write CF. It's necessary as these fields are
-// not available when construcing `WriteCompactionFilterFactory`.
+// not available when constructing `WriteCompactionFilterFactory`.
 struct GcContext {
     db: RocksEngine,
     store_id: u64,
     safe_point: Arc<AtomicU64>,
     cfg_tracker: GcWorkerConfigManager,
     feature_gate: FeatureGate,
-    gc_scheduler: Scheduler<GcTask>,
+    gc_scheduler: Scheduler<GcTask<RocksEngine>>,
     region_info_provider: Arc<dyn RegionInfoProvider + 'static>,
     #[cfg(any(test, feature = "failpoints"))]
     callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
@@ -103,19 +101,22 @@ lazy_static! {
     .unwrap();
 }
 
-pub trait CompactionFilterInitializer {
+pub trait CompactionFilterInitializer<EK>
+where
+    EK: KvEngine,
+{
     fn init_compaction_filter(
         &self,
         store_id: u64,
         safe_point: Arc<AtomicU64>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
-        gc_scheduler: Scheduler<GcTask>,
+        gc_scheduler: Scheduler<GcTask<EK>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
     );
 }
 
-impl<EK> CompactionFilterInitializer for EK
+impl<EK> CompactionFilterInitializer<EK> for EK
 where
     EK: KvEngine,
 {
@@ -125,21 +126,21 @@ where
         _safe_point: Arc<AtomicU64>,
         _cfg_tracker: GcWorkerConfigManager,
         _feature_gate: FeatureGate,
-        _gc_scheduler: Scheduler<GcTask>,
+        _gc_scheduler: Scheduler<GcTask<EK>>,
         _region_info_provider: Arc<dyn RegionInfoProvider>,
     ) {
         info!("Compaction filter is not supported for this engine.");
     }
 }
 
-impl CompactionFilterInitializer for RocksEngine {
+impl CompactionFilterInitializer<RocksEngine> for RocksEngine {
     fn init_compaction_filter(
         &self,
         store_id: u64,
         safe_point: Arc<AtomicU64>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
-        gc_scheduler: Scheduler<GcTask>,
+        gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
     ) {
         info!("initialize GC context for compaction filter");
@@ -242,7 +243,7 @@ struct WriteCompactionFilter {
     encountered_errors: bool,
 
     write_batch: RocksWriteBatch,
-    gc_scheduler: Scheduler<GcTask>,
+    gc_scheduler: Scheduler<GcTask<RocksEngine>>,
     // A key batch which is going to be sent to the GC worker.
     mvcc_deletions: Vec<Key>,
     // The count of records covered the current mvcc-deletion mark. The mvcc-deletion
@@ -273,7 +274,7 @@ impl WriteCompactionFilter {
         engine: RocksEngine,
         safe_point: u64,
         context: &CompactionFilterContext,
-        gc_scheduler: Scheduler<GcTask>,
+        gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         regions_provider: (u64, Arc<dyn RegionInfoProvider>),
     ) -> Self {
         // Safe point must have been initialized.
@@ -314,7 +315,7 @@ impl WriteCompactionFilter {
 
     // `log_on_error` indicates whether to print an error log on scheduling failures.
     // It's only enabled for `GcTask::OrphanVersions`.
-    fn schedule_gc_task(&self, task: GcTask, log_on_error: bool) {
+    fn schedule_gc_task(&self, task: GcTask<RocksEngine>, log_on_error: bool) {
         match self.gc_scheduler.schedule(task) {
             Ok(_) => {}
             Err(e) => {
@@ -419,7 +420,7 @@ impl WriteCompactionFilter {
         Ok(decision)
     }
 
-    fn handle_filtered_write(&mut self, write: WriteRef) -> Result<(), String> {
+    fn handle_filtered_write(&mut self, write: WriteRef<'_>) -> Result<(), String> {
         if write.short_value.is_none() && write.write_type == WriteType::Put {
             let prefix = Key::from_encoded_slice(&self.mvcc_key_prefix);
             let def_key = prefix.append_ts(write.start_ts).into_encoded();
@@ -483,11 +484,11 @@ impl WriteCompactionFilter {
     }
 
     fn flush_metrics(&self) {
-        GC_COMPACTION_FILTERED.inc_by(self.total_filtered as i64);
-        GC_COMPACTION_MVCC_ROLLBACK.inc_by(self.mvcc_rollback_and_locks as i64);
+        GC_COMPACTION_FILTERED.inc_by(self.total_filtered as u64);
+        GC_COMPACTION_MVCC_ROLLBACK.inc_by(self.mvcc_rollback_and_locks as u64);
         GC_COMPACTION_FILTER_ORPHAN_VERSIONS
             .with_label_values(&["generated"])
-            .inc_by(self.orphan_versions as i64);
+            .inc_by(self.orphan_versions as u64);
         if let Some((versions, filtered)) = STATS.with(|stats| {
             stats.versions.update(|x| x + self.total_versions);
             stats.filtered.update(|x| x + self.total_filtered);
@@ -554,7 +555,7 @@ impl Drop for WriteCompactionFilter {
 
         #[cfg(any(test, feature = "failpoints"))]
         for callback in &self.callbacks_on_drop {
-            callback(&self);
+            callback(self);
         }
     }
 }
@@ -595,7 +596,7 @@ fn split_ts(key: &[u8]) -> Result<(&[u8], u64), String> {
     }
 }
 
-fn parse_write(value: &[u8]) -> Result<WriteRef, String> {
+fn parse_write(value: &[u8]) -> Result<WriteRef<'_>, String> {
     match WriteRef::parse(value) {
         Ok(write) => Ok(write),
         Err(_) => Err(format!(
@@ -650,10 +651,7 @@ fn check_need_gc(
     let (mut sum_props, mut needs_gc) = (MvccProperties::new(), 0);
     for i in 0..context.file_numbers().len() {
         let table_props = context.table_properties(i);
-        let user_props = unsafe {
-            &*(table_props.user_collected_properties() as *const _
-                as *const RocksUserCollectedPropertiesNoRc)
-        };
+        let user_props = table_props.user_collected_properties();
         if let Ok(props) = RocksMvccProperties::decode(user_props) {
             sum_props.add(&props);
             let (sst_needs_gc, skip_more_checks) = check_props(&props);
@@ -711,8 +709,8 @@ pub mod test_utils {
         pub start: Option<&'a [u8]>,
         pub end: Option<&'a [u8]>,
         pub target_level: Option<usize>,
-        pub gc_scheduler: Scheduler<GcTask>,
-        pub gc_receiver: ReceiverWrapper<GcTask>,
+        pub gc_scheduler: Scheduler<GcTask<RocksEngine>>,
+        pub gc_receiver: ReceiverWrapper<GcTask<RocksEngine>>,
         pub(super) callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
     }
 

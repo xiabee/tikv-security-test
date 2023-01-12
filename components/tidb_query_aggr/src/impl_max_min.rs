@@ -184,7 +184,7 @@ where
             return Ok(());
         }
 
-        if C::sort_compare(&self.extremum.as_ref().unwrap(), &value.as_ref().unwrap())? == E::ORD {
+        if C::sort_compare(self.extremum.as_ref().unwrap(), value.as_ref().unwrap())? == E::ORD {
             self.extremum = value.map(|x| x.into_owned_value());
         }
         Ok(())
@@ -249,7 +249,11 @@ where
     ///
     /// ref: https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_max
     #[inline]
-    fn update_concrete(&mut self, _ctx: &mut EvalContext, value: Option<EnumRef>) -> Result<()> {
+    fn update_concrete(
+        &mut self,
+        _ctx: &mut EvalContext,
+        value: Option<EnumRef<'_>>,
+    ) -> Result<()> {
         let extreme_ref = self
             .extremum
             .as_ref()
@@ -257,11 +261,7 @@ where
 
         if value.is_some()
             && (self.extremum.is_none()
-                || extreme_ref
-                    .unwrap()
-                    .as_str()?
-                    .cmp(&value.unwrap().as_str()?)
-                    == E::ORD)
+                || extreme_ref.unwrap().as_str()?.cmp(value.unwrap().as_str()?) == E::ORD)
         {
             self.extremum = value.map(|x| x.into_owned_value());
         }
@@ -338,7 +338,7 @@ where
     ///
     /// ref: https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_max
     #[inline]
-    fn update_concrete(&mut self, _ctx: &mut EvalContext, value: Option<SetRef>) -> Result<()> {
+    fn update_concrete(&mut self, _ctx: &mut EvalContext, value: Option<SetRef<'_>>) -> Result<()> {
         let extreme_ref = self
             .extremum
             .as_ref()
@@ -764,7 +764,7 @@ mod tests {
                 update!(
                     state,
                     &mut ctx,
-                    Some(&String::from(arg).into_bytes() as BytesRef)
+                    Some(&String::from(arg).into_bytes() as BytesRef<'_>)
                 )
                 .unwrap();
             }
@@ -912,7 +912,7 @@ mod tests {
                     &mut ctx,
                     &src_schema,
                     columns,
-                    &logical_rows,
+                    logical_rows,
                     logical_rows.len(),
                 )
                 .unwrap();
@@ -929,7 +929,7 @@ mod tests {
                     &mut ctx,
                     &src_schema,
                     columns,
-                    &logical_rows,
+                    logical_rows,
                     logical_rows.len(),
                 )
                 .unwrap();

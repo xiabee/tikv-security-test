@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::metrics::*;
 use super::{
     BoxRegionChangeObserver, BoxRoleObserver, Coprocessor, CoprocessorHost, ObserverContext,
-    RegionChangeEvent, RegionChangeObserver, Result, RoleObserver,
+    RegionChangeEvent, RegionChangeObserver, Result, RoleChange, RoleObserver,
 };
 use collections::HashMap;
 use engine_traits::KvEngine;
@@ -120,7 +120,7 @@ impl Display for RegionInfoQuery {
         match self {
             RegionInfoQuery::RaftStoreEvent(e) => write!(f, "RaftStoreEvent({:?})", e),
             RegionInfoQuery::SeekRegion { from, .. } => {
-                write!(f, "SeekRegion(from: {})", log_wrappers::Value::key(&from))
+                write!(f, "SeekRegion(from: {})", log_wrappers::Value::key(from))
             }
             RegionInfoQuery::FindRegionById { region_id, .. } => {
                 write!(f, "FindRegionById(region_id: {})", region_id)
@@ -167,8 +167,9 @@ impl RegionChangeObserver for RegionEventListener {
 }
 
 impl RoleObserver for RegionEventListener {
-    fn on_role_change(&self, context: &mut ObserverContext<'_>, role: StateRole) {
+    fn on_role_change(&self, context: &mut ObserverContext<'_>, role_change: &RoleChange) {
         let region = context.region().clone();
+        let role = role_change.state;
         let event = RaftStoreEvent::RoleChange { region, role };
         self.scheduler
             .schedule(RegionInfoQuery::RaftStoreEvent(event))
@@ -459,6 +460,12 @@ impl RegionCollector {
     }
 }
 
+impl Default for RegionCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Runnable for RegionCollector {
     type Task = RegionInfoQuery;
 
@@ -719,14 +726,14 @@ mod tests {
         assert!(c.region_ranges.is_empty());
 
         for region in regions {
-            must_create_region(c, &region, StateRole::Follower);
+            must_create_region(c, region, StateRole::Follower);
         }
 
         let expected_regions: Vec<_> = regions
             .iter()
             .map(|r| (r.clone(), StateRole::Follower))
             .collect();
-        check_collection(&c, &expected_regions);
+        check_collection(c, &expected_regions);
     }
 
     fn must_create_region(c: &mut RegionCollector, region: &Region, role: StateRole) {

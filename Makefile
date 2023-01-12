@@ -39,6 +39,8 @@ ifeq ($(TCMALLOC),1)
 ENABLE_FEATURES += tcmalloc
 else ifeq ($(MIMALLOC),1)
 ENABLE_FEATURES += mimalloc
+else ifeq ($(SNMALLOC),1)
+ENABLE_FEATURES += snmalloc
 else ifeq ($(SYSTEM_ALLOC),1)
 # no feature needed for system allocator
 else
@@ -86,13 +88,6 @@ ifeq ($(BCC_IOSNOOP),1)
 ENABLE_FEATURES += bcc-iosnoop
 endif
 
-# Use Prost instead of rust-protobuf to encode and decode protocol buffers.
-ifeq ($(PROST),1)
-ENABLE_FEATURES += prost-codec
-else
-ENABLE_FEATURES += protobuf-codec
-endif
-
 # Set the storage engines used for testing
 ifneq ($(NO_DEFAULT_TEST_ENGINES),1)
 ENABLE_FEATURES += test-engines-rocksdb
@@ -103,6 +98,7 @@ endif
 ifneq ($(NO_CLOUD),1)
 ENABLE_FEATURES += cloud-aws
 ENABLE_FEATURES += cloud-gcp
+ENABLE_FEATURES += cloud-azure
 endif
 
 PROJECT_DIR:=$(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
@@ -326,7 +322,7 @@ ctl:
 # Actually use make to track dependencies! This saves half a second.
 error_code_files := $(shell find $(PROJECT_DIR)/components/error_code/ -type f )
 etc/error_code.toml: $(error_code_files)
-	cargo run --manifest-path components/error_code/Cargo.toml --features protobuf-codec
+	cargo run --manifest-path components/error_code/Cargo.toml
 
 error-code: etc/error_code.toml
 

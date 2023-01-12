@@ -1,5 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
+// #[PerformanceCriticalPath] called by Fsm on_ready_compute_hash
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
@@ -8,6 +9,7 @@ use engine_traits::{CfName, KvEngine};
 use kvproto::metapb::Region;
 use kvproto::pdpb::CheckPolicy;
 use kvproto::raft_cmdpb::{ComputeHashRequest, RaftCmdRequest};
+use protobuf::Message;
 use raft::eraftpb;
 use tikv_util::box_try;
 
@@ -479,8 +481,13 @@ impl<E: KvEngine> CoprocessorHost<E> {
         Ok(hashes)
     }
 
-    pub fn on_role_change(&self, region: &Region, role: StateRole) {
-        loop_ob!(region, &self.registry.role_observers, on_role_change, role);
+    pub fn on_role_change(&self, region: &Region, role_change: RoleChange) {
+        loop_ob!(
+            region,
+            &self.registry.role_observers,
+            on_role_change,
+            &role_change
+        );
     }
 
     pub fn on_region_changed(&self, region: &Region, event: RegionChangeEvent, role: StateRole) {
@@ -505,7 +512,7 @@ impl<E: KvEngine> CoprocessorHost<E> {
         }
         for batch in &cmd_batches {
             for cmd in &batch.cmds {
-                self.post_apply(&batch.region, &cmd);
+                self.post_apply(Region::default_instance(), cmd);
             }
         }
         for observer in &self.registry.cmd_observers {
@@ -618,7 +625,7 @@ mod tests {
     }
 
     impl RoleObserver for TestCoprocessor {
-        fn on_role_change(&self, ctx: &mut ObserverContext<'_>, _: StateRole) {
+        fn on_role_change(&self, ctx: &mut ObserverContext<'_>, _: &RoleChange) {
             self.called.fetch_add(7, Ordering::SeqCst);
             ctx.bypass = self.bypass.load(Ordering::SeqCst);
         }
@@ -719,8 +726,8 @@ mod tests {
         host.post_apply(&region, &Cmd::new(0, query_req, query_resp));
         assert_all!(&[&ob.called], &[21]);
 
-        host.on_role_change(&region, StateRole::Leader);
-        assert_all!(&[&ob.called], &[28]);
+        host.on_role_change(&region, RoleChange::new(StateRole::Leader));
+        assert_all!([&ob.called], &[28]);
 
         host.on_region_changed(&region, RegionChangeEvent::Create, StateRole::Follower);
         assert_all!(&[&ob.called], &[36]);
@@ -731,7 +738,7 @@ mod tests {
         assert_all!(&[&ob.called], &[55]);
 
         let observe_info = CmdObserveInfo::from_handle(ObserveHandle::new(), ObserveHandle::new());
-        let mut cb = CmdBatch::new(&observe_info, Region::default());
+        let mut cb = CmdBatch::new(&observe_info, 0);
         cb.push(&observe_info, 0, Cmd::default());
         host.on_flush_applied_cmd_batch(cb.level, vec![cb], &PanicEngine);
         // `post_apply` + `on_flush_applied_cmd_batch` => 13 + 6 = 19

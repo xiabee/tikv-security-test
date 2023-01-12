@@ -4,15 +4,6 @@ version = "0.0.1"
 edition = "2018"
 publish = false
 
-[features]
-default = ["protobuf-codec"]
-protobuf-codec = [
-  "error_code/protobuf-codec",
-]
-prost-codec = [
-  "error_code/prost-codec",
-]
-
 [dependencies]
 byteorder = "1.2"
 error_code = { path = "../error_code", default-features = false }
@@ -24,5 +15,5 @@ tikv_alloc = { path = "../tikv_alloc" }
 [dev-dependencies]
 panic_hook = { path = "../panic_hook" }
 protobuf = "2"
-bytes = "0.5"
-rand = "0.7"
+bytes = "1.0"
+rand = "0.8"

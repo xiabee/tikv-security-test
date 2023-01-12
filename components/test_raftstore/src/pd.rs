@@ -26,6 +26,7 @@ use fail::fail_point;
 use keys::{self, data_key, enc_end_key, enc_start_key};
 use pd_client::{Error, FeatureGate, Key, PdClient, PdFuture, RegionInfo, RegionStat, Result};
 use raftstore::store::util::{check_key_in_region, find_peer, is_learner};
+use raftstore::store::QueryStats;
 use raftstore::store::{INIT_EPOCH_CONF_VER, INIT_EPOCH_VER};
 use tikv_util::time::{Instant, UnixSecs};
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
@@ -133,7 +134,7 @@ impl Operator {
         match *self {
             Operator::AddPeer { ref peer, .. } => {
                 if let Either::Left(ref peer) = *peer {
-                    let conf_change_type = if is_learner(&peer) {
+                    let conf_change_type = if is_learner(peer) {
                         ConfChangeType::AddLearnerNode
                     } else {
                         ConfChangeType::AddNode
@@ -183,7 +184,7 @@ impl Operator {
             } => {
                 let mut cps = Vec::with_capacity(to_add_peers.len() + remove_peers.len());
                 for peer in to_add_peers.iter() {
-                    let conf_change_type = if is_learner(&peer) {
+                    let conf_change_type = if is_learner(peer) {
                         ConfChangeType::AddLearnerNode
                     } else {
                         ConfChangeType::AddNode
@@ -502,7 +503,15 @@ impl PdCluster {
             region.get_region_epoch().clone(),
         );
         assert!(end_key > start_key);
+        let created_by_unsafe_recover = (!start_key.is_empty() || !end_key.is_empty())
+            && incoming_epoch.get_version() == 1
+            && incoming_epoch.get_conf_ver() == 1;
         let overlaps = self.get_overlap(start_key, end_key);
+        if created_by_unsafe_recover {
+            // Allow recreated region by unsafe recover to overwrite other regions with a "older"
+            // epoch.
+            return Ok(overlaps);
+        }
         for r in overlaps.iter() {
             if incoming_epoch.get_version() < r.get_region_epoch().get_version() {
                 return Err(box_err!("epoch {:?} is stale.", incoming_epoch));
@@ -526,16 +535,21 @@ impl PdCluster {
     ) -> Result<pdpb::RegionHeartbeatResponse> {
         let overlaps = self.check_put_region(region.clone())?;
         let same_region = {
-            let (ver, conf_ver) = (
+            let (ver, conf_ver, start_key, end_key) = (
                 region.get_region_epoch().get_version(),
                 region.get_region_epoch().get_conf_ver(),
+                region.get_start_key(),
+                region.get_end_key(),
             );
             overlaps.len() == 1
                 && overlaps[0].get_id() == region.get_id()
                 && overlaps[0].get_region_epoch().get_version() == ver
                 && overlaps[0].get_region_epoch().get_conf_ver() == conf_ver
+                && overlaps[0].get_start_key() == start_key
+                && overlaps[0].get_end_key() == end_key
         };
         if !same_region {
+            debug!("region changed"; "from" => ?overlaps, "to" => ?region, "leader" => ?leader);
             // remove overlap regions
             for r in overlaps {
                 self.remove_region(&r);
@@ -731,6 +745,7 @@ pub struct TestPdClient {
     tso: AtomicU64,
     trigger_tso_failure: AtomicBool,
     feature_gate: FeatureGate,
+    trigger_leader_info_loss: AtomicBool,
 }
 
 impl TestPdClient {
@@ -745,6 +760,7 @@ impl TestPdClient {
             is_incompatible,
             tso: AtomicU64::new(1),
             trigger_tso_failure: AtomicBool::new(false),
+            trigger_leader_info_loss: AtomicBool::new(false),
             feature_gate,
         }
     }
@@ -1206,6 +1222,10 @@ impl TestPdClient {
         self.trigger_tso_failure.store(true, Ordering::SeqCst);
     }
 
+    pub fn trigger_leader_info_loss(&self) {
+        self.trigger_leader_info_loss.store(true, Ordering::SeqCst);
+    }
+
     pub fn shutdown_store(&self, store_id: u64) {
         match self.cluster.write() {
             Ok(mut c) => {
@@ -1293,9 +1313,13 @@ impl PdClient for TestPdClient {
 
     fn get_region(&self, key: &[u8]) -> Result<metapb::Region> {
         self.check_bootstrap()?;
-        if let Some(region) = self.cluster.rl().get_region(data_key(key)) {
-            if check_key_in_region(key, &region).is_ok() {
-                return Ok(region);
+
+        for _ in 1..500 {
+            sleep_ms(10);
+            if let Some(region) = self.cluster.rl().get_region(data_key(key)) {
+                if check_key_in_region(key, &region).is_ok() {
+                    return Ok(region);
+                }
             }
         }
 
@@ -1331,7 +1355,11 @@ impl PdClient for TestPdClient {
         let cluster = self.cluster.rl();
         match cluster.get_region_by_id(region_id) {
             Ok(resp) => {
-                let leader = cluster.leaders.get(&region_id).cloned().unwrap_or_default();
+                let leader = if self.trigger_leader_info_loss.load(Ordering::SeqCst) {
+                    new_peer(0, 0)
+                } else {
+                    cluster.leaders.get(&region_id).cloned().unwrap_or_default()
+                };
                 Box::pin(ok(resp.map(|r| (r, leader))))
             }
             Err(e) => Box::pin(err(e)),
@@ -1477,7 +1505,11 @@ impl PdClient for TestPdClient {
         Box::pin(ok(resp))
     }
 
-    fn store_heartbeat(&self, stats: pdpb::StoreStats) -> PdFuture<pdpb::StoreHeartbeatResponse> {
+    fn store_heartbeat(
+        &self,
+        stats: pdpb::StoreStats,
+        _: Option<pdpb::StoreReport>,
+    ) -> PdFuture<pdpb::StoreHeartbeatResponse> {
         if let Err(e) = self.check_bootstrap() {
             return Box::pin(err(e));
         }
@@ -1495,8 +1527,12 @@ impl PdClient for TestPdClient {
                 .or_insert_with(pdpb::PeerStat::default);
             let read_keys = peer_stat.get_read_keys() + peer_stat_sum.get_read_keys();
             let read_bytes = peer_stat.get_read_bytes() + peer_stat_sum.get_read_bytes();
+            let mut read_query_stats = QueryStats::default();
+            read_query_stats.add_query_stats(peer_stat.get_query_stats());
+            read_query_stats.add_query_stats(peer_stat_sum.get_query_stats());
             peer_stat_sum.set_read_keys(read_keys);
             peer_stat_sum.set_read_bytes(read_bytes);
+            peer_stat_sum.set_query_stats(read_query_stats.0);
             peer_stat_sum.set_region_id(region_id);
         }
 

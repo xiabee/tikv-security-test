@@ -7,8 +7,10 @@ mod compact;
 mod consistency_check;
 mod metrics;
 mod pd;
+mod query_stats;
 mod raftlog_gc;
 mod read;
+mod refresh_config;
 mod region;
 mod split_check;
 mod split_config;
@@ -22,9 +24,13 @@ pub use self::consistency_check::{Runner as ConsistencyCheckRunner, Task as Cons
 pub use self::pd::{
     FlowStatistics, FlowStatsReporter, HeartbeatTask, Runner as PdRunner, Task as PdTask,
 };
+pub use self::query_stats::QueryStats;
 pub use self::raftlog_gc::{Runner as RaftlogGcRunner, Task as RaftlogGcTask};
 pub use self::read::{LocalReader, Progress as ReadProgress, ReadDelegate, ReadExecutor, TrackVer};
+pub use self::refresh_config::{
+    Runner as RefreshConfigRunner, Task as RefreshConfigTask, ThreadPool as RaftStoreThreadPool,
+};
 pub use self::region::{Runner as RegionRunner, Task as RegionTask};
 pub use self::split_check::{KeyEntry, Runner as SplitCheckRunner, Task as SplitCheckTask};
 pub use self::split_config::{SplitConfig, SplitConfigManager};
-pub use self::split_controller::{AutoSplitController, ReadStats};
+pub use self::split_controller::{AutoSplitController, ReadStats, WriteStats};

@@ -51,6 +51,12 @@ impl Service {
     }
 }
 
+impl Default for Service {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn make_members_response(eps: Vec<String>) -> GetMembersResponse {
     let mut members = Vec::with_capacity(eps.len());
     for (i, ep) in (&eps).iter().enumerate() {
@@ -228,6 +234,7 @@ impl PdMocker for Service {
             .insert(region_id, req.get_leader().clone());
 
         let mut resp = RegionHeartbeatResponse::default();
+        resp.set_region_id(req.get_region().get_id());
         let header = Service::header();
         resp.set_header(header);
         Some(Ok(resp))

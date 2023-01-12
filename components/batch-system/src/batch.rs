@@ -5,24 +5,26 @@
 //! represents a peer, the other is control FSM, which usually represents something
 //! that controls how the former is created or metrics are collected.
 
+// #[PerformanceCriticalPath]
 use crate::config::Config;
 use crate::fsm::{Fsm, FsmScheduler, Priority};
 use crate::mailbox::BasicMailbox;
 use crate::router::Router;
 use crossbeam::channel::{self, SendError};
+use fail::fail_point;
 use file_system::{set_io_type, IOType};
 use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, current, JoinHandle, ThreadId};
 use std::time::Duration;
 use tikv_util::mpsc;
 use tikv_util::time::Instant;
 use tikv_util::{debug, error, info, safe_panic, thd_name, warn};
 
 /// A unify type for FSMs so that they can be sent to channel easily.
-enum FsmTypes<N, C> {
+pub enum FsmTypes<N, C> {
     Normal(Box<N>),
     Control(Box<C>),
     // Used as a signal that scheduler should be shutdown.
@@ -70,7 +72,7 @@ macro_rules! impl_sched {
             fn shutdown(&self) {
                 // TODO: close it explicitly once it's supported.
                 // Magic number, actually any number greater than poll pool size works.
-                for _ in 0..100 {
+                for _ in 0..256 {
                     let _ = self.sender.send(FsmTypes::Empty);
                     let _ = self.low_sender.send(FsmTypes::Empty);
                 }
@@ -82,18 +84,9 @@ macro_rules! impl_sched {
 impl_sched!(NormalScheduler, FsmTypes::Normal, Fsm = N);
 impl_sched!(ControlScheduler, FsmTypes::Control, Fsm = C);
 
-/// Fsm that contains tracked offset for accessing in `PollHandler::end` function.
-pub trait TrackedFsm: Deref + DerefMut {
-    /// Get the offset of current fsm in `PollHandler::end`.
-    ///
-    /// It's not valid anymore after `PollHandler::end` is finished.
-    fn offset(&self) -> usize;
-}
-
 pub struct NormalFsm<N> {
     fsm: Box<N>,
     timer: Instant,
-    offset: usize,
     policy: Option<ReschedulePolicy>,
 }
 
@@ -103,7 +96,6 @@ impl<N> NormalFsm<N> {
         NormalFsm {
             fsm,
             timer: Instant::now_coarse(),
-            offset: 0,
             policy: None,
         }
     }
@@ -122,13 +114,6 @@ impl<N> DerefMut for NormalFsm<N> {
     #[inline]
     fn deref_mut(&mut self) -> &mut N {
         &mut self.fsm
-    }
-}
-
-impl<N> TrackedFsm for NormalFsm<N> {
-    #[inline]
-    fn offset(&self) -> usize {
-        self.offset
     }
 }
 
@@ -307,7 +292,7 @@ impl HandleResult {
 ///
 /// Note that, every poll thread has its own handler, which doesn't have to be
 /// Sync.
-pub trait PollHandler<N, C> {
+pub trait PollHandler<N, C>: Send + 'static {
     /// This function is called at the very beginning of every round.
     fn begin(&mut self, batch_size: usize);
 
@@ -323,20 +308,14 @@ pub trait PollHandler<N, C> {
     /// This function is called when handling readiness for normal FSM.
     ///
     /// The returned value is handled in the same way as `handle_control`.
-    fn handle_normal(&mut self, normal: &mut impl TrackedFsm<Target = N>) -> HandleResult;
+    fn handle_normal(&mut self, normal: &mut impl DerefMut<Target = N>) -> HandleResult;
 
     /// This function is called after `handle_normal` is called for all fsm and before calling
-    /// `end`. The function is expected to run lightweight work. If any fsms expects to skip
-    /// `end`, its offset should be pushed to `to_skip_end`.
-    fn light_end(
-        &mut self,
-        _batch: &mut [Option<impl TrackedFsm<Target = N>>],
-        _to_skip_end: &mut Vec<usize>,
-    ) {
-    }
+    /// `end`. The function is expected to run lightweight work.
+    fn light_end(&mut self, _batch: &mut [Option<impl DerefMut<Target = N>>]) {}
 
     /// This function is called at the end of every round.
-    fn end(&mut self, batch: &mut [Option<impl TrackedFsm<Target = N>>]);
+    fn end(&mut self, batch: &mut [Option<impl DerefMut<Target = N>>]);
 
     /// This function is called when batch system is going to sleep.
     fn pause(&mut self) {}
@@ -348,12 +327,25 @@ pub trait PollHandler<N, C> {
 }
 
 /// Internal poller that fetches batch and call handler hooks for readiness.
-struct Poller<N: Fsm, C: Fsm, Handler> {
-    router: Router<N, C, NormalScheduler<N, C>, ControlScheduler<N, C>>,
-    fsm_receiver: channel::Receiver<FsmTypes<N, C>>,
-    handler: Handler,
-    max_batch_size: usize,
-    reschedule_duration: Duration,
+pub struct Poller<N: Fsm, C: Fsm, Handler> {
+    pub router: Router<N, C, NormalScheduler<N, C>, ControlScheduler<N, C>>,
+    pub fsm_receiver: channel::Receiver<FsmTypes<N, C>>,
+    pub handler: Handler,
+    pub max_batch_size: usize,
+    pub reschedule_duration: Duration,
+    pub joinable_workers: Option<Arc<Mutex<Vec<ThreadId>>>>,
+}
+
+impl<N, C, Handler> Drop for Poller<N, C, Handler>
+where
+    N: Fsm,
+    C: Fsm,
+{
+    fn drop(&mut self) {
+        if let Some(joinable_workers) = &self.joinable_workers {
+            joinable_workers.lock().unwrap().push(current().id());
+        }
+    }
 }
 
 enum ReschedulePolicy {
@@ -382,7 +374,8 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
     }
 
     // Poll for readiness and forward to handler. Remove stale peer if necessary.
-    fn poll(&mut self) {
+    pub fn poll(&mut self) {
+        fail_point!("poll");
         let mut batch = Batch::with_capacity(self.max_batch_size);
         let mut reschedule_fsms = Vec::with_capacity(self.max_batch_size);
         let mut to_skip_end = Vec::with_capacity(self.max_batch_size);
@@ -410,7 +403,6 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             let mut hot_fsm_count = 0;
             for (i, p) in batch.normals.iter_mut().enumerate() {
                 let p = p.as_mut().unwrap();
-                p.offset = i;
                 let res = self.handler.handle_normal(p);
                 if p.is_stopped() {
                     p.policy = Some(ReschedulePolicy::Remove);
@@ -451,7 +443,6 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     break;
                 }
                 let p = batch.normals[fsm_cnt].as_mut().unwrap();
-                p.offset = fsm_cnt;
                 let res = self.handler.handle_normal(p);
                 if p.is_stopped() {
                     p.policy = Some(ReschedulePolicy::Remove);
@@ -465,7 +456,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 }
                 fsm_cnt += 1;
             }
-            self.handler.light_end(&mut batch.normals, &mut to_skip_end);
+            self.handler.light_end(&mut batch.normals);
             for offset in &to_skip_end {
                 batch.schedule(&self.router, *offset, true);
             }
@@ -476,6 +467,24 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             // to remove the correct FSM.
             while let Some(r) = reschedule_fsms.pop() {
                 batch.schedule(&self.router, r, false);
+            }
+        }
+        if let Some(fsm) = batch.control.take() {
+            self.router.control_scheduler.schedule(fsm);
+            info!("poller will exit, release the left ControlFsm");
+        }
+        let left_fsm_cnt = batch.normals.len();
+        if left_fsm_cnt > 0 {
+            info!(
+                "poller will exit, schedule {} left NormalFsms",
+                left_fsm_cnt
+            );
+            for i in 0..left_fsm_cnt {
+                let to_schedule = match batch.normals[i].take() {
+                    Some(f) => f,
+                    None => continue,
+                };
+                self.router.normal_scheduler.schedule(to_schedule.fsm);
             }
         }
         batch.clear();
@@ -501,9 +510,11 @@ pub struct BatchSystem<N: Fsm, C: Fsm> {
     low_receiver: channel::Receiver<FsmTypes<N, C>>,
     pool_size: usize,
     max_batch_size: usize,
-    workers: Vec<JoinHandle<()>>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    joinable_workers: Arc<Mutex<Vec<ThreadId>>>,
     reschedule_duration: Duration,
     low_priority_pool_size: usize,
+    pool_state_builder: Option<PoolStateBuilder<N, C>>,
 }
 
 impl<N, C> BatchSystem<N, C>
@@ -513,6 +524,21 @@ where
 {
     pub fn router(&self) -> &BatchRouter<N, C> {
         &self.router
+    }
+
+    pub fn build_pool_state<H: HandlerBuilder<N, C>>(
+        &mut self,
+        handler_builder: H,
+    ) -> PoolState<N, C, H> {
+        let pool_state_builder = self.pool_state_builder.take().unwrap();
+        pool_state_builder.build(
+            self.name_prefix.as_ref().unwrap().clone(),
+            self.low_priority_pool_size,
+            self.workers.clone(),
+            self.joinable_workers.clone(),
+            handler_builder,
+            self.pool_size,
+        )
     }
 
     fn start_poller<B>(&mut self, name: String, priority: Priority, builder: &mut B)
@@ -531,6 +557,11 @@ where
             handler,
             max_batch_size: self.max_batch_size,
             reschedule_duration: self.reschedule_duration,
+            joinable_workers: if priority == Priority::Normal {
+                Some(Arc::clone(&self.joinable_workers))
+            } else {
+                None
+            },
         };
         let props = tikv_util::thread_group::current_properties();
         let t = thread::Builder::new()
@@ -541,7 +572,7 @@ where
                 poller.poll();
             })
             .unwrap();
-        self.workers.push(t);
+        self.workers.lock().unwrap().push(t);
     }
 
     /// Start the batch system.
@@ -576,7 +607,7 @@ where
         info!("shutdown batch system {}", name_prefix);
         self.router.broadcast_shutdown();
         let mut last_error = None;
-        for h in self.workers.drain(..) {
+        for h in self.workers.lock().unwrap().drain(..) {
             debug!("waiting for {}", h.thread().name().unwrap());
             if let Err(e) = h.join() {
                 error!("failed to join worker thread: {:?}", e);
@@ -588,6 +619,54 @@ where
         }
         info!("batch system {} is stopped.", name_prefix);
     }
+}
+
+struct PoolStateBuilder<N, C> {
+    max_batch_size: usize,
+    reschedule_duration: Duration,
+    fsm_receiver: channel::Receiver<FsmTypes<N, C>>,
+    fsm_sender: channel::Sender<FsmTypes<N, C>>,
+    pool_size: usize,
+}
+
+impl<N, C> PoolStateBuilder<N, C> {
+    fn build<H: HandlerBuilder<N, C>>(
+        self,
+        name_prefix: String,
+        low_priority_pool_size: usize,
+        workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        joinable_workers: Arc<Mutex<Vec<ThreadId>>>,
+        handler_builder: H,
+        id_base: usize,
+    ) -> PoolState<N, C, H> {
+        PoolState {
+            name_prefix,
+            handler_builder,
+            fsm_receiver: self.fsm_receiver,
+            fsm_sender: self.fsm_sender,
+            low_priority_pool_size,
+            workers,
+            joinable_workers,
+            expected_pool_size: self.pool_size,
+            max_batch_size: self.max_batch_size,
+            reschedule_duration: self.reschedule_duration,
+            id_base,
+        }
+    }
+}
+
+pub struct PoolState<N, C, H: HandlerBuilder<N, C>> {
+    pub name_prefix: String,
+    pub handler_builder: H,
+    pub fsm_receiver: channel::Receiver<FsmTypes<N, C>>,
+    pub fsm_sender: channel::Sender<FsmTypes<N, C>>,
+    pub low_priority_pool_size: usize,
+    pub expected_pool_size: usize,
+    pub workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    pub joinable_workers: Arc<Mutex<Vec<ThreadId>>>,
+    pub max_batch_size: usize,
+    pub reschedule_duration: Duration,
+    pub id_base: usize,
 }
 
 pub type BatchRouter<N, C> = Router<N, C, NormalScheduler<N, C>, ControlScheduler<N, C>>;
@@ -609,8 +688,15 @@ pub fn create_system<N: Fsm, C: Fsm>(
         low_sender: tx2.clone(),
     };
     let control_scheduler = ControlScheduler {
-        sender: tx,
+        sender: tx.clone(),
         low_sender: tx2,
+    };
+    let pool_state_builder = PoolStateBuilder {
+        max_batch_size: cfg.max_batch_size(),
+        reschedule_duration: cfg.reschedule_duration.0,
+        fsm_receiver: rx.clone(),
+        fsm_sender: tx,
+        pool_size: cfg.pool_size,
     };
     let router = Router::new(control_box, normal_scheduler, control_scheduler, state_cnt);
     let system = BatchSystem {
@@ -620,9 +706,11 @@ pub fn create_system<N: Fsm, C: Fsm>(
         low_receiver: rx2,
         pool_size: cfg.pool_size,
         max_batch_size: cfg.max_batch_size(),
+        workers: Arc::new(Mutex::new(Vec::new())),
+        joinable_workers: Arc::new(Mutex::new(Vec::new())),
         reschedule_duration: cfg.reschedule_duration.0,
-        workers: vec![],
         low_priority_pool_size: cfg.low_priority_pool_size,
+        pool_state_builder: Some(pool_state_builder),
     };
     (router, system)
 }

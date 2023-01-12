@@ -66,10 +66,9 @@ pub struct ScannerPool<T, E> {
 impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
     pub fn new(count: usize, raft_router: T) -> Self {
         let workers = Arc::new(
-            Builder::new()
-                .threaded_scheduler()
+            Builder::new_multi_thread()
                 .thread_name("inc-scan")
-                .core_threads(count)
+                .worker_threads(count)
                 .build()
                 .unwrap(),
         );
@@ -109,7 +108,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
                     } else {
                         TxnExtraOp::Noop
                     };
-                    let mut scanner = ScannerBuilder::new(snap, TimeStamp::max(), false)
+                    let mut scanner = ScannerBuilder::new(snap, TimeStamp::max())
                         .range(None, None)
                         .build_delta_scanner(task.checkpoint_ts, txn_extra_op)
                         .unwrap();

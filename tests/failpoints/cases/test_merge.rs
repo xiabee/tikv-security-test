@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::kvrpcpb::*;
-use kvproto::metapb::Region;
 use kvproto::raft_serverpb::{PeerState, RaftMessage, RegionLocalState};
 use kvproto::tikvpb::TikvClient;
 use raft::eraftpb::MessageType;
@@ -523,123 +522,6 @@ fn test_node_merge_multiple_snapshots(together: bool) {
     must_get_equal(&cluster.get_engine(3), b"k9", b"v9");
 }
 
-fn prepare_request_snapshot_cluster() -> (Cluster<NodeCluster>, Region, Region) {
-    let mut cluster = new_node_cluster(0, 3);
-    configure_for_merge(&mut cluster);
-    let pd_client = Arc::clone(&cluster.pd_client);
-    pd_client.disable_default_operator();
-
-    cluster.run();
-
-    let region = pd_client.get_region(b"k1").unwrap();
-    cluster.must_split(&region, b"k2");
-
-    cluster.must_put(b"k1", b"v1");
-    cluster.must_put(b"k3", b"v3");
-
-    let region = pd_client.get_region(b"k3").unwrap();
-    let target_region = pd_client.get_region(b"k1").unwrap();
-
-    // Make sure peer 1 is the leader.
-    cluster.must_transfer_leader(region.get_id(), new_peer(1, 1));
-
-    (cluster, region, target_region)
-}
-
-// Test if request snapshot is rejected during merging.
-#[test]
-fn test_node_merge_reject_request_snapshot() {
-    let (mut cluster, region, target_region) = prepare_request_snapshot_cluster();
-
-    let k = b"k3_for_apply_to_current_term";
-    cluster.must_put(k, b"value");
-    for i in 1..=3 {
-        must_get_equal(&cluster.get_engine(i), k, b"value");
-    }
-
-    let apply_prepare_merge_fp = "apply_before_prepare_merge";
-    fail::cfg(apply_prepare_merge_fp, "pause").unwrap();
-    let prepare_merge = new_prepare_merge(target_region);
-    let mut req = new_admin_request(region.get_id(), region.get_region_epoch(), prepare_merge);
-    req.mut_header().set_peer(new_peer(1, 1));
-    let (tx, rx) = mpsc::sync_channel(1);
-    cluster
-        .sim
-        .rl()
-        .async_command_on_node(
-            1,
-            req,
-            Callback::Write {
-                cb: Box::new(|_: WriteResponse| {}),
-                proposed_cb: Some(Box::new(move || tx.send(()).unwrap())),
-                committed_cb: None,
-            },
-        )
-        .unwrap();
-    // Proposing merge shouldn't fail.
-    assert!(rx.recv_timeout(Duration::from_millis(200)).is_ok());
-
-    // Install snapshot filter before requesting snapshot.
-    let (tx, rx) = mpsc::channel();
-    let notifier = Mutex::new(Some(tx));
-    cluster.sim.wl().add_recv_filter(
-        2,
-        Box::new(RecvSnapshotFilter {
-            notifier,
-            region_id: region.get_id(),
-        }),
-    );
-    cluster.must_request_snapshot(2, region.get_id());
-    // Leader should reject request snapshot while merging.
-    rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
-
-    // Transfer leader to peer 3, new leader should reject request snapshot too.
-    cluster.must_transfer_leader(region.get_id(), new_peer(3, 3));
-    rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
-    fail::remove(apply_prepare_merge_fp);
-}
-
-// Test if merge is rejected during requesting snapshot.
-#[test]
-fn test_node_request_snapshot_reject_merge() {
-    let (cluster, region, target_region) = prepare_request_snapshot_cluster();
-
-    // Pause generating snapshot.
-    let region_gen_snap_fp = "region_gen_snap";
-    fail::cfg(region_gen_snap_fp, "pause").unwrap();
-
-    // Install snapshot filter before requesting snapshot.
-    let (tx, rx) = mpsc::channel();
-    let notifier = Mutex::new(Some(tx));
-    cluster.sim.wl().add_recv_filter(
-        2,
-        Box::new(RecvSnapshotFilter {
-            notifier,
-            region_id: region.get_id(),
-        }),
-    );
-    cluster.must_request_snapshot(2, region.get_id());
-    // Leader can not generate a snapshot.
-    rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
-
-    let prepare_merge = new_prepare_merge(target_region.clone());
-    let mut req = new_admin_request(region.get_id(), region.get_region_epoch(), prepare_merge);
-    req.mut_header().set_peer(new_peer(1, 1));
-    cluster
-        .sim
-        .rl()
-        .async_command_on_node(1, req, Callback::None)
-        .unwrap();
-    sleep_ms(200);
-
-    // Merge will never happen.
-    let target = cluster.get_region(target_region.get_start_key());
-    assert_eq!(target, target_region);
-    fail::remove(region_gen_snap_fp);
-    // Drop cluster to ensure notifier will not send any message after rx is dropped.
-    drop(cluster);
-}
-
 // Test if compact log is ignored after premerge was applied and restart
 // I.e. is_merging flag should be set after restart
 #[test]
@@ -895,9 +777,8 @@ fn test_node_merge_cascade_merge_with_apply_yield() {
     let r3 = pd_client.get_region(b"k9").unwrap();
 
     pd_client.must_merge(r2.get_id(), r1.get_id());
-    assert_eq!(r1.get_id(), 1000);
-    let yield_apply_1000_fp = "yield_apply_1000";
-    fail::cfg(yield_apply_1000_fp, "80%3*return()").unwrap();
+    let yield_apply_first_region_fp = "yield_apply_first_region";
+    fail::cfg(yield_apply_first_region_fp, "80%3*return()").unwrap();
 
     for i in 0..10 {
         cluster.must_put(format!("k{}", i).as_bytes(), b"v2");
@@ -1362,4 +1243,82 @@ fn test_prewrite_before_max_ts_is_synced() {
     thread::sleep(Duration::from_millis(200));
     let resp = do_prewrite(&mut cluster);
     assert!(!resp.get_region_error().has_max_timestamp_not_synced());
+}
+
+// Testing that when the source peer is destroyed while merging, it should not persist the `merge_state`
+// thus won't generate gc message to destroy other peers
+#[test]
+fn test_destroy_source_peer_while_merging() {
+    let mut cluster = new_node_cluster(0, 5);
+    configure_for_merge(&mut cluster);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.run();
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+    for i in 1..=5 {
+        must_get_equal(&cluster.get_engine(i), b"k1", b"v1");
+        must_get_equal(&cluster.get_engine(i), b"k3", b"v3");
+    }
+
+    cluster.must_split(&pd_client.get_region(b"k1").unwrap(), b"k2");
+    let left = pd_client.get_region(b"k1").unwrap();
+    let right = pd_client.get_region(b"k3").unwrap();
+    cluster.must_transfer_leader(right.get_id(), new_peer(1, 1));
+
+    let schedule_merge_fp = "on_schedule_merge";
+    fail::cfg(schedule_merge_fp, "return()").unwrap();
+
+    // Start merge and wait until peer 5 apply prepare merge
+    cluster.must_try_merge(right.get_id(), left.get_id());
+    cluster.must_peer_state(right.get_id(), 5, PeerState::Merging);
+
+    // filter heartbeat and append message for peer 5
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(right.get_id(), 5)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgHeartbeat)
+            .msg_type(MessageType::MsgAppend),
+    ));
+
+    // remove peer from target region to trigger merge rollback.
+    pd_client.must_remove_peer(left.get_id(), find_peer(&left, 2).unwrap().clone());
+    must_get_none(&cluster.get_engine(2), b"k1");
+
+    // Merge must rollbacked if we can put more data to the source region
+    fail::remove(schedule_merge_fp);
+    cluster.must_put(b"k4", b"v4");
+    for i in 1..=4 {
+        must_get_equal(&cluster.get_engine(i), b"k4", b"v4");
+    }
+
+    // remove peer 5 from peer list so it will destroy itself by tombstone message
+    // and should not persist the `merge_state`
+    pd_client.must_remove_peer(right.get_id(), new_peer(5, 5));
+    must_get_none(&cluster.get_engine(5), b"k3");
+
+    // so that other peers will send message to store 5
+    pd_client.must_add_peer(right.get_id(), new_peer(5, 6));
+    // but it is still in tombstone state due to the message filter
+    let state = cluster.region_local_state(right.get_id(), 5);
+    assert_eq!(state.get_state(), PeerState::Tombstone);
+
+    // let the peer on store 4 have a larger peer id
+    pd_client.must_remove_peer(right.get_id(), new_peer(4, 4));
+    pd_client.must_add_peer(right.get_id(), new_peer(4, 7));
+    must_get_equal(&cluster.get_engine(4), b"k4", b"v4");
+
+    // if store 5 have persist the merge state, peer 2 and peer 3 will be destroyed because
+    // store 5 will response their request vote message with a gc message, and peer 7 will cause
+    // store 5 panic because peer 7 have larger peer id than the peer in the merge state
+    cluster.clear_send_filters();
+    cluster.add_send_filter(IsolationFilterFactory::new(1));
+
+    cluster.must_put(b"k5", b"v5");
+    assert!(!state.has_merge_state(), "{:?}", state);
+    for i in 2..=5 {
+        must_get_equal(&cluster.get_engine(i), b"k5", b"v5");
+    }
 }

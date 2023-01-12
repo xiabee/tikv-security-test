@@ -7,8 +7,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use engine_rocks::Compat;
-use engine_traits::{KvEngine, Peekable};
+use engine_traits::{KvEngine, RaftEngineReadOnly};
 use file_system::{IOOp, IOType};
 use futures::executor::block_on;
 use grpcio::Environment;
@@ -31,15 +30,16 @@ fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
 
     let r1 = cluster.run_conf_change();
 
+    let first_value = vec![0; 10240];
     // at least 4m data
-    for i in 0..2 * 1024 {
-        let key = format!("{:01024}", i);
-        let value = format!("{:01024}", i);
-        cluster.must_put(key.as_bytes(), value.as_bytes());
+    for i in 0..400 {
+        let key = format!("{:03}", i);
+        cluster.must_put(key.as_bytes(), &first_value);
     }
+    let first_key: &[u8] = b"000";
 
     let engine_2 = cluster.get_engine(2);
-    must_get_none(&engine_2, &format!("{:01024}", 0).into_bytes());
+    must_get_none(&engine_2, first_key);
     // add peer (2,2) to region 1.
     pd_client.must_add_peer(r1, new_peer(2, 2));
 
@@ -49,9 +49,7 @@ fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
     must_get_equal(&engine_2, key, value);
 
     // now snapshot must be applied on peer 2;
-    let key = format!("{:01024}", 0);
-    let value = format!("{:01024}", 0);
-    must_get_equal(&engine_2, key.as_bytes(), value.as_bytes());
+    must_get_equal(&engine_2, first_key, &first_value);
     let stale = Arc::new(AtomicBool::new(false));
     cluster.sim.wl().add_recv_filter(
         3,
@@ -61,16 +59,15 @@ fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
         )),
     );
     pd_client.must_add_peer(r1, new_peer(3, 3));
-    let mut i = 2 * 1024;
+    let mut i = 400;
     loop {
         i += 1;
-        let key = format!("{:01024}", i);
-        let value = format!("{:01024}", i);
-        cluster.must_put(key.as_bytes(), value.as_bytes());
+        let key = format!("{:03}", i);
+        cluster.must_put(key.as_bytes(), &first_value);
         if stale.load(Ordering::Relaxed) {
             break;
         }
-        if i > 10 * 1024 {
+        if i > 1000 {
             panic!("snapshot should be sent twice after {} kvs", i);
         }
     }
@@ -79,13 +76,6 @@ fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
     must_get_equal(&engine_3, b"k3", b"v3");
 
     // TODO: add more tests.
-}
-
-#[test]
-fn test_node_huge_snapshot() {
-    let count = 5;
-    let mut cluster = new_node_cluster(0, count);
-    test_huge_snapshot(&mut cluster);
 }
 
 #[test]
@@ -450,45 +440,9 @@ fn test_server_snapshot_with_append() {
 }
 
 #[test]
-fn test_request_snapshot_apply_repeatedly() {
-    let mut cluster = new_node_cluster(0, 2);
-    configure_for_request_snapshot(&mut cluster);
-
-    let pd_client = Arc::clone(&cluster.pd_client);
-    // Disable default max peer count check.
-    pd_client.disable_default_operator();
-    let region_id = cluster.run_conf_change();
-    pd_client.must_add_peer(region_id, new_peer(2, 2));
-    cluster.must_transfer_leader(region_id, new_peer(2, 2));
-
-    sleep_ms(200);
-    // Install snapshot filter before requesting snapshot.
-    let (tx, rx) = mpsc::channel();
-    let notifier = Mutex::new(Some(tx));
-    cluster.sim.wl().add_recv_filter(
-        1,
-        Box::new(RecvSnapshotFilter {
-            notifier,
-            region_id,
-        }),
-    );
-    cluster.must_request_snapshot(1, region_id);
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
-
-    sleep_ms(200);
-    let engine = cluster.get_raft_engine(1);
-    let raft_key = keys::raft_state_key(region_id);
-    let raft_state: RaftLocalState = engine.c().get_msg(&raft_key).unwrap().unwrap();
-    assert!(
-        raft_state.get_last_index() > RAFT_INIT_LOG_INDEX,
-        "{:?}",
-        raft_state
-    );
-}
-
-#[test]
 fn test_inspected_snapshot() {
     let mut cluster = new_server_cluster(1, 3);
+    cluster.cfg.prefer_mem = false;
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(20);
     cluster.cfg.raft_store.raft_log_gc_count_limit = 8;
     cluster.cfg.raft_store.merge_max_log_gap = 3;
@@ -740,6 +694,9 @@ fn test_snapshot_clean_up_logs_with_log_gc() {
     // Peer (4, 4) must become leader at the end and send snapshot to 2.
     must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
 
+    let raft_engine = cluster.engines[&2].raft.clone();
+    let mut dest = vec![];
+    raft_engine.get_all_entries_to(1, &mut dest).unwrap();
     // No new log is proposed, so there should be no log at all.
-    assert_eq!(cluster.get_first_log(1, 2), None);
+    assert!(dest.is_empty(), "{:?}", dest);
 }

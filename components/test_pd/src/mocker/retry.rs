@@ -9,6 +9,7 @@ use pd_client::REQUEST_RECONNECT_INTERVAL;
 use super::*;
 
 #[derive(Debug)]
+#[allow(clippy::new_without_default)]
 pub struct Retry {
     retry: usize,
     count: AtomicUsize,
@@ -75,14 +76,18 @@ impl NotRetry {
     }
 }
 
+impl Default for NotRetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PdMocker for NotRetry {
     fn get_region_by_id(&self, _: &GetRegionByIdRequest) -> Option<Result<GetRegionResponse>> {
         if !self.is_visited.swap(true, Ordering::Relaxed) {
-            info!(
-                "[NotRetry] get_region_by_id returns Ok(_) with header has IncompatibleVersion error"
-            );
+            info!("[NotRetry] get_region_by_id returns Ok(_) with header has RegionNotFound error");
             let mut err = Error::default();
-            err.set_type(ErrorType::IncompatibleVersion);
+            err.set_type(ErrorType::RegionNotFound);
             let mut resp = GetRegionResponse::default();
             resp.mut_header().set_error(err);
             Some(Ok(resp))
@@ -94,11 +99,9 @@ impl PdMocker for NotRetry {
 
     fn get_store(&self, _: &GetStoreRequest) -> Option<Result<GetStoreResponse>> {
         if !self.is_visited.swap(true, Ordering::Relaxed) {
-            info!(
-                "[NotRetry] get_region_by_id returns Ok(_) with header has IncompatibleVersion error"
-            );
+            info!("[NotRetry] get_region_by_id returns Ok(_) with header has Unknown error");
             let mut err = Error::default();
-            err.set_type(ErrorType::IncompatibleVersion);
+            err.set_type(ErrorType::Unknown);
             let mut resp = GetStoreResponse::default();
             resp.mut_header().set_error(err);
             Some(Ok(resp))

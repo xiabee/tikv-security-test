@@ -5,9 +5,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use std::{fs, io, thread};
 
-use engine_traits::{Iterable, RaftEngineReadOnly};
+use engine_traits::RaftEngineReadOnly;
 use raft::eraftpb::MessageType;
-use raftstore::store::*;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::PathBuf;
@@ -187,66 +186,6 @@ fn assert_snapshot(snap_dir: &str, region_id: u64, exist: bool) {
     }
 }
 
-#[test]
-fn test_node_request_snapshot_on_split() {
-    let mut cluster = new_node_cluster(0, 3);
-    configure_for_request_snapshot(&mut cluster);
-    cluster.run();
-
-    let region = cluster.get_region(b"");
-    // Make sure peer 2 does not in the pending state.
-    cluster.must_transfer_leader(1, new_peer(2, 2));
-    for _ in 0..100 {
-        cluster.must_put(&[7; 100], &[7; 100]);
-    }
-    cluster.must_transfer_leader(1, new_peer(3, 3));
-
-    let split_fp = "apply_before_split_1_3";
-    fail::cfg(split_fp, "pause").unwrap();
-    let (split_tx, split_rx) = mpsc::channel();
-    cluster.split_region(
-        &region,
-        b"k1",
-        Callback::write(Box::new(move |_| {
-            split_tx.send(()).unwrap();
-        })),
-    );
-    // Split is stopped on peer3.
-    split_rx
-        .recv_timeout(Duration::from_millis(100))
-        .unwrap_err();
-
-    // Request snapshot.
-    let committed_index = cluster.must_request_snapshot(2, region.get_id());
-
-    // Install snapshot filter after requesting snapshot.
-    let (tx, rx) = mpsc::channel();
-    let notifier = Mutex::new(Some(tx));
-    cluster.sim.wl().add_recv_filter(
-        2,
-        Box::new(RecvSnapshotFilter {
-            notifier,
-            region_id: region.get_id(),
-        }),
-    );
-    // There is no snapshot as long as we pause the split.
-    rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
-
-    // Continue split.
-    fail::remove(split_fp);
-    split_rx.recv().unwrap();
-    let mut m = rx.recv().unwrap();
-    let snapshot = m.take_message().take_snapshot();
-
-    // Requested snapshot_index >= committed_index.
-    assert!(
-        snapshot.get_metadata().get_index() >= committed_index,
-        "{:?} | {}",
-        m,
-        committed_index
-    );
-}
-
 // A peer on store 3 is isolated and is applying snapshot. (add failpoint so it's always pending)
 // Then two conf change happens, this peer is removed and a new peer is added on store 3.
 // Then isolation clear, this peer will be destroyed because of a bigger peer id in msg.
@@ -265,7 +204,6 @@ fn test_destroy_peer_on_pending_snapshot() {
         }
     })
     .unwrap();
-
     let r1 = cluster.run_conf_change();
     pd_client.must_add_peer(r1, new_peer(2, 2));
     pd_client.must_add_peer(r1, new_peer(3, 3));
@@ -306,7 +244,6 @@ fn test_destroy_peer_on_pending_snapshot() {
     sleep_ms(100);
 
     fail::remove(apply_snapshot_fp);
-
     fail::remove(before_handle_normal_3_fp);
 
     cluster.must_put(b"k120", b"v1");
@@ -314,57 +251,89 @@ fn test_destroy_peer_on_pending_snapshot() {
     must_get_equal(&cluster.get_engine(3), b"k120", b"v1");
 }
 
-// This test is to repro the issue #11618.
-// Basically it aborts a snapshot and wait for an election done. (without fix, raft will panic)
-// The test step is make peer 3 partitioned with rest.
-// And then recover from partition and the leader will try to send a snapshot to peer3.
-// Abort the snapshot and then wait for a election happening, we expect raft will panic
+// The peer 3 in store 3 is isolated for a while and then recovered.
+// During its applying snapshot, however the peer is destroyed and thus applying snapshot is canceled.
+// And when it's destroyed (destroy is not finished either), the machine restarted.
+// After the restart, the snapshot should be applied successfully.println!
+// And new data should be written to store 3 successfully.
 #[test]
-fn test_abort_snapshot_and_wait_election() {
+fn test_destroy_peer_on_pending_snapshot_and_restart() {
     let mut cluster = new_server_cluster(0, 3);
-    cluster.cfg.raft_store.raft_base_tick_interval = ReadableDuration::millis(10);
-    cluster.cfg.raft_store.raft_election_timeout_ticks = 25; // > lease 240ms
-    cluster.cfg.raft_store.hibernate_regions = false;
     configure_for_snapshot(&mut cluster);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
     let r1 = cluster.run_conf_change();
     pd_client.must_add_peer(r1, new_peer(2, 2));
-    pd_client.must_add_peer(r1, new_peer(3, 1003));
+    pd_client.must_add_peer(r1, new_peer(3, 3));
 
     cluster.must_put(b"k1", b"v1");
-    let region = cluster.get_region(b"k1");
     // Ensure peer 3 is initialized.
     must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
 
     cluster.must_transfer_leader(1, new_peer(1, 1));
-
-    let apply_snapshot_fp = "region_apply_snap_abort";
-    fail::cfg(apply_snapshot_fp, "return()").unwrap();
+    let destroy_peer_fp = "destroy_peer_after_pending_move";
+    fail::cfg(destroy_peer_fp, "return(true)").unwrap();
 
     cluster.add_send_filter(IsolationFilterFactory::new(3));
+
     for i in 0..20 {
         cluster.must_put(format!("k1{}", i).as_bytes(), b"v1");
     }
 
-    // Wait for leader send snapshot.
-    let (sx, rx) = mpsc::sync_channel::<bool>(10);
-    let recv_snapshot_filter = RegionPacketFilter::new(region.get_id(), 3)
-        .direction(Direction::Recv)
-        .msg_type(MessageType::MsgSnapshot)
-        .allow(1)
-        .set_msg_callback(Arc::new(move |_| {
-            sx.send(true).unwrap();
-        }));
-    cluster.add_recv_filter(CloneFilterFactory(recv_snapshot_filter));
+    // skip applying snapshot into RocksDB to keep peer status is Applying
+    let apply_snapshot_fp = "apply_pending_snapshot";
+    fail::cfg(apply_snapshot_fp, "return()").unwrap();
 
-    cluster.clear_send_filters(); // allow snapshot to sent over to peer 3
-    rx.recv().unwrap(); // got the snapshot message
-    cluster.add_send_filter(IsolationFilterFactory::new(3)); // partition the peer 3 again
-    sleep_ms(500); // wait for election happen and expect raft will panic
     cluster.clear_send_filters();
-    cluster.clear_recv_filters();
+    // Wait for leader send snapshot.
+    sleep_ms(100);
+
+    // Don't send check stale msg to PD
+    let peer_check_stale_state_fp = "peer_check_stale_state";
+    fail::cfg(peer_check_stale_state_fp, "return()").unwrap();
+
+    pd_client.must_remove_peer(r1, new_peer(3, 3));
+    // Without it, pd_client.must_remove_peer does not trigger destroy_peer!
+    pd_client.must_add_peer(r1, new_peer(3, 4));
+
+    let before_handle_normal_3_fp = "before_handle_normal_3";
+    // to pause ApplyTaskRes::Destroy so that peer gc could finish
+    fail::cfg(before_handle_normal_3_fp, "pause").unwrap();
+    // Wait for leader send msg to peer 3.
+    // Then destroy peer 3
+    sleep_ms(100);
+
+    fail::remove(before_handle_normal_3_fp); // allow destroy run
+
+    // restart node 3
+    cluster.stop_node(3);
+    fail::remove(apply_snapshot_fp);
+    fail::remove(peer_check_stale_state_fp);
+    fail::remove(destroy_peer_fp);
+    cluster.run_node(3).unwrap();
+    must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
+    // After peer 3 has applied snapshot, data should be got.
+    must_get_equal(&cluster.get_engine(3), b"k119", b"v1");
+    // In the end the snapshot file should be gc-ed anyway, either by new peer or by store
+    let now = Instant::now();
+    loop {
+        let mut snap_files = vec![];
+        let snap_dir = cluster.get_snap_dir(3);
+        // snapfiles should be gc.
+        snap_files.extend(fs::read_dir(snap_dir).unwrap().map(|p| p.unwrap().path()));
+        if snap_files.is_empty() {
+            break;
+        }
+        if now.saturating_elapsed() > Duration::from_secs(5) {
+            panic!("snap files are not gc-ed");
+        }
+        sleep_ms(20);
+    }
+
+    cluster.must_put(b"k120", b"v1");
+    // new data should be replicated to peer 4 in store 3
+    must_get_equal(&cluster.get_engine(3), b"k120", b"v1");
 }
 
 #[test]
@@ -449,7 +418,6 @@ fn test_receive_old_snapshot() {
             .reserve_dropped(Arc::clone(&dropped_msgs)),
     );
     cluster.sim.wl().add_recv_filter(2, recv_filter);
-
     cluster.clear_send_filters();
 
     for _ in 0..20 {
@@ -665,6 +633,49 @@ fn test_snapshot_gc_after_failed() {
     cluster.sim.wl().clear_recv_filters(3);
 }
 
+#[test]
+fn test_sending_fail_with_net_error() {
+    let mut cluster = new_server_cluster(1, 2);
+    configure_for_snapshot(&mut cluster);
+    cluster.cfg.raft_store.snap_gc_timeout = ReadableDuration::millis(300);
+
+    let pd_client = Arc::clone(&cluster.pd_client);
+    // Disable default max peer count check.
+    pd_client.disable_default_operator();
+    let r1 = cluster.run_conf_change();
+    cluster.must_put(b"k1", b"v1");
+    let (send_tx, send_rx) = mpsc::sync_channel(1);
+    // only send one MessageType::MsgSnapshot message
+    cluster.sim.wl().add_send_filter(
+        1,
+        Box::new(
+            RegionPacketFilter::new(r1, 1)
+                .allow(1)
+                .direction(Direction::Send)
+                .msg_type(MessageType::MsgSnapshot)
+                .set_msg_callback(Arc::new(move |m: &RaftMessage| {
+                    if m.get_message().get_msg_type() == MessageType::MsgSnapshot {
+                        let _ = send_tx.send(());
+                    }
+                })),
+        ),
+    );
+
+    // peer2 will interrupt in receiving snapshot
+    fail::cfg("receiving_snapshot_net_error", "return()").unwrap();
+    pd_client.must_add_peer(r1, new_learner_peer(2, 2));
+
+    // ready to send notify.
+    send_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    // need to wait receiver handle the snapshot request
+    sleep_ms(100);
+
+    // peer2 will not become learner so ti will has k1 key and receiving count will zero
+    let engine2 = cluster.get_engine(2);
+    must_get_none(&engine2, b"k1");
+    assert_eq!(cluster.get_snap_mgr(2).stats().receiving_count, 0);
+}
+
 /// Logs scan are now moved to raftlog gc threads. The case is to test if logs
 /// are still cleaned up when there is stale logs before first index during applying
 /// snapshot. It's expected to schedule a gc task after applying snapshot.
@@ -713,57 +724,8 @@ fn test_snapshot_clean_up_logs_with_unfinished_log_gc() {
     must_get_equal(&cluster.get_engine(3), b"k60", b"v60");
 
     let truncated_index = cluster.truncated_state(1, 3).get_index();
-    let seek_key = keys::raft_log_key(1, 0);
-    let (key, _) = raft_engine.seek(&seek_key).unwrap().unwrap();
-    let last_truncated_key = keys::raft_log_key(1, truncated_index);
+    let mut dest = vec![];
+    raft_engine.get_all_entries_to(1, &mut dest).unwrap();
     // Only previous log should be cleaned up.
-    assert!(
-        key.as_slice() > &last_truncated_key[..],
-        "{:?} > {:?}",
-        key,
-        last_truncated_key
-    );
-}
-
-#[test]
-fn test_sending_fail_with_net_error() {
-    let mut cluster = new_server_cluster(1, 2);
-    configure_for_snapshot(&mut cluster);
-    cluster.cfg.raft_store.snap_gc_timeout = ReadableDuration::millis(300);
-
-    let pd_client = Arc::clone(&cluster.pd_client);
-    // Disable default max peer count check.
-    pd_client.disable_default_operator();
-    let r1 = cluster.run_conf_change();
-    cluster.must_put(b"k1", b"v1");
-    let (send_tx, send_rx) = mpsc::sync_channel(1);
-    // only send one MessageType::MsgSnapshot message
-    cluster.sim.wl().add_send_filter(
-        1,
-        Box::new(
-            RegionPacketFilter::new(r1, 1)
-                .allow(1)
-                .direction(Direction::Send)
-                .msg_type(MessageType::MsgSnapshot)
-                .set_msg_callback(Arc::new(move |m: &RaftMessage| {
-                    if m.get_message().get_msg_type() == MessageType::MsgSnapshot {
-                        let _ = send_tx.send(());
-                    }
-                })),
-        ),
-    );
-
-    // peer2 will interrupt in receiving snapshot
-    fail::cfg("receiving_snapshot_net_error", "return()").unwrap();
-    pd_client.must_add_peer(r1, new_learner_peer(2, 2));
-
-    // ready to send notify.
-    send_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    // need to wait receiver handle the snapshot request
-    sleep_ms(100);
-
-    // peer2 will not become learner so ti will has k1 key and receiving count will zero
-    let engine2 = cluster.get_engine(2);
-    must_get_none(&engine2, b"k1");
-    assert_eq!(cluster.get_snap_mgr(2).stats().receiving_count, 0);
+    assert!(dest[0].get_index() > truncated_index, "{:?}", dest);
 }

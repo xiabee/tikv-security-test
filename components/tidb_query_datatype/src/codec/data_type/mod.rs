@@ -300,7 +300,7 @@ impl Evaluable for Int {
     }
 
     #[inline]
-    fn borrow_scalar_value_ref(v: ScalarValueRef) -> Option<&Self> {
+    fn borrow_scalar_value_ref(v: ScalarValueRef<'_>) -> Option<&Self> {
         match v {
             ScalarValueRef::Int(x) => x,
             ScalarValueRef::Enum(x) => {
@@ -407,7 +407,7 @@ impl<'a, T: Evaluable + EvaluableRet> EvaluableRef<'a> for &'a T {
 
     #[inline]
     fn from_owned_value(value: &'a T) -> Self {
-        &value
+        value
     }
 }
 

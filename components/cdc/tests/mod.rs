@@ -5,16 +5,17 @@ use std::time::Duration;
 
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
-use configuration::Configuration;
 use engine_rocks::RocksEngine;
 use grpcio::{ChannelBuilder, Environment};
 use grpcio::{ClientDuplexReceiver, ClientDuplexSender, ClientUnaryReceiver};
 use kvproto::cdcpb::{create_change_data, ChangeDataClient, ChangeDataEvent, ChangeDataRequest};
 use kvproto::kvrpcpb::*;
 use kvproto::tikvpb::TikvClient;
+use online_config::OnlineConfig;
 use raftstore::coprocessor::CoprocessorHost;
 use test_raftstore::*;
 use tikv::config::CdcConfig;
+use tikv::server::DEFAULT_CLUSTER_ID;
 use tikv_util::config::ReadableDuration;
 use tikv_util::worker::{LazyWorker, Runnable};
 use tikv_util::HandyRwLock;
@@ -114,6 +115,13 @@ impl TestSuiteBuilder {
     }
 
     pub fn build(self) -> TestSuite {
+        self.build_with_cluster_runner(|cluster| cluster.run())
+    }
+
+    pub fn build_with_cluster_runner<F>(self, mut runner: F) -> TestSuite
+    where
+        F: FnMut(&mut Cluster<ServerCluster>),
+    {
         init();
         let memory_quota = self.memory_quota.unwrap_or(usize::MAX);
         let mut cluster = self.cluster.unwrap();
@@ -154,19 +162,21 @@ impl TestSuiteBuilder {
             endpoints.insert(id, worker);
         }
 
-        cluster.run();
+        runner(&mut cluster);
         for (id, worker) in &mut endpoints {
             let sim = cluster.sim.wl();
             let raft_router = sim.get_server_router(*id);
-            let cdc_ob = obs.get(&id).unwrap().clone();
+            let cdc_ob = obs.get(id).unwrap().clone();
             let cm = sim.get_concurrency_manager(*id);
             let env = Arc::new(Environment::new(1));
             let cfg = CdcConfig::default();
             let mut cdc_endpoint = cdc::Endpoint::new(
+                DEFAULT_CLUSTER_ID,
                 &cfg,
                 pd_cli.clone(),
                 worker.scheduler(),
                 raft_router,
+                cluster.engines[id].kv.clone(),
                 cdc_ob,
                 cluster.store_metas[id].clone(),
                 cm.clone(),
@@ -203,6 +213,12 @@ pub struct TestSuite {
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
 
     env: Arc<Environment>,
+}
+
+impl Default for TestSuiteBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TestSuite {
@@ -442,7 +458,7 @@ impl TestSuite {
         let env = self.env.clone();
         self.cdc_cli.entry(store_id).or_insert_with(|| {
             let channel = ChannelBuilder::new(env)
-                .max_receive_message_len(std::i32::MAX)
+                .max_receive_message_len(i32::MAX)
                 .connect(&addr);
             ChangeDataClient::new(channel)
         })

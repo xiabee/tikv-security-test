@@ -7,7 +7,7 @@ use std::intrinsics::copy_nonoverlapping;
 use std::ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub};
 use std::str::{self, FromStr};
 use std::string::ToString;
-use std::{cmp, i32, i64, mem, u32, u64};
+use std::{cmp, mem};
 
 use codec::prelude::*;
 use tikv_util::escape;
@@ -2399,8 +2399,7 @@ mod tests {
     use crate::expr::{EvalConfig, Flag};
     use std::cmp::Ordering;
     use std::collections::hash_map::DefaultHasher;
-    use std::f64::EPSILON;
-    use std::iter::repeat;
+
     use std::sync::Arc;
 
     #[test]
@@ -2438,14 +2437,8 @@ mod tests {
     #[test]
     fn test_from_f64() {
         let cs = vec![
-            (
-                std::f64::INFINITY,
-                Err(Error::InvalidDataType(String::new())),
-            ),
-            (
-                -std::f64::INFINITY,
-                Err(Error::InvalidDataType(String::new())),
-            ),
+            (f64::INFINITY, Err(Error::InvalidDataType(String::new()))),
+            (-f64::INFINITY, Err(Error::InvalidDataType(String::new()))),
             (10.123, Ok(Decimal::from_str("10.123").unwrap())),
             (-10.123, Ok(Decimal::from_str("-10.123").unwrap())),
             (10.111, Ok(Decimal::from_str("10.111").unwrap())),
@@ -2582,7 +2575,12 @@ mod tests {
             assert_eq!(res, dec_str);
 
             let f: f64 = dec.convert(&mut ctx).unwrap();
-            assert!((exp - f).abs() < EPSILON, "expect: {}, got: {}", exp, f);
+            assert!(
+                (exp - f).abs() < f64::EPSILON,
+                "expect: {}, got: {}",
+                exp,
+                f
+            );
         }
     }
 
@@ -3202,9 +3200,9 @@ mod tests {
 
     #[test]
     fn test_add() {
-        let a = "2".to_owned() + &repeat('1').take(71).collect::<String>();
-        let b: String = repeat('8').take(81).collect();
-        let c = "8888888890".to_owned() + &repeat('9').take(71).collect::<String>();
+        let a = "2".to_owned() + &"1".repeat(71);
+        let b: String = "8".repeat(81);
+        let c = "8888888890".to_owned() + &"9".repeat(71);
         let cases = vec![
             (
                 ".00012345000098765",
@@ -3297,8 +3295,8 @@ mod tests {
 
     #[test]
     fn test_mul() {
-        let a = "1".to_owned() + &repeat('0').take(60).collect::<String>();
-        let b = "1".to_owned() + &repeat("0").take(60).collect::<String>();
+        let a = "1".to_owned() + &"0".repeat(60);
+        let b = "1".to_owned() + &"0".repeat(60);
         let cases = vec![
             ("12", "10", Res::Ok("120")),
             ("0", "-1.1", Res::Ok("0")),

@@ -1,5 +1,6 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
+// #[PerformanceCriticalPath]
 use prometheus::IntGauge;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -205,6 +206,10 @@ impl<T: Display + Send + 'static> LazyWorker<T> {
     pub fn stop_worker(mut self) {
         self.stop();
         self.worker.stop()
+    }
+
+    pub fn remote(&self) -> Remote<yatp::task::future::TaskCell> {
+        self.worker.remote.clone()
     }
 }
 

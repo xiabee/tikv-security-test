@@ -25,6 +25,10 @@ impl RaftEngineReadOnly for PanicEngine {
     ) -> Result<usize> {
         panic!()
     }
+
+    fn get_all_entries_to(&self, region_id: u64, buf: &mut Vec<Entry>) -> Result<()> {
+        panic!()
+    }
 }
 
 impl RaftEngine for PanicEngine {
@@ -93,6 +97,10 @@ impl RaftEngine for PanicEngine {
     fn dump_stats(&self) -> Result<String> {
         panic!()
     }
+
+    fn get_engine_size(&self) -> Result<u64> {
+        panic!()
+    }
 }
 
 impl RaftLogBatch for PanicWriteBatch {
@@ -108,11 +116,15 @@ impl RaftLogBatch for PanicWriteBatch {
         panic!()
     }
 
-    fn size(&self) -> usize {
+    fn persist_size(&self) -> usize {
         panic!()
     }
 
     fn is_empty(&self) -> bool {
+        panic!()
+    }
+
+    fn merge(&mut self, _: Self) {
         panic!()
     }
 }

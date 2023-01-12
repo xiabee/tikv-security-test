@@ -12,9 +12,6 @@ use pd_client::PdClient;
 use test_raftstore::*;
 use tikv_util::debug;
 
-#[cfg(feature = "prost-codec")]
-use kvproto::cdcpb::event::{Event as Event_oneof_event, LogType as EventLogType};
-#[cfg(not(feature = "prost-codec"))]
 use kvproto::cdcpb::*;
 
 use crate::{new_event_feed, TestSuite, TestSuiteBuilder};
@@ -244,6 +241,7 @@ fn test_cdc_scan_continues_after_region_split() {
     event_feed_wrap.replace(None);
     suite.stop();
 }
+
 // Test the `ResolvedTs` sequence shouldn't be pushed to a region downstream
 // if the downstream hasn't been initialized.
 #[test]

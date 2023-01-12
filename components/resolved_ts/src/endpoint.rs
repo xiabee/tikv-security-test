@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use concurrency_manager::ConcurrencyManager;
-use configuration::{self, ConfigChange, ConfigManager, Configuration};
 use engine_traits::{KvEngine, Snapshot};
 use grpcio::Environment;
 use kvproto::metapb::Region;
 use kvproto::raft_cmdpb::AdminCmdType;
+use online_config::{self, ConfigChange, ConfigManager, OnlineConfig};
 use pd_client::PdClient;
 use raftstore::coprocessor::CmdBatch;
 use raftstore::coprocessor::{ObserveHandle, ObserveID};
@@ -245,6 +245,7 @@ impl ObserveRegion {
 }
 
 pub struct Endpoint<T, E: KvEngine, C> {
+    store_id: Option<u64>,
     cfg: ResolvedTsConfig,
     cfg_version: usize,
     store_meta: Arc<Mutex<StoreMeta>>,
@@ -274,7 +275,10 @@ where
         security_mgr: Arc<SecurityManager>,
         sinker: C,
     ) -> Self {
-        let region_read_progress = store_meta.lock().unwrap().region_read_progress.clone();
+        let (region_read_progress, store_id) = {
+            let meta = store_meta.lock().unwrap();
+            (meta.region_read_progress.clone(), meta.store_id)
+        };
         let advance_worker = AdvanceTsWorker::new(
             pd_client,
             scheduler.clone(),
@@ -286,6 +290,7 @@ where
         );
         let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, raft_router);
         let ep = Self {
+            store_id,
             cfg: cfg.clone(),
             cfg_version: 0,
             scheduler,
@@ -356,7 +361,7 @@ where
                         entries,
                         apply_index,
                     })
-                    .unwrap_or_else(|e| debug!("schedule resolved ts task failed"; "err" => ?e));
+                    .unwrap_or_else(|e| warn!("schedule resolved ts task failed"; "err" => ?e));
                 RTS_SCAN_TASKS.with_label_values(&["finish"]).inc();
             }),
             on_error: Some(Box::new(move |observe_id, _region, e| {
@@ -366,7 +371,7 @@ where
                         observe_id,
                         cause: format!("met error while handle scan task {:?}", e),
                     })
-                    .unwrap();
+                    .unwrap_or_else(|schedule_err| warn!("schedule re-register task failed"; "err" => ?schedule_err, "re-register cause" => ?e));
                 RTS_SCAN_TASKS.with_label_values(&["abort"]).inc();
             })),
         }
@@ -379,9 +384,10 @@ where
                 resolver_status,
                 ..
             } = observe_region;
+
             info!(
                 "deregister observe region";
-                "store_id" => ?self.store_meta.lock().unwrap().store_id,
+                "store_id" => ?self.get_or_init_store_id(),
                 "region_id" => region_id,
                 "observe_id" => ?handle.id
             );
@@ -446,6 +452,7 @@ where
                 warn!("resolved ts deregister region failed due to observe_id not match");
                 return;
             }
+
             info!(
                 "register region again";
                 "region_id" => region_id,
@@ -474,7 +481,7 @@ where
 
         let mut min_ts = TimeStamp::max();
         for region_id in regions.iter() {
-            if let Some(observe_region) = self.regions.get_mut(&region_id) {
+            if let Some(observe_region) = self.regions.get_mut(region_id) {
                 if let ResolverStatus::Ready = observe_region.resolver_status {
                     let resolved_ts = observe_region.resolver.resolve(ts);
                     if resolved_ts < min_ts {
@@ -499,7 +506,7 @@ where
             .into_iter()
             .filter_map(|batch| {
                 if !batch.is_empty() {
-                    if let Some(observe_region) = self.regions.get_mut(&batch.region.get_id()) {
+                    if let Some(observe_region) = self.regions.get_mut(&batch.region_id) {
                         let observe_id = batch.rts_id;
                         let region_id = observe_region.meta.id;
                         if observe_region.handle.id == observe_id {
@@ -515,7 +522,7 @@ where
                             });
                         } else {
                             debug!("resolved ts CmdBatch discarded";
-                                "region_id" => batch.region.get_id(),
+                                "region_id" => batch.region_id,
                                 "observe_id" => ?batch.rts_id,
                                 "current" => ?observe_region.handle.id,
                             );
@@ -576,6 +583,14 @@ where
             "prev" => prev,
             "current" => ?self.cfg,
         );
+    }
+
+    fn get_or_init_store_id(&mut self) -> Option<u64> {
+        self.store_id.or_else(|| {
+            let meta = self.store_meta.lock().unwrap();
+            self.store_id = meta.store_id;
+            meta.store_id
+        })
     }
 }
 
@@ -728,7 +743,7 @@ impl<S: Snapshot> ResolvedTsConfigManager<S> {
 }
 
 impl<S: Snapshot> ConfigManager for ResolvedTsConfigManager<S> {
-    fn dispatch(&mut self, change: ConfigChange) -> configuration::Result<()> {
+    fn dispatch(&mut self, change: ConfigChange) -> online_config::Result<()> {
         if let Err(e) = self.0.schedule(Task::ChangeConfig { change }) {
             error!("failed to schedule ChangeConfig task"; "err" => ?e);
         }
@@ -745,10 +760,14 @@ where
     C: CmdSinker<E::Snapshot>,
 {
     fn on_timeout(&mut self) {
+        let store_id = self.get_or_init_store_id();
         let (mut oldest_ts, mut oldest_region, mut zero_ts_count) = (u64::MAX, 0, 0);
+        let (mut oldest_leader_ts, mut oldest_leader_region) = (u64::MAX, 0);
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
-                let ts = read_progress.safe_ts();
+                let (peers, leader_info) = read_progress.dump_leader_info();
+                let leader_store_id = crate::util::find_store_id(&peers, leader_info.peer_id);
+                let ts = leader_info.get_read_state().get_safe_ts();
                 if ts == 0 {
                     zero_ts_count += 1;
                     continue;
@@ -756,6 +775,13 @@ where
                 if ts < oldest_ts {
                     oldest_ts = ts;
                     oldest_region = *region_id;
+                }
+
+                if let (Some(store_id), Some(leader_store_id)) = (store_id, leader_store_id) {
+                    if leader_store_id == store_id && ts < oldest_leader_ts {
+                        oldest_leader_ts = ts;
+                        oldest_leader_region = *region_id;
+                    }
                 }
             }
         });
@@ -782,9 +808,16 @@ where
         RTS_MIN_RESOLVED_TS.set(oldest_ts as i64);
         RTS_ZERO_RESOLVED_TS.set(zero_ts_count as i64);
         RTS_MIN_RESOLVED_TS_GAP.set(
-            TimeStamp::physical_now().saturating_sub(TimeStamp::from(oldest_ts).physical()) as i64
-                / 1000i64,
+            TimeStamp::physical_now().saturating_sub(TimeStamp::from(oldest_ts).physical()) as i64,
         );
+
+        RTS_MIN_LEADER_RESOLVED_TS_REGION.set(oldest_leader_region as i64);
+        RTS_MIN_LEADER_RESOLVED_TS.set(oldest_leader_ts as i64);
+        RTS_MIN_LEADER_RESOLVED_TS_GAP.set(
+            TimeStamp::physical_now().saturating_sub(TimeStamp::from(oldest_leader_ts).physical())
+                as i64,
+        );
+
         RTS_LOCK_HEAP_BYTES_GAUGE.set(lock_heap_size as i64);
         RTS_REGION_RESOLVE_STATUS_GAUGE_VEC
             .with_label_values(&["resolved"])

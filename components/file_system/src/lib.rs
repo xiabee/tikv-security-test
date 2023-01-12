@@ -5,7 +5,10 @@
 
 #[macro_use]
 extern crate lazy_static;
+
+#[cfg(test)]
 extern crate test;
+
 #[allow(unused_extern_crates)]
 extern crate tikv_alloc;
 
@@ -14,6 +17,8 @@ mod iosnoop;
 mod metrics;
 mod metrics_manager;
 mod rate_limiter;
+#[allow(unused)]
+mod thread_io;
 
 pub use file::{File, OpenOptions};
 pub use iosnoop::{get_io_type, init_io_snooper, set_io_type};
@@ -34,7 +39,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use configuration::ConfigValue;
+use online_config::ConfigValue;
 use openssl::error::ErrorStack;
 use openssl::hash::{self, Hasher, MessageDigest};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -412,7 +417,7 @@ impl<R: Read> Read for Sha256Reader<R> {
     }
 }
 
-const SPACE_PLACEHOLDER_FILE: &str = "space_placeholder_file";
+pub const SPACE_PLACEHOLDER_FILE: &str = "space_placeholder_file";
 
 /// Create a file with hole, to reserve space for TiKV.
 pub fn reserve_space_for_recover<P: AsRef<Path>>(data_dir: P, file_size: u64) -> io::Result<()> {
@@ -423,13 +428,21 @@ pub fn reserve_space_for_recover<P: AsRef<Path>>(data_dir: P, file_size: u64) ->
         }
         delete_file_if_exist(&path)?;
     }
-    if file_size > 0 {
+    fn do_reserve(dir: &Path, path: &Path, file_size: u64) -> io::Result<()> {
         let f = File::create(&path)?;
         f.allocate(file_size)?;
         f.sync_all()?;
-        sync_dir(data_dir)?;
+        sync_dir(dir)
     }
-    Ok(())
+    if file_size > 0 {
+        let res = do_reserve(data_dir.as_ref(), &path, file_size);
+        if res.is_err() {
+            let _ = delete_file_if_exist(&path);
+        }
+        res
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -521,12 +534,12 @@ mod tests {
 
     fn gen_rand_file<P: AsRef<Path>>(path: P, size: usize) -> u32 {
         let mut rng = thread_rng();
-        let s: String = iter::repeat(())
+        let s: Vec<u8> = iter::repeat(())
             .map(|()| rng.sample(Alphanumeric))
             .take(size)
             .collect();
-        write(path, s.as_bytes()).unwrap();
-        calc_crc32_bytes(s.as_bytes())
+        write(path, s.as_slice()).unwrap();
+        calc_crc32_bytes(s.as_slice())
     }
 
     #[test]

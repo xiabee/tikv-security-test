@@ -1,5 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
+// #[PerformanceCriticalPath]
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::option::Option;
@@ -835,7 +836,7 @@ impl<'a> ChangePeerI for &'a ChangePeerV2Request {
 pub struct MsgType<'a>(pub &'a RaftMessage);
 
 impl Display for MsgType<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.0.has_extra_msg() {
             write!(f, "{:?}", self.0.get_message().get_msg_type())
         } else {
@@ -923,12 +924,18 @@ impl RegionReadProgressRegistry {
     }
 }
 
+impl Default for RegionReadProgressRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `RegionReadProgress` is used to keep track of the replica's `safe_ts`, the replica can handle a read
 /// request directly without requiring leader lease or read index iff `safe_ts` >= `read_ts` (the `read_ts`
 /// is usually stale i.e seconds ago).
 ///
 /// `safe_ts` is updated by the `(apply index, safe ts)` item:
-/// ```
+/// ```ignore
 /// if self.applied_index >= item.apply_index {
 ///     self.safe_ts = max(self.safe_ts, item.safe_ts)
 /// }
@@ -1016,7 +1023,7 @@ impl RegionReadProgress {
     }
 
     // Dump the `LeaderInfo` and the peer list
-    fn dump_leader_info(&self) -> (Vec<Peer>, LeaderInfo) {
+    pub fn dump_leader_info(&self) -> (Vec<Peer>, LeaderInfo) {
         let mut leader_info = LeaderInfo::default();
         let core = self.core.lock().unwrap();
         let read_state = {
@@ -1232,6 +1239,68 @@ impl RegionReadProgressCore {
             });
         }
         self.pending_items.push_back(item);
+    }
+}
+
+/// Represent the duration of all stages of raftstore recorded by one inspecting.
+#[derive(Default, Debug)]
+pub struct RaftstoreDuration {
+    pub store_wait_duration: Option<std::time::Duration>,
+    pub store_process_duration: Option<std::time::Duration>,
+    pub store_write_duration: Option<std::time::Duration>,
+    pub apply_wait_duration: Option<std::time::Duration>,
+    pub apply_process_duration: Option<std::time::Duration>,
+}
+
+impl RaftstoreDuration {
+    pub fn sum(&self) -> std::time::Duration {
+        self.store_wait_duration.unwrap_or_default()
+            + self.store_process_duration.unwrap_or_default()
+            + self.store_write_duration.unwrap_or_default()
+            + self.apply_wait_duration.unwrap_or_default()
+            + self.apply_process_duration.unwrap_or_default()
+    }
+}
+
+/// Used to inspect the latency of all stages of raftstore.
+pub struct LatencyInspector {
+    id: u64,
+    duration: RaftstoreDuration,
+    cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>,
+}
+
+impl LatencyInspector {
+    pub fn new(id: u64, cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>) -> Self {
+        Self {
+            id,
+            cb,
+            duration: RaftstoreDuration::default(),
+        }
+    }
+
+    pub fn record_store_wait(&mut self, duration: std::time::Duration) {
+        self.duration.store_wait_duration = Some(duration);
+    }
+
+    pub fn record_store_process(&mut self, duration: std::time::Duration) {
+        self.duration.store_process_duration = Some(duration);
+    }
+
+    pub fn record_store_write(&mut self, duration: std::time::Duration) {
+        self.duration.store_write_duration = Some(duration);
+    }
+
+    pub fn record_apply_wait(&mut self, duration: std::time::Duration) {
+        self.duration.apply_wait_duration = Some(duration);
+    }
+
+    pub fn record_apply_process(&mut self, duration: std::time::Duration) {
+        self.duration.apply_process_duration = Some(duration);
+    }
+
+    /// Call the callback.
+    pub fn finish(self) {
+        (self.cb)(self.id, self.duration);
     }
 }
 

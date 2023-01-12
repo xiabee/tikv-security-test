@@ -101,15 +101,15 @@ impl Tracker {
     pub fn on_scheduled(&mut self) {
         assert_eq!(self.current_stage, TrackerState::Initialized);
         let now = Instant::now_coarse();
-        self.schedule_wait_time = now.saturating_duration_since(self.request_begin_at);
+        self.schedule_wait_time = now - self.request_begin_at;
         self.current_stage = TrackerState::Scheduled(now);
     }
 
     pub fn on_snapshot_finished(&mut self) {
         if let TrackerState::Scheduled(at) = self.current_stage {
             let now = Instant::now_coarse();
-            self.snapshot_wait_time = now.saturating_duration_since(at);
-            self.wait_time = now.saturating_duration_since(self.request_begin_at);
+            self.snapshot_wait_time = now - at;
+            self.wait_time = now - self.request_begin_at;
             self.current_stage = TrackerState::SnapshotRetrieved(now);
         } else {
             unreachable!()
@@ -119,7 +119,7 @@ impl Tracker {
     pub fn on_begin_all_items(&mut self) {
         if let TrackerState::SnapshotRetrieved(at) = self.current_stage {
             let now = Instant::now_coarse();
-            self.handler_build_time = now.saturating_duration_since(at);
+            self.handler_build_time = now - at;
             self.current_stage = TrackerState::AllItemsBegan;
         } else {
             unreachable!()
@@ -131,7 +131,7 @@ impl Tracker {
         match self.current_stage {
             TrackerState::AllItemsBegan => {}
             TrackerState::ItemFinished(at) => {
-                self.item_suspend_time = now.saturating_duration_since(at);
+                self.item_suspend_time = now - at;
                 self.total_suspend_time += self.item_suspend_time;
             }
             _ => unreachable!(),
@@ -148,7 +148,7 @@ impl Tracker {
     ) {
         if let TrackerState::ItemBegan(at) = self.current_stage {
             let now = Instant::now_coarse();
-            self.item_process_time = now.saturating_duration_since(at);
+            self.item_process_time = now - at;
             self.total_process_time += self.item_process_time;
             if let Some(storage_stats) = some_storage_stats {
                 self.total_storage_stats.add(&storage_stats);
@@ -209,6 +209,7 @@ impl Tracker {
 
         let mut detail_v2 = ScanDetailV2::default();
         detail_v2.set_processed_versions(self.total_storage_stats.write.processed_keys as u64);
+        detail_v2.set_processed_versions_size(self.total_storage_stats.processed_size as u64);
         detail_v2.set_total_versions(self.total_storage_stats.write.total_op_count() as u64);
         detail_v2.set_rocksdb_delete_skipped_count(
             self.total_perf_stats.0.internal_delete_skipped_count as u64,
@@ -233,7 +234,7 @@ impl Tracker {
             _ => unreachable!(),
         }
 
-        self.req_lifetime = self.request_begin_at.saturating_elapsed();
+        self.req_lifetime = Instant::now_coarse() - self.request_begin_at;
         self.current_stage = TrackerState::AllItemFinished;
         self.track();
     }
@@ -267,6 +268,7 @@ impl Tracker {
                 "tag" => self.req_ctx.tag.get_str(),
                 "scan.is_desc" => self.req_ctx.is_desc_scan,
                 "scan.processed" => total_storage_stats.write.processed_keys,
+                "scan.processed_size" => total_storage_stats.processed_size,
                 "scan.total" => total_storage_stats.write.total_op_count(),
                 "scan.ranges" => self.req_ctx.ranges.len(),
                 "scan.range.first" => ?first_range,
@@ -337,7 +339,7 @@ impl Tracker {
             false
         };
 
-        tls_collect_qps(
+        tls_collect_query(
             region_id,
             peer,
             Key::from_raw(start_key).as_encoded(),

@@ -42,6 +42,7 @@ make_auto_flush_static_metric! {
         raw_batch_delete,
         raw_get_key_ttl,
         raw_compare_and_swap,
+        raw_checksum,
         unsafe_destroy_range,
         physical_scan_lock,
         register_lock_observer,
@@ -146,8 +147,16 @@ make_static_metric! {
         "type" => BatchableRequestKind,
     }
 
-    pub struct RequestBatchRatioHistogramVec: Histogram {
-        "type" => BatchableRequestKind,
+    pub label_enum FlushReason {
+        full,
+        full_after_delay,
+        delay,
+        eof,
+        wake,
+    }
+
+    pub struct RaftMessageFlushCounterVec: IntCounter {
+        "reason" => FlushReason,
     }
 }
 
@@ -219,6 +228,13 @@ lazy_static! {
             "Duration of memory lock checking for replica read",
             &["result"],
             exponential_buckets(1e-6f64, 4f64, 10).unwrap() // 1us ~ 262ms
+        )
+        .unwrap();
+    pub static ref ADDRESS_RESOLVE_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_server_address_resolve_duration_secs",
+            "Duration of resolving store address",
+            exponential_buckets(0.0001, 2.0, 20).unwrap()
         )
         .unwrap();
 }
@@ -347,16 +363,14 @@ lazy_static! {
         &["type", "store_id"]
     )
     .unwrap();
-    pub static ref RAFT_MESSAGE_FLUSH_COUNTER: IntCounter = register_int_counter!(
-        "tikv_server_raft_message_flush_total",
-        "Total number of raft messages flushed immediately"
-    )
-    .unwrap();
-    pub static ref RAFT_MESSAGE_DELAY_FLUSH_COUNTER: IntCounter = register_int_counter!(
-        "tikv_server_raft_message_delay_flush_total",
-        "Total number of raft messages flushed delay"
-    )
-    .unwrap();
+    pub static ref RAFT_MESSAGE_FLUSH_COUNTER: RaftMessageFlushCounterVec =
+        register_static_int_counter_vec!(
+            RaftMessageFlushCounterVec,
+            "tikv_server_raft_message_flush_total",
+            "Total number of raft messages flushed immediately",
+            &["reason"]
+        )
+        .unwrap();
     pub static ref CONFIG_ROCKSDB_GAUGE: GaugeVec = register_gauge_vec!(
         "tikv_config_rocksdb",
         "Config information of rocksdb",
@@ -385,6 +399,11 @@ lazy_static! {
     .unwrap();
     pub static ref MEMORY_USAGE_GAUGE: IntGauge =
         register_int_gauge!("tikv_server_memory_usage", "Memory usage for the instance").unwrap();
+    pub static ref RAFT_APPEND_REJECTS: IntCounter = register_int_counter!(
+        "tikv_server_raft_append_rejects",
+        "Count for rejected Raft append messages"
+    )
+    .unwrap();
 }
 
 make_auto_flush_static_metric! {

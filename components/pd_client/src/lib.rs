@@ -17,12 +17,15 @@ pub use self::feature_gate::{Feature, FeatureGate};
 pub use self::util::PdConnector;
 pub use self::util::REQUEST_RECONNECT_INTERVAL;
 
+use std::collections::HashMap;
 use std::ops::Deref;
 
 use futures::future::BoxFuture;
+use grpcio::ClientSStreamReceiver;
 use kvproto::metapb;
 use kvproto::pdpb;
 use kvproto::replication_modepb::{RegionReplicationStatus, ReplicationStatus};
+use pdpb::{QueryStats, WatchGlobalConfigResponse};
 use tikv_util::time::UnixSecs;
 use txn_types::TimeStamp;
 
@@ -37,9 +40,13 @@ pub struct RegionStat {
     pub written_keys: u64,
     pub read_bytes: u64,
     pub read_keys: u64,
+    pub query_stats: QueryStats,
     pub approximate_size: u64,
     pub approximate_keys: u64,
     pub last_report_ts: UnixSecs,
+    // cpu_usage is the CPU time usage of the leader region since the last heartbeat,
+    // which is calculated by cpu_time_delta/heartbeat_reported_interval.
+    pub cpu_usage: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +77,21 @@ pub const INVALID_ID: u64 = 0;
 /// creating the PdClient is enough and the PdClient will use this cluster id
 /// all the time.
 pub trait PdClient: Send + Sync {
+    /// Load a list of GlobalConfig
+    fn load_global_config(&self, _list: Vec<String>) -> PdFuture<HashMap<String, String>> {
+        unimplemented!();
+    }
+
+    /// Store a list of GlobalConfig
+    fn store_global_config(&self, _list: HashMap<String, String>) -> PdFuture<()> {
+        unimplemented!();
+    }
+
+    /// Watching change of GlobalConfig
+    fn watch_global_config(&self) -> Result<ClientSStreamReceiver<WatchGlobalConfigResponse>> {
+        unimplemented!();
+    }
+
     /// Returns the cluster ID.
     fn get_cluster_id(&self) -> Result<u64> {
         unimplemented!();
@@ -213,7 +235,11 @@ pub trait PdClient: Send + Sync {
     }
 
     /// Sends store statistics regularly.
-    fn store_heartbeat(&self, _stats: pdpb::StoreStats) -> PdFuture<pdpb::StoreHeartbeatResponse> {
+    fn store_heartbeat(
+        &self,
+        _stats: pdpb::StoreStats,
+        _report: Option<pdpb::StoreReport>,
+    ) -> PdFuture<pdpb::StoreHeartbeatResponse> {
         unimplemented!();
     }
 
