@@ -2,8 +2,7 @@
 
 use std::cell::RefCell;
 
-use prometheus::local::*;
-use prometheus::*;
+use prometheus::{local::*, *};
 use prometheus_static_metric::*;
 
 make_static_metric! {
@@ -48,8 +47,7 @@ make_static_metric! {
 }
 
 lazy_static! {
-    pub static ref IO_BYTES_VEC: IOBytesVec = register_static_int_counter_vec!(
-        IOBytesVec,
+    pub static ref IO_BYTES_VEC: IntCounterVec = register_int_counter_vec!(
         "tikv_io_bytes",
         "Bytes of disk tikv io",
         &["type", "op"]

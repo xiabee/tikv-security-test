@@ -1,18 +1,20 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::{num::NonZeroU64, sync::Arc};
+
+use engine_traits::{CfName, IterOptions, Peekable, ReadOptions, Snapshot};
+use kvproto::kvrpcpb::ExtraOp as TxnExtraOp;
+use pd_client::BucketMeta;
+use raftstore::{
+    store::{RegionIterator, RegionSnapshot, TxnExt},
+    Error as RaftServerError,
+};
+use txn_types::{Key, Value};
 
 use crate::{
     self as kv, Error, Error as KvError, ErrorInner, Iterator as EngineIterator,
     Snapshot as EngineSnapshot, SnapshotExt,
 };
-use engine_traits::CfName;
-use engine_traits::{IterOptions, Peekable, ReadOptions, Snapshot};
-use kvproto::kvrpcpb::ExtraOp as TxnExtraOp;
-use raftstore::store::{RegionIterator, RegionSnapshot, TxnExt};
-use raftstore::Error as RaftServerError;
-use txn_types::{Key, Value};
 
 impl From<RaftServerError> for Error {
     fn from(e: RaftServerError) -> Error {
@@ -48,6 +50,10 @@ impl<'a, S: Snapshot> SnapshotExt for RegionSnapshotExt<'a, S> {
 
     fn get_txn_ext(&self) -> Option<&Arc<TxnExt>> {
         self.snapshot.txn_ext.as_ref()
+    }
+
+    fn get_buckets(&self) -> Option<Arc<BucketMeta>> {
+        self.snapshot.bucket_meta.clone()
     }
 }
 

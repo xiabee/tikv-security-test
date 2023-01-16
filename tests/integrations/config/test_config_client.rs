@@ -1,11 +1,14 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{Read, Write},
+    sync::{Arc, Mutex},
+};
+
 use online_config::{ConfigChange, OnlineConfig};
 use raftstore::store::Config as RaftstoreConfig;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
 use tikv::config::*;
 
 fn change(name: &str, value: &str) -> HashMap<String, String> {
@@ -16,7 +19,8 @@ fn change(name: &str, value: &str) -> HashMap<String, String> {
 
 #[test]
 fn test_update_config() {
-    let (cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+    cfg.validate().unwrap();
     let cfg_controller = ConfigController::new(cfg);
     let mut cfg = cfg_controller.get_current();
 
@@ -51,9 +55,9 @@ fn test_update_config() {
 
 #[test]
 fn test_dispatch_change() {
+    use std::{error::Error, result::Result};
+
     use online_config::ConfigManager;
-    use std::error::Error;
-    use std::result::Result;
 
     #[derive(Clone)]
     struct CfgManager(Arc<Mutex<RaftstoreConfig>>);
@@ -65,7 +69,8 @@ fn test_dispatch_change() {
         }
     }
 
-    let (cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+    cfg.validate().unwrap();
     let cfg_controller = ConfigController::new(cfg);
     let mut cfg = cfg_controller.get_current();
     let mgr = CfgManager(Arc::new(Mutex::new(cfg.raft_store.clone())));
@@ -184,9 +189,9 @@ blob-run-mode = "read-only"
 
 #[test]
 fn test_update_from_toml_file() {
+    use std::{error::Error, result::Result};
+
     use online_config::ConfigManager;
-    use std::error::Error;
-    use std::result::Result;
 
     #[derive(Clone)]
     struct CfgManager(Arc<Mutex<RaftstoreConfig>>);
@@ -202,7 +207,7 @@ fn test_update_from_toml_file() {
     let cfg_controller = ConfigController::new(cfg);
     let cfg = cfg_controller.get_current();
     let mgr = CfgManager(Arc::new(Mutex::new(cfg.raft_store.clone())));
-    cfg_controller.register(Module::Raftstore, Box::new(mgr.clone()));
+    cfg_controller.register(Module::Raftstore, Box::new(mgr));
 
     // update config file
     let c = r#"

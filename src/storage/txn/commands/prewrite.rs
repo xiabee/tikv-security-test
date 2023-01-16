@@ -6,6 +6,14 @@
 //! handling of the commands is similar. We therefore have a single type (Prewriter) to handle both
 //! kinds of prewrite.
 
+use std::mem;
+
+use engine_traits::CF_WRITE;
+use kvproto::kvrpcpb::{AssertionLevel, ExtraOp};
+use tikv_kv::SnapshotExt;
+use txn_types::{Key, Mutation, OldValue, OldValues, TimeStamp, TxnExtra, Write, WriteType};
+
+use super::ReaderWithStats;
 use crate::storage::{
     kv::WriteData,
     lock_manager::LockManager,
@@ -24,13 +32,6 @@ use crate::storage::{
     types::PrewriteResult,
     Context, Error as StorageError, ProcessResult, Snapshot,
 };
-use engine_traits::CF_WRITE;
-use kvproto::kvrpcpb::{AssertionLevel, ExtraOp};
-use std::mem;
-use tikv_kv::SnapshotExt;
-use txn_types::{Key, Mutation, OldValue, OldValues, TimeStamp, TxnExtra, Write, WriteType};
-
-use super::ReaderWithStats;
 
 pub(crate) const FORWARD_MIN_MUTATIONS_NUM: usize = 12;
 
@@ -388,8 +389,8 @@ impl<K: PrewriteKind> Prewriter<K> {
 
         let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
         let mut reader = ReaderWithStats::new(
-            SnapshotReader::new(self.start_ts, snapshot, !self.ctx.get_not_fill_cache()),
-            &mut context.statistics,
+            SnapshotReader::new_with_ctx(self.start_ts, snapshot, &self.ctx),
+            context.statistics,
         );
         // Set extra op here for getting the write record when check write conflict in prewrite.
 
@@ -488,6 +489,9 @@ impl<K: PrewriteKind> Prewriter<K> {
             }
         }
 
+        // If there are other errors, return other error prior to `AssertionFailed`.
+        let mut assertion_failure = None;
+
         for m in mem::take(&mut self.mutations) {
             let is_pessimistic_lock = m.is_pessimistic_lock();
             let m = m.into_mutation();
@@ -560,10 +564,18 @@ impl<K: PrewriteKind> Prewriter<K> {
                         Err(e) => locks.push(Err(e.into())),
                     }
                 }
+                Err(e @ MvccError(box MvccErrorInner::AssertionFailed { .. })) => {
+                    if assertion_failure.is_none() {
+                        assertion_failure = Some(e);
+                    }
+                }
                 Err(e) => return Err(Error::from(e)),
             }
         }
 
+        if let Some(e) = assertion_failure {
+            return Err(Error::from(e));
+        }
         Ok((locks, final_min_commit_ts))
     }
 
@@ -800,28 +812,39 @@ pub(in crate::storage::txn) fn fallback_1pc_locks(txn: &mut MvccTxn) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::txn::actions::acquire_pessimistic_lock::tests::must_pessimistic_locked;
-    use crate::storage::txn::actions::tests::{
-        must_pessimistic_prewrite_put_async_commit, must_prewrite_delete, must_prewrite_put,
-        must_prewrite_put_async_commit, must_prewrite_put_impl,
-    };
-    use crate::storage::{
-        mvcc::{tests::*, Error as MvccError, ErrorInner as MvccErrorInner},
-        txn::{
-            commands::test_util::prewrite_command,
-            commands::test_util::{
-                commit, pessimistic_prewrite_with_cm, prewrite, prewrite_with_cm, rollback,
-            },
-            tests::{must_acquire_pessimistic_lock, must_commit, must_rollback},
-            Error, ErrorInner,
-        },
-        DummyLockManager, Engine, Snapshot, Statistics, TestEngineBuilder,
-    };
     use concurrency_manager::ConcurrencyManager;
+    use engine_rocks::ReadPerfInstant;
     use engine_traits::CF_WRITE;
     use kvproto::kvrpcpb::{Assertion, Context, ExtraOp};
     use txn_types::{Key, Mutation, TimeStamp};
+
+    use super::*;
+    use crate::storage::{
+        mvcc::{tests::*, Error as MvccError, ErrorInner as MvccErrorInner},
+        txn::{
+            actions::{
+                acquire_pessimistic_lock::tests::must_pessimistic_locked,
+                tests::{
+                    must_pessimistic_prewrite_put_async_commit, must_prewrite_delete,
+                    must_prewrite_put, must_prewrite_put_async_commit,
+                },
+            },
+            commands::{
+                check_txn_status::tests::must_success as must_check_txn_status,
+                test_util::{
+                    commit, pessimistic_prewrite_with_cm, prewrite, prewrite_command,
+                    prewrite_with_cm, rollback,
+                },
+            },
+            tests::{
+                must_acquire_pessimistic_lock, must_acquire_pessimistic_lock_err, must_commit,
+                must_prewrite_put_err_impl, must_prewrite_put_impl, must_rollback,
+            },
+            Error, ErrorInner,
+        },
+        types::TxnStatus,
+        DummyLockManager, Engine, Snapshot, Statistics, TestEngineBuilder,
+    };
 
     fn inner_test_prewrite_skip_constraint_check(pri_key_number: u8, write_num: usize) {
         let mut mutations = Vec::default();
@@ -943,9 +966,9 @@ mod tests {
 
     #[test]
     fn test_prewrite_skip_too_many_tombstone() {
-        use crate::server::gc_worker::gc_by_compact;
-        use crate::storage::kv::PerfStatisticsInstant;
         use engine_rocks::{set_perf_level, PerfLevel};
+
+        use crate::server::gc_worker::gc_by_compact;
         let mut mutations = Vec::default();
         let pri_key_number = 0;
         let pri_key = &[pri_key_number];
@@ -973,7 +996,7 @@ mod tests {
         // seek write cf.
         gc_by_compact(&engine, pri_key, 101);
         set_perf_level(PerfLevel::EnableTimeExceptForMutex);
-        let perf = PerfStatisticsInstant::new();
+        let perf = ReadPerfInstant::new();
         let mut statistic = Statistics::default();
         while mutations.len() > FORWARD_MIN_MUTATIONS_NUM + 1 {
             mutations.pop();
@@ -989,7 +1012,7 @@ mod tests {
         .unwrap();
         let d = perf.delta();
         assert_eq!(1, statistic.write.seek);
-        assert_eq!(d.0.internal_delete_skipped_count, 0);
+        assert_eq!(d.internal_delete_skipped_count, 0);
     }
 
     #[test]
@@ -1348,10 +1371,11 @@ mod tests {
 
     #[test]
     fn test_out_of_sync_max_ts() {
-        use crate::storage::{kv::Result, CfName, ConcurrencyManager, DummyLockManager, Value};
         use engine_test::kv::KvTestEngineIterator;
         use engine_traits::{IterOptions, ReadOptions};
         use kvproto::kvrpcpb::ExtraOp;
+
+        use crate::storage::{kv::Result, CfName, ConcurrencyManager, DummyLockManager, Value};
         #[derive(Clone)]
         struct MockSnapshot;
 
@@ -2029,6 +2053,164 @@ mod tests {
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         assert!(prewrite_cmd.cmd.process_write(snap, context).is_err());
+    }
+
+    #[test]
+    fn test_assertion_fail_on_conflicting_index_key() {
+        let engine = crate::storage::TestEngineBuilder::new().build().unwrap();
+
+        // Simulate two transactions that tries to insert the same row with a secondary index, and
+        // the second one canceled the first one (by rolling back its lock).
+
+        let t1_start_ts = TimeStamp::compose(1, 0);
+        let t2_start_ts = TimeStamp::compose(2, 0);
+        let t2_commit_ts = TimeStamp::compose(3, 0);
+
+        // txn1 acquires lock on the row key.
+        must_acquire_pessimistic_lock(&engine, b"row", b"row", t1_start_ts, t1_start_ts);
+        // txn2 rolls it back.
+        let err =
+            must_acquire_pessimistic_lock_err(&engine, b"row", b"row", t2_start_ts, t2_start_ts);
+        assert!(matches!(err, MvccError(box MvccErrorInner::KeyIsLocked(_))));
+        must_check_txn_status(
+            &engine,
+            b"row",
+            t1_start_ts,
+            t2_start_ts,
+            t2_start_ts,
+            false,
+            false,
+            true,
+            |status| status == TxnStatus::PessimisticRollBack,
+        );
+        // And then txn2 acquire continues and finally commits
+        must_acquire_pessimistic_lock(&engine, b"row", b"row", t2_start_ts, t2_start_ts);
+        must_prewrite_put_impl(
+            &engine,
+            b"row",
+            b"value",
+            b"row",
+            &None,
+            t2_start_ts,
+            true,
+            1000,
+            t2_start_ts,
+            1,
+            t2_start_ts.next(),
+            0.into(),
+            false,
+            Assertion::NotExist,
+            AssertionLevel::Strict,
+        );
+        must_prewrite_put_impl(
+            &engine,
+            b"index",
+            b"value",
+            b"row",
+            &None,
+            t2_start_ts,
+            false,
+            1000,
+            t2_start_ts,
+            1,
+            t2_start_ts.next(),
+            0.into(),
+            false,
+            Assertion::NotExist,
+            AssertionLevel::Strict,
+        );
+        must_commit(&engine, b"row", t2_start_ts, t2_commit_ts);
+        must_commit(&engine, b"index", t2_start_ts, t2_commit_ts);
+
+        // Txn1 continues. If the two keys are sent in the single prewrite request, the
+        // AssertionFailed error won't be returned since there are other error.
+        let cm = ConcurrencyManager::new(1.into());
+        let mut stat = Statistics::default();
+        // Two keys in single request:
+        let cmd = PrewritePessimistic::with_defaults(
+            vec![
+                (
+                    Mutation::make_put(Key::from_raw(b"row"), b"value".to_vec()),
+                    true,
+                ),
+                (
+                    Mutation::make_put(Key::from_raw(b"index"), b"value".to_vec()),
+                    false,
+                ),
+            ],
+            b"row".to_vec(),
+            t1_start_ts,
+            t2_start_ts,
+        );
+        let err = prewrite_command(&engine, cm.clone(), &mut stat, cmd).unwrap_err();
+        assert!(matches!(
+            err,
+            Error(box ErrorInner::Mvcc(MvccError(
+                box MvccErrorInner::PessimisticLockNotFound { .. }
+            )))
+        ));
+        // Passing keys in different order gets the same result:
+        let cmd = PrewritePessimistic::with_defaults(
+            vec![
+                (
+                    Mutation::make_put(Key::from_raw(b"index"), b"value".to_vec()),
+                    false,
+                ),
+                (
+                    Mutation::make_put(Key::from_raw(b"row"), b"value".to_vec()),
+                    true,
+                ),
+            ],
+            b"row".to_vec(),
+            t1_start_ts,
+            t2_start_ts,
+        );
+        let err = prewrite_command(&engine, cm, &mut stat, cmd).unwrap_err();
+        assert!(matches!(
+            err,
+            Error(box ErrorInner::Mvcc(MvccError(
+                box MvccErrorInner::PessimisticLockNotFound { .. }
+            )))
+        ));
+
+        // If the two keys are sent in different requests, it would be the client's duty to ignore
+        // the assertion error.
+        let err = must_prewrite_put_err_impl(
+            &engine,
+            b"row",
+            b"value",
+            b"row",
+            &None,
+            t1_start_ts,
+            t1_start_ts,
+            true,
+            0,
+            false,
+            Assertion::NotExist,
+            AssertionLevel::Strict,
+        );
+        assert!(matches!(
+            err,
+            MvccError(box MvccErrorInner::PessimisticLockNotFound { .. })
+        ));
+        let err = must_prewrite_put_err_impl(
+            &engine,
+            b"index",
+            b"value",
+            b"row",
+            &None,
+            t1_start_ts,
+            t1_start_ts,
+            false,
+            0,
+            false,
+            Assertion::NotExist,
+            AssertionLevel::Strict,
+        );
+        assert!(matches!(
+            err,
+            MvccError(box MvccErrorInner::PessimisticLockNotFound { .. })
+        ));
     }
 
     #[test]

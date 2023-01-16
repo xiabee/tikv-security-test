@@ -1,15 +1,13 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use server::setup::initial_logger;
-use std::borrow::ToOwned;
-use std::error::Error;
-use std::str::FromStr;
-use std::{process, str, u64};
+use std::{borrow::ToOwned, error::Error, str, str::FromStr, u64};
 
+use server::setup::initial_logger;
 use tikv::config::TiKvConfig;
 
 const LOG_DIR: &str = "./ctl-engine-info-log";
 
+#[allow(clippy::field_reassign_with_default)]
 pub fn init_ctl_logger(level: &str) {
     let mut cfg = TiKvConfig::default();
     cfg.log.level = slog::Level::from_str(level).unwrap();
@@ -21,12 +19,10 @@ pub fn init_ctl_logger(level: &str) {
 pub fn warning_prompt(message: &str) -> bool {
     const EXPECTED: &str = "I consent";
     println!("{}", message);
-    let input: String = promptly::prompt(format!(
-        "Type \"{}\" to continue, anything else to exit",
-        EXPECTED
-    ))
-    .unwrap();
-    if input == EXPECTED {
+    println!("Type \"{}\" to continue, anything else to exit", EXPECTED);
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).unwrap();
+    if answer.trim_end_matches('\n') == EXPECTED {
         true
     } else {
         println!("exit.");
@@ -63,7 +59,7 @@ pub fn convert_gbmb(mut bytes: u64) -> String {
 
 pub fn perror_and_exit<E: Error>(prefix: &str, e: E) -> ! {
     println!("{}: {}", prefix, e);
-    process::exit(-1);
+    tikv_util::logger::exit_process_gracefully(-1);
 }
 
 #[cfg(test)]

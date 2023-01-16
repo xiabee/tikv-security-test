@@ -1,14 +1,20 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::deadlock::Scheduler as DeadlockScheduler;
-use super::waiter_manager::Scheduler as WaiterMgrScheduler;
+use std::{
+    error::Error,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
 use online_config::{ConfigChange, ConfigManager, OnlineConfig};
 use serde::de::{Deserialize, Deserializer, IntoDeserializer};
-
-use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tikv_util::config::ReadableDuration;
+
+use super::{
+    deadlock::Scheduler as DeadlockScheduler, waiter_manager::Scheduler as WaiterMgrScheduler,
+};
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]
@@ -55,7 +61,7 @@ impl Default for Config {
             wait_for_lock_timeout: ReadableDuration::millis(1000),
             wake_up_delay_duration: ReadableDuration::millis(20),
             pipelined: true,
-            in_memory: false,
+            in_memory: true,
         }
     }
 }
@@ -126,13 +132,13 @@ mod tests {
         wait-for-lock-timeout = "10ms"
         wake-up-delay-duration = 100
         pipelined = false
-        in-memory = true
+        in-memory = false
         "#;
 
         let config: Config = toml::from_str(conf).unwrap();
         assert_eq!(config.wait_for_lock_timeout.as_millis(), 10);
         assert_eq!(config.wake_up_delay_duration.as_millis(), 100);
         assert_eq!(config.pipelined, false);
-        assert_eq!(config.in_memory, true);
+        assert_eq!(config.in_memory, false);
     }
 }

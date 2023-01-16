@@ -4,17 +4,18 @@
 use kvproto::kvrpcpb::{ExtraOp, LockInfo};
 use txn_types::{Key, OldValues, TimeStamp, TxnExtra};
 
-use crate::storage::kv::WriteData;
-use crate::storage::lock_manager::{LockManager, WaitTimeout};
-use crate::storage::mvcc::{
-    Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader,
-};
-use crate::storage::txn::commands::{
-    Command, CommandExt, ReaderWithStats, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
-    WriteResult, WriteResultLockInfo,
-};
-use crate::storage::txn::{acquire_pessimistic_lock, Error, ErrorInner, Result};
 use crate::storage::{
+    kv::WriteData,
+    lock_manager::{LockManager, WaitTimeout},
+    mvcc::{Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader},
+    txn::{
+        acquire_pessimistic_lock,
+        commands::{
+            Command, CommandExt, ReaderWithStats, ResponsePolicy, TypedCommand, WriteCommand,
+            WriteContext, WriteResult, WriteResultLockInfo,
+        },
+        Error, ErrorInner, Result,
+    },
     Error as StorageError, ErrorInner as StorageErrorInner, PessimisticLockRes, ProcessResult,
     Result as StorageResult, Snapshot,
 };
@@ -74,16 +75,12 @@ fn extract_lock_info_from_result<T>(res: &StorageResult<T>) -> &LockInfo {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock {
-    fn process_write(
-        mut self,
-        snapshot: S,
-        mut context: WriteContext<'_, L>,
-    ) -> Result<WriteResult> {
+    fn process_write(mut self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
         let (start_ts, ctx, keys) = (self.start_ts, self.ctx, self.keys);
         let mut txn = MvccTxn::new(start_ts, context.concurrency_manager);
         let mut reader = ReaderWithStats::new(
-            SnapshotReader::new(start_ts, snapshot, !ctx.get_not_fill_cache()),
-            &mut context.statistics,
+            SnapshotReader::new_with_ctx(start_ts, snapshot, &ctx),
+            context.statistics,
         );
 
         let rows = keys.len();

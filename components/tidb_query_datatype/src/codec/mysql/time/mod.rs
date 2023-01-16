@@ -4,27 +4,29 @@ pub mod extension;
 mod tz;
 pub mod weekmode;
 
-pub use self::extension::*;
-pub use self::tz::Tz;
-pub use self::weekmode::WeekMode;
-
-use std::cmp::Ordering;
-use std::convert::{TryFrom, TryInto};
-use std::fmt::Write;
-use std::hash::{Hash, Hasher};
+use std::{
+    cmp::Ordering,
+    convert::{TryFrom, TryInto},
+    fmt::Write,
+    hash::{Hash, Hasher},
+};
 
 use bitfield::bitfield;
 use boolinator::Boolinator;
 use chrono::prelude::*;
-
-use crate::{FieldTypeAccessor, FieldTypeTp};
 use codec::prelude::*;
 use tipb::FieldType;
 
-use crate::codec::convert::ConvertTo;
-use crate::codec::mysql::{check_fsp, Decimal, Duration};
-use crate::codec::{Error, Result, TEN_POW};
-use crate::expr::{EvalContext, Flag, SqlMode};
+pub use self::{extension::*, tz::Tz, weekmode::WeekMode};
+use crate::{
+    codec::{
+        convert::ConvertTo,
+        mysql::{check_fsp, Decimal, Duration},
+        Error, Result, TEN_POW,
+    },
+    expr::{EvalContext, Flag, SqlMode},
+    FieldTypeAccessor, FieldTypeTp,
+};
 
 const MIN_TIMESTAMP: i64 = 0;
 pub const MAX_TIMESTAMP: i64 = (1 << 31) - 1;
@@ -311,7 +313,7 @@ mod parser {
         let end = input
             .iter()
             .position(|&c| !c.is_ascii_digit())
-            .unwrap_or_else(|| input.len());
+            .unwrap_or(input.len());
         (end != 0).as_option()?;
         Some((&input[end..], &input[..end]))
     }
@@ -1343,6 +1345,13 @@ impl Time {
         Time::try_from_chrono_datetime(ctx, time, time_type, duration.fsp() as i8)
     }
 
+    pub fn from_local_time(ctx: &mut EvalContext, time_type: TimeType, fsp: i8) -> Result<Time> {
+        let fsp = check_fsp(fsp)?;
+        let utc = Local::now();
+        let timestamp = ctx.cfg.tz.from_utc_datetime(&utc.naive_utc());
+        Time::try_from_chrono_datetime(ctx, timestamp.naive_local(), time_type, fsp as i8)
+    }
+
     pub fn from_year(
         ctx: &mut EvalContext,
         year: u32,
@@ -1685,14 +1694,14 @@ impl Time {
     #[inline]
     pub fn to_numeric_string(self) -> String {
         let mut buffer = String::with_capacity(15);
-        write!(&mut buffer, "{}", self.date_format("%Y%m%d").unwrap()).unwrap();
+        write!(buffer, "{}", self.date_format("%Y%m%d").unwrap()).unwrap();
         if self.get_time_type() != TimeType::Date {
-            write!(&mut buffer, "{}", self.date_format("%H%i%S").unwrap()).unwrap();
+            write!(buffer, "{}", self.date_format("%H%i%S").unwrap()).unwrap();
         }
         let fsp = usize::from(self.fsp());
         if fsp > 0 {
             write!(
-                &mut buffer,
+                buffer,
                 ".{:0width$}",
                 self.micro() / TEN_POW[MICRO_WIDTH - fsp],
                 width = fsp
@@ -1958,13 +1967,15 @@ impl crate::codec::data_type::AsMySQLBool for Time {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::codec::mysql::{MAX_FSP, UNSPECIFIED_FSP};
-    use crate::expr::EvalConfig;
-
     use std::sync::Arc;
 
-    #[derive(Debug)]
+    use super::*;
+    use crate::{
+        codec::mysql::{MAX_FSP, UNSPECIFIED_FSP},
+        expr::EvalConfig,
+    };
+
+    #[derive(Debug, Default)]
     struct TimeEnv {
         strict_mode: bool,
         no_zero_in_date: bool,
@@ -1972,19 +1983,6 @@ mod tests {
         allow_invalid_date: bool,
         ignore_truncate: bool,
         time_zone: Option<Tz>,
-    }
-
-    impl Default for TimeEnv {
-        fn default() -> TimeEnv {
-            TimeEnv {
-                strict_mode: false,
-                no_zero_in_date: false,
-                no_zero_date: false,
-                allow_invalid_date: false,
-                ignore_truncate: false,
-                time_zone: None,
-            }
-        }
     }
 
     impl From<TimeEnv> for EvalContext {
@@ -2779,6 +2777,20 @@ mod tests {
             assert_eq!(today.hour(), 0);
             assert_eq!(today.minute(), 0);
             assert_eq!(today.second(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_local_time() -> Result<()> {
+        let mut ctx = EvalContext::default();
+        for i in 2..10 {
+            let actual = Time::from_local_time(&mut ctx, TimeType::DateTime, i % MAX_FSP)?;
+            let c_datetime = actual.try_into_chrono_datetime(&mut ctx)?;
+
+            let now0 = c_datetime.timestamp_millis() as u64;
+            let now1 = Utc::now().timestamp_millis() as u64;
+            assert!(now1 - now0 < 1000, "{:?} {:?}", now1, now0);
         }
         Ok(())
     }

@@ -3,8 +3,11 @@
 use std::ops::Deref;
 
 use engine_traits::{ReadOptions, CF_DEFAULT, CF_WRITE};
-use tikv::storage::mvcc::near_load_data_by_write;
-use tikv::storage::{Cursor, CursorBuilder, ScanMode, Snapshot as EngineSnapshot, Statistics};
+use getset::CopyGetters;
+use tikv::storage::{
+    mvcc::near_load_data_by_write, Cursor, CursorBuilder, ScanMode, Snapshot as EngineSnapshot,
+    Statistics,
+};
 use tikv_kv::Iterator;
 use tikv_util::{
     config::ReadableSize,
@@ -14,8 +17,7 @@ use tikv_util::{
 };
 use txn_types::{Key, MutationType, OldValue, TimeStamp, Value, WriteRef, WriteType};
 
-use crate::metrics::*;
-use crate::Result;
+use crate::{metrics::*, Result};
 
 pub(crate) type OldValueCallback = Box<
     dyn Fn(Key, TimeStamp, &mut OldValueCache, &mut Statistics) -> Result<Option<Vec<u8>>> + Send,
@@ -44,11 +46,17 @@ impl SizePolicy<Key, (OldValue, Option<MutationType>)> for OldValueCacheSizePoli
     }
 }
 
+#[derive(CopyGetters)]
 pub struct OldValueCache {
-    pub cache: LruCache<Key, (OldValue, Option<MutationType>), OldValueCacheSizePolicy>,
-    pub access_count: usize,
-    pub miss_count: usize,
-    pub miss_none_count: usize,
+    cache: LruCache<Key, (OldValue, Option<MutationType>), OldValueCacheSizePolicy>,
+    #[getset(get_copy = "pub")]
+    access_count: usize,
+    #[getset(get_copy = "pub")]
+    miss_count: usize,
+    #[getset(get_copy = "pub")]
+    miss_none_count: usize,
+    #[getset(get_copy = "pub")]
+    update_count: usize,
 }
 
 impl OldValueCache {
@@ -63,12 +71,31 @@ impl OldValueCache {
             access_count: 0,
             miss_count: 0,
             miss_none_count: 0,
+            update_count: 0,
         }
     }
 
-    pub(crate) fn resize(&mut self, new_capacity: ReadableSize) {
+    pub fn insert(&mut self, key: Key, old_value: (OldValue, Option<MutationType>)) {
+        self.cache.insert(key, old_value);
+        self.update_count += 1;
+    }
+
+    pub fn resize(&mut self, new_capacity: ReadableSize) {
         CDC_OLD_VALUE_CACHE_MEMORY_QUOTA.set(new_capacity.0 as i64);
         self.cache.resize(new_capacity.0 as usize);
+    }
+
+    pub fn flush_metrics(&mut self) {
+        fail::fail_point!("cdc_flush_old_value_metrics", |_| {});
+        CDC_OLD_VALUE_CACHE_BYTES.set(self.cache.size() as i64);
+        CDC_OLD_VALUE_CACHE_LEN.set(self.cache.len() as i64);
+        CDC_OLD_VALUE_CACHE_ACCESS.add(self.access_count as i64);
+        CDC_OLD_VALUE_CACHE_MISS.add(self.miss_count as i64);
+        CDC_OLD_VALUE_CACHE_MISS_NONE.add(self.miss_none_count as i64);
+        self.access_count = 0;
+        self.miss_count = 0;
+        self.miss_none_count = 0;
+        self.update_count = 0;
     }
 
     #[cfg(test)]
@@ -261,14 +288,16 @@ fn get_value_default<S: EngineSnapshot>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use engine_rocks::RocksEngine;
-    use engine_traits::{KvEngine, MiscExt};
     use std::sync::Arc;
-    use tikv::config::DbConfig;
-    use tikv::storage::kv::TestEngineBuilder;
-    use tikv::storage::txn::tests::*;
-    use tikv_kv::PerfStatisticsInstant;
+
+    use engine_rocks::{ReadPerfInstant, RocksEngine};
+    use engine_traits::{KvEngine, MiscExt};
+    use tikv::{
+        config::DbConfig,
+        storage::{kv::TestEngineBuilder, txn::tests::*},
+    };
+
+    use super::*;
 
     fn must_get_eq(
         kv_engine: &RocksEngine,
@@ -568,7 +597,7 @@ mod tests {
 
         let key = format!("zkey-{:0>3}", 0).into_bytes();
         let snapshot = Arc::new(kv_engine.snapshot());
-        let perf_instant = PerfStatisticsInstant::new();
+        let perf_instant = ReadPerfInstant::new();
         let value = get_old_value(
             &snapshot,
             Key::from_raw(&key).append_ts(100.into()),
@@ -582,6 +611,6 @@ mod tests {
         // block read count should be 1 instead of 4 because some of them
         // are filtered by `prefix_seek`.
         let perf_delta = perf_instant.delta();
-        assert_eq!(perf_delta.0.block_read_count, 1);
+        assert_eq!(perf_delta.block_read_count, 1);
     }
 }

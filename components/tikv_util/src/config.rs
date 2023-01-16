@@ -1,23 +1,29 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::error::Error;
-use std::fmt::{self, Write};
-use std::fs;
-use std::net::{SocketAddrV4, SocketAddrV6};
-use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
-use std::path::{Path, PathBuf};
-use std::str::{self, FromStr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
-use std::time::Duration;
+use std::{
+    error::Error,
+    fmt::{self, Write},
+    fs,
+    net::{SocketAddrV4, SocketAddrV6},
+    ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign},
+    path::{Path, PathBuf},
+    str::{self, FromStr},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock, RwLockReadGuard,
+    },
+    time::Duration,
+};
 
-use serde::de::{self, Unexpected, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use online_config::ConfigValue;
+use serde::{
+    de::{self, Unexpected, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use thiserror::Error;
 
 use super::time::Instant;
 use crate::slow_log;
-use online_config::ConfigValue;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -60,7 +66,7 @@ pub enum LogFormat {
     Json,
 }
 
-#[derive(Clone, Debug, Copy, PartialEq, Default)]
+#[derive(Clone, Debug, Copy, PartialEq, PartialOrd, Default)]
 pub struct ReadableSize(pub u64);
 
 impl From<ReadableSize> for ConfigValue {
@@ -94,6 +100,10 @@ impl ReadableSize {
 
     pub const fn as_mb(self) -> u64 {
         self.0 / MIB
+    }
+
+    pub fn as_mb_f64(self) -> f64 {
+        self.0 as f64 / MIB as f64
     }
 }
 
@@ -134,14 +144,14 @@ impl Serialize for ReadableSize {
             write!(buffer, "{}PiB", size / PIB).unwrap();
         } else if size % TIB == 0 {
             write!(buffer, "{}TiB", size / TIB).unwrap();
-        } else if size % GIB as u64 == 0 {
+        } else if size % GIB == 0 {
             write!(buffer, "{}GiB", size / GIB).unwrap();
-        } else if size % MIB as u64 == 0 {
+        } else if size % MIB == 0 {
             write!(buffer, "{}MiB", size / MIB).unwrap();
-        } else if size % KIB as u64 == 0 {
+        } else if size % KIB == 0 {
             write!(buffer, "{}KiB", size / KIB).unwrap();
         } else {
-            return serializer.serialize_u64(size);
+            write!(buffer, "{}B", size).unwrap();
         }
         serializer.serialize_str(&buffer)
     }
@@ -177,7 +187,15 @@ impl FromStr for ReadableSize {
             "G" | "GB" | "GiB" => GIB,
             "T" | "TB" | "TiB" => TIB,
             "P" | "PB" | "PiB" => PIB,
-            "B" | "" => UNIT,
+            "B" | "" => {
+                if size.chars().all(|c| char::is_ascii_digit(&c)) {
+                    return size
+                        .parse::<u64>()
+                        .map(|n| ReadableSize(n))
+                        .map_err(|_| format!("invalid size string: {:?}", s));
+                }
+                UNIT
+            }
             _ => {
                 return Err(format!(
                     "only B, KB, KiB, MB, MiB, GB, GiB, TB, TiB, PB, and PiB are supported: {:?}",
@@ -745,10 +763,12 @@ pub fn check_kernel() -> Vec<ConfigError> {
 
 #[cfg(target_os = "linux")]
 mod check_data_dir {
-    use std::ffi::{CStr, CString};
-    use std::fs;
-    use std::path::Path;
-    use std::sync::Mutex;
+    use std::{
+        ffi::{CStr, CString},
+        fs,
+        path::Path,
+        sync::Mutex,
+    };
 
     use lazy_static::lazy_static;
 
@@ -886,9 +906,8 @@ mod check_data_dir {
 
     #[cfg(test)]
     mod tests {
-        use std::fs::File;
-        use std::io::Write;
-        use std::os::unix::fs::symlink;
+        use std::{fs::File, io::Write, os::unix::fs::symlink};
+
         use tempfile::Builder;
 
         use super::*;
@@ -1152,7 +1171,7 @@ enum TomlLine {
     // the `Keys` from "[`Keys`]"
     Table(String),
     // the `Keys` from "`Keys` = value"
-    KVPair(String),
+    KvPair(String),
     // Comment, empty line, etc.
     Unknown,
 }
@@ -1168,13 +1187,13 @@ impl TomlLine {
         if v.is_empty() || v.len() > 2 || TomlLine::parse_key(v[v.len() - 1].as_str()).is_none() {
             return TomlLine::Unknown;
         }
-        TomlLine::KVPair(v.pop().unwrap())
+        TomlLine::KvPair(v.pop().unwrap())
     }
 
     fn parse(s: &str) -> TomlLine {
         let s = s.trim();
         // try to parse table from format of "[`Keys`]"
-        if let Some(k) = s.strip_prefix('[').map(|s| s.strip_suffix(']')).flatten() {
+        if let Some(k) = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             return match TomlLine::parse_key(k) {
                 Some(k) => TomlLine::Table(k),
                 None => TomlLine::Unknown,
@@ -1248,7 +1267,7 @@ impl TomlWriter {
                     self.write(line.as_bytes());
                     self.current_table = keys;
                 }
-                TomlLine::KVPair(keys) => {
+                TomlLine::KvPair(keys) => {
                     match change.remove(&TomlLine::concat_key(&self.current_table, &keys)) {
                         None => self.write(line.as_bytes()),
                         Some(chg) => self.write(TomlLine::encode_kv(&keys, &chg).as_bytes()),
@@ -1380,14 +1399,182 @@ macro_rules! numeric_enum_serializing_mod {
     }
 }
 
+/// Helper for migrating Raft data safely. Such migration is defined as
+/// multiple states that can be uniquely distinguished. And the transtions
+/// between these states are atomic.
+///
+/// States:
+///   1. Init - Only source directory contains Raft data.
+///   2. Migrating - A marker file contains the path of source directory. The source
+///      directory contains a complete copy of Raft data. Target directory may exist.
+///   3. Completed - Only target directory contains Raft data. Marker file may exist.
+pub struct RaftDataStateMachine {
+    root: PathBuf,
+    in_progress_marker: PathBuf,
+    source: PathBuf,
+    target: PathBuf,
+}
+
+impl RaftDataStateMachine {
+    pub fn new(root: &str, source: &str, target: &str) -> Self {
+        let root = PathBuf::from(root);
+        let in_progress_marker = root.join("MIGRATING-RAFT");
+        let source = PathBuf::from(source);
+        let target = PathBuf::from(target);
+        Self {
+            root,
+            in_progress_marker,
+            source,
+            target,
+        }
+    }
+
+    /// Checks if the current condition is a valid state.
+    pub fn validate(&self, should_exist: bool) -> std::result::Result<(), String> {
+        if Self::data_exists(&self.source)
+            && Self::data_exists(&self.target)
+            && !self.in_progress_marker.exists()
+        {
+            return Err(format!(
+                "Found multiple raft data sets: {}, {}",
+                self.source.display(),
+                self.target.display()
+            ));
+        }
+        let exists = Self::data_exists(&self.source) || Self::data_exists(&self.target);
+        if exists != should_exist {
+            if should_exist {
+                return Err("Cannot find raft data set.".to_owned());
+            } else {
+                return Err("Found raft data set when it should not exist.".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether a migration is needed. When it's needed, enters the `Migrating`
+    /// state. Otherwise prepares the target directory for opening.
+    pub fn before_open_target(&mut self) -> bool {
+        // Clean up trash directory if there is any.
+        for p in [&self.source, &self.target] {
+            let trash = p.with_extension("REMOVE");
+            if trash.exists() {
+                fs::remove_dir_all(&trash).unwrap();
+            }
+        }
+        if !Self::data_exists(&self.source) {
+            // Recover from Completed state.
+            if self.in_progress_marker.exists() {
+                Self::must_remove(&self.in_progress_marker);
+            }
+            return false;
+        } else if self.in_progress_marker.exists() {
+            if let Some(real_source) = self.read_marker() {
+                // Recover from Migrating state.
+                if real_source == self.target {
+                    if Self::data_exists(&self.target) {
+                        Self::must_remove(&self.source);
+                        return false;
+                    }
+                    // It's actually in Completed state, just in the reverse direction.
+                    // Equivalent to Init state.
+                } else {
+                    assert!(real_source == self.source);
+                    Self::must_remove(&self.target);
+                    return true;
+                }
+            } else {
+                // Halfway between Init and Migrating.
+                assert!(!Self::data_exists(&self.target));
+            }
+        }
+        // Init -> Migrating.
+        self.write_marker();
+        true
+    }
+
+    /// Exits the `Migrating` state and enters the `Completed` state.
+    pub fn after_dump_data(&mut self) {
+        assert!(Self::data_exists(&self.source));
+        assert!(Self::data_exists(&self.target));
+        Self::must_remove(&self.source); // Enters the `Completed` state.
+        Self::must_remove(&self.in_progress_marker);
+    }
+
+    // `after_dump_data` involves two atomic operations, insert a check point between
+    // them to test crash safety.
+    #[cfg(test)]
+    fn after_dump_data_with_check<F: Fn()>(&mut self, check: &F) {
+        assert!(Self::data_exists(&self.source));
+        assert!(Self::data_exists(&self.target));
+        Self::must_remove(&self.source); // Enters the `Completed` state.
+        check();
+        Self::must_remove(&self.in_progress_marker);
+    }
+
+    fn write_marker(&self) {
+        use std::io::Write;
+        let mut f = fs::File::create(&self.in_progress_marker).unwrap();
+        f.write_all(self.source.to_str().unwrap().as_bytes())
+            .unwrap();
+        f.sync_all().unwrap();
+        f.write_all(b"//").unwrap();
+        f.sync_all().unwrap();
+        Self::sync_dir(&self.root);
+    }
+
+    // Assumes there is a marker file. Returns None when the content of marker file is
+    // incomplete.
+    fn read_marker(&self) -> Option<PathBuf> {
+        let marker = fs::read_to_string(&self.in_progress_marker).unwrap();
+        if marker.ends_with("//") {
+            Some(PathBuf::from(&marker[..marker.len() - 2]))
+        } else {
+            None
+        }
+    }
+
+    fn must_remove(path: &Path) {
+        if path.exists() {
+            if path.is_dir() {
+                info!("Removing directory"; "path" => %path.display());
+                let trash = path.with_extension("REMOVE");
+                Self::must_rename_dir(path, &trash);
+                fs::remove_dir_all(&trash).unwrap();
+            } else {
+                info!("Removing file"; "path" => %path.display());
+                fs::remove_file(&path).unwrap();
+                Self::sync_dir(path.parent().unwrap());
+            }
+        }
+    }
+
+    fn must_rename_dir(from: &Path, to: &Path) {
+        fs::rename(from, to).unwrap();
+        let mut dir = to.to_path_buf();
+        assert!(dir.pop());
+        Self::sync_dir(&dir);
+    }
+
+    fn data_exists(path: &Path) -> bool {
+        if !path.exists() || !path.is_dir() {
+            return false;
+        }
+        fs::read_dir(&path).unwrap().next().is_some()
+    }
+
+    fn sync_dir(dir: &Path) {
+        fs::File::open(&dir).and_then(|d| d.sync_all()).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::io::Write;
-    use std::path::Path;
+    use std::{fs::File, io::Write, path::Path};
+
+    use tempfile::Builder;
 
     use super::*;
-    use tempfile::Builder;
 
     #[test]
     fn test_readable_size() {
@@ -1433,10 +1620,10 @@ mod tests {
         }
 
         let c = SizeHolder {
-            s: ReadableSize(512),
+            s: ReadableSize((isize::MAX) as u64),
         };
         let res_str = toml::to_string(&c).unwrap();
-        assert_eq!(res_str, "s = 512\n");
+        assert_eq!(res_str, "s = \"9223372036854775807B\"\n");
         let res_size: SizeHolder = toml::from_str(&res_str).unwrap();
         assert_eq!(res_size.s.0, c.s.0);
 
@@ -1760,8 +1947,9 @@ mod tests {
 
     #[test]
     fn test_multi_tracker() {
-        use super::*;
         use std::sync::Arc;
+
+        use super::*;
 
         #[derive(Debug, Default, PartialEq)]
         struct Value {
@@ -1894,5 +2082,81 @@ yyy = 100
             toml_value["readpool"]["storage"]["normal-concurrency"].as_integer(),
             Some(2)
         );
+    }
+
+    #[test]
+    fn test_raft_data_migration() {
+        fn run_migration<F: Fn()>(root: &Path, source: &Path, target: &Path, check: F) {
+            let mut state = RaftDataStateMachine::new(
+                root.to_str().unwrap(),
+                source.to_str().unwrap(),
+                target.to_str().unwrap(),
+            );
+            state.validate(true).unwrap();
+            check();
+            // Dump to target.
+            if state.before_open_target() {
+                check();
+                // Simulate partial writes.
+                let marker = root.join("MIGRATING-RAFT");
+                if marker.exists() {
+                    let backup_marker = fs::read_to_string(&marker).unwrap();
+                    fs::write(&marker, "").unwrap();
+                    check();
+                    fs::write(&marker, backup_marker).unwrap();
+                }
+
+                let source_file = source.join("file");
+                let target_file = target.join("file");
+                if !target.exists() {
+                    fs::create_dir_all(&target).unwrap();
+                    check();
+                }
+                fs::copy(&source_file, &target_file).unwrap();
+                check();
+                state.after_dump_data_with_check(&check);
+            }
+            check();
+        }
+
+        fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+            if dst.exists() {
+                fs::remove_dir_all(dst)?;
+            }
+            fs::create_dir_all(&dst)?;
+            for entry in fs::read_dir(src)? {
+                let entry = entry?;
+                let ty = entry.file_type()?;
+                if ty.is_dir() {
+                    copy_dir(&entry.path(), &dst.join(entry.file_name()))?;
+                } else {
+                    fs::copy(entry.path(), &dst.join(entry.file_name()))?;
+                }
+            }
+            Ok(())
+        }
+
+        let dir = tempfile::Builder::new().tempdir().unwrap();
+        let root = dir.path().join("root");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        // Write some data into source.
+        let source_file = source.join("file");
+        File::create(&source_file).unwrap();
+
+        let backup = dir.path().join("backup");
+
+        run_migration(&root, &source, &target, || {
+            copy_dir(&root, &backup).unwrap();
+
+            // Simulate restart and migrate in halfway.
+            run_migration(&root, &source, &target, || {});
+            copy_dir(&backup, &root).unwrap();
+            //
+            run_migration(&root, &target, &source, || {});
+            copy_dir(&backup, &root).unwrap();
+        });
     }
 }

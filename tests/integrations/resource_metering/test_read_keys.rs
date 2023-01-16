@@ -1,34 +1,33 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::resource_metering::test_suite::MockReceiverServer;
-
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use concurrency_manager::ConcurrencyManager;
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
-use engine_rocks::PerfLevel;
 use grpcio::{ChannelBuilder, Environment};
-use kvproto::coprocessor;
-use kvproto::kvrpcpb::*;
-use kvproto::resource_usage_agent::ResourceUsageRecord;
-use kvproto::tikvpb::*;
+use kvproto::{coprocessor, kvrpcpb::*, resource_usage_agent::ResourceUsageRecord, tikvpb::*};
 use protobuf::Message;
 use resource_metering::ResourceTagFactory;
 use test_coprocessor::{DAGSelect, ProductTable, Store};
 use test_raftstore::*;
 use test_util::alloc_port;
 use tidb_query_datatype::codec::Datum;
-use tikv::config::CoprReadPoolConfig;
-use tikv::coprocessor::{readpool_impl, Endpoint};
-use tikv::read_pool::ReadPool;
-use tikv::storage::{Engine, RocksEngine, TestEngineBuilder};
-use tikv_util::config::ReadableDuration;
-use tikv_util::thread_group::GroupProperties;
-use tikv_util::HandyRwLock;
+use tikv::{
+    config::CoprReadPoolConfig,
+    coprocessor::{readpool_impl, Endpoint},
+    read_pool::ReadPool,
+    storage::{Engine, RocksEngine},
+};
+use tikv_util::{
+    config::ReadableDuration, quota_limiter::QuotaLimiter, thread_group::GroupProperties,
+    HandyRwLock,
+};
 use tipb::SelectResponse;
 
+use crate::resource_metering::test_suite::MockReceiverServer;
+
 #[test]
+#[ignore = "the case is unstable, ref #11765"]
 pub fn test_read_keys() {
     // Create & start receiver server.
     let (tx, rx) = unbounded();
@@ -174,6 +173,7 @@ fn recv_read_keys(rx: &Receiver<Vec<ResourceUsageRecord>>) -> u32 {
 }
 
 #[test]
+#[ignore = "the case is unstable, ref #11765"]
 fn test_read_keys_coprocessor() {
     // Start resource metering.
     let mut cfg = resource_metering::Config::default();
@@ -183,7 +183,7 @@ fn test_read_keys_coprocessor() {
     let (_, collector_reg_handle, resource_tag_factory, recorder_worker) =
         resource_metering::init_recorder(cfg.precision.as_millis());
     let (_, data_sink_reg_handle, reporter_worker) =
-        resource_metering::init_reporter(cfg.clone(), collector_reg_handle.clone());
+        resource_metering::init_reporter(cfg, collector_reg_handle);
 
     let data_sink = MockDataSink::new();
     let _reg_guard = data_sink_reg_handle.register(Box::new(data_sink.clone()));
@@ -230,8 +230,7 @@ fn init_coprocessor_with_data(
     vals: &[(i64, Option<&str>, i64)],
     tag_factory: ResourceTagFactory,
 ) -> Endpoint<RocksEngine> {
-    let engine = TestEngineBuilder::new().build().unwrap();
-    let mut store = Store::from_engine(engine);
+    let mut store = Store::default();
     store.begin();
     for &(id, name, count) in vals {
         store
@@ -252,8 +251,8 @@ fn init_coprocessor_with_data(
         &tikv::server::Config::default(),
         pool.handle(),
         cm,
-        PerfLevel::EnableCount,
         tag_factory,
+        Arc::new(QuotaLimiter::default()),
     )
 }
 

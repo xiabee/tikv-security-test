@@ -2,7 +2,7 @@
 
 mod storage_impl;
 
-pub use self::storage_impl::TiKVStorage;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use kvproto::coprocessor::{KeyRange, Response};
@@ -11,9 +11,12 @@ use tidb_query_common::{execute_stats::ExecSummary, storage::IntervalRange};
 use tikv_alloc::trace::MemoryTraceGuard;
 use tipb::{DagRequest, SelectResponse, StreamResponse};
 
-use crate::coprocessor::metrics::*;
-use crate::coprocessor::{Deadline, RequestHandler, Result};
-use crate::storage::{Statistics, Store};
+pub use self::storage_impl::TiKvStorage;
+use crate::{
+    coprocessor::{metrics::*, Deadline, RequestHandler, Result},
+    storage::{Statistics, Store},
+    tikv_util::quota_limiter::QuotaLimiter,
+};
 
 pub struct DagHandlerBuilder<S: Store + 'static> {
     req: DagRequest,
@@ -25,6 +28,7 @@ pub struct DagHandlerBuilder<S: Store + 'static> {
     is_streaming: bool,
     is_cache_enabled: bool,
     paging_size: Option<u64>,
+    quota_limiter: Arc<QuotaLimiter>,
 }
 
 impl<S: Store + 'static> DagHandlerBuilder<S> {
@@ -37,6 +41,7 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
         is_streaming: bool,
         is_cache_enabled: bool,
         paging_size: Option<u64>,
+        quota_limiter: Arc<QuotaLimiter>,
     ) -> Self {
         DagHandlerBuilder {
             req,
@@ -48,9 +53,11 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
             is_streaming,
             is_cache_enabled,
             paging_size,
+            quota_limiter,
         }
     }
 
+    #[must_use]
     pub fn data_version(mut self, data_version: Option<u64>) -> Self {
         self.data_version = data_version;
         self
@@ -68,6 +75,7 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
             self.batch_row_limit,
             self.is_streaming,
             self.paging_size,
+            self.quota_limiter,
         )?
         .into_boxed())
     }
@@ -89,16 +97,18 @@ impl BatchDAGHandler {
         streaming_batch_limit: usize,
         is_streaming: bool,
         paging_size: Option<u64>,
+        quota_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self> {
         Ok(Self {
             runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request(
                 req,
                 ranges,
-                TiKVStorage::new(store, is_cache_enabled),
+                TiKvStorage::new(store, is_cache_enabled),
                 deadline,
                 streaming_batch_limit,
                 is_streaming,
                 paging_size,
+                quota_limiter,
             )?,
             data_version,
         })

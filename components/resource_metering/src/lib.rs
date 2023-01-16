@@ -2,20 +2,18 @@
 
 // TODO(mornyx): crate doc.
 
-#![feature(shrink_to)]
 #![feature(hash_drain_filter)]
 #![feature(core_intrinsics)]
 
-use std::intrinsics::unlikely;
-use std::pin::Pin;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-
-use recorder::{LocalStorage, LocalStorageRef, STORAGE};
-use tikv_util::sys::thread;
-use tikv_util::warn;
-use tikv_util::worker::{Scheduler, Worker};
+use std::{
+    intrinsics::unlikely,
+    pin::Pin,
+    sync::{
+        atomic::Ordering::{Relaxed, SeqCst},
+        Arc,
+    },
+    task::{Context, Poll},
+};
 
 pub use collector::Collector;
 pub use config::{Config, ConfigManager};
@@ -25,14 +23,19 @@ pub use recorder::{
     CollectorRegHandle, ConfigChangeNotifier as RecorderConfigChangeNotifier, CpuRecorder,
     Recorder, RecorderBuilder, SummaryRecorder,
 };
-pub use reporter::data_sink::DataSink;
-pub use reporter::data_sink_reg::DataSinkRegHandle;
-pub use reporter::pubsub::PubSubService;
-pub use reporter::single_target::{
-    init_single_target, AddressChangeNotifier, SingleTargetDataSink,
-};
+use recorder::{LocalStorage, LocalStorageRef, STORAGE};
 pub use reporter::{
-    init_reporter, ConfigChangeNotifier as ReporterConfigChangeNotifier, Reporter, Task,
+    data_sink::DataSink,
+    data_sink_reg::DataSinkRegHandle,
+    init_reporter,
+    pubsub::PubSubService,
+    single_target::{init_single_target, AddressChangeNotifier, SingleTargetDataSink},
+    ConfigChangeNotifier as ReporterConfigChangeNotifier, Reporter, Task,
+};
+use tikv_util::{
+    sys::thread,
+    warn,
+    worker::{Scheduler, Worker},
 };
 
 mod collector;
@@ -181,6 +184,19 @@ impl ResourceTagFactory {
         }
     }
 
+    // create a new tag with key ranges for a read request.
+    pub fn new_tag_with_key_ranges(
+        &self,
+        context: &kvproto::kvrpcpb::Context,
+        key_ranges: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> ResourceMeteringTag {
+        let tag_infos = TagInfos::from_rpc_context_with_key_ranges(context, key_ranges);
+        ResourceMeteringTag {
+            infos: Arc::new(tag_infos),
+            resource_tag_factory: self.clone(),
+        }
+    }
+
     fn register_local_storage(&self, storage: &LocalStorage) -> bool {
         let lsr = LocalStorageRef {
             id: thread::thread_id(),
@@ -263,7 +279,7 @@ impl<T: futures::Stream> futures::Stream for InTags<T> {
 }
 
 /// This structure is the actual internal data of [ResourceMeteringTag], and all
-/// internal data comes from the requested [Context].
+/// internal data comes from the request's [Context] and the request itself.
 ///
 /// [Context]: kvproto::kvrpcpb::Context
 #[derive(Debug, Default, Eq, PartialEq, Clone, Hash)]
@@ -271,6 +287,8 @@ pub struct TagInfos {
     pub store_id: u64,
     pub region_id: u64,
     pub peer_id: u64,
+    // Only a read request contains the key ranges.
+    pub key_ranges: Vec<(Vec<u8>, Vec<u8>)>,
     pub extra_attachment: Vec<u8>,
 }
 
@@ -281,6 +299,22 @@ impl TagInfos {
             store_id: peer.get_store_id(),
             peer_id: peer.get_id(),
             region_id: context.get_region_id(),
+            key_ranges: vec![],
+            extra_attachment: Vec::from(context.get_resource_group_tag()),
+        }
+    }
+
+    // create a TagInfos with start and end keys for a read request.
+    pub fn from_rpc_context_with_key_ranges(
+        context: &kvproto::kvrpcpb::Context,
+        key_ranges: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Self {
+        let peer = context.get_peer();
+        Self {
+            store_id: peer.get_store_id(),
+            peer_id: peer.get_id(),
+            region_id: context.get_region_id(),
+            key_ranges,
             extra_attachment: Vec::from(context.get_resource_group_tag()),
         }
     }
@@ -301,6 +335,7 @@ mod tests {
                     store_id: 1,
                     region_id: 2,
                     peer_id: 3,
+                    key_ranges: vec![],
                     extra_attachment: b"12345".to_vec(),
                 }),
                 resource_tag_factory,

@@ -1,23 +1,31 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cmp;
-use std::collections::HashMap;
-use std::io::Read;
-use std::ops::{Deref, DerefMut};
-use std::u64;
+use std::{
+    cmp,
+    collections::HashMap,
+    io::Read,
+    ops::{Deref, DerefMut},
+    u64,
+};
 
-use crate::decode_properties::{DecodeProperties, IndexHandle, IndexHandles};
 use engine_traits::{MvccProperties, Range};
 use rocksdb::{
     DBEntryType, TablePropertiesCollector, TablePropertiesCollectorFactory, TitanBlobIndex,
     UserCollectedProperties,
 };
-use tikv_util::codec::number::{self, NumberEncoder};
-use tikv_util::codec::{Error, Result};
-use tikv_util::info;
+use tikv_util::{
+    codec::{
+        number::{self, NumberEncoder},
+        Error, Result,
+    },
+    info,
+};
 use txn_types::{Key, Write, WriteType};
 
-use crate::mvcc_properties::*;
+use crate::{
+    decode_properties::{DecodeProperties, IndexHandle, IndexHandles},
+    mvcc_properties::*,
+};
 
 const PROP_TOTAL_SIZE: &str = "tikv.total_size";
 const PROP_SIZE_INDEX: &str = "tikv.size_index";
@@ -528,21 +536,20 @@ pub fn get_range_entries_and_versions(
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
-
     use std::sync::Arc;
 
-    use crate::raw::{ColumnFamilyOptions, DBOptions, Writable};
-    use crate::raw::{DBEntryType, TablePropertiesCollector};
+    use engine_traits::{CF_WRITE, LARGE_CFS};
+    use rand::Rng;
     use tempfile::Builder;
     use test::Bencher;
-
-    use crate::compat::Compat;
-    use crate::raw_util::CFOptions;
-    use engine_traits::{CF_WRITE, LARGE_CFS};
     use txn_types::{Key, Write, WriteType};
 
     use super::*;
+    use crate::{
+        compat::Compat,
+        raw::{ColumnFamilyOptions, DBEntryType, DBOptions, TablePropertiesCollector, Writable},
+        raw_util::CFOptions,
+    };
 
     #[allow(clippy::many_single_char_names)]
     #[test]
@@ -598,19 +605,19 @@ mod tests {
         assert_eq!(props.get_approximate_keys_in_range(b"", b"k"), 11_u64);
 
         assert_eq!(props.offsets.len(), 7);
-        let a = props.get(b"a".as_ref());
+        let a = props.get(b"a");
         assert_eq!(a.size, 1);
-        let e = props.get(b"e".as_ref());
+        let e = props.get(b"e");
         assert_eq!(e.size, DEFAULT_PROP_SIZE_INDEX_DISTANCE + 5);
-        let i = props.get(b"i".as_ref());
+        let i = props.get(b"i");
         assert_eq!(i.size, DEFAULT_PROP_SIZE_INDEX_DISTANCE / 8 * 17 + 9);
-        let k = props.get(b"k".as_ref());
+        let k = props.get(b"k");
         assert_eq!(k.size, DEFAULT_PROP_SIZE_INDEX_DISTANCE / 8 * 25 + 11);
-        let m = props.get(b"m".as_ref());
+        let m = props.get(b"m");
         assert_eq!(m.keys, 11 + DEFAULT_PROP_KEYS_INDEX_DISTANCE);
-        let n = props.get(b"n".as_ref());
+        let n = props.get(b"n");
         assert_eq!(n.keys, 11 + 2 * DEFAULT_PROP_KEYS_INDEX_DISTANCE);
-        let o = props.get(b"o".as_ref());
+        let o = props.get(b"o");
         assert_eq!(o.keys, 12 + 2 * DEFAULT_PROP_KEYS_INDEX_DISTANCE);
         let empty = RangeOffsets::default();
         let cases = [

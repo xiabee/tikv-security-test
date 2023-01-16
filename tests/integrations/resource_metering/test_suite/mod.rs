@@ -3,26 +3,28 @@
 mod mock_pubsub;
 mod mock_receiver_server;
 
-pub use mock_receiver_server::MockReceiverServer;
-
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crossbeam::channel::{unbounded, Receiver, Sender};
-use futures::channel::oneshot;
-use futures::{select, FutureExt};
+use futures::{channel::oneshot, select, FutureExt};
 use grpcio::{ChannelBuilder, ClientSStreamReceiver, Environment};
-use kvproto::kvrpcpb::{ApiVersion, Context};
-use kvproto::resource_usage_agent::{
-    ResourceMeteringPubSubClient, ResourceMeteringRequest, ResourceUsageRecord,
+use kvproto::{
+    kvrpcpb::Context,
+    resource_usage_agent::{
+        ResourceMeteringPubSubClient, ResourceMeteringRequest, ResourceUsageRecord,
+    },
 };
-use resource_metering::Config;
+pub use mock_receiver_server::MockReceiverServer;
+use resource_metering::{Config, ResourceTagFactory};
 use tempfile::TempDir;
 use test_util::alloc_port;
-use tikv::config::{ConfigController, TiKvConfig};
-use tikv::storage::lock_manager::DummyLockManager;
-use tikv::storage::{RocksEngine, Storage, TestEngineBuilder, TestStorageBuilder};
+use tikv::{
+    config::{ConfigController, TiKvConfig},
+    storage::{
+        lock_manager::DummyLockManager, RocksEngine, StorageApiV1, TestEngineBuilder,
+        TestStorageBuilderApiV1,
+    },
+};
 use tokio::runtime::{self, Runtime};
 use txn_types::{Key, TimeStamp};
 
@@ -30,8 +32,9 @@ pub struct TestSuite {
     pubsub_server_port: u16,
     receiver_server: Option<MockReceiverServer>,
 
-    storage: Storage<RocksEngine, DummyLockManager>,
+    storage: StorageApiV1<RocksEngine, DummyLockManager>,
     cfg_controller: ConfigController,
+    resource_tag_factory: ResourceTagFactory,
 
     tx: Sender<Vec<ResourceUsageRecord>>,
     rx: Receiver<Vec<ResourceUsageRecord>>,
@@ -54,7 +57,7 @@ impl TestSuite {
         let (recorder_notifier, collector_reg_handle, resource_tag_factory, recorder_worker) =
             resource_metering::init_recorder(cfg.precision.as_millis());
         let (reporter_notifier, data_sink_reg_handle, reporter_worker) =
-            resource_metering::init_reporter(cfg.clone(), collector_reg_handle.clone());
+            resource_metering::init_reporter(cfg.clone(), collector_reg_handle);
         let env = Arc::new(Environment::new(2));
         let (address_change_notifier, single_target_worker) = resource_metering::init_single_target(
             cfg.receiver_address.clone(),
@@ -81,14 +84,10 @@ impl TestSuite {
         );
 
         let engine = TestEngineBuilder::new().build().unwrap();
-        let storage = TestStorageBuilder::from_engine_and_lock_mgr(
-            engine,
-            DummyLockManager {},
-            ApiVersion::V1,
-        )
-        .set_resource_tag_factory(resource_tag_factory)
-        .build()
-        .unwrap();
+        let storage = TestStorageBuilderApiV1::from_engine_and_lock_mgr(engine, DummyLockManager)
+            .set_resource_tag_factory(resource_tag_factory.clone())
+            .build()
+            .unwrap();
 
         let (tx, rx) = unbounded();
 
@@ -102,6 +101,7 @@ impl TestSuite {
             receiver_server: None,
             storage,
             cfg_controller,
+            resource_tag_factory,
             tx,
             rx,
             env,
@@ -116,6 +116,14 @@ impl TestSuite {
                 recorder_worker.stop_worker();
             })),
         }
+    }
+
+    pub fn get_storage(&self) -> StorageApiV1<RocksEngine, DummyLockManager> {
+        self.storage.clone()
+    }
+
+    pub fn get_tag_factory(&self) -> ResourceTagFactory {
+        self.resource_tag_factory.clone()
     }
 
     pub fn subscribe(
@@ -166,7 +174,7 @@ impl TestSuite {
     }
 
     pub fn get_current_cfg(&self) -> Config {
-        self.cfg_controller.get_current().resource_metering.clone()
+        self.cfg_controller.get_current().resource_metering
     }
 
     pub fn start_receiver_at(&mut self, port: u16) {
@@ -229,7 +237,7 @@ impl TestSuite {
 
     pub fn nonblock_receiver_all(&self) -> HashMap<String, (Vec<u64>, Vec<u32>)> {
         let mut res = HashMap::new();
-        for r in self.rx.try_recv() {
+        if let Ok(r) = self.rx.try_recv() {
             Self::merge_records(&mut res, r);
         }
         res
@@ -265,7 +273,7 @@ impl TestSuite {
     }
 
     pub fn flush_receiver(&self) {
-        while let Ok(_) = self.rx.try_recv() {}
+        while self.rx.try_recv().is_ok() {}
         let _ = self.rx.recv_timeout(
             self.get_current_cfg().report_receiver_interval.0 + Duration::from_millis(500),
         );

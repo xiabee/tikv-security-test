@@ -1,28 +1,33 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use collections::HashSet;
 use crossbeam::channel::TrySendError;
-use engine_rocks::raw::DB;
-use engine_rocks::{RocksEngine, RocksSnapshot};
+use engine_rocks::{raw::DB, RocksEngine, RocksSnapshot};
 use engine_traits::{ALL_CFS, CF_DEFAULT};
-use kvproto::kvrpcpb::{Context, ExtraOp as TxnExtraOp};
-use kvproto::metapb::Region;
-use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, Response};
-use kvproto::raft_serverpb::RaftMessage;
-use raftstore::router::{LocalReadRouter, RaftStoreRouter};
-use raftstore::store::{
-    cmd_resp, util, Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter,
-    RaftCmdExtraOpts, RaftCommand, ReadResponse, RegionSnapshot, SignificantMsg, StoreMsg,
-    StoreRouter, WriteResponse,
+use kvproto::{
+    kvrpcpb::{Context, ExtraOp as TxnExtraOp},
+    metapb::Region,
+    raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, Response},
+    raft_serverpb::RaftMessage,
 };
-use raftstore::Result;
+use raftstore::{
+    router::{LocalReadRouter, RaftStoreRouter},
+    store::{
+        cmd_resp, util, Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter,
+        RaftCmdExtraOpts, RaftCommand, ReadResponse, RegionSnapshot, SignificantMsg,
+        SignificantRouter, StoreMsg, StoreRouter, WriteResponse,
+    },
+    Result,
+};
 use tempfile::{Builder, TempDir};
-use tikv::storage::kv::{Callback as EngineCallback, Modify, WriteData};
-use tikv::storage::Engine;
 use tikv::{
     server::raftkv::{CmdRes, RaftKv},
-    storage::kv::SnapContext,
+    storage::{
+        kv::{Callback as EngineCallback, Modify, SnapContext, WriteData},
+        Engine,
+    },
 };
 use tikv_util::time::ThreadReadId;
 use txn_types::Key;
@@ -73,6 +78,12 @@ impl CasualRouter<RocksEngine> for SyncBenchRouter {
     }
 }
 
+impl SignificantRouter<RocksEngine> for SyncBenchRouter {
+    fn significant_send(&self, _: u64, _: SignificantMsg<RocksSnapshot>) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl ProposalRouter<RocksSnapshot> for SyncBenchRouter {
     fn send(
         &self,
@@ -90,11 +101,6 @@ impl StoreRouter<RocksEngine> for SyncBenchRouter {
 impl RaftStoreRouter<RocksEngine> for SyncBenchRouter {
     /// Sends RaftMessage to local store.
     fn send_raft_msg(&self, _: RaftMessage) -> Result<()> {
-        Ok(())
-    }
-
-    /// Sends a significant message. We should guarantee that the message can't be dropped.
-    fn significant_send(&self, _: u64, _: SignificantMsg<RocksSnapshot>) -> Result<()> {
         Ok(())
     }
 
@@ -177,6 +183,7 @@ fn bench_async_snapshot(b: &mut test::Bencher) {
     let kv = RaftKv::new(
         SyncBenchRouter::new(region.clone(), db.clone()),
         RocksEngine::from_db(db),
+        Arc::new(RwLock::new(HashSet::default())),
     );
 
     let mut ctx = Context::default();
@@ -209,6 +216,7 @@ fn bench_async_write(b: &mut test::Bencher) {
     let kv = RaftKv::new(
         SyncBenchRouter::new(region.clone(), db.clone()),
         RocksEngine::from_db(db),
+        Arc::new(RwLock::new(HashSet::default())),
     );
 
     let mut ctx = Context::default();

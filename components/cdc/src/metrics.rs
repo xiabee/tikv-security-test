@@ -1,10 +1,11 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::cell::RefCell;
+
+use engine_rocks::ReadPerfContext;
 use lazy_static::*;
 use prometheus::*;
 use prometheus_static_metric::*;
-use std::cell::RefCell;
-use tikv::storage::kv::PerfStatisticsDelta;
 use tikv::storage::Statistics;
 
 /// Installing a new capture contains 2 phases, one for incremental scanning and one for
@@ -71,6 +72,10 @@ make_auto_flush_static_metric! {
 }
 
 lazy_static! {
+    pub static ref CDC_ENDPOINT_PENDING_TASKS: IntGauge = register_int_gauge!(
+        "tikv_cdc_endpoint_pending_tasks",
+        "CDC endpoint pending tasks"
+    ).unwrap();
     pub static ref CDC_RESOLVED_TS_GAP_HISTOGRAM: Histogram = register_histogram!(
         "tikv_cdc_resolved_ts_gap_seconds",
         "Bucketed histogram of the gap between cdc resolved ts and current tso",
@@ -201,14 +206,14 @@ lazy_static! {
 }
 
 thread_local! {
-    pub static TLS_CDC_PERF_STATS: RefCell<PerfStatisticsDelta> = RefCell::new(PerfStatisticsDelta::default());
+    pub static TLS_CDC_PERF_STATS: RefCell<ReadPerfContext> = RefCell::new(ReadPerfContext::default());
 }
 
 macro_rules! tls_flush_perf_stat {
     ($local_stats:ident, $stat:ident) => {
         CDC_ROCKSDB_PERF_COUNTER_STATIC
             .$stat
-            .inc_by($local_stats.0.$stat as u64);
+            .inc_by($local_stats.$stat as u64);
     };
 }
 

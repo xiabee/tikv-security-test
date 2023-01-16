@@ -4,16 +4,20 @@ mod charset;
 pub mod collator;
 pub mod encoding;
 
-use std::cmp::Ordering;
-use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
-use std::ops::Deref;
+use std::{
+    cmp::Ordering,
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+    ops::Deref,
+};
 
 use codec::prelude::*;
 use num::Unsigned;
 
-use crate::codec::data_type::{Bytes, BytesGuard, BytesRef, BytesWriter};
-use crate::codec::Result;
+use crate::codec::{
+    data_type::{Bytes, BytesGuard, BytesRef, BytesWriter},
+    Result,
+};
 
 #[macro_export]
 macro_rules! match_template_collator {
@@ -35,6 +39,32 @@ macro_rules! match_template_collator {
             $($tail)*
          }
      }}
+}
+
+#[macro_export]
+macro_rules! match_template_multiple_collators {
+    ((), (), $($tail:tt)*) => {
+        $($tail)*
+    };
+    (($first:tt), ($match_exprs:tt), $($tail:tt)*) => {
+        match_template_multiple_collators! {
+            ($first,), ($match_exprs,), $($tail)*
+        }
+    };
+    (($first:tt, $($t:tt)*), ($first_match_expr:tt, $($match_exprs:tt)*), $($tail:tt)*) => {{
+        #[allow(unused_imports)]
+        use $crate::codec::collation::collator::*;
+
+        match_template_collator! {
+            $first, match $first_match_expr {
+                Collation::$first => {
+                    match_template_multiple_collators! {
+                        ($($t)*), ($($match_exprs)*), $($tail)*
+                    }
+                }
+            }
+        }
+    }};
 }
 
 #[macro_export]
@@ -63,6 +93,8 @@ pub trait Charset {
     fn validate(bstr: &[u8]) -> Result<()>;
 
     fn decode_one(data: &[u8]) -> Option<(Self::Char, usize)>;
+
+    fn charset() -> crate::Charset;
 }
 
 pub trait Collator: 'static + std::marker::Send + std::marker::Sync + std::fmt::Debug {

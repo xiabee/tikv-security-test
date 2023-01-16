@@ -1,13 +1,15 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{collections::HashMap, time::Duration};
+
 use engine_traits::CF_DEFAULT;
 use kvproto::raft_cmdpb::RaftCmdResponse;
 use raftstore::Result;
-use std::collections::HashMap;
-use std::time::Duration;
 use test_raftstore::*;
-use tikv_util::sys::thread::{self, Pid};
-use tikv_util::HandyRwLock;
+use tikv_util::{
+    sys::thread::{self, Pid},
+    HandyRwLock,
+};
 
 fn put_with_timeout<T: Simulator>(
     cluster: &mut Cluster<T>,
@@ -55,9 +57,22 @@ fn test_increase_pool() {
 
         // Update config, expand from 1 to 2
         cfg_controller.update(change).unwrap();
-        cluster.cfg.raft_store.store_batch_system.pool_size = 2;
-        cluster.cfg.raft_store.apply_batch_system.pool_size = 2;
-        assert_eq!(cfg_controller.get_current(), cluster.cfg.tikv);
+        assert_eq!(
+            cfg_controller
+                .get_current()
+                .raft_store
+                .apply_batch_system
+                .pool_size,
+            2
+        );
+        assert_eq!(
+            cfg_controller
+                .get_current()
+                .raft_store
+                .store_batch_system
+                .pool_size,
+            2
+        );
     }
 
     // Request can be handled as usual
@@ -110,9 +125,23 @@ fn test_decrease_pool() {
         // Update config, shrink from 2 to 1
         cfg_controller.update(change).unwrap();
         std::thread::sleep(std::time::Duration::from_secs(1));
-        cluster.cfg.raft_store.store_batch_system.pool_size = 1;
-        cluster.cfg.raft_store.apply_batch_system.pool_size = 1;
-        assert_eq!(cfg_controller.get_current(), cluster.cfg.tikv);
+
+        assert_eq!(
+            cfg_controller
+                .get_current()
+                .raft_store
+                .apply_batch_system
+                .pool_size,
+            1
+        );
+        assert_eq!(
+            cfg_controller
+                .get_current()
+                .raft_store
+                .store_batch_system
+                .pool_size,
+            1
+        );
     }
 
     // Save current poller tids after scaling down

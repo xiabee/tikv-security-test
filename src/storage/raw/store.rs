@@ -1,38 +1,42 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath]
-use super::encoded::RawEncodeSnapshot;
+use std::{marker::PhantomData, time::Duration};
 
-use crate::storage::kv::Result;
-use crate::storage::kv::{Cursor, ScanMode, Snapshot};
-use crate::storage::Statistics;
-
-use api_version::{APIV1TTL, APIV2};
+use api_version::{ApiV1, ApiV1Ttl, ApiV2, KvFormat};
 use engine_traits::{CfName, IterOptions, DATA_KEY_PREFIX_LEN};
 use kvproto::kvrpcpb::{ApiVersion, KeyRange};
-use std::time::Duration;
 use tikv_util::time::Instant;
 use txn_types::{Key, KvPair};
 use yatp::task::future::reschedule;
 
+use super::{encoded::RawEncodeSnapshot, raw_mvcc::RawMvccSnapshot};
+use crate::{
+    coprocessor::checksum_crc64_xor,
+    storage::{
+        kv::{Cursor, Result, ScanMode, Snapshot},
+        Statistics,
+    },
+};
+
 const MAX_TIME_SLICE: Duration = Duration::from_millis(2);
 const MAX_BATCH_SIZE: usize = 1024;
 
+// TODO: refactor to utilize generic type `KvFormat` and eliminate matching `api_version`.
 pub enum RawStore<S: Snapshot> {
-    V1(RawStoreInner<S>),
-    V1TTL(RawStoreInner<RawEncodeSnapshot<S, APIV1TTL>>),
-    V2(RawStoreInner<RawEncodeSnapshot<S, APIV2>>),
+    V1(RawStoreInner<S, ApiV1>),
+    V1Ttl(RawStoreInner<RawEncodeSnapshot<S, ApiV1Ttl>, ApiV1Ttl>),
+    V2(RawStoreInner<RawEncodeSnapshot<RawMvccSnapshot<S>, ApiV2>, ApiV2>),
 }
 
 impl<'a, S: Snapshot> RawStore<S> {
     pub fn new(snapshot: S, api_version: ApiVersion) -> Self {
         match api_version {
             ApiVersion::V1 => RawStore::V1(RawStoreInner::new(snapshot)),
-            ApiVersion::V1ttl => RawStore::V1TTL(RawStoreInner::new(
+            ApiVersion::V1ttl => RawStore::V1Ttl(RawStoreInner::new(
                 RawEncodeSnapshot::from_snapshot(snapshot),
             )),
             ApiVersion::V2 => RawStore::V2(RawStoreInner::new(RawEncodeSnapshot::from_snapshot(
-                snapshot,
+                RawMvccSnapshot::from_snapshot(snapshot),
             ))),
         }
     }
@@ -45,7 +49,7 @@ impl<'a, S: Snapshot> RawStore<S> {
     ) -> Result<Option<Vec<u8>>> {
         match self {
             RawStore::V1(inner) => inner.raw_get_key_value(cf, key, stats),
-            RawStore::V1TTL(inner) => inner.raw_get_key_value(cf, key, stats),
+            RawStore::V1Ttl(inner) => inner.raw_get_key_value(cf, key, stats),
             RawStore::V2(inner) => inner.raw_get_key_value(cf, key, stats),
         }
     }
@@ -58,7 +62,7 @@ impl<'a, S: Snapshot> RawStore<S> {
     ) -> Result<Option<u64>> {
         match self {
             RawStore::V1(_) => panic!("get ttl on non-ttl store"),
-            RawStore::V1TTL(inner) => inner.snapshot.get_key_ttl_cf(cf, key, stats),
+            RawStore::V1Ttl(inner) => inner.snapshot.get_key_ttl_cf(cf, key, stats),
             RawStore::V2(inner) => inner.snapshot.get_key_ttl_cf(cf, key, stats),
         }
     }
@@ -85,7 +89,7 @@ impl<'a, S: Snapshot> RawStore<S> {
                     .forward_raw_scan(cf, start_key, limit, statistics, option, key_only)
                     .await
             }
-            RawStore::V1TTL(inner) => {
+            RawStore::V1Ttl(inner) => {
                 inner
                     .forward_raw_scan(cf, start_key, limit, statistics, option, key_only)
                     .await
@@ -120,7 +124,7 @@ impl<'a, S: Snapshot> RawStore<S> {
                     .reverse_raw_scan(cf, start_key, limit, statistics, option, key_only)
                     .await
             }
-            RawStore::V1TTL(inner) => {
+            RawStore::V1Ttl(inner) => {
                 inner
                     .reverse_raw_scan(cf, start_key, limit, statistics, option, key_only)
                     .await
@@ -136,24 +140,28 @@ impl<'a, S: Snapshot> RawStore<S> {
     pub async fn raw_checksum_ranges(
         &'a self,
         cf: CfName,
-        ranges: Vec<KeyRange>,
-        statistics: &'a mut Statistics,
+        ranges: &[KeyRange],
+        statistics: &'a mut Vec<Statistics>,
     ) -> Result<(u64, u64, u64)> {
         match self {
             RawStore::V1(inner) => inner.raw_checksum_ranges(cf, ranges, statistics).await,
-            RawStore::V1TTL(inner) => inner.raw_checksum_ranges(cf, ranges, statistics).await,
+            RawStore::V1Ttl(inner) => inner.raw_checksum_ranges(cf, ranges, statistics).await,
             RawStore::V2(inner) => inner.raw_checksum_ranges(cf, ranges, statistics).await,
         }
     }
 }
 
-pub struct RawStoreInner<S: Snapshot> {
+pub struct RawStoreInner<S: Snapshot, F: KvFormat> {
     snapshot: S,
+    _phantom: PhantomData<F>,
 }
 
-impl<'a, S: Snapshot> RawStoreInner<S> {
+impl<'a, S: Snapshot, F: KvFormat> RawStoreInner<S, F> {
     pub fn new(snapshot: S) -> Self {
-        RawStoreInner { snapshot }
+        RawStoreInner {
+            snapshot,
+            _phantom: PhantomData,
+        }
     }
 
     pub fn raw_get_key_value(
@@ -281,21 +289,23 @@ impl<'a, S: Snapshot> RawStoreInner<S> {
     pub async fn raw_checksum_ranges(
         &'a self,
         cf: CfName,
-        ranges: Vec<KeyRange>,
-        statistics: &'a mut Statistics,
+        ranges: &[KeyRange],
+        statistics: &'a mut Vec<Statistics>,
     ) -> Result<(u64, u64, u64)> {
         let mut total_bytes = 0;
         let mut total_kvs = 0;
-        let mut digest = crc64fast::Digest::new();
+        let digest = crc64fast::Digest::new();
+        let mut checksum: u64 = 0;
         let mut row_count = 0;
         let mut time_slice_start = Instant::now();
-        let statistics = statistics.mut_cf_statistics(cf);
         for r in ranges {
+            let mut stats = Statistics::default();
+            let cf_stats = stats.mut_cf_statistics(cf);
             let mut opts = IterOptions::new(None, None, false);
             opts.set_upper_bound(r.get_end_key(), DATA_KEY_PREFIX_LEN);
             let mut cursor =
                 Cursor::new(self.snapshot.iter_cf(cf, opts)?, ScanMode::Forward, false);
-            cursor.seek(&Key::from_encoded(r.get_start_key().to_vec()), statistics)?;
+            cursor.seek(&Key::from_encoded(r.get_start_key().to_vec()), cf_stats)?;
             while cursor.valid()? {
                 row_count += 1;
                 if row_count >= MAX_BATCH_SIZE {
@@ -305,15 +315,17 @@ impl<'a, S: Snapshot> RawStoreInner<S> {
                     }
                     row_count = 0;
                 }
-                let k = cursor.key(statistics);
-                let v = cursor.value(statistics);
-                digest.write(k);
-                digest.write(v);
+                // Calculate checksum on user key, as timestamp is not visible on client side.
+                let v = cursor.value(cf_stats);
+                let (raw_key, _) =
+                    F::decode_raw_key_owned(Key::from_encoded_slice(cursor.key(cf_stats)), true)?;
+                checksum = checksum_crc64_xor(checksum, digest.clone(), &raw_key, v);
                 total_kvs += 1;
-                total_bytes += k.len() + v.len();
-                cursor.next(statistics);
+                total_bytes += raw_key.len() + v.len();
+                cursor.next(cf_stats);
             }
+            statistics.push(stats);
         }
-        Ok((digest.sum64(), total_kvs, total_bytes as u64))
+        Ok((checksum, total_kvs, total_bytes as u64))
     }
 }

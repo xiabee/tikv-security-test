@@ -1,10 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::path::{Path, PathBuf};
-use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    io::{Error as IoError, ErrorKind, Result as IoResult},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    thread::JoinHandle,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crossbeam::channel::{self, select, tick};
 use engine_traits::{EncryptionKeyManager, FileEncryptionInfo};
@@ -14,15 +19,16 @@ use kvproto::encryptionpb::{DataKey, EncryptionMethod, FileDictionary, FileInfo,
 use protobuf::Message;
 use tikv_util::{box_err, debug, error, info, thd_name, warn};
 
-use crate::config::EncryptionConfig;
-
-use crate::crypter::{self, compat, Iv};
-use crate::encrypted_file::EncryptedFile;
-use crate::file_dict_file::FileDictionaryFile;
-use crate::io::{DecrypterReader, EncrypterWriter};
-use crate::master_key::Backend;
-use crate::metrics::*;
-use crate::{Error, Result};
+use crate::{
+    config::EncryptionConfig,
+    crypter::{self, compat, Iv},
+    encrypted_file::EncryptedFile,
+    file_dict_file::FileDictionaryFile,
+    io::{DecrypterReader, EncrypterWriter},
+    master_key::Backend,
+    metrics::*,
+    Error, Result,
+};
 
 const KEY_DICT_NAME: &str = "key.dict";
 const FILE_DICT_NAME: &str = "file.dict";
@@ -54,7 +60,7 @@ impl Dicts {
         Ok(Dicts {
             file_dict: Mutex::new(FileDictionary::default()),
             file_dict_file: Mutex::new(FileDictionaryFile::new(
-                Path::new(path).to_owned(),
+                Path::new(path),
                 FILE_DICT_NAME,
                 enable_file_dictionary_log,
                 file_dictionary_rewrite_threshold,
@@ -203,12 +209,12 @@ impl Dicts {
         ENCRYPTION_FILE_NUM_GAUGE.set(file_num);
 
         if method != EncryptionMethod::Plaintext {
-            info!("new encrypted file";
+            debug!("new encrypted file";
                   "fname" => fname,
                   "method" => format!("{:?}", method),
                   "iv" => hex::encode(iv.as_slice()));
         } else {
-            info!("new plaintext file"; "fname" => fname);
+            debug!("new plaintext file"; "fname" => fname);
         }
         Ok(file)
     }
@@ -236,9 +242,9 @@ impl Dicts {
         file_dict_file.remove(fname)?;
         ENCRYPTION_FILE_NUM_GAUGE.set(file_num);
         if file.method != compat(EncryptionMethod::Plaintext) {
-            info!("delete encrypted file"; "fname" => fname);
+            debug!("delete encrypted file"; "fname" => fname);
         } else {
-            info!("delete plaintext file"; "fname" => fname);
+            debug!("delete plaintext file"; "fname" => fname);
         }
         Ok(())
     }
@@ -456,6 +462,23 @@ impl DataKeyManager {
             }
         };
         Ok(Some(Self::from_dicts(dicts, args.method, master_key)?))
+    }
+
+    /// Will block file operation for a considerable amount of time. Only used for debugging purpose.
+    pub fn retain_encrypted_files(&self, f: impl Fn(&str) -> bool) {
+        let mut dict = self.dicts.file_dict.lock().unwrap();
+        let mut file_dict_file = self.dicts.file_dict_file.lock().unwrap();
+        dict.files.retain(|fname, info| {
+            if info.method != EncryptionMethod::Plaintext {
+                let retain = f(fname);
+                if !retain {
+                    file_dict_file.remove(fname).unwrap();
+                }
+                retain
+            } else {
+                false
+            }
+        });
     }
 
     fn load_dicts(master_key: &dyn Backend, args: &DataKeyManagerArgs) -> Result<LoadDicts> {
@@ -753,15 +776,17 @@ impl EncryptionKeyManager for DataKeyManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::master_key::tests::{decrypt_called, encrypt_called, MockBackend};
-    use crate::master_key::{FileBackend, PlaintextBackend};
-
     use engine_traits::EncryptionMethod as DBEncryptionMethod;
     use file_system::{remove_file, File};
     use matches::assert_matches;
     use tempfile::TempDir;
     use test_util::create_test_key_file;
+
+    use super::*;
+    use crate::master_key::{
+        tests::{decrypt_called, encrypt_called, MockBackend},
+        FileBackend, PlaintextBackend,
+    };
 
     lazy_static::lazy_static! {
         static ref LOCK_FOR_GAUGE: Mutex<i32> = Mutex::new(1);

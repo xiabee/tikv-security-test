@@ -1,25 +1,24 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::iter::*;
-use std::sync::*;
-use std::thread;
-use std::time::*;
-
-use kvproto::kvrpcpb::Context;
-use kvproto::raft_cmdpb::CmdType;
-use kvproto::raft_serverpb::{PeerState, RaftMessage, RegionLocalState};
-use raft::eraftpb::ConfChangeType;
-use raft::eraftpb::MessageType;
+use std::{iter::*, sync::*, thread, time::*};
 
 use engine_rocks::Compat;
-use engine_traits::Peekable;
-use engine_traits::{CF_RAFT, CF_WRITE};
+use engine_traits::{Peekable, CF_LOCK, CF_RAFT, CF_WRITE};
+use kvproto::{
+    kvrpcpb::Context,
+    raft_cmdpb::CmdType,
+    raft_serverpb::{PeerState, RaftMessage, RegionLocalState},
+};
 use pd_client::PdClient;
+use raft::eraftpb::{ConfChangeType, MessageType};
+use raftstore::store::{Callback, LocksStatus};
 use test_raftstore::*;
-use tikv::storage::kv::SnapContext;
-use tikv::storage::kv::SnapshotExt;
-use tikv_util::config::*;
-use tikv_util::HandyRwLock;
+use tikv::storage::{
+    kv::{SnapContext, SnapshotExt},
+    Engine, Snapshot,
+};
+use tikv_util::{config::*, HandyRwLock};
+use txn_types::{Key, PessimisticLock};
 
 /// Test if merge is working as expected in a general condition.
 #[test]
@@ -116,7 +115,7 @@ fn test_node_merge_with_slow_learner() {
     let mut cluster = new_node_cluster(0, 2);
     configure_for_merge(&mut cluster);
     cluster.cfg.raft_store.raft_log_gc_threshold = 40;
-    cluster.cfg.raft_store.raft_log_gc_count_limit = 40;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(40);
     cluster.cfg.raft_store.merge_max_log_gap = 15;
     cluster.pd_client.disable_default_operator();
 
@@ -483,7 +482,7 @@ fn test_node_merge_brain_split() {
     configure_for_merge(&mut cluster);
     ignore_merge_target_integrity(&mut cluster);
     cluster.cfg.raft_store.raft_log_gc_threshold = 12;
-    cluster.cfg.raft_store.raft_log_gc_count_limit = 12;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(12);
 
     cluster.run();
     cluster.must_put(b"k1", b"v1");
@@ -1135,8 +1134,6 @@ fn test_merge_remove_target_peer_isolated() {
 
 #[test]
 fn test_sync_max_ts_after_region_merge() {
-    use tikv::storage::{Engine, Snapshot};
-
     let mut cluster = new_server_cluster(0, 3);
     configure_for_merge(&mut cluster);
     cluster.run();
@@ -1254,6 +1251,199 @@ fn test_merge_snapshot_demote() {
     must_get_equal(&cluster.get_engine(3), b"k4", b"v4");
 }
 
+#[test]
+fn test_propose_in_memory_pessimistic_locks() {
+    let mut cluster = new_server_cluster(0, 2);
+    configure_for_merge(&mut cluster);
+    cluster.run();
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    let region = cluster.get_region(b"k1");
+    cluster.must_split(&region, b"k2");
+    let left = cluster.get_region(b"k1");
+    let right = cluster.get_region(b"k3");
+
+    // Transfer the leader of the right region to store 2. The leaders of source and target
+    // regions don't need to be on the same store.
+    cluster.must_transfer_leader(right.id, new_peer(2, 2));
+
+    // Insert lock l1 into the left region
+    let snapshot = cluster.must_get_snapshot_of_region(left.id);
+    let txn_ext = snapshot.txn_ext.unwrap();
+    let l1 = PessimisticLock {
+        primary: b"k1".to_vec().into_boxed_slice(),
+        start_ts: 10.into(),
+        ttl: 3000,
+        for_update_ts: 20.into(),
+        min_commit_ts: 30.into(),
+    };
+    assert!(
+        txn_ext
+            .pessimistic_locks
+            .write()
+            .insert(vec![(Key::from_raw(b"k1"), l1.clone())])
+            .is_ok()
+    );
+
+    // Insert lock l2 into the right region
+    let snapshot = cluster.must_get_snapshot_of_region(right.id);
+    let txn_ext = snapshot.txn_ext.unwrap();
+    let l2 = PessimisticLock {
+        primary: b"k3".to_vec().into_boxed_slice(),
+        start_ts: 10.into(),
+        ttl: 3000,
+        for_update_ts: 20.into(),
+        min_commit_ts: 30.into(),
+    };
+    assert!(
+        txn_ext
+            .pessimistic_locks
+            .write()
+            .insert(vec![(Key::from_raw(b"k3"), l2.clone())])
+            .is_ok()
+    );
+
+    // Merge left region into the right region
+    pd_client.must_merge(left.id, right.id);
+
+    // After the left region is merged into the right region, its pessimistic locks should be
+    // proposed and applied to the storage.
+    let snapshot = cluster.must_get_snapshot_of_region(right.id);
+    let value = snapshot
+        .get_cf(CF_LOCK, &Key::from_raw(b"k1"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, l1.into_lock().to_bytes());
+
+    // The lock belonging to the target region should remain unchanged.
+    let snapshot = cluster.must_get_snapshot_of_region(right.id);
+    let txn_ext = snapshot.txn_ext.unwrap();
+    assert_eq!(
+        txn_ext.pessimistic_locks.read().get(&Key::from_raw(b"k3")),
+        Some(&(l2, false))
+    );
+}
+
+#[test]
+fn test_merge_pessimistic_locks_when_gap_is_too_large() {
+    let mut cluster = new_server_cluster(0, 2);
+    configure_for_merge(&mut cluster);
+    cluster.cfg.pessimistic_txn.pipelined = true;
+    cluster.cfg.pessimistic_txn.in_memory = true;
+    // Set raft_entry_max_size to 64 KiB. We will try to make the gap larger than the limit later.
+    cluster.cfg.raft_store.raft_entry_max_size = ReadableSize::kb(64);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.run();
+
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    let region = cluster.get_region(b"k1");
+    cluster.must_split(&region, b"k2");
+    let left = cluster.get_region(b"k1");
+    let right = cluster.get_region(b"k3");
+
+    cluster.must_transfer_leader(right.id, new_peer(2, 2));
+
+    cluster.add_send_filter(CloneFilterFactory(RegionPacketFilter::new(
+        left.get_id(),
+        2,
+    )));
+
+    let large_bytes = vec![b'v'; 32 << 10]; // 32 KiB
+    // 4 * 32 KiB = 128 KiB > raft_entry_max_size
+    for _ in 0..4 {
+        cluster.async_put(b"k1", &large_bytes).unwrap();
+    }
+
+    cluster.merge_region(left.id, right.id, Callback::None);
+    thread::sleep(Duration::from_millis(150));
+
+    // The gap is too large, so the previous merge should fail. And this new put request
+    // should be allowed.
+    let res = cluster.async_put(b"k1", b"new_val").unwrap();
+
+    cluster.clear_send_filters();
+    assert!(res.recv().is_ok());
+
+    assert_eq!(cluster.must_get(b"k1").unwrap(), b"new_val");
+}
+
+#[test]
+fn test_merge_pessimistic_locks_repeated_merge() {
+    let mut cluster = new_server_cluster(0, 2);
+    configure_for_merge(&mut cluster);
+    cluster.cfg.pessimistic_txn.pipelined = true;
+    cluster.cfg.pessimistic_txn.in_memory = true;
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.run();
+
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    let region = cluster.get_region(b"k1");
+    cluster.must_split(&region, b"k2");
+    let left = cluster.get_region(b"k1");
+    let right = cluster.get_region(b"k3");
+
+    let snapshot = cluster.must_get_snapshot_of_region(left.id);
+    let txn_ext = snapshot.ext().get_txn_ext().unwrap().clone();
+    let lock = PessimisticLock {
+        primary: b"k1".to_vec().into_boxed_slice(),
+        start_ts: 10.into(),
+        ttl: 3000,
+        for_update_ts: 20.into(),
+        min_commit_ts: 30.into(),
+    };
+    assert!(
+        txn_ext
+            .pessimistic_locks
+            .write()
+            .insert(vec![(Key::from_raw(b"k1"), lock.clone())])
+            .is_ok()
+    );
+
+    // Filter MsgAppend, so the proposed PrepareMerge will not succeed
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(left.id, 2)
+            .msg_type(MessageType::MsgAppend)
+            .direction(Direction::Recv),
+    ));
+    cluster.merge_region(left.id, right.id, Callback::None);
+    cluster.merge_region(left.id, right.id, Callback::None);
+    thread::sleep(Duration::from_millis(150));
+
+    // After that, the pessimistic locks status should remain in Merging state.
+    // Failing to propose the second merge region will not revert the state
+    assert_eq!(
+        txn_ext.pessimistic_locks.read().status,
+        LocksStatus::MergingRegion
+    );
+
+    cluster.clear_send_filters();
+    pd_client.check_merged_timeout(left.id, Duration::from_secs(5));
+    let snapshot = cluster.must_get_snapshot_of_region(right.id);
+    let value = snapshot
+        .get_cf(CF_LOCK, &Key::from_raw(b"k1"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, lock.into_lock().to_bytes());
+}
+
 /// Check if merge is cleaned up if the merge target is destroyed several times before it's ever
 /// scheduled.
 #[test]
@@ -1311,7 +1501,7 @@ fn test_node_merge_long_isolated() {
 
     // Now peer(1, 1010) should probably created in memory but not persisted.
     pd_client.must_remove_peer(right.get_id(), new_peer(1, 1010));
-    cluster.wait_tombstone(right.get_id(), new_peer(1, 1010));
+    cluster.wait_tombstone(right.get_id(), new_peer(1, 1010), true);
     cluster.clear_send_filters();
     // Source peer should discover it's impossible to proceed and cleanup itself.
     must_get_none(&cluster.get_engine(1), b"k1");

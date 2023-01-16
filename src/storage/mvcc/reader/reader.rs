@@ -1,15 +1,24 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use crate::storage::kv::{Cursor, CursorBuilder, ScanMode, Snapshot as EngineSnapshot, Statistics};
-use crate::storage::mvcc::{
-    default_not_found_error,
-    reader::{OverlappedWrite, TxnCommitRecord},
-    Result,
-};
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
+use kvproto::{
+    errorpb::{self, EpochNotMatch, StaleCommand},
+    kvrpcpb::Context,
+};
 use tikv_kv::SnapshotExt;
 use txn_types::{Key, Lock, OldValue, TimeStamp, Value, Write, WriteRef, WriteType};
+
+use crate::storage::{
+    kv::{
+        Cursor, CursorBuilder, Error as KvError, ScanMode, Snapshot as EngineSnapshot, Statistics,
+    },
+    mvcc::{
+        default_not_found_error,
+        reader::{OverlappedWrite, TxnCommitRecord},
+        Result,
+    },
+};
 
 /// Read from an MVCC snapshot, i.e., a logical view of the database at a specific timestamp (the
 /// start_ts).
@@ -29,6 +38,13 @@ impl<S: EngineSnapshot> SnapshotReader<S> {
     pub fn new(start_ts: TimeStamp, snapshot: S, fill_cache: bool) -> Self {
         SnapshotReader {
             reader: MvccReader::new(snapshot, None, fill_cache),
+            start_ts,
+        }
+    }
+
+    pub fn new_with_ctx(start_ts: TimeStamp, snapshot: S, ctx: &Context) -> Self {
+        SnapshotReader {
+            reader: MvccReader::new_with_ctx(snapshot, None, ctx),
             start_ts,
         }
     }
@@ -115,6 +131,12 @@ pub struct MvccReader<S: EngineSnapshot> {
     current_key: Option<Key>,
 
     fill_cache: bool,
+
+    // The term and the epoch version when the snapshot is created. They will be zero
+    // if the two properties are not available.
+    term: u64,
+    #[allow(dead_code)]
+    version: u64,
 }
 
 impl<S: EngineSnapshot> MvccReader<S> {
@@ -128,6 +150,23 @@ impl<S: EngineSnapshot> MvccReader<S> {
             scan_mode,
             current_key: None,
             fill_cache,
+            term: 0,
+            version: 0,
+        }
+    }
+
+    pub fn new_with_ctx(snapshot: S, scan_mode: Option<ScanMode>, ctx: &Context) -> Self {
+        Self {
+            snapshot,
+            statistics: Statistics::default(),
+            data_cursor: None,
+            lock_cursor: None,
+            write_cursor: None,
+            scan_mode,
+            current_key: None,
+            fill_cache: !ctx.get_not_fill_cache(),
+            term: ctx.get_term(),
+            version: ctx.get_region_epoch().get_version(),
         }
     }
 
@@ -161,7 +200,7 @@ impl<S: EngineSnapshot> MvccReader<S> {
     }
 
     pub fn load_lock(&mut self, key: &Key) -> Result<Option<Lock>> {
-        if let Some(pessimistic_lock) = self.load_in_memory_pessimistic_lock(key) {
+        if let Some(pessimistic_lock) = self.load_in_memory_pessimistic_lock(key)? {
             return Ok(Some(pessimistic_lock));
         }
 
@@ -185,15 +224,37 @@ impl<S: EngineSnapshot> MvccReader<S> {
         Ok(res)
     }
 
-    fn load_in_memory_pessimistic_lock(&self, key: &Key) -> Option<Lock> {
-        self.snapshot.ext().get_txn_ext().and_then(|txn_ext| {
-            txn_ext
-                .pessimistic_locks
-                .read()
-                .map
-                .get(key)
-                .map(|lock| lock.to_lock())
-        })
+    fn load_in_memory_pessimistic_lock(&self, key: &Key) -> Result<Option<Lock>> {
+        self.snapshot
+            .ext()
+            .get_txn_ext()
+            .and_then(|txn_ext| {
+                // If the term or region version has changed, do not read the lock table.
+                // Instead, just return a StaleCommand or EpochNotMatch error, so the
+                // client will not receive a false error because the lock table has been
+                // cleared.
+                let locks = txn_ext.pessimistic_locks.read();
+                if self.term != 0 && locks.term != self.term {
+                    let mut err = errorpb::Error::default();
+                    err.set_stale_command(StaleCommand::default());
+                    return Some(Err(KvError::from(err).into()));
+                }
+                if self.version != 0 && locks.version != self.version {
+                    let mut err = errorpb::Error::default();
+                    // We don't know the current regions. Just return an empty EpochNotMatch error.
+                    err.set_epoch_not_match(EpochNotMatch::default());
+                    return Some(Err(KvError::from(err).into()));
+                }
+
+                locks.get(key).map(|(lock, _)| {
+                    // For write commands that are executed in serial, it should be impossible
+                    // to read a deleted lock.
+                    // For read commands in the scheduler, it should read the lock marked deleted
+                    // because the lock is not actually deleted from the underlying storage.
+                    Ok(lock.to_lock())
+                })
+            })
+            .transpose()
     }
 
     fn get_scan_mode(&self, allow_backward: bool) -> ScanMode {
@@ -556,29 +617,36 @@ impl<S: EngineSnapshot> MvccReader<S> {
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-    use crate::storage::kv::Modify;
-    use crate::storage::mvcc::{tests::write, MvccReader, MvccTxn};
-    use crate::storage::txn::{
-        acquire_pessimistic_lock, cleanup, commit, gc, prewrite, CommitKind, TransactionKind,
-        TransactionProperties,
-    };
-    use crate::storage::{Engine, TestEngineBuilder};
+    use std::{ops::Bound, sync::Arc, u64};
+
     use concurrency_manager::ConcurrencyManager;
-    use engine_rocks::properties::MvccPropertiesCollectorFactory;
-    use engine_rocks::raw::DB;
-    use engine_rocks::raw::{ColumnFamilyOptions, DBOptions};
-    use engine_rocks::raw_util::CFOptions;
-    use engine_rocks::{Compat, RocksSnapshot};
-    use engine_traits::{IterOptions, Mutable, WriteBatch, WriteBatchExt};
-    use engine_traits::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-    use kvproto::kvrpcpb::{AssertionLevel, Context};
-    use kvproto::metapb::{Peer, Region};
+    use engine_rocks::{
+        properties::MvccPropertiesCollectorFactory,
+        raw::{ColumnFamilyOptions, DBOptions, DB},
+        raw_util::CFOptions,
+        Compat, RocksSnapshot,
+    };
+    use engine_traits::{
+        IterOptions, Mutable, WriteBatch, WriteBatchExt, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT,
+        CF_WRITE,
+    };
+    use kvproto::{
+        kvrpcpb::{AssertionLevel, Context},
+        metapb::{Peer, Region},
+    };
     use raftstore::store::RegionSnapshot;
-    use std::ops::Bound;
-    use std::sync::Arc;
-    use std::u64;
     use txn_types::{LockType, Mutation};
+
+    use super::*;
+    use crate::storage::{
+        kv::Modify,
+        mvcc::{tests::write, MvccReader, MvccTxn},
+        txn::{
+            acquire_pessimistic_lock, cleanup, commit, gc, prewrite, CommitKind, TransactionKind,
+            TransactionProperties,
+        },
+        Engine, TestEngineBuilder,
+    };
 
     pub struct RegionEngine {
         db: Arc<DB>,

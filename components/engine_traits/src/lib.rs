@@ -139,7 +139,7 @@
 //!
 //! # The porting process
 //!
-//! These are some guidelines that seem to make the porting managable. As the
+//! These are some guidelines that seem to make the porting manageable. As the
 //! process continues new strategies are discovered and written here. This is a
 //! big refactoring and will take many monthse.
 //!
@@ -293,8 +293,7 @@ mod mvcc_properties;
 mod sst_partitioner;
 pub use crate::sst_partitioner::*;
 mod range_properties;
-pub use crate::mvcc_properties::*;
-pub use crate::range_properties::*;
+pub use crate::{mvcc_properties::*, range_properties::*};
 mod ttl_properties;
 pub use crate::ttl_properties::*;
 mod perf_context;
@@ -327,8 +326,14 @@ mod options;
 pub use crate::options::*;
 pub mod range;
 pub use crate::range::*;
+
+// FIXME: Move raft engine traits to a separate crate.
+
 mod raft_engine;
-pub use raft_engine::{CacheStats, RaftEngine, RaftEngineReadOnly, RaftLogBatch, RaftLogGCTask};
+pub use raft_engine::{
+    CacheStats, RaftEngine, RaftEngineDebug, RaftEngineReadOnly, RaftLogBatch, RaftLogGCTask,
+    RAFT_LOG_MULTI_GET_CNT,
+};
 
 // These modules need further scrutiny
 

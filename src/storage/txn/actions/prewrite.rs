@@ -1,6 +1,14 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
+use std::cmp;
+
+use fail::fail_point;
+use kvproto::kvrpcpb::{Assertion, AssertionLevel};
+use txn_types::{
+    is_short_value, Key, Mutation, MutationType, OldValue, TimeStamp, Value, Write, WriteType,
+};
+
 use crate::storage::{
     mvcc::{
         metrics::{
@@ -9,17 +17,9 @@ use crate::storage::{
         },
         Error, ErrorInner, Lock, LockType, MvccTxn, Result, SnapshotReader,
     },
-    txn::actions::check_data_constraint::check_data_constraint,
-    txn::LockInfo,
+    txn::{actions::check_data_constraint::check_data_constraint, LockInfo},
     Snapshot,
 };
-use fail::fail_point;
-use std::cmp;
-use txn_types::{
-    is_short_value, Key, Mutation, MutationType, OldValue, TimeStamp, Value, Write, WriteType,
-};
-
-use kvproto::kvrpcpb::{Assertion, AssertionLevel};
 
 /// Prewrite a single mutation by creating and storing a lock and value.
 pub fn prewrite<S: Snapshot>(
@@ -340,54 +340,63 @@ impl<'a> PrewriteMutation<'a> {
         &self,
         reader: &mut SnapshotReader<S>,
     ) -> Result<Option<(Write, TimeStamp)>> {
-        match reader.seek_write(&self.key, TimeStamp::max())? {
-            Some((commit_ts, write)) => {
-                // Abort on writes after our start/for_update timestamp ...
-                // If exists a commit version whose commit timestamp is larger than current start/for_update
-                // timestamp, we should abort current prewrite.
-                match self.txn_props.kind {
-                    TransactionKind::Optimistic(_) => {
-                        if commit_ts > self.txn_props.start_ts {
-                            MVCC_CONFLICT_COUNTER.prewrite_write_conflict.inc();
-                            self.write_conflict_error(&write, commit_ts)?;
-                        }
-                    }
-                    // Note: PessimisticLockNotFound can happen on a non-pessimistically locked key,
-                    // if it is a retrying prewrite request.
-                    TransactionKind::Pessimistic(for_update_ts) => {
-                        if commit_ts > for_update_ts {
-                            warn!("conflicting write was found, pessimistic lock must be lost for the corresponding row key"; 
-                                "key" => %self.key, 
-                                "start_ts" => self.txn_props.start_ts, 
-                                "for_update_ts" => for_update_ts,
-                                "conflicting start_ts" => write.start_ts,
-                                "conflicting commit_ts" => commit_ts);
-                            return Err(ErrorInner::PessimisticLockNotFound {
-                                start_ts: self.txn_props.start_ts,
-                                key: self.key.clone().into_raw()?,
-                            }
-                            .into());
-                        }
-                    }
-                }
-                // If there's a write record whose commit_ts equals to our start ts, the current
-                // transaction is ok to continue, unless the record means that the current
-                // transaction has been rolled back.
-                if commit_ts == self.txn_props.start_ts
-                    && (write.write_type == WriteType::Rollback || write.has_overlapped_rollback)
-                {
-                    MVCC_CONFLICT_COUNTER.rolled_back.inc();
-                    // TODO: Maybe we need to add a new error for the rolled back case.
-                    self.write_conflict_error(&write, commit_ts)?;
-                }
-                // Should check it when no lock exists, otherwise it can report error when there is
-                // a lock belonging to a committed transaction which deletes the key.
-                check_data_constraint(reader, self.should_not_exist, &write, commit_ts, &self.key)?;
-
-                Ok(Some((write, commit_ts)))
+        let mut seek_ts = TimeStamp::max();
+        while let Some((commit_ts, write)) = reader.seek_write(&self.key, seek_ts)? {
+            // If there's a write record whose commit_ts equals to our start ts, the current
+            // transaction is ok to continue, unless the record means that the current
+            // transaction has been rolled back.
+            if commit_ts == self.txn_props.start_ts
+                && (write.write_type == WriteType::Rollback || write.has_overlapped_rollback)
+            {
+                MVCC_CONFLICT_COUNTER.rolled_back.inc();
+                // TODO: Maybe we need to add a new error for the rolled back case.
+                self.write_conflict_error(&write, commit_ts)?;
             }
-            None => Ok(None),
+            match self.txn_props.kind {
+                TransactionKind::Optimistic(_) => {
+                    if commit_ts > self.txn_props.start_ts {
+                        MVCC_CONFLICT_COUNTER.prewrite_write_conflict.inc();
+                        self.write_conflict_error(&write, commit_ts)?;
+                    }
+                }
+                // Note: PessimisticLockNotFound can happen on a non-pessimistically locked key,
+                // if it is a retrying prewrite request.
+                TransactionKind::Pessimistic(for_update_ts) => {
+                    if commit_ts > for_update_ts {
+                        // Don't treat newer Rollback records as write conflicts. They can cause
+                        // false positive errors because they can be written even if the pessimistic
+                        // lock of the corresponding row key exists.
+                        // Rollback records are only used to prevent retried prewrite from
+                        // succeeding. Even if the Rollback record of the current transaction is
+                        // collapsed by a newer record, it is safe to prewrite this non-pessimistic
+                        // key because either the primary key is rolled back or it's protected
+                        // because it's written by CheckSecondaryLocks.
+                        if write.write_type == WriteType::Rollback {
+                            seek_ts = commit_ts.prev();
+                            continue;
+                        }
+
+                        warn!("conflicting write was found, pessimistic lock must be lost for the corresponding row key"; 
+                            "key" => %self.key, 
+                            "start_ts" => self.txn_props.start_ts, 
+                            "for_update_ts" => for_update_ts,
+                            "conflicting start_ts" => write.start_ts,
+                            "conflicting commit_ts" => commit_ts);
+                        return Err(ErrorInner::PessimisticLockNotFound {
+                            start_ts: self.txn_props.start_ts,
+                            key: self.key.clone().into_raw()?,
+                        }
+                        .into());
+                    }
+                }
+            }
+            // Should check it when no lock exists, otherwise it can report error when there
+            // is a lock belonging to a committed transaction which deletes the key.
+            check_data_constraint(reader, self.should_not_exist, &write, commit_ts, &self.key)?;
+
+            return Ok(Some((write, commit_ts)));
         }
+        Ok(None)
     }
 
     fn write_lock(self, lock_status: LockStatus, txn: &mut MvccTxn) -> Result<TimeStamp> {
@@ -520,17 +529,25 @@ impl<'a> PrewriteMutation<'a> {
             MVCC_PREWRITE_ASSERTION_PERF_COUNTER_VEC.write_loaded.inc();
         }
 
-        match (self.assertion, write) {
+        let assertion_err = match (self.assertion, write) {
             (Assertion::Exist, None) => {
-                self.assertion_failed_error(TimeStamp::zero(), TimeStamp::zero())?
+                self.assertion_failed_error(TimeStamp::zero(), TimeStamp::zero())
             }
             (Assertion::Exist, Some((w, commit_ts))) if w.write_type == WriteType::Delete => {
-                self.assertion_failed_error(w.start_ts, *commit_ts)?;
+                self.assertion_failed_error(w.start_ts, *commit_ts)
             }
             (Assertion::NotExist, Some((w, commit_ts))) if w.write_type == WriteType::Put => {
-                self.assertion_failed_error(w.start_ts, *commit_ts)?;
+                self.assertion_failed_error(w.start_ts, *commit_ts)
             }
-            _ => (),
+            _ => Ok(()),
+        };
+
+        // Assertion error can be caused by a rollback. So make up a constraint check if the check was skipped before.
+        if assertion_err.is_err() {
+            if self.skip_constraint_check() {
+                self.check_for_newer_version(reader)?;
+            }
+            assertion_err?;
         }
 
         Ok((reloaded_write, reloaded))
@@ -680,6 +697,16 @@ fn amend_pessimistic_lock<S: Snapshot>(
 }
 
 pub mod tests {
+    #[cfg(test)]
+    use std::sync::Arc;
+
+    use concurrency_manager::ConcurrencyManager;
+    use kvproto::kvrpcpb::Context;
+    #[cfg(test)]
+    use rand::{Rng, SeedableRng};
+    #[cfg(test)]
+    use txn_types::OldValue;
+
     use super::*;
     #[cfg(test)]
     use crate::storage::{
@@ -687,14 +714,6 @@ pub mod tests {
         txn::{commands::prewrite::fallback_1pc_locks, tests::*},
     };
     use crate::storage::{mvcc::tests::*, Engine};
-    use concurrency_manager::ConcurrencyManager;
-    use kvproto::kvrpcpb::Context;
-    #[cfg(test)]
-    use rand::{Rng, SeedableRng};
-    #[cfg(test)]
-    use std::sync::Arc;
-    #[cfg(test)]
-    use txn_types::OldValue;
 
     fn optimistic_txn_props(primary: &[u8], start_ts: TimeStamp) -> TransactionProperties<'_> {
         TransactionProperties {
@@ -1474,6 +1493,38 @@ pub mod tests {
             kvproto::kvrpcpb::AssertionLevel::Off,
         );
         must_locked(&engine, b"k2", 13);
+        must_rollback(&engine, b"k2", 13, false);
+
+        // Write a Rollback at 50 first. A retried prewrite at the same ts should
+        // report WriteConflict.
+        must_rollback(&engine, b"k2", 50, false);
+        let err = must_retry_pessimistic_prewrite_put_err(
+            &engine, b"k2", b"v2", b"k1", &None, 50, 50, false, 0,
+        );
+        assert!(
+            matches!(err, Error(box ErrorInner::WriteConflict { .. })),
+            "{:?}",
+            err
+        );
+        // But prewriting at 48 can succeed because a newer rollback is allowed.
+        must_prewrite_put_impl(
+            &engine,
+            b"k2",
+            b"v2",
+            b"k1",
+            &None,
+            48.into(),
+            false,
+            100,
+            48.into(),
+            1,
+            49.into(),
+            TimeStamp::default(),
+            true,
+            kvproto::kvrpcpb::Assertion::None,
+            kvproto::kvrpcpb::AssertionLevel::Off,
+        );
+        must_locked(&engine, b"k2", 48);
     }
 
     #[test]

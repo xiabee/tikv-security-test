@@ -1,14 +1,12 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use prometheus::*;
+use prometheus::{exponential_buckets, *};
 use prometheus_static_metric::*;
-
-use crate::storage::ErrorHeaderKind;
-use prometheus::exponential_buckets;
 
 pub use crate::storage::kv::metrics::{
     GcKeysCF, GcKeysCounterVec, GcKeysCounterVecInner, GcKeysDetail,
 };
+use crate::storage::ErrorHeaderKind;
 
 make_auto_flush_static_metric! {
     pub label_enum GrpcTypeKind {
@@ -62,6 +60,7 @@ make_auto_flush_static_metric! {
     pub label_enum GcCommandKind {
         gc,
         gc_keys,
+        raw_gc_keys,
         unsafe_destroy_range,
         physical_scan_lock,
         validate_config,
@@ -209,6 +208,10 @@ lazy_static! {
         &["cf", "tag"]
     )
     .unwrap();
+    pub static ref GC_KEY_FAILURES: IntCounter = register_int_counter!(
+        "tikv_gcworker_gc_key_failures",
+        "Counter of gc key failures"
+    ).unwrap();
     pub static ref GRPC_MSG_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
         "tikv_grpc_msg_duration_seconds",
         "Bucketed histogram of grpc server messages",

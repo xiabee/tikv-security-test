@@ -9,6 +9,19 @@ mod cmd;
 mod executor;
 mod util;
 
+use std::{
+    borrow::ToOwned,
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufReader, Read},
+    path::Path,
+    str,
+    string::ToString,
+    sync::Arc,
+    thread,
+    time::Duration,
+    u64,
+};
+
 use encryption_export::{
     create_backend, data_key_manager_from_config, encryption_method_from_db_encryption_method,
     DataKeyManager, DecrypterReader, Iv,
@@ -19,33 +32,23 @@ use file_system::calc_crc32;
 use futures::executor::block_on;
 use gag::BufferRedirect;
 use grpcio::{CallOption, ChannelBuilder, Environment};
-use kvproto::debugpb::{Db as DBType, *};
-use kvproto::encryptionpb::EncryptionMethod;
-use kvproto::kvrpcpb::SplitRegionRequest;
-use kvproto::raft_serverpb::SnapshotMeta;
-use kvproto::tikvpb::TikvClient;
+use kvproto::{
+    debugpb::{Db as DBType, *},
+    encryptionpb::EncryptionMethod,
+    kvrpcpb::SplitRegionRequest,
+    raft_serverpb::SnapshotMeta,
+    tikvpb::TikvClient,
+};
 use pd_client::{Config as PdConfig, PdClient, RpcClient};
 use protobuf::Message;
 use regex::Regex;
 use security::{SecurityConfig, SecurityManager};
-use std::borrow::ToOwned;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read};
-use std::path::Path;
-use std::string::ToString;
-use std::sync::Arc;
-use std::time::Duration;
-use std::{process, str, thread, u64};
-use structopt::clap::ErrorKind;
-use structopt::StructOpt;
-use tikv::config::TiKvConfig;
-use tikv::server::debug::BottommostLevelCompaction;
+use structopt::{clap::ErrorKind, StructOpt};
+use tikv::{config::TiKvConfig, server::debug::BottommostLevelCompaction};
 use tikv_util::{escape, run_and_wait_child_process, unescape};
 use txn_types::Key;
 
-use crate::cmd::*;
-use crate::executor::*;
-use crate::util::*;
+use crate::{cmd::*, executor::*, util::*};
 
 fn main() {
     let opt = Opt::from_args();
@@ -96,6 +99,7 @@ fn main() {
             match args[0].as_str() {
                 "ldb" => run_ldb_command(args, &cfg),
                 "sst_dump" => run_sst_dump_command(args, &cfg),
+                "raft-engine-ctl" => run_raft_engine_ctl_command(args),
                 _ => Opt::clap().print_help().unwrap(),
             }
         }
@@ -180,6 +184,19 @@ fn main() {
                 DataKeyManager::dump_file_dict(&cfg.storage.data_dir, path.as_deref()).unwrap();
             }
         },
+        Cmd::CleanupEncryptionMeta {} => {
+            let key_manager =
+                match data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
+                    .expect("data_key_manager_from_config should success")
+                {
+                    Some(mgr) => mgr,
+                    None => {
+                        println!("Encryption is disabled");
+                        return;
+                    }
+                };
+            key_manager.retain_encrypted_files(|fname| Path::new(fname).exists())
+        }
         Cmd::CompactCluster {
             db,
             cf,
@@ -269,7 +286,7 @@ fn main() {
                     let limit = limit.unwrap_or(0);
                     if to.is_empty() && limit == 0 {
                         println!(r#"please pass "to" or "limit""#);
-                        process::exit(-1);
+                        tikv_util::logger::exit_process_gracefully(-1);
                     }
                     let cfs = show_cf.iter().map(AsRef::as_ref).collect();
                     debug_executor.dump_mvccs_infos(from, to, limit, cfs, start_ts, commit_ts);
@@ -423,7 +440,7 @@ fn main() {
                 Cmd::Fail { cmd: subcmd } => {
                     if host.is_none() {
                         println!("command fail requires host");
-                        process::exit(-1);
+                        tikv_util::logger::exit_process_gracefully(-1);
                     }
                     let client = new_debug_client(host.unwrap(), mgr);
                     match subcmd {
@@ -655,6 +672,11 @@ fn run_ldb_command(args: Vec<String>, cfg: &TiKvConfig) {
 fn run_sst_dump_command(args: Vec<String>, cfg: &TiKvConfig) {
     let opts = cfg.rocksdb.build_opt();
     engine_rocks::raw::run_sst_dump_tool(&args, &opts);
+}
+
+fn run_raft_engine_ctl_command(mut args: Vec<String>) {
+    args.remove(0);
+    raft_engine_ctl::run_command(args);
 }
 
 fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, cfg: &TiKvConfig) {

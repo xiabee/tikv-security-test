@@ -5,16 +5,16 @@ use std::{
     pin::Pin,
 };
 
+use file_system::File;
 use futures_util::{
     io::AsyncRead,
     task::{Context, Poll},
 };
 use kvproto::encryptionpb::EncryptionMethod;
 use openssl::symm::{Cipher as OCipher, Crypter as OCrypter, Mode};
+use tikv_util::box_err;
 
 use crate::{Iv, Result};
-use file_system::File;
-use tikv_util::box_err;
 
 const AES_BLOCK_SIZE: usize = 16;
 const MAX_INPLACE_CRYPTION_SIZE: usize = 1024 * 1024;
@@ -131,6 +131,16 @@ impl<W> EncrypterWriter<W> {
     #[inline]
     pub fn finalize(self) -> IoResult<W> {
         self.0.finalize()
+    }
+
+    #[inline]
+    pub fn inner(&self) -> &W {
+        &self.0.writer
+    }
+
+    #[inline]
+    pub fn inner_mut(&mut self) -> &mut W {
+        &mut self.0.writer
     }
 }
 
@@ -399,10 +409,7 @@ impl CrypterCore {
 
     fn reset_buffer(&mut self, size: usize) {
         // OCrypter require the output buffer to have block_size extra bytes, or it will panic.
-        self.buffer.reserve(size + self.block_size);
-        unsafe {
-            self.buffer.set_len(size + self.block_size);
-        }
+        self.buffer.resize(size + self.block_size, 0);
     }
 
     pub fn reset_crypter(&mut self, offset: u64) -> IoResult<()> {
@@ -495,12 +502,14 @@ impl CrypterCore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::crypter;
+    use std::{cmp::min, io::Cursor};
+
     use byteorder::{BigEndian, ByteOrder};
     use futures::AsyncReadExt;
     use rand::{rngs::OsRng, RngCore};
-    use std::{cmp::min, io::Cursor};
+
+    use super::*;
+    use crate::crypter;
 
     fn generate_data_key(method: EncryptionMethod) -> Vec<u8> {
         let key_length = crypter::get_method_key_length(method);

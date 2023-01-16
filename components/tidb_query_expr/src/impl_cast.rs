@@ -1,26 +1,34 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::borrow::Cow;
-use std::convert::TryFrom;
-use std::convert::TryInto;
-use std::num::IntErrorKind;
+use std::{
+    borrow::Cow,
+    convert::{TryFrom, TryInto},
+    num::IntErrorKind,
+};
 
+use byteorder::{BigEndian, ByteOrder};
 use num_traits::identities::Zero;
 use tidb_query_codegen::rpn_fn;
-use tidb_query_datatype::*;
+use tidb_query_common::Result;
+use tidb_query_datatype::{
+    codec::{
+        collation::Encoding,
+        convert::*,
+        data_type::*,
+        error::{ERR_DATA_OUT_OF_RANGE, ERR_TRUNCATE_WRONG_VALUE},
+        mysql::{
+            binary_literal,
+            time::{MAX_YEAR, MIN_YEAR},
+            Time,
+        },
+        Error,
+    },
+    expr::EvalContext,
+    *,
+};
 use tipb::{Expr, FieldType};
 
-use crate::types::RpnExpressionBuilder;
-use crate::{RpnExpressionNode, RpnFnCallExtra, RpnFnMeta};
-use tidb_query_common::Result;
-use tidb_query_datatype::codec::collation::Encoding;
-use tidb_query_datatype::codec::convert::*;
-use tidb_query_datatype::codec::data_type::*;
-use tidb_query_datatype::codec::error::{ERR_DATA_OUT_OF_RANGE, ERR_TRUNCATE_WRONG_VALUE};
-use tidb_query_datatype::codec::mysql::time::{MAX_YEAR, MIN_YEAR};
-use tidb_query_datatype::codec::mysql::{binary_literal, Time};
-use tidb_query_datatype::codec::Error;
-use tidb_query_datatype::expr::EvalContext;
+use crate::{types::RpnExpressionBuilder, RpnExpressionNode, RpnFnCallExtra, RpnFnMeta};
 
 fn get_cast_fn_rpn_meta(
     is_from_constant: bool,
@@ -114,6 +122,8 @@ fn get_cast_fn_rpn_meta(
         (EvalType::Int, EvalType::Bytes) => {
             if FieldTypeAccessor::tp(from_field_type) == FieldTypeTp::Year {
                 cast_year_as_string_fn_meta()
+            } else if FieldTypeAccessor::tp(from_field_type) == FieldTypeTp::Bit {
+                cast_bit_as_string_fn_meta()
             } else if from_field_type.is_unsigned() {
                 cast_uint_as_string_fn_meta()
             } else {
@@ -516,12 +526,11 @@ fn cast_string_as_signed_real(
     match val {
         None => Ok(None),
         Some(val) => {
-            let r: f64;
-            if val.is_empty() {
-                r = 0.0;
+            let r = if val.is_empty() {
+                0.0
             } else {
-                r = val.convert(ctx)?;
-            }
+                val.convert(ctx)?
+            };
             let r = produce_float_with_specified_tp(ctx, extra.ret_field_type, r)?;
             Ok(Real::new(r).ok())
         }
@@ -641,6 +650,31 @@ fn cast_year_as_string(
         val.to_string().into_bytes()
     };
     cast_as_string_helper(ctx, extra, cast)
+}
+
+#[rpn_fn(nullable, capture = [ctx, extra])]
+#[inline]
+fn cast_bit_as_string(
+    _ctx: &mut EvalContext,
+    extra: &RpnFnCallExtra,
+    val: Option<&Int>,
+) -> Result<Option<Bytes>> {
+    match val {
+        None => Ok(None),
+        Some(val) => {
+            let mut buf = [0; 8];
+            BigEndian::write_u64(&mut buf, *val as u64);
+            let flen = extra.ret_field_type.as_accessor().flen();
+            if flen > 0 && flen <= 8 {
+                let start_idx: usize = (8 - flen) as usize;
+                let buf = &buf[start_idx..8];
+                Ok(Some(buf.to_vec()))
+            } else {
+                // The length of casting bit to string should between 0 and 8.
+                Err(other_err!("Unsupported ret_field_type.Flen {:?}", flen))
+            }
+        }
+    }
 }
 
 #[rpn_fn(nullable, capture = [ctx, extra])]
@@ -1452,31 +1486,38 @@ fn from_binary<E: Encoding>(val: BytesRef) -> Result<Option<Bytes>> {
 
 #[cfg(test)]
 mod tests {
-    use super::Result;
-    use crate::impl_cast::*;
-    use crate::types::test_util::RpnFnScalarEvaluator;
-    use crate::RpnFnCallExtra;
-    use std::collections::BTreeMap;
-    use std::fmt::{Debug, Display};
-    use std::sync::Arc;
-    use std::{f32, f64, i64, u64};
-    use tidb_query_datatype::builder::FieldTypeBuilder;
-    use tidb_query_datatype::codec::convert::produce_dec_with_specified_tp;
-    use tidb_query_datatype::codec::data_type::{Bytes, Int, Real};
-    use tidb_query_datatype::codec::error::{
-        ERR_DATA_OUT_OF_RANGE, ERR_DATA_TOO_LONG, ERR_TRUNCATE_WRONG_VALUE, ERR_UNKNOWN,
-        WARN_DATA_TRUNCATED,
+    use std::{
+        collections::BTreeMap,
+        f32, f64,
+        fmt::{Debug, Display},
+        i64,
+        sync::Arc,
+        u64,
     };
-    use tidb_query_datatype::codec::mysql::charset::*;
-    use tidb_query_datatype::codec::mysql::decimal::{max_decimal, max_or_min_dec};
-    use tidb_query_datatype::codec::mysql::{
-        Decimal, Duration, Json, RoundMode, Time, TimeType, MAX_FSP, MIN_FSP,
+
+    use tidb_query_datatype::{
+        builder::FieldTypeBuilder,
+        codec::{
+            convert::produce_dec_with_specified_tp,
+            data_type::{Bytes, Int, Real},
+            error::{
+                ERR_DATA_OUT_OF_RANGE, ERR_DATA_TOO_LONG, ERR_TRUNCATE_WRONG_VALUE, ERR_UNKNOWN,
+                WARN_DATA_TRUNCATED,
+            },
+            mysql::{
+                charset::*,
+                decimal::{max_decimal, max_or_min_dec},
+                Decimal, Duration, Json, RoundMode, Time, TimeType, MAX_FSP, MIN_FSP,
+            },
+        },
+        expr::{EvalConfig, EvalContext, Flag},
+        Collation, FieldTypeFlag, FieldTypeTp, UNSPECIFIED_LENGTH,
     };
-    use tidb_query_datatype::expr::Flag;
-    use tidb_query_datatype::expr::{EvalConfig, EvalContext};
-    use tidb_query_datatype::{Collation, FieldTypeFlag, FieldTypeTp, UNSPECIFIED_LENGTH};
     use tikv_util::buffer_vec::BufferVec;
     use tipb::ScalarFuncSig;
+
+    use super::Result;
+    use crate::{impl_cast::*, types::test_util::RpnFnScalarEvaluator, RpnFnCallExtra};
 
     fn test_none_with_ctx_and_extra<F, Input, Ret>(func: F)
     where
@@ -1558,24 +1599,13 @@ mod tests {
         assert!(r.is_none());
     }
 
+    #[derive(Default)]
     struct CtxConfig {
         overflow_as_warning: bool,
         truncate_as_warning: bool,
         should_clip_to_zero: bool,
         in_insert_stmt: bool,
         in_update_or_delete_stmt: bool,
-    }
-
-    impl Default for CtxConfig {
-        fn default() -> Self {
-            CtxConfig {
-                overflow_as_warning: false,
-                truncate_as_warning: false,
-                should_clip_to_zero: false,
-                in_insert_stmt: false,
-                in_update_or_delete_stmt: false,
-            }
-        }
     }
 
     impl From<CtxConfig> for EvalContext {
@@ -4936,7 +4966,7 @@ mod tests {
                         overflow_as_warning,
                         truncate_as_warning,
                         warning_err_code,
-                        expect.to_string(),
+                        expect,
                         pd_res_log,
                         cast_func_res_log
                     );
@@ -6168,12 +6198,11 @@ mod tests {
                     Ok(v) => match v {
                         Some(dur) => {
                             if expect_max {
-                                let max_val_str: &str;
-                                if dur.is_neg() {
-                                    max_val_str = "-838:59:59";
+                                let max_val_str = if dur.is_neg() {
+                                    "-838:59:59"
                                 } else {
-                                    max_val_str = "838:59:59";
-                                }
+                                    "838:59:59"
+                                };
                                 let max_expect = Duration::parse(&mut ctx, max_val_str, fsp);
                                 let log = format!(
                                     "func_name: {}, input: {}, output: {:?}, output_warn: {:?}, expect: {:?}",

@@ -1,23 +1,24 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::HashMap;
-use std::mem;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    mem,
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{self, RecvTimeoutError},
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration,
+};
 
 use futures::executor::block_on;
 use kvproto::raft_serverpb::RaftMessage;
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
-use raftstore::store::ReadIndexContext;
-use raftstore::Result;
+use raftstore::{store::ReadIndexContext, Result};
 use test_raftstore::*;
-use tikv_util::config::*;
-use tikv_util::time::Instant;
-use tikv_util::HandyRwLock;
+use tikv_util::{config::*, time::Instant, HandyRwLock};
 use txn_types::{Key, Lock, LockType};
 use uuid::Uuid;
 
@@ -104,7 +105,7 @@ fn test_replica_read_not_applied() {
 
     // Unpark all append responses so that the new leader can commit its first entry.
     let router = cluster.sim.wl().get_router(2).unwrap();
-    for raft_msg in mem::replace(dropped_msgs.lock().unwrap().as_mut(), vec![]) {
+    for raft_msg in mem::take::<Vec<_>>(dropped_msgs.lock().unwrap().as_mut()) {
         router.send_raft_message(raft_msg).unwrap();
     }
 
@@ -192,6 +193,7 @@ fn test_read_hibernated_region() {
     // Initialize the cluster.
     configure_for_lease_read(&mut cluster, Some(100), Some(8));
     cluster.cfg.raft_store.raft_store_max_leader_lease = ReadableDuration(Duration::from_millis(1));
+    cluster.cfg.raft_store.check_leader_lease_interval = ReadableDuration::hours(10);
     cluster.pd_client.disable_default_operator();
     let r1 = cluster.run_conf_change();
     let p2 = new_peer(2, 2);
@@ -333,6 +335,8 @@ fn test_read_index_retry_lock_checking() {
 
     let rid = cluster.run_conf_change();
     pd_client.must_add_peer(rid, new_peer(2, 2));
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
 
     cluster.must_transfer_leader(1, new_peer(2, 2));
     cluster.must_transfer_leader(1, new_peer(1, 1));
@@ -397,7 +401,7 @@ fn test_split_isolation() {
     // Use long election timeout and short lease.
     configure_for_hibernate(&mut cluster);
     configure_for_lease_read(&mut cluster, Some(50), Some(20));
-    cluster.cfg.raft_store.raft_log_gc_count_limit = 11;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(11);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -415,7 +419,7 @@ fn test_split_isolation() {
     cluster.must_split(&r1, b"k2");
     let idx = cluster.truncated_state(1, 1).get_index();
     // Trigger a log compaction, so the left region ['', 'k2'] cannot created through split cmd.
-    for i in 2..cluster.cfg.raft_store.raft_log_gc_count_limit * 2 {
+    for i in 2..cluster.cfg.raft_store.raft_log_gc_count_limit() * 2 {
         cluster.must_put(format!("k{}", i).as_bytes(), format!("v{}", i).as_bytes());
     }
     cluster.wait_log_truncated(1, 1, idx + 1);
@@ -454,7 +458,8 @@ fn test_read_local_after_snapshpot_replace_peer() {
     let mut cluster = new_node_cluster(0, 3);
     configure_for_lease_read(&mut cluster, Some(50), None);
     cluster.cfg.raft_store.raft_log_gc_threshold = 12;
-    cluster.cfg.raft_store.raft_log_gc_count_limit = 12;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(12);
+
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -517,8 +522,9 @@ fn test_malformed_read_index() {
     let mut cluster = new_node_cluster(0, 3);
     configure_for_lease_read(&mut cluster, Some(50), None);
     cluster.cfg.raft_store.raft_log_gc_threshold = 12;
-    cluster.cfg.raft_store.raft_log_gc_count_limit = 12;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(12);
     cluster.cfg.raft_store.hibernate_regions = true;
+    cluster.cfg.raft_store.check_leader_lease_interval = ReadableDuration::hours(10);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 

@@ -1,14 +1,14 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use collections::HashMap;
-use kvproto::kvrpcpb::Context;
-use kvproto::resource_usage_agent::ResourceUsageRecord;
-use resource_metering::error::Result;
-use resource_metering::{init_recorder, init_reporter, Config, DataSink};
+use kvproto::{kvrpcpb::Context, resource_usage_agent::ResourceUsageRecord};
+use resource_metering::{error::Result, init_recorder, init_reporter, Config, DataSink};
 use tikv_util::config::ReadableDuration;
 
 const PRECISION_MS: u64 = 1000;
@@ -69,7 +69,7 @@ fn test_summary() {
                 resource_metering::record_write_keys(456);
             }
             thread::sleep(Duration::from_millis(REPORT_INTERVAL_MS + 500)); // wait report
-            assert!(data_sink.get(&b"TAG-1".to_vec()).is_none());
+            assert!(data_sink.get(b"TAG-1").is_none());
             data_sink.clear();
         })
         .join()
@@ -95,7 +95,7 @@ fn test_summary() {
             }
             thread::sleep(Duration::from_millis(REPORT_INTERVAL_MS + 500)); // wait report
 
-            let r = data_sink.get(&b"TAG-1".to_vec()).unwrap();
+            let r = data_sink.get(b"TAG-1").unwrap();
             assert_eq!(
                 r.get_record()
                     .get_items()
@@ -133,7 +133,7 @@ fn test_summary() {
             resource_metering::record_write_keys(456);
         }
         thread::sleep(Duration::from_millis(REPORT_INTERVAL_MS + 500)); // wait report
-        assert!(data_sink.get(&b"TAG-1".to_vec()).is_none());
+        assert!(data_sink.get(b"TAG-1").is_none());
         data_sink.clear();
     })
     .join()

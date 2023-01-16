@@ -1,13 +1,14 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::ops::{Index, IndexMut, Range, RangeFrom, RangeTo};
+
 use tipb::FieldType;
 
 use super::LazyBatchColumn;
-use crate::codec::data_type::VectorValue;
-use crate::codec::Result;
-use crate::expr::EvalContext;
-
-use std::ops::{Index, IndexMut, Range, RangeFrom, RangeTo};
+use crate::{
+    codec::{data_type::VectorValue, Result},
+    expr::EvalContext,
+};
 
 /// Stores multiple `LazyBatchColumn`s. Each column has an equal length.
 #[derive(Clone, Debug)]
@@ -48,6 +49,7 @@ impl LazyBatchColumnVec {
 
     /// Creates a new empty `LazyBatchColumnVec` with the same number of columns and schema.
     #[inline]
+    #[must_use]
     pub fn clone_empty(&self, capacity: usize) -> Self {
         Self {
             columns: self
@@ -60,6 +62,7 @@ impl LazyBatchColumnVec {
 
     /// Creates a new `LazyBatchColumnVec`, which contains `columns_count` number of raw columns.
     #[cfg(test)]
+    #[must_use]
     pub fn with_raw_columns(columns_count: usize) -> Self {
         let mut columns = Vec::with_capacity(columns_count);
         for _ in 0..columns_count {

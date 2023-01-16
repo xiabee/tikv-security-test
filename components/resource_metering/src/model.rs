@@ -1,17 +1,19 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::TagInfos;
-
-use std::cell::Cell;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    cell::Cell,
+    sync::{
+        atomic::{AtomicU32, Ordering::Relaxed},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use collections::HashMap;
 use kvproto::resource_usage_agent::{GroupTagRecord, GroupTagRecordItem, ResourceUsageRecord};
 use tikv_util::warn;
+
+use crate::TagInfos;
 
 thread_local! {
     static STATIC_BUF: Cell<Vec<u32>> = Cell::new(vec![]);
@@ -324,6 +326,7 @@ impl SummaryRecord {
     }
 
     /// Gets the value and writes it to zero.
+    #[must_use]
     pub fn take_and_reset(&self) -> Self {
         Self {
             read_keys: AtomicU32::new(self.read_keys.swap(0, Relaxed)),
@@ -334,9 +337,10 @@ impl SummaryRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
     use super::*;
     use crate::TagInfos;
-    use std::sync::atomic::Ordering::Relaxed;
 
     #[test]
     fn test_summary_record() {
@@ -371,18 +375,21 @@ mod tests {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"a".to_vec(),
         });
         let tag2 = Arc::new(TagInfos {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"b".to_vec(),
         });
         let tag3 = Arc::new(TagInfos {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"c".to_vec(),
         });
         let mut records = Records::default();
@@ -427,18 +434,21 @@ mod tests {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"a".to_vec(),
         });
         let tag2 = Arc::new(TagInfos {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"b".to_vec(),
         });
         let tag3 = Arc::new(TagInfos {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"c".to_vec(),
         });
         let mut records = HashMap::default();
@@ -503,18 +513,21 @@ mod tests {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"a".to_vec(),
         });
         let tag2 = Arc::new(TagInfos {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"b".to_vec(),
         });
         let tag3 = Arc::new(TagInfos {
             store_id: 0,
             region_id: 0,
             peer_id: 0,
+            key_ranges: vec![],
             extra_attachment: b"c".to_vec(),
         });
 

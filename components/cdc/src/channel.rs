@@ -1,8 +1,13 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::fmt;
-use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
-use std::time::Duration;
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use futures::{
     channel::mpsc::{
@@ -15,8 +20,7 @@ use futures::{
 use grpcio::WriteFlags;
 use kvproto::cdcpb::{ChangeDataEvent, Event, ResolvedTs};
 use protobuf::Message;
-use tikv_util::time::Instant;
-use tikv_util::{impl_display_as_debug, warn};
+use tikv_util::{impl_display_as_debug, time::Instant, warn};
 
 use crate::metrics::*;
 
@@ -164,7 +168,7 @@ impl EventBatcher {
                 self.total_resolved_ts_bytes += size as usize;
             }
             CdcEvent::Barrier(_) => {
-                // Barrier requires events must be batched accross the barrier.
+                // Barrier requires events must be batched across the barrier.
                 self.last_size = CDC_RESP_MAX_BYTES;
             }
         }
@@ -387,12 +391,12 @@ impl<'a> Drain {
             });
             let (event_bytes, resolved_ts_bytes) = batcher.statistics();
             let resps = batcher.build();
-            let last_idx = resps.len() - 1;
+            let resps_len = resps.len();
             // Events are about to be sent, free pending events memory counter.
             memory_quota.free(bytes as _);
             for (i, e) in resps.into_iter().enumerate() {
                 // Buffer messages and flush them at once.
-                let write_flags = WriteFlags::default().buffer_hint(i != last_idx);
+                let write_flags = WriteFlags::default().buffer_hint(i + 1 != resps_len);
                 sink.feed((e, write_flags)).await?;
             }
             sink.flush().await?;
@@ -450,13 +454,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::{assert_matches::assert_matches, sync::mpsc, time::Duration};
 
     use futures::executor::block_on;
-    use kvproto::cdcpb::{ChangeDataEvent, Event, ResolvedTs};
-    use kvproto::cdcpb::{EventEntries, EventRow, Event_oneof_event};
+    use kvproto::cdcpb::{
+        ChangeDataEvent, Event, EventEntries, EventRow, Event_oneof_event, ResolvedTs,
+    };
 
     use super::*;
 

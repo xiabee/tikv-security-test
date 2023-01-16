@@ -1,15 +1,17 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{
+    sync::{mpsc, Arc},
+    thread,
+    time::Duration,
+};
+
 use grpcio::EnvBuilder;
 use kvproto::metapb::*;
 use pd_client::{PdClient, RegionInfo, RegionStat, RpcClient};
 use security::{SecurityConfig, SecurityManager};
 use test_pd::{mocker::*, util::*, Server as MockServer};
 use tikv_util::config::ReadableDuration;
-
-use std::sync::{mpsc, Arc};
-use std::thread;
-use std::time::Duration;
 
 fn new_test_server_and_client(
     update_interval: ReadableDuration,
@@ -64,7 +66,7 @@ fn test_pd_client_deadlock() {
         request!(client => block_on(region_heartbeat(0, Region::default(), Peer::default(), RegionStat::default(), None))),
         request!(client => block_on(ask_split(Region::default()))),
         request!(client => block_on(ask_batch_split(Region::default(), 1))),
-        request!(client => block_on(store_heartbeat(Default::default(), None))),
+        request!(client => block_on(store_heartbeat(Default::default(), None, None))),
         request!(client => block_on(report_batch_split(vec![]))),
         request!(client => scatter_region(RegionInfo::new(Region::default(), None))),
         request!(client => block_on(get_gc_safe_point())),

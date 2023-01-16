@@ -1,15 +1,16 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{iter, str};
+use std::{cmp::Ordering, iter, str};
+
+use bstr::ByteSlice;
 use tidb_query_codegen::rpn_fn;
+use tidb_query_common::Result;
+use tidb_query_datatype::{
+    codec::{collation::*, data_type::*},
+    *,
+};
 
 use crate::impl_math::i64_to_usize;
-use bstr::ByteSlice;
-use std::cmp::Ordering;
-use tidb_query_common::Result;
-use tidb_query_datatype::codec::collation::*;
-use tidb_query_datatype::codec::data_type::*;
-use tidb_query_datatype::*;
 
 const SPACE: u8 = 0o40u8;
 const MAX_BLOB_WIDTH: i32 = 16_777_216; // FIXME: Should be isize
@@ -31,7 +32,7 @@ fn get_utf8_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .map(|(i, _)| i)
         .nth(char_idx)
-        .unwrap_or_else(|| s.len())
+        .unwrap_or(s.len())
 }
 
 #[rpn_fn(writer)]
@@ -435,7 +436,7 @@ pub fn left(lhs: BytesRef, rhs: &Int, writer: BytesWriter) -> Result<BytesGuard>
         return Ok(writer.write_ref(Some(b"")));
     }
     let rhs = *rhs as usize;
-    let result = if lhs.len() < rhs { &lhs } else { &lhs[..rhs] };
+    let result = if lhs.len() < rhs { lhs } else { &lhs[..rhs] };
 
     Ok(writer.write_ref(Some(result)))
 }
@@ -500,6 +501,35 @@ pub fn insert(
     ret.extend_from_slice(newstr);
     ret.extend_from_slice(&s[upos + ulen - 1..]);
     Ok(writer.write(Some(ret)))
+}
+
+#[rpn_fn(writer)]
+#[inline]
+pub fn insert_utf8(
+    s_utf8: BytesRef,
+    pos: &Int,
+    len: &Int,
+    newstr_utf8: BytesRef,
+    writer: BytesWriter,
+) -> Result<BytesGuard> {
+    let s = str::from_utf8(&*s_utf8)?;
+    let newstr = str::from_utf8(&*newstr_utf8)?;
+    let pos = *pos;
+    let len = *len;
+    let upos: usize = pos as usize;
+    let slen = s.chars().count();
+    let mut ulen: usize = len as usize;
+    if pos < 1 || upos > slen {
+        return Ok(writer.write_ref(Some(s_utf8)));
+    }
+    if ulen > slen - upos + 1 || len < 0 {
+        ulen = slen - upos + 1;
+    }
+    let mut pw = writer.begin();
+    pw.partial_write(s[0..upos - 1].as_bytes());
+    pw.partial_write(newstr.as_bytes());
+    pw.partial_write(s[upos + ulen - 1..].as_bytes());
+    Ok(pw.finish())
 }
 
 #[rpn_fn(writer)]
@@ -1079,7 +1109,7 @@ fn substring(input: BytesRef, pos: Int, len: Int, writer: BytesWriter) -> Result
     let start = if pos_positive {
         (pos - 1).min(input.len())
     } else {
-        input.len().checked_sub(pos).unwrap_or_else(|| input.len())
+        input.len().checked_sub(pos).unwrap_or(input.len())
     };
     let end = start.saturating_add(len).min(input.len());
     Ok(writer.write_ref(Some(&input[start..end])))
@@ -1089,8 +1119,10 @@ fn substring(input: BytesRef, pos: Int, len: Int, writer: BytesWriter) -> Result
 mod tests {
     use std::{f64, i64};
 
-    use tidb_query_datatype::builder::FieldTypeBuilder;
-    use tidb_query_datatype::codec::mysql::charset::{CHARSET_GBK, CHARSET_UTF8MB4};
+    use tidb_query_datatype::{
+        builder::FieldTypeBuilder,
+        codec::mysql::charset::{CHARSET_GBK, CHARSET_UTF8MB4},
+    };
     use tipb::ScalarFuncSig;
 
     use super::*;
@@ -2613,6 +2645,145 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_utf8() {
+        let cases = vec![
+            (
+                "hello, world!".as_bytes(),
+                1,
+                0,
+                "asd".as_bytes(),
+                "asdhello, world!".as_bytes(),
+            ),
+            (
+                "hello, world!".as_bytes(),
+                0,
+                -1,
+                "asd".as_bytes(),
+                "hello, world!".as_bytes(),
+            ),
+            (
+                "hello, world!".as_bytes(),
+                0,
+                0,
+                "asd".as_bytes(),
+                "hello, world!".as_bytes(),
+            ),
+            (
+                "hello, world!".as_bytes(),
+                -1,
+                0,
+                "asd".as_bytes(),
+                "hello, world!".as_bytes(),
+            ),
+            (
+                "hello, world!".as_bytes(),
+                1,
+                -1,
+                "asd".as_bytes(),
+                "asd".as_bytes(),
+            ),
+            (
+                "hello, world!".as_bytes(),
+                1,
+                1,
+                "asd".as_bytes(),
+                "asdello, world!".as_bytes(),
+            ),
+            (
+                "hello, world!".as_bytes(),
+                1,
+                3,
+                "asd".as_bytes(),
+                "asdlo, world!".as_bytes(),
+            ),
+            (
+                "hello, world!".as_bytes(),
+                2,
+                2,
+                "asd".as_bytes(),
+                "hasdlo, world!".as_bytes(),
+            ),
+            (
+                "hello".as_bytes(),
+                5,
+                2,
+                "asd".as_bytes(),
+                "hellasd".as_bytes(),
+            ),
+            (
+                "hello".as_bytes(),
+                5,
+                200,
+                "asd".as_bytes(),
+                "hellasd".as_bytes(),
+            ),
+            (
+                "hello".as_bytes(),
+                2,
+                200,
+                "asd".as_bytes(),
+                "hasd".as_bytes(),
+            ),
+            (
+                "hello".as_bytes(),
+                -1,
+                200,
+                "asd".as_bytes(),
+                "hello".as_bytes(),
+            ),
+            (
+                "hello".as_bytes(),
+                0,
+                200,
+                "asd".as_bytes(),
+                "hello".as_bytes(),
+            ),
+        ];
+        for (s1, i1, i2, s2, exp) in cases {
+            let s1 = Some(s1.as_bytes().to_vec());
+            let i1 = Some(i1);
+            let i2 = Some(i2);
+            let s2 = Some(s2.as_bytes().to_vec());
+            let exp = Some(exp.as_bytes().to_vec());
+            let got = RpnFnScalarEvaluator::new()
+                .push_param(s1)
+                .push_param(i1)
+                .push_param(i2)
+                .push_param(s2)
+                .evaluate(ScalarFuncSig::InsertUtf8)
+                .unwrap();
+            assert_eq!(got, exp);
+        }
+
+        let null_cases = vec![
+            (None, Some(-1), Some(200), Some("asd".as_bytes())),
+            (
+                Some("hello".as_bytes()),
+                None,
+                Some(200),
+                Some("asd".as_bytes()),
+            ),
+            (
+                Some("hello".as_bytes()),
+                Some(-1),
+                None,
+                Some("asd".as_bytes()),
+            ),
+            (Some("hello".as_bytes()), Some(-1), Some(200), None),
+        ];
+        for (s1, i1, i2, s2) in null_cases {
+            let got = RpnFnScalarEvaluator::new()
+                .push_param(s1)
+                .push_param(i1)
+                .push_param(i2)
+                .push_param(s2)
+                .evaluate::<Bytes>(ScalarFuncSig::InsertUtf8)
+                .unwrap();
+            assert_eq!(got, None);
+        }
+    }
+
+    #[test]
     fn test_right_utf8() {
         let cases = vec![
             (Some(b"hello".to_vec()), Some(0), Some(b"".to_vec())),
@@ -2828,6 +2999,52 @@ mod tests {
                         .build(),
                 )
                 .evaluate(ScalarFuncSig::Lower)
+                .unwrap();
+            assert_eq!(output, exp);
+        }
+    }
+
+    #[test]
+    fn test_lower_utf8() {
+        // Test non-binary string case
+        let cases = vec![
+            (
+                Some("HELLO".as_bytes().to_vec()),
+                Some("hello".as_bytes().to_vec()),
+            ),
+            (
+                Some("123".as_bytes().to_vec()),
+                Some("123".as_bytes().to_vec()),
+            ),
+            (
+                Some("CAFÉ".as_bytes().to_vec()),
+                Some("café".as_bytes().to_vec()),
+            ),
+            (
+                Some("数据库".as_bytes().to_vec()),
+                Some("数据库".as_bytes().to_vec()),
+            ),
+            (
+                Some("НОЧЬ НА ОКРАИНЕ МОСКВЫ".as_bytes().to_vec()),
+                Some("ночь на окраине москвы".as_bytes().to_vec()),
+            ),
+            (
+                Some("قاعدة البيانات".as_bytes().to_vec()),
+                Some("قاعدة البيانات".as_bytes().to_vec()),
+            ),
+            (None, None),
+        ];
+
+        for (arg, exp) in cases {
+            let output = RpnFnScalarEvaluator::new()
+                .push_param_with_field_type(
+                    arg.clone(),
+                    FieldTypeBuilder::new()
+                        .tp(FieldTypeTp::VarString)
+                        .charset(CHARSET_UTF8MB4)
+                        .build(),
+                )
+                .evaluate(ScalarFuncSig::LowerUtf8)
                 .unwrap();
             assert_eq!(output, exp);
         }

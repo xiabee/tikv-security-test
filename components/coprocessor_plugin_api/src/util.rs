@@ -1,7 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::allocator::HostAllocatorPtr;
-use super::plugin_api::CoprocessorPlugin;
+use super::{allocator::HostAllocatorPtr, plugin_api::CoprocessorPlugin};
 
 /// Name of the exported constructor with signature [`PluginConstructorSignature`] for the plugin.
 pub static PLUGIN_CONSTRUCTOR_SYMBOL: &[u8] = b"_plugin_create";
@@ -133,7 +132,7 @@ macro_rules! declare_plugin {
 /// *Note: Depending on artifacts of other crates will be easier with
 /// [this RFC](https://github.com/rust-lang/cargo/issues/9096).*
 pub fn pkgname_to_libname(pkgname: &str) -> String {
-    let pkgname = pkgname.to_string().replace("-", "_");
+    let pkgname = pkgname.to_string().replace('-', "_");
     if cfg!(target_os = "windows") {
         format!("{}.dll", pkgname)
     } else if cfg!(target_os = "macos") {

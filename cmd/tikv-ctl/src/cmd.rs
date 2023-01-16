@@ -1,11 +1,9 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{borrow::ToOwned, lazy::SyncLazy, str, string::ToString, u64};
+
 use clap::{crate_authors, AppSettings};
 use engine_traits::CF_DEFAULT;
-use std::borrow::ToOwned;
-use std::lazy::SyncLazy;
-use std::string::ToString;
-use std::{str, u64};
 use structopt::StructOpt;
 
 const RAW_KEY_HINT: &str = "Raw key (generally starts with \"z\") in escaped form";
@@ -531,6 +529,8 @@ pub enum Cmd {
         #[structopt(subcommand)]
         cmd: EncryptionMetaCmd,
     },
+    /// Delete encryption keys that are no longer associated with physical files.
+    CleanupEncryptionMeta {},
     /// Print bad ssts related infos
     BadSsts {
         #[structopt(long)]

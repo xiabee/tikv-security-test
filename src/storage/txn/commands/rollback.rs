@@ -1,16 +1,22 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use crate::storage::kv::WriteData;
-use crate::storage::lock_manager::LockManager;
-use crate::storage::mvcc::{MvccTxn, SnapshotReader};
-use crate::storage::txn::commands::{
-    Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
-    WriteCommand, WriteContext, WriteResult,
-};
-use crate::storage::txn::{cleanup, Result};
-use crate::storage::{ProcessResult, Snapshot};
 use txn_types::{Key, TimeStamp};
+
+use crate::storage::{
+    kv::WriteData,
+    lock_manager::LockManager,
+    mvcc::{MvccTxn, SnapshotReader},
+    txn::{
+        cleanup,
+        commands::{
+            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
+            WriteCommand, WriteContext, WriteResult,
+        },
+        Result,
+    },
+    ProcessResult, Snapshot,
+};
 
 command! {
     /// Rollback from the transaction that was started at `start_ts`.
@@ -35,11 +41,11 @@ impl CommandExt for Rollback {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Rollback {
-    fn process_write(self, snapshot: S, mut context: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
         let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
         let mut reader = ReaderWithStats::new(
-            SnapshotReader::new(self.start_ts, snapshot, !self.ctx.get_not_fill_cache()),
-            &mut context.statistics,
+            SnapshotReader::new_with_ctx(self.start_ts, snapshot, &self.ctx),
+            context.statistics,
         );
 
         let rows = self.keys.len();
@@ -68,8 +74,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Rollback {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::txn::tests::*;
-    use crate::storage::TestEngineBuilder;
+    use crate::storage::{txn::tests::*, TestEngineBuilder};
 
     #[test]
     fn rollback_lock_with_existing_rollback() {

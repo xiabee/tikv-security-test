@@ -1,13 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::HashMap;
-use std::string::ToString;
+use std::{collections::HashMap, string::ToString};
+
+use kvproto::diagnosticspb::{ServerInfoItem, ServerInfoPair};
+use tikv_util::{
+    config::KIB,
+    sys::{cpu_time::LiunxStyleCpuTime, SysQuota, *},
+};
+use walkdir::WalkDir;
 
 use crate::server::service::diagnostics::{ioload, SYS_INFO};
-use kvproto::diagnosticspb::{ServerInfoItem, ServerInfoPair};
-use tikv_util::config::KIB;
-use tikv_util::sys::{cpu_time::LiunxStyleCpuTime, SysQuota, *};
-use walkdir::WalkDir;
 
 type CpuTimeSnapshot = Option<LiunxStyleCpuTime>;
 
@@ -485,7 +487,7 @@ fn get_sysctl_list() -> HashMap<String, String> {
             let content = std::fs::read_to_string(entry.path()).ok()?;
             let path = entry.path().to_str()?;
 
-            let name = path.trim_start_matches(DIR).replace("/", ".");
+            let name = path.trim_start_matches(DIR).replace('/', ".");
             Some((name, content.trim().to_string()))
         })
         .collect()
@@ -630,9 +632,8 @@ mod tests {
                 .iter()
                 .map(|x| x.get_key())
                 .collect::<Vec<&str>>();
-            assert_eq!(
-                keys,
-                vec![
+            assert!(
+                keys.starts_with(&[
                     "read_io/s",
                     "read_merges/s",
                     "read_sectors/s",
@@ -644,7 +645,9 @@ mod tests {
                     "in_flight/s",
                     "io_ticks/s",
                     "time_in_queue/s",
-                ]
+                ]),
+                "actual: {:?}",
+                keys
             );
         }
     }

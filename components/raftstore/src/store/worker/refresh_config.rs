@@ -1,14 +1,19 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
-use crate::store::fsm::apply::{ApplyFsm, ControlFsm};
-use crate::store::fsm::store::StoreFsm;
-use crate::store::fsm::PeerFsm;
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::Arc,
+    thread,
+};
+
 use batch_system::{BatchRouter, Fsm, FsmTypes, HandlerBuilder, Poller, PoolState, Priority};
 use file_system::{set_io_type, IOType};
-use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
-use std::thread;
-use tikv_util::worker::Runnable;
-use tikv_util::{debug, error, info, safe_panic, thd_name};
+use tikv_util::{debug, error, info, safe_panic, thd_name, worker::Runnable};
+
+use crate::store::fsm::{
+    apply::{ApplyFsm, ControlFsm},
+    store::StoreFsm,
+    PeerFsm,
+};
 
 pub struct PoolController<N: Fsm, C: Fsm, H: HandlerBuilder<N, C>> {
     pub router: BatchRouter<N, C>,
@@ -103,26 +108,39 @@ where
     }
 }
 
-#[derive(Debug)]
-pub enum ThreadPool {
+#[derive(Debug, Clone, Copy)]
+pub enum BatchComponent {
     Store,
     Apply,
 }
 
+impl Display for BatchComponent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match *self {
+            BatchComponent::Store => {
+                write!(f, "raft")
+            }
+            BatchComponent::Apply => {
+                write!(f, "apply")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Task {
-    ScalePool(ThreadPool, usize),
+    ScalePool(BatchComponent, usize),
+    ScaleBatchSize(BatchComponent, usize),
 }
 
 impl Display for Task {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self {
             Task::ScalePool(pool, size) => {
-                write!(f, "Scale pool ")?;
-                match pool {
-                    ThreadPool::Store => write!(f, "ajusts apply: {} ", size),
-                    ThreadPool::Apply => write!(f, "ajusts raft: {} ", size),
-                }
+                write!(f, "Scale pool ajusts {}: {} ", pool, size)
+            }
+            Task::ScaleBatchSize(component, size) => {
+                write!(f, "Scale max_batch_size adjusts {}: {} ", component, size)
             }
         }
     }
@@ -205,9 +223,17 @@ where
 
     fn run(&mut self, task: Task) {
         match task {
-            Task::ScalePool(pool, size) => match pool {
-                ThreadPool::Store => self.resize_raft_pool(size),
-                ThreadPool::Apply => self.resize_apply_pool(size),
+            Task::ScalePool(component, size) => match component {
+                BatchComponent::Store => self.resize_raft_pool(size),
+                BatchComponent::Apply => self.resize_apply_pool(size),
+            },
+            Task::ScaleBatchSize(component, size) => match component {
+                BatchComponent::Store => {
+                    self.raft_pool.state.max_batch_size = size;
+                }
+                BatchComponent::Apply => {
+                    self.apply_pool.state.max_batch_size = size;
+                }
             },
         }
     }

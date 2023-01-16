@@ -1,12 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{
+    collections::{HashMap, HashSet},
+    fs::read_to_string,
+    mem::MaybeUninit,
+    num::IntErrorKind,
+    path::{Path, PathBuf},
+};
+
 use num_traits::Bounded;
 use procfs::process::{MountInfo, Process};
-use std::collections::{HashMap, HashSet};
-use std::fs::read_to_string;
-use std::mem::MaybeUninit;
-use std::num::IntErrorKind;
-use std::path::{Path, PathBuf};
 
 // ## Differences between cgroup v1 and v2:
 // ### memory subsystem, memory limitation
@@ -248,11 +251,18 @@ fn cgroup_mountinfos_v2() -> HashMap<String, (String, PathBuf)> {
 }
 
 fn parse_mountinfos_v2(infos: Vec<MountInfo>) -> HashMap<String, (String, PathBuf)> {
-    let mut ret = HashMap::new();
-    let mut cg_infos = infos.into_iter().filter(|x| x.fs_type == "cgroup2");
-    if let Some(cg_info) = cg_infos.next() {
-        assert!(cg_infos.next().is_none()); // Only one item for cgroup-2.
-        ret.insert("".to_string(), (cg_info.root, cg_info.mount_point));
+    let mut ret: HashMap<String, (String, PathBuf)> = HashMap::new();
+    let cg_infos = infos.into_iter().filter(|x| x.fs_type == "cgroup2");
+    for info in cg_infos {
+        // Should only be one item for cgroup-2.
+        if let Some((root, mount_point)) = ret.insert("".to_string(), (info.root, info.mount_point))
+        {
+            warn!(
+                "Found multiple cgroup2 mountinfos, dropping {} {}",
+                root,
+                mount_point.display()
+            );
+        }
     }
     ret
 }
@@ -279,15 +289,12 @@ fn build_path(path: &str, root: &str, mount_point: &Path) -> Option<PathBuf> {
 }
 
 fn parse_memory_max(line: &str) -> Option<u64> {
-    if line == "max" {
-        return None;
-    }
-    match capping_parse_int::<u64>(line) {
-        Ok(x) => Some(x),
-        Err(e) => {
-            warn!("fail to parse memory max: {}", e);
-            None
-        }
+    if line != "max" {
+        capping_parse_int::<u64>(line)
+            .map_err(|e| warn!("fail to parse memory max"; "line" => %line, "err" => %e))
+            .ok()
+    } else {
+        None
     }
 }
 
@@ -358,9 +365,9 @@ fn parse_cpu_quota_v1(line1: &str, line2: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs::OpenOptions, io::Write};
+
     use super::*;
-    use std::fs::OpenOptions;
-    use std::io::Write;
 
     #[test]
     fn test_defult_cgroup_sys() {
@@ -429,6 +436,36 @@ mod tests {
             .open(&format!("{}/mountinfo", dir))
             .unwrap();
         f.write_all(b"1663 1661 0:27 /../../../../../.. /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n").unwrap();
+
+        let cgroups = parse_proc_cgroup_v2("0::/\n");
+        let mount_points = {
+            let infos = Process::new_with_root(PathBuf::from(dir))
+                .and_then(|x| x.mountinfo())
+                .unwrap();
+            parse_mountinfos_v2(infos)
+        };
+        let cgroup_sys = CGroupSys {
+            cgroups,
+            mount_points,
+            is_v2: true,
+        };
+
+        assert_eq!(cgroup_sys.memory_limit_in_bytes(), None);
+    }
+
+    #[test]
+    fn test_conflicting_mountinfo() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        std::fs::copy("/proc/self/stat", &format!("{}/stat", dir)).unwrap();
+
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&format!("{}/mountinfo", dir))
+            .unwrap();
+        f.write_all(b"1663 1661 0:27 /../../../../../.. /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw
+        1663 1661 0:27 /../../../../../.. /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw").unwrap();
 
         let cgroups = parse_proc_cgroup_v2("0::/\n");
         let mount_points = {
@@ -516,9 +553,10 @@ mod tests {
             ("21474836480", Some(21474836480)),
             // Malformed.
             ("19446744073709551610", Some(u64::MAX)),
-            ("-18446744073709551610", None),
+            ("-18446744073709551610", None), // Raise InvalidDigit instead of NegOverflow.
             ("0.1", None),
         ];
+        println!("{:?}", "-18446744073709551610".parse::<u64>());
         for (content, expect) in cases.into_iter() {
             let limit = parse_memory_max(content);
             assert_eq!(limit, expect);

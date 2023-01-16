@@ -1,15 +1,21 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::timestamp::TimeStamp;
+use std::fmt::{self, Debug, Display, Formatter};
+
 use bitflags::bitflags;
 use byteorder::{ByteOrder, NativeEndian};
 use collections::HashMap;
 use kvproto::kvrpcpb::{self, Assertion};
-use std::fmt::{self, Debug, Display, Formatter};
-use tikv_util::codec;
-use tikv_util::codec::bytes;
-use tikv_util::codec::bytes::BytesEncoder;
-use tikv_util::codec::number::{self, NumberEncoder};
+use tikv_util::{
+    codec,
+    codec::{
+        bytes,
+        bytes::BytesEncoder,
+        number::{self, NumberEncoder},
+    },
+};
+
+use super::timestamp::TimeStamp;
 
 // Short value max len must <= 255.
 pub const SHORT_VALUE_MAX_LEN: usize = 255;
@@ -105,6 +111,7 @@ impl Key {
 
     /// Creates a new key by appending a `u64` timestamp to this key.
     #[inline]
+    #[must_use]
     pub fn append_ts(mut self, ts: TimeStamp) -> Key {
         self.0.encode_u64_desc(ts.into_inner()).unwrap();
         self
@@ -224,7 +231,7 @@ impl Key {
 
 impl Clone for Key {
     fn clone(&self) -> Self {
-        // default clone implemention use self.len() to reserve capacity
+        // default clone implementation use self.len() to reserve capacity
         // for the sake of appending ts, we need to reserve more
         let mut key = Vec::with_capacity(self.0.capacity());
         key.extend_from_slice(&self.0);
@@ -251,28 +258,6 @@ pub enum MutationType {
     Lock,
     Insert,
     Other,
-}
-
-/// A row mutation.
-#[derive(Debug, Clone)]
-pub enum RawMutation {
-    /// Put `Value` into `Key` with TTL. The TTL will overwrite the existing TTL value.
-    Put { key: Key, value: Value, ttl: u64 },
-    /// Delete `Key`.
-    Delete { key: Key },
-}
-
-impl RawMutation {
-    pub fn key(&self) -> &Key {
-        match self {
-            RawMutation::Put {
-                ref key,
-                value: _,
-                ttl: _,
-            } => key,
-            RawMutation::Delete { ref key } => key,
-        }
-    }
 }
 
 /// A row mutation.
@@ -508,6 +493,9 @@ bitflags! {
         const ONE_PC = 0b00000001;
         /// Indicates this request is from a stale read-only transaction.
         const STALE_READ = 0b00000010;
+        /// Indicates this request is a transfer leader command that needs to be proposed
+        /// like a normal command.
+        const TRANSFER_LEADER_PROPOSAL = 0b00000100;
     }
 }
 
