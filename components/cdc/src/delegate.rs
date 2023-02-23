@@ -38,23 +38,23 @@ use crate::{
     initializer::KvEntry,
     metrics::*,
     old_value::{OldValueCache, OldValueCallback},
-    service::ConnID,
+    service::ConnId,
     Error, Result,
 };
 
 static DOWNSTREAM_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique identifier of a Downstream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct DownstreamID(usize);
+#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+pub struct DownstreamId(usize);
 
-impl DownstreamID {
-    pub fn new() -> DownstreamID {
-        DownstreamID(DOWNSTREAM_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
+impl DownstreamId {
+    pub fn new() -> DownstreamId {
+        DownstreamId(DOWNSTREAM_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
     }
 }
 
-impl Default for DownstreamID {
+impl Default for DownstreamId {
     fn default() -> Self {
         Self::new()
     }
@@ -64,10 +64,11 @@ impl Default for DownstreamID {
 pub enum DownstreamState {
     /// It's just created and rejects change events and resolved timestamps.
     Uninitialized,
-    /// It has got a snapshot for incremental scan, and change events will be accepted.
-    /// However it still rejects resolved timestamps.
+    /// It has got a snapshot for incremental scan, and change events will be
+    /// accepted. However it still rejects resolved timestamps.
     Initializing,
-    /// Incremental scan is finished so that resolved timestamps are acceptable now.
+    /// Incremental scan is finished so that resolved timestamps are acceptable
+    /// now.
     Normal,
     Stopped,
 }
@@ -78,7 +79,8 @@ impl Default for DownstreamState {
     }
 }
 
-/// Shold only be called when it's uninitialized or stopped. Return false if it's stopped.
+/// Should only be called when it's uninitialized or stopped. Return false if
+/// it's stopped.
 pub(crate) fn on_init_downstream(s: &AtomicCell<DownstreamState>) -> bool {
     s.compare_exchange(
         DownstreamState::Uninitialized,
@@ -87,7 +89,8 @@ pub(crate) fn on_init_downstream(s: &AtomicCell<DownstreamState>) -> bool {
     .is_ok()
 }
 
-/// Shold only be called when it's initializing or stopped. Return false if it's stopped.
+/// Should only be called when it's initializing or stopped. Return false if
+/// it's stopped.
 pub(crate) fn post_init_downstream(s: &AtomicCell<DownstreamState>) -> bool {
     s.compare_exchange(DownstreamState::Initializing, DownstreamState::Normal)
         .is_ok()
@@ -116,16 +119,17 @@ impl DownstreamState {
 pub struct Downstream {
     // TODO: include cdc request.
     /// A unique identifier of the Downstream.
-    id: DownstreamID,
+    id: DownstreamId,
     // The request ID set by CDC to identify events corresponding different requests.
     req_id: u64,
-    conn_id: ConnID,
+    conn_id: ConnId,
     // The IP address of downstream.
     peer: String,
     region_epoch: RegionEpoch,
     sink: Option<Sink>,
     state: Arc<AtomicCell<DownstreamState>>,
     kv_api: ChangeDataRequestKvApi,
+    filter_loop: bool,
 }
 
 impl Downstream {
@@ -137,11 +141,12 @@ impl Downstream {
         peer: String,
         region_epoch: RegionEpoch,
         req_id: u64,
-        conn_id: ConnID,
+        conn_id: ConnId,
         kv_api: ChangeDataRequestKvApi,
+        filter_loop: bool,
     ) -> Downstream {
         Downstream {
-            id: DownstreamID::new(),
+            id: DownstreamId::new(),
             req_id,
             conn_id,
             peer,
@@ -149,6 +154,7 @@ impl Downstream {
             sink: None,
             state: Arc::new(AtomicCell::new(DownstreamState::default())),
             kv_api,
+            filter_loop,
         }
     }
 
@@ -196,15 +202,19 @@ impl Downstream {
         self.sink = Some(sink);
     }
 
-    pub fn get_id(&self) -> DownstreamID {
+    pub fn get_id(&self) -> DownstreamId {
         self.id
+    }
+
+    pub fn get_filter_loop(&self) -> bool {
+        self.filter_loop
     }
 
     pub fn get_state(&self) -> Arc<AtomicCell<DownstreamState>> {
         self.state.clone()
     }
 
-    pub fn get_conn_id(&self) -> ConnID {
+    pub fn get_conn_id(&self) -> ConnId {
         self.conn_id
     }
 }
@@ -244,7 +254,6 @@ pub struct Delegate {
     pending: Option<Pending>,
     txn_extra_op: Arc<AtomicCell<TxnExtraOp>>,
     failed: bool,
-    has_resolver: bool,
 }
 
 impl Delegate {
@@ -259,12 +268,7 @@ impl Delegate {
             pending: Some(Pending::default()),
             txn_extra_op,
             failed: false,
-            has_resolver: false,
         }
-    }
-
-    pub fn has_resolver(&self) -> bool {
-        self.has_resolver
     }
 
     /// Let downstream subscribe the delegate.
@@ -274,14 +278,11 @@ impl Delegate {
             // Check if the downstream is out dated.
             self.check_epoch_on_ready(&downstream)?;
         }
-        if downstream.kv_api == ChangeDataRequestKvApi::TiDb {
-            self.has_resolver = true;
-        }
         self.add_downstream(downstream);
         Ok(())
     }
 
-    pub fn downstream(&self, downstream_id: DownstreamID) -> Option<&Downstream> {
+    pub fn downstream(&self, downstream_id: DownstreamId) -> Option<&Downstream> {
         self.downstreams().iter().find(|d| d.id == downstream_id)
     }
 
@@ -301,7 +302,7 @@ impl Delegate {
 
     /// Let downstream unsubscribe the delegate.
     /// Return whether the delegate is empty or not.
-    pub fn unsubscribe(&mut self, id: DownstreamID, err: Option<Error>) -> bool {
+    pub fn unsubscribe(&mut self, id: DownstreamId, err: Option<Error>) -> bool {
         let error_event = err.map(|err| err.into_error_event(self.region_id));
         let region_id = self.region_id;
         if let Some(d) = self.remove_downstream(id) {
@@ -355,9 +356,10 @@ impl Delegate {
         let _ = self.broadcast(send);
     }
 
-    /// `txn_extra_op` returns a shared flag which is accessed in TiKV's transaction layer to
-    /// determine whether to capture modifications' old value or not. Unsubsribing all downstreams
-    /// or calling `Delegate::stop` will store it with `TxnExtraOp::Noop`.
+    /// `txn_extra_op` returns a shared flag which is accessed in TiKV's
+    /// transaction layer to determine whether to capture modifications' old
+    /// value or not. Unsubscribing all downstreams or calling
+    /// `Delegate::stop` will store it with `TxnExtraOp::Noop`.
     ///
     /// NOTE: Dropping a `Delegate` won't update this flag.
     pub fn txn_extra_op(&self) -> &AtomicCell<TxnExtraOp> {
@@ -380,7 +382,8 @@ impl Delegate {
         Ok(())
     }
 
-    /// Install a resolver. Return downstreams which fail because of the region's internal changes.
+    /// Install a resolver. Return downstreams which fail because of the
+    /// region's internal changes.
     pub fn on_region_ready(
         &mut self,
         mut resolver: Resolver,
@@ -427,8 +430,6 @@ impl Delegate {
         let resolved_ts = resolver.resolve(min_ts);
         debug!("cdc resolved ts updated";
             "region_id" => self.region_id, "resolved_ts" => resolved_ts);
-        CDC_RESOLVED_TS_GAP_HISTOGRAM
-            .observe((min_ts.physical() - resolved_ts.physical()) as f64 / 1000f64);
         Some(resolved_ts)
     }
 
@@ -446,6 +447,7 @@ impl Delegate {
         for cmd in batch.into_iter(self.region_id) {
             let Cmd {
                 index,
+                term: _,
                 mut request,
                 mut response,
             } = cmd;
@@ -476,6 +478,7 @@ impl Delegate {
         region_id: u64,
         request_id: u64,
         entries: Vec<Option<KvEntry>>,
+        filter_loop: bool,
     ) -> Result<Vec<CdcEvent>> {
         let entries_len = entries.len();
         let mut rows = vec![Vec::with_capacity(entries_len)];
@@ -531,6 +534,10 @@ impl Delegate {
                     set_event_row_type(&mut row, EventLogType::Initialized);
                     row_size = 0;
                 }
+            }
+            // if the `txn_source` is not 0 and we should filter it out, skip this event.
+            if row.txn_source != 0 && filter_loop {
+                continue;
             }
             if current_rows_size + row_size >= CDC_EVENT_MAX_BYTES {
                 rows.push(Vec::with_capacity(entries_len));
@@ -613,10 +620,7 @@ impl Delegate {
             rows.push(v);
         }
         self.sink_downstream(rows, index, ChangeDataRequestKvApi::TiDb)?;
-
-        self.sink_downstream(raw_rows, index, ChangeDataRequestKvApi::RawKv)?;
-
-        Ok(())
+        self.sink_downstream(raw_rows, index, ChangeDataRequestKvApi::RawKv)
     }
 
     fn sink_downstream(
@@ -628,6 +632,48 @@ impl Delegate {
         if entries.is_empty() {
             return Ok(());
         }
+
+        let downstreams = self.downstreams();
+        assert!(
+            !downstreams.is_empty(),
+            "region {} miss downstream",
+            self.region_id
+        );
+
+        let mut need_filter = false;
+        for ds in downstreams {
+            if ds.filter_loop {
+                need_filter = true;
+                break;
+            }
+        }
+
+        // collect the change event cause by user write, which is `txn_source` = 0.
+        // for changefeed which only need the user write, send the `filtered`, or else,
+        // send them all.
+        let filtered = if need_filter {
+            let filtered = entries
+                .iter()
+                .filter(|x| x.txn_source == 0)
+                .cloned()
+                .collect::<Vec<EventRow>>();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(Event {
+                    region_id: self.region_id,
+                    index,
+                    event: Some(Event_oneof_event::Entries(EventEntries {
+                        entries: filtered.into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })
+            }
+        } else {
+            None
+        };
+
         let event_entries = EventEntries {
             entries: entries.into(),
             ..Default::default()
@@ -638,14 +684,23 @@ impl Delegate {
             event: Some(Event_oneof_event::Entries(event_entries)),
             ..Default::default()
         };
+
         let send = move |downstream: &Downstream| {
-            // No ready downstream or a downstream that does not match the kv_api type, will be ignored.
-            // There will be one region that contains both Txn & Raw entries.
+            // No ready downstream or a downstream that does not match the kv_api type, will
+            // be ignored. There will be one region that contains both Txn & Raw entries.
             // The judgement here is for sending entries to downstreams with correct kv_api.
             if !downstream.state.load().ready_for_change_events() || downstream.kv_api != kv_api {
                 return Ok(());
             }
-            let event = change_data_event.clone();
+            if downstream.filter_loop && filtered.is_none() {
+                return Ok(());
+            }
+
+            let event = if downstream.filter_loop {
+                filtered.clone().unwrap()
+            } else {
+                change_data_event.clone()
+            };
             // Do not force send for real time change data events.
             let force_send = false;
             downstream.sink_event(event, force_send)
@@ -830,7 +885,7 @@ impl Delegate {
         self.txn_extra_op.store(TxnExtraOp::ReadOldValue);
     }
 
-    fn remove_downstream(&mut self, id: DownstreamID) -> Option<Downstream> {
+    fn remove_downstream(&mut self, id: DownstreamId) -> Option<Downstream> {
         let downstreams = self.downstreams_mut();
         if let Some(index) = downstreams.iter().position(|x| x.id == id) {
             let downstream = downstreams.swap_remove(index);
@@ -849,9 +904,9 @@ impl Delegate {
         if let Err(e) = compare_region_epoch(
             &downstream.region_epoch,
             region,
-            false, /* check_conf_ver */
-            true,  /* check_ver */
-            true,  /* include_region */
+            false, // check_conf_ver
+            true,  // check_ver
+            true,  // include_region
         ) {
             info!(
                 "cdc fail to subscribe downstream";
@@ -890,9 +945,10 @@ fn make_overlapped_rollback(key: Key, row: &mut EventRow) {
     set_event_row_type(row, EventLogType::Rollback);
 }
 
-/// Decodes the write record and store its information in `row`. This may be called both when
-/// doing incremental scan of observing apply events. There's different behavior for the two
-/// case, distinguished by the `is_apply` parameter.
+/// Decodes the write record and store its information in `row`. This may be
+/// called both when doing incremental scan of observing apply events. There's
+/// different behavior for the two case, distinguished by the `is_apply`
+/// parameter.
 fn decode_write(
     key: Vec<u8>,
     value: &[u8],
@@ -904,8 +960,8 @@ fn decode_write(
     let write = WriteRef::parse(value).unwrap().to_owned();
 
     // For scanning, ignore the GC fence and read the old data;
-    // For observed apply, drop the record it self but keep only the overlapped rollback information
-    // if gc_fence exists.
+    // For observed apply, drop the record it self but keep only the overlapped
+    // rollback information if gc_fence exists.
     if is_apply && write.gc_fence.is_some() {
         // `gc_fence` is set means the write record has been rewritten.
         // Currently the only case is writing overlapped_rollback. And in this case
@@ -925,6 +981,7 @@ fn decode_write(
         }
     };
     let commit_ts = if write.write_type == WriteType::Rollback {
+        assert_eq!(write.txn_source, 0);
         0
     } else {
         key.decode_ts().unwrap().into_inner()
@@ -933,6 +990,8 @@ fn decode_write(
     row.commit_ts = commit_ts;
     row.key = key.truncate_ts().unwrap().into_raw().unwrap();
     row.op_type = op_type as _;
+    // used for filter out the event. see `txn_source` field for more detail.
+    row.txn_source = write.txn_source;
     set_event_row_type(row, r_type);
     if let Some(value) = write.short_value {
         row.value = value;
@@ -959,6 +1018,8 @@ fn decode_lock(key: Vec<u8>, lock: Lock, row: &mut EventRow, has_value: &mut boo
     row.start_ts = lock.ts.into_inner();
     row.key = key.into_raw().unwrap();
     row.op_type = op_type as _;
+    // used for filter out the event. see `txn_source` field for more detail.
+    row.txn_source = lock.txn_source;
     set_event_row_type(row, EventLogType::Prewrite);
     if let Some(value) = lock.short_value {
         row.value = value;
@@ -1026,8 +1087,9 @@ mod tests {
             String::new(),
             region_epoch,
             request_id,
-            ConnID::new(),
+            ConnId::new(),
             ChangeDataRequestKvApi::TiDb,
+            false,
         );
         downstream.set_sink(sink);
         let mut delegate = Delegate::new(region_id, Default::default());
@@ -1145,7 +1207,14 @@ mod tests {
             let mut epoch = RegionEpoch::default();
             epoch.set_conf_ver(region_version);
             epoch.set_version(region_version);
-            Downstream::new(peer, epoch, id, ConnID::new(), ChangeDataRequestKvApi::TiDb)
+            Downstream::new(
+                peer,
+                epoch,
+                id,
+                ConnId::new(),
+                ChangeDataRequestKvApi::TiDb,
+                false,
+            )
         };
 
         // Create a new delegate.
@@ -1185,7 +1254,7 @@ mod tests {
         assert!(delegate.handle.is_observing());
 
         // Subscribe with an invalid epoch.
-        assert!(delegate.subscribe(new_downstream(1, 2)).is_err());
+        delegate.subscribe(new_downstream(1, 2)).unwrap_err();
         assert_eq!(delegate.downstreams().len(), 1);
 
         // Unsubscribe all downstreams.

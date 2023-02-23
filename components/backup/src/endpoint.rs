@@ -9,21 +9,22 @@ use std::{
 };
 
 use async_channel::SendError;
+use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
-use engine_rocks::raw::DB;
+use engine_rocks::RocksEngine;
 use engine_traits::{name_to_cf, raw_ttl::ttl_current_ts, CfName, SstCompressionType};
 use external_storage::{BackendConfig, HdfsConfig};
 use external_storage_export::{create_storage, ExternalStorage};
-use futures::channel::mpsc::*;
+use futures::{channel::mpsc::*, executor::block_on};
 use kvproto::{
     brpb::*,
     encryptionpb::EncryptionMethod,
-    kvrpcpb::{ApiVersion, Context, IsolationLevel},
+    kvrpcpb::{ApiVersion, Context, IsolationLevel, KeyRange},
     metapb::*,
 };
 use online_config::OnlineConfig;
 use raft::StateRole;
-use raftstore::{coprocessor::RegionInfoProvider, store::util::find_peer};
+use raftstore::coprocessor::RegionInfoProvider;
 use tikv::{
     config::BackupConfig,
     storage::{
@@ -36,6 +37,7 @@ use tikv::{
 };
 use tikv_util::{
     box_err, debug, error, error_unknown, impl_display_as_debug, info,
+    store::find_peer,
     time::{Instant, Limiter},
     warn,
     worker::Runnable,
@@ -57,6 +59,7 @@ const BACKUP_BATCH_LIMIT: usize = 1024;
 struct Request {
     start_key: Vec<u8>,
     end_key: Vec<u8>,
+    sub_ranges: Vec<KeyRange>,
     start_ts: TimeStamp,
     end_ts: TimeStamp,
     limiter: Limiter,
@@ -117,6 +120,7 @@ impl Task {
             request: Request {
                 start_key: req.get_start_key().to_owned(),
                 end_key: req.get_end_key().to_owned(),
+                sub_ranges: req.get_sub_ranges().to_owned(),
                 start_ts: req.get_start_version().into(),
                 end_ts: req.get_end_version().into(),
                 backend: req.get_storage_backend().clone(),
@@ -288,7 +292,7 @@ impl BackupRange {
     async fn backup<E: Engine>(
         &self,
         writer_builder: BackupWriterBuilder,
-        engine: E,
+        mut engine: E,
         concurrency_manager: ConcurrencyManager,
         backup_ts: TimeStamp,
         begin_ts: TimeStamp,
@@ -326,6 +330,7 @@ impl BackupRange {
         assert!(!ctx.get_replica_read());
         let snap_ctx = SnapContext {
             pb_ctx: &ctx,
+            allowed_in_flashback: self.region.is_in_flashback,
             ..Default::default()
         };
 
@@ -344,7 +349,7 @@ impl BackupRange {
             snapshot,
             backup_ts,
             IsolationLevel::Si,
-            false, /* fill_cache */
+            false, // fill_cache
             Default::default(),
             Default::default(),
             false,
@@ -469,7 +474,7 @@ impl BackupRange {
             while cursor.valid()? && batch.len() < BACKUP_BATCH_LIMIT {
                 let key = cursor.key(cfstatistics);
                 let value = cursor.value(cfstatistics);
-                let is_valid = self.codec.is_valid_raw_value(key, value, current_ts)?;
+                let (is_valid, expired) = self.codec.is_valid_raw_value(key, value, current_ts)?;
                 if is_valid {
                     batch.push(Ok((
                         self.codec
@@ -477,6 +482,8 @@ impl BackupRange {
                             .into_encoded(),
                         self.codec.convert_encoded_value_to_dst_version(value)?,
                     )));
+                } else if expired {
+                    cfstatistics.raw_value_tombstone += 1;
                 };
                 debug!("backup raw key";
                     "key" => &log_wrappers::Value::key(&self.codec.convert_encoded_key_to_dst_version(key)?.into_encoded()),
@@ -503,8 +510,8 @@ impl BackupRange {
 
     async fn backup_raw_kv_to_file<E: Engine>(
         &self,
-        engine: E,
-        db: Arc<DB>,
+        mut engine: E,
+        db: RocksEngine,
         limiter: &Limiter,
         file_name: String,
         cf: CfNameWrap,
@@ -577,8 +584,7 @@ pub struct ConfigManager(Arc<RwLock<BackupConfig>>);
 
 impl online_config::ConfigManager for ConfigManager {
     fn dispatch(&mut self, change: online_config::ConfigChange) -> online_config::Result<()> {
-        self.0.write().unwrap().update(change);
-        Ok(())
+        self.0.write().unwrap().update(change)
     }
 }
 
@@ -659,11 +665,12 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     store_id: u64,
     pool: RefCell<ControlThreadPool>,
     io_pool: Runtime,
-    db: Arc<DB>,
+    db: RocksEngine,
     config_manager: ConfigManager,
     concurrency_manager: ConcurrencyManager,
     softlimit: SoftLimitKeeper,
     api_version: ApiVersion,
+    causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used in rawkv apiv2 only
 
     pub(crate) engine: E,
     pub(crate) region_info: R,
@@ -672,6 +679,8 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
 /// The progress of a backup task
 pub struct Progress<R: RegionInfoProvider> {
     store_id: u64,
+    ranges: Vec<(Option<Key>, Option<Key>)>,
+    next_index: usize,
     next_start: Option<Key>,
     end_key: Option<Key>,
     region_info: R,
@@ -681,7 +690,7 @@ pub struct Progress<R: RegionInfoProvider> {
 }
 
 impl<R: RegionInfoProvider> Progress<R> {
-    fn new(
+    fn new_with_range(
         store_id: u64,
         next_start: Option<Key>,
         end_key: Option<Key>,
@@ -689,14 +698,41 @@ impl<R: RegionInfoProvider> Progress<R> {
         codec: KeyValueCodec,
         cf: CfName,
     ) -> Self {
-        Progress {
+        let ranges = vec![(next_start, end_key)];
+        Self::new_with_ranges(store_id, ranges, region_info, codec, cf)
+    }
+
+    fn new_with_ranges(
+        store_id: u64,
+        ranges: Vec<(Option<Key>, Option<Key>)>,
+        region_info: R,
+        codec: KeyValueCodec,
+        cf: CfName,
+    ) -> Self {
+        let mut prs = Progress {
             store_id,
-            next_start,
-            end_key,
+            ranges,
+            next_index: 0,
+            next_start: None,
+            end_key: None,
             region_info,
             finished: false,
             codec,
             cf,
+        };
+        prs.try_next();
+        prs
+    }
+
+    /// try the next range. If all the ranges are consumed,
+    /// set self.finish true.
+    fn try_next(&mut self) {
+        if self.ranges.len() > self.next_index {
+            (self.next_start, self.end_key) = self.ranges[self.next_index].clone();
+
+            self.next_index += 1;
+        } else {
+            self.finished = true;
         }
     }
 
@@ -766,11 +802,12 @@ impl<R: RegionInfoProvider> Progress<R> {
             // region, we need to set the `finished` flag here in case
             // we run with `next_start` set to None
             if b.region.get_end_key().is_empty() || b.end_key == self.end_key {
-                self.finished = true;
+                self.try_next();
+            } else {
+                self.next_start = b.end_key.clone();
             }
-            self.next_start = b.end_key.clone();
         } else {
-            self.finished = true;
+            self.try_next();
         }
         branges
     }
@@ -781,10 +818,11 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         store_id: u64,
         engine: E,
         region_info: R,
-        db: Arc<DB>,
+        db: RocksEngine,
         config: BackupConfig,
         concurrency_manager: ConcurrencyManager,
         api_version: ApiVersion,
+        causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
     ) -> Endpoint<E, R> {
         let pool = ControlThreadPool::new();
         let rt = utils::create_tokio_runtime(config.io_thread_size, "backup-io").unwrap();
@@ -802,6 +840,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             config_manager,
             concurrency_manager,
             api_version,
+            causal_ts_provider,
         }
     }
 
@@ -940,6 +979,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             }
                         }
                         Ok(stat) => {
+                            BACKUP_RAW_EXPIRED_COUNT.inc_by(stat.data.raw_value_tombstone as u64);
                             // TODO: maybe add the stat to metrics?
                             debug!("backup region finish";
                             "region" => ?brange.region,
@@ -949,6 +989,39 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                 }
             }
         });
+    }
+
+    fn get_progress_by_req(
+        &self,
+        request: &Request,
+        codec: KeyValueCodec,
+    ) -> Arc<Mutex<Progress<R>>> {
+        if request.sub_ranges.is_empty() {
+            let start_key = codec.encode_backup_key(request.start_key.clone());
+            let end_key = codec.encode_backup_key(request.end_key.clone());
+            Arc::new(Mutex::new(Progress::new_with_range(
+                self.store_id,
+                start_key,
+                end_key,
+                self.region_info.clone(),
+                codec,
+                request.cf,
+            )))
+        } else {
+            let mut ranges = Vec::with_capacity(request.sub_ranges.len());
+            for k in &request.sub_ranges {
+                let start_key = codec.encode_backup_key(k.start_key.clone());
+                let end_key = codec.encode_backup_key(k.end_key.clone());
+                ranges.push((start_key, end_key));
+            }
+            Arc::new(Mutex::new(Progress::new_with_ranges(
+                self.store_id,
+                ranges,
+                self.region_info.clone(),
+                codec,
+                request.cf,
+            )))
+        }
     }
 
     pub fn handle_backup_task(&self, task: Task) {
@@ -966,17 +1039,32 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             }
             return;
         }
-        let start_key = codec.encode_backup_key(request.start_key.clone());
-        let end_key = codec.encode_backup_key(request.end_key.clone());
+        // Flush causal timestamp to make sure that future writes will have larger
+        // timestamps. And help TiKV-BR acquire a backup-ts with intact data
+        // smaller than it. (Note that intactness is not fully ensured now,
+        // until the safe-ts of RawKV is implemented. TiKV-BR need a workaround
+        // by rewinding backup-ts to a small "safe interval").
+        if request.is_raw_kv {
+            if let Err(e) = self
+                .causal_ts_provider
+                .as_ref()
+                .map_or(Ok(TimeStamp::new(0)), |provider| {
+                    block_on(provider.async_flush())
+                })
+            {
+                error!("backup flush causal timestamp failed"; "err" => ?e);
+                let mut response = BackupResponse::default();
+                let err_msg = format!("fail to flush causal ts, {:?}", e);
+                response.set_error(crate::Error::Other(box_err!(err_msg)).into());
+                if let Err(err) = resp.unbounded_send(response) {
+                    error_unknown!(?err; "backup failed to send response");
+                }
+                return;
+            }
+        }
 
-        let prs = Arc::new(Mutex::new(Progress::new(
-            self.store_id,
-            start_key,
-            end_key,
-            self.region_info.clone(),
-            codec,
-            request.cf,
-        )));
+        let prs = self.get_progress_by_req(&request, codec);
+
         let backend = match create_storage(&request.backend, self.get_config()) {
             Ok(backend) => backend,
             Err(err) => {
@@ -1065,10 +1153,13 @@ fn get_max_start_key(start_key: Option<&Key>, region: &Region) -> Option<Key> {
     }
 }
 
-/// Construct an backup file name based on the given store id, region, range start key and local unix timestamp.
-/// A name consists with five parts: store id, region_id, a epoch version, the hash of range start key and timestamp.
-/// range start key is used to keep the unique file name for file, to handle different tables exists on the same region.
-/// local unix timestamp is used to keep the unique file name for file, to handle receive the same request after connection reset.
+/// Construct an backup file name based on the given store id, region, range
+/// start key and local unix timestamp. A name consists with five parts: store
+/// id, region_id, a epoch version, the hash of range start key and timestamp.
+/// range start key is used to keep the unique file name for file, to handle
+/// different tables exists on the same region. local unix timestamp is used to
+/// keep the unique file name for file, to handle receive the same request after
+/// connection reset.
 pub fn backup_file_name(
     store_id: u64,
     region: &Region,
@@ -1155,13 +1246,10 @@ pub mod tests {
     use collections::HashSet;
     use engine_traits::MiscExt;
     use external_storage_export::{make_local_backend, make_noop_backend};
-    use file_system::{IOOp, IORateLimiter, IOType};
+    use file_system::{IoOp, IoRateLimiter, IoType};
     use futures::{executor::block_on, stream::StreamExt};
     use kvproto::metapb;
-    use raftstore::{
-        coprocessor::{RegionCollector, Result as CopResult, SeekRegionCallback},
-        store::util::new_peer,
-    };
+    use raftstore::coprocessor::{RegionCollector, Result as CopResult, SeekRegionCallback};
     use rand::Rng;
     use tempfile::TempDir;
     use tikv::{
@@ -1171,7 +1259,7 @@ pub mod tests {
             RocksEngine, TestEngineBuilder,
         },
     };
-    use tikv_util::config::ReadableSize;
+    use tikv_util::{config::ReadableSize, store::new_peer};
     use tokio::time;
     use txn_types::SHORT_VALUE_MAX_LEN;
 
@@ -1237,18 +1325,19 @@ pub mod tests {
     }
 
     pub fn new_endpoint() -> (TempDir, Endpoint<RocksEngine, MockRegionInfoProvider>) {
-        new_endpoint_with_limiter(None, ApiVersion::V1, false)
+        new_endpoint_with_limiter(None, ApiVersion::V1, false, None)
     }
 
     pub fn new_endpoint_with_limiter(
-        limiter: Option<Arc<IORateLimiter>>,
+        limiter: Option<Arc<IoRateLimiter>>,
         api_version: ApiVersion,
         is_raw_kv: bool,
+        causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
     ) -> (TempDir, Endpoint<RocksEngine, MockRegionInfoProvider>) {
         let temp = TempDir::new().unwrap();
         let rocks = TestEngineBuilder::new()
             .path(temp.path())
-            .cfs(&[
+            .cfs([
                 engine_traits::CF_DEFAULT,
                 engine_traits::CF_LOCK,
                 engine_traits::CF_WRITE,
@@ -1259,7 +1348,7 @@ pub mod tests {
             .unwrap();
         let concurrency_manager = ConcurrencyManager::new(1.into());
         let need_encode_key = !is_raw_kv || api_version == ApiVersion::V2;
-        let db = rocks.get_rocksdb().get_sync_db();
+        let db = rocks.get_rocksdb();
         (
             temp,
             Endpoint::new(
@@ -1275,6 +1364,7 @@ pub mod tests {
                 },
                 concurrency_manager,
                 api_version,
+                causal_ts_provider,
             ),
         )
     }
@@ -1352,17 +1442,9 @@ pub mod tests {
         // Test seek backup range.
         let test_seek_backup_range =
             |start_key: &[u8], end_key: &[u8], expect: Vec<(&[u8], &[u8])>| {
-                let start_key = if start_key.is_empty() {
-                    None
-                } else {
-                    Some(Key::from_raw(start_key))
-                };
-                let end_key = if end_key.is_empty() {
-                    None
-                } else {
-                    Some(Key::from_raw(end_key))
-                };
-                let mut prs = Progress::new(
+                let start_key = (!start_key.is_empty()).then_some(Key::from_raw(start_key));
+                let end_key = (!end_key.is_empty()).then_some(Key::from_raw(end_key));
+                let mut prs = Progress::new_with_range(
                     endpoint.store_id,
                     start_key,
                     end_key,
@@ -1414,6 +1496,7 @@ pub mod tests {
                     request: Request {
                         start_key: start_key.to_vec(),
                         end_key: end_key.to_vec(),
+                        sub_ranges: Vec::new(),
                         start_ts: 1.into(),
                         end_ts: 1.into(),
                         backend,
@@ -1481,11 +1564,194 @@ pub mod tests {
     }
 
     #[test]
+    fn test_seek_ranges() {
+        let (_tmp, endpoint) = new_endpoint();
+
+        endpoint.region_info.set_regions(vec![
+            (b"".to_vec(), b"1".to_vec(), 1),
+            (b"1".to_vec(), b"2".to_vec(), 2),
+            (b"3".to_vec(), b"4".to_vec(), 3),
+            (b"7".to_vec(), b"9".to_vec(), 4),
+            (b"9".to_vec(), b"".to_vec(), 5),
+        ]);
+        // Test seek backup range.
+        let test_seek_backup_ranges =
+            |sub_ranges: Vec<(&[u8], &[u8])>, expect: Vec<(&[u8], &[u8])>| {
+                let mut ranges = Vec::with_capacity(sub_ranges.len());
+                for &(start_key, end_key) in &sub_ranges {
+                    let start_key = (!start_key.is_empty()).then_some(Key::from_raw(start_key));
+                    let end_key = (!end_key.is_empty()).then_some(Key::from_raw(end_key));
+                    ranges.push((start_key, end_key));
+                }
+                let mut prs = Progress::new_with_ranges(
+                    endpoint.store_id,
+                    ranges,
+                    endpoint.region_info.clone(),
+                    KeyValueCodec::new(false, ApiVersion::V1, ApiVersion::V1),
+                    engine_traits::CF_DEFAULT,
+                );
+
+                let mut ranges = Vec::with_capacity(expect.len());
+                while ranges.len() != expect.len() {
+                    let n = (rand::random::<usize>() % 3) + 1;
+                    let mut r = prs.forward(n);
+                    // The returned backup ranges should <= n
+                    assert!(r.len() <= n);
+
+                    if r.is_empty() {
+                        // if return a empty vec then the progress is finished
+                        assert_eq!(
+                            ranges.len(),
+                            expect.len(),
+                            "got {:?}, expect {:?}",
+                            ranges,
+                            expect
+                        );
+                    }
+                    ranges.append(&mut r);
+                }
+
+                for (a, b) in ranges.into_iter().zip(expect) {
+                    assert_eq!(
+                        a.start_key.map_or_else(Vec::new, |k| k.into_raw().unwrap()),
+                        b.0
+                    );
+                    assert_eq!(
+                        a.end_key.map_or_else(Vec::new, |k| k.into_raw().unwrap()),
+                        b.1
+                    );
+                }
+            };
+
+        // Test whether responses contain correct range.
+        #[allow(clippy::blocks_in_if_conditions)]
+        let test_handle_backup_task_ranges =
+            |sub_ranges: Vec<(&[u8], &[u8])>, expect: Vec<(&[u8], &[u8])>| {
+                let tmp = TempDir::new().unwrap();
+                let backend = make_local_backend(tmp.path());
+                let (tx, rx) = unbounded();
+
+                let mut ranges = Vec::with_capacity(sub_ranges.len());
+                for &(start_key, end_key) in &sub_ranges {
+                    let key_range = KeyRange {
+                        start_key: start_key.to_vec(),
+                        end_key: end_key.to_vec(),
+                        ..Default::default()
+                    };
+                    ranges.push(key_range);
+                }
+                let task = Task {
+                    request: Request {
+                        start_key: b"1".to_vec(),
+                        end_key: b"2".to_vec(),
+                        sub_ranges: ranges,
+                        start_ts: 1.into(),
+                        end_ts: 1.into(),
+                        backend,
+                        limiter: Limiter::new(f64::INFINITY),
+                        cancel: Arc::default(),
+                        is_raw_kv: false,
+                        dst_api_ver: ApiVersion::V1,
+                        cf: engine_traits::CF_DEFAULT,
+                        compression_type: CompressionType::Unknown,
+                        compression_level: 0,
+                        cipher: CipherInfo::default(),
+                    },
+                    resp: tx,
+                };
+                endpoint.handle_backup_task(task);
+                let resps: Vec<_> = block_on(rx.collect());
+                for a in &resps {
+                    assert!(
+                        expect
+                            .iter()
+                            .any(|b| { a.get_start_key() == b.0 && a.get_end_key() == b.1 }),
+                        "{:?} {:?}",
+                        resps,
+                        expect
+                    );
+                }
+                assert_eq!(resps.len(), expect.len());
+            };
+
+        // Backup range from case.0 to case.1,
+        // the case.2 is the expected results.
+        type Case<'a> = (Vec<(&'a [u8], &'a [u8])>, Vec<(&'a [u8], &'a [u8])>);
+
+        let case: Vec<Case<'_>> = vec![
+            (
+                vec![(b"", b"1"), (b"1", b"2")],
+                vec![(b"", b"1"), (b"1", b"2")],
+            ),
+            (
+                vec![(b"", b"2"), (b"3", b"4")],
+                vec![(b"", b"1"), (b"1", b"2"), (b"3", b"4")],
+            ),
+            (
+                vec![(b"7", b"8"), (b"8", b"9")],
+                vec![(b"7", b"8"), (b"8", b"9")],
+            ),
+            (
+                vec![(b"8", b"9"), (b"6", b"8")],
+                vec![(b"8", b"9"), (b"7", b"8")],
+            ),
+            (
+                vec![(b"8", b"85"), (b"88", b"89"), (b"7", b"8")],
+                vec![(b"8", b"85"), (b"88", b"89"), (b"7", b"8")],
+            ),
+            (
+                vec![(b"8", b"85"), (b"", b"35"), (b"88", b"89"), (b"7", b"8")],
+                vec![
+                    (b"8", b"85"),
+                    (b"", b"1"),
+                    (b"1", b"2"),
+                    (b"3", b"35"),
+                    (b"88", b"89"),
+                    (b"7", b"8"),
+                ],
+            ),
+            (vec![(b"", b"1")], vec![(b"", b"1")]),
+            (vec![(b"", b"2")], vec![(b"", b"1"), (b"1", b"2")]),
+            (vec![(b"1", b"2")], vec![(b"1", b"2")]),
+            (vec![(b"1", b"3")], vec![(b"1", b"2")]),
+            (vec![(b"1", b"4")], vec![(b"1", b"2"), (b"3", b"4")]),
+            (vec![(b"4", b"5")], vec![]),
+            (vec![(b"4", b"6")], vec![]),
+            (vec![(b"4", b"6"), (b"6", b"7")], vec![]),
+            (vec![(b"2", b"3"), (b"4", b"6"), (b"6", b"7")], vec![]),
+            (vec![(b"2", b"7")], vec![(b"3", b"4")]),
+            (vec![(b"7", b"8")], vec![(b"7", b"8")]),
+            (
+                vec![(b"3", b"")],
+                vec![(b"3", b"4"), (b"7", b"9"), (b"9", b"")],
+            ),
+            (vec![(b"5", b"")], vec![(b"7", b"9"), (b"9", b"")]),
+            (vec![(b"7", b"")], vec![(b"7", b"9"), (b"9", b"")]),
+            (vec![(b"8", b"91")], vec![(b"8", b"9"), (b"9", b"91")]),
+            (vec![(b"8", b"")], vec![(b"8", b"9"), (b"9", b"")]),
+            (
+                vec![(b"", b"")],
+                vec![
+                    (b"", b"1"),
+                    (b"1", b"2"),
+                    (b"3", b"4"),
+                    (b"7", b"9"),
+                    (b"9", b""),
+                ],
+            ),
+        ];
+        for (ranges, expect_ranges) in case {
+            test_seek_backup_ranges(ranges.clone(), expect_ranges.clone());
+            test_handle_backup_task_ranges(ranges, expect_ranges);
+        }
+    }
+
+    #[test]
     fn test_handle_backup_task() {
-        let limiter = Arc::new(IORateLimiter::new_for_test());
+        let limiter = Arc::new(IoRateLimiter::new_for_test());
         let stats = limiter.statistics().unwrap();
-        let (tmp, endpoint) = new_endpoint_with_limiter(Some(limiter), ApiVersion::V1, false);
-        let engine = endpoint.engine.clone();
+        let (tmp, endpoint) = new_endpoint_with_limiter(Some(limiter), ApiVersion::V1, false, None);
+        let mut engine = endpoint.engine.clone();
 
         endpoint
             .region_info
@@ -1501,24 +1767,24 @@ pub mod tests {
                 let commit = alloc_ts();
                 let key = format!("{}", i);
                 must_prewrite_put(
-                    &engine,
+                    &mut engine,
                     key.as_bytes(),
                     &vec![i; *len],
                     key.as_bytes(),
                     start,
                 );
-                must_commit(&engine, key.as_bytes(), start, commit);
+                must_commit(&mut engine, key.as_bytes(), start, commit);
                 backup_tss.push((alloc_ts(), len));
             }
         }
         // flush to disk so that read requests can be traced by TiKV limiter.
         engine
             .get_rocksdb()
-            .flush_cf(engine_traits::CF_DEFAULT, true /*sync*/)
+            .flush_cf(engine_traits::CF_DEFAULT, true /* sync */)
             .unwrap();
         engine
             .get_rocksdb()
-            .flush_cf(engine_traits::CF_WRITE, true /*sync*/)
+            .flush_cf(engine_traits::CF_WRITE, true /* sync */)
             .unwrap();
 
         // TODO: check key number for each snapshot.
@@ -1553,14 +1819,14 @@ pub mod tests {
             info!("{:?}", files);
             assert_eq!(
                 files.len(),
-                file_len, /* default and write */
+                file_len, // default and write
                 "{:?}",
                 resp
             );
             let (none, _rx) = block_on(rx.into_future());
             assert!(none.is_none(), "{:?}", none);
-            assert_eq!(stats.fetch(IOType::Export, IOOp::Write), 0);
-            assert_ne!(stats.fetch(IOType::Export, IOOp::Read), 0);
+            assert_eq!(stats.fetch(IoType::Export, IoOp::Write), 0);
+            assert_ne!(stats.fetch(IoType::Export, IoOp::Read), 0);
         }
     }
 
@@ -1594,10 +1860,10 @@ pub mod tests {
         })
     }
 
-    fn generate_engine_test_value(user_value: String, api_ver: ApiVersion) -> Vec<u8> {
+    fn generate_engine_test_value(user_value: String, api_ver: ApiVersion, ttl: u64) -> Vec<u8> {
         let raw_value = RawValue {
             user_value: user_value.into_bytes(),
-            expire_ts: Some(u64::MAX),
+            expire_ts: Some(ttl),
             is_delete: false,
         };
         dispatch_api_version!(api_ver, {
@@ -1620,17 +1886,22 @@ pub mod tests {
         Key::from_encoded(raw_key.into_bytes())
     }
 
-    fn test_handle_backup_raw_task_impl(cur_api_ver: ApiVersion, dst_api_ver: ApiVersion) -> bool {
-        let limiter = Arc::new(IORateLimiter::new_for_test());
+    fn test_handle_backup_raw_task_impl(
+        cur_api_ver: ApiVersion,
+        dst_api_ver: ApiVersion,
+        test_ttl: bool,
+    ) -> bool {
+        let limiter = Arc::new(IoRateLimiter::new_for_test());
         let stats = limiter.statistics().unwrap();
-        let (tmp, endpoint) = new_endpoint_with_limiter(Some(limiter), cur_api_ver, true);
+        let (tmp, endpoint) = new_endpoint_with_limiter(Some(limiter), cur_api_ver, true, None);
         let engine = endpoint.engine.clone();
 
         let start_key_idx: u64 = 100;
         let end_key_idx: u64 = 110;
+        let ttl_expire_cnt = 2;
         endpoint.region_info.set_regions(vec![(
-            vec![], //generate_test_raw_key(start_key_idx).into_bytes(),
-            vec![], //generate_test_raw_key(end_key_idx).into_bytes(),
+            vec![], // generate_test_raw_key(start_key_idx).into_bytes(),
+            vec![], // generate_test_raw_key(end_key_idx).into_bytes(),
             1,
         )]);
         let ctx = Context::default();
@@ -1640,24 +1911,31 @@ pub mod tests {
         while i < end_key_idx {
             let key_str = generate_test_raw_key(i, cur_api_ver);
             let value_str = generate_test_raw_value(i, cur_api_ver);
-            let key = generate_engine_test_key(key_str.clone(), None, cur_api_ver);
-            let value = generate_engine_test_value(value_str.clone(), cur_api_ver);
+            let ttl = if test_ttl && i >= end_key_idx - ttl_expire_cnt {
+                1 // let last `ttl_expire_cnt` value expired when backup
+            } else {
+                u64::MAX
+            };
+            // engine do not append ts anymore, need write ts encoded key into engine.
+            let key = generate_engine_test_key(key_str.clone(), Some(i.into()), cur_api_ver);
+            let value = generate_engine_test_value(value_str.clone(), cur_api_ver, ttl);
             let dst_user_key = convert_test_backup_user_key(key_str, cur_api_ver, dst_api_ver);
             let dst_value = value_str.as_bytes();
-            checksum = checksum_crc64_xor(
-                checksum,
-                digest.clone(),
-                dst_user_key.as_encoded(),
-                dst_value,
-            );
-            let ret = engine.put(&ctx, key, value);
-            assert!(ret.is_ok());
+            if ttl != 1 {
+                checksum = checksum_crc64_xor(
+                    checksum,
+                    digest.clone(),
+                    dst_user_key.as_encoded(),
+                    dst_value,
+                );
+            }
+            engine.put(&ctx, key, value).unwrap();
             i += 1;
         }
         // flush to disk so that read requests can be traced by TiKV limiter.
         engine
             .get_rocksdb()
-            .flush_cf(engine_traits::CF_DEFAULT, true /*sync*/)
+            .flush_cf(engine_traits::CF_DEFAULT, true /* sync */)
             .unwrap();
 
         // TODO: check key number for each snapshot.
@@ -1683,6 +1961,10 @@ pub mod tests {
         } else {
             vec![]
         };
+        if test_ttl {
+            std::thread::sleep(Duration::from_secs(2)); // wait for ttl expired
+        }
+        let original_expire_cnt = BACKUP_RAW_EXPIRED_COUNT.get();
         req.set_start_key(backup_start.clone());
         req.set_end_key(backup_end.clone());
         req.set_is_raw_kv(true);
@@ -1702,14 +1984,26 @@ pub mod tests {
             assert!(resp.has_error());
             return false;
         }
+
+        let current_expire_cnt = BACKUP_RAW_EXPIRED_COUNT.get();
+        let expect_expire_cnt = if test_ttl {
+            original_expire_cnt + ttl_expire_cnt
+        } else {
+            original_expire_cnt
+        };
+        assert_eq!(expect_expire_cnt, current_expire_cnt);
         assert!(!resp.has_error(), "{:?}", resp);
         assert_eq!(resp.get_start_key(), backup_start);
         assert_eq!(resp.get_end_key(), backup_end);
         let file_len = 1;
         let files = resp.get_files();
         info!("{:?}", files);
-        assert_eq!(files.len(), file_len /* default cf*/, "{:?}", resp);
-        assert_eq!(files[0].total_kvs, end_key_idx - start_key_idx);
+        let mut expect_cnt = end_key_idx - start_key_idx;
+        if test_ttl {
+            expect_cnt -= 2;
+        }
+        assert_eq!(files.len(), file_len /* default cf */, "{:?}", resp);
+        assert_eq!(files[0].total_kvs, expect_cnt);
         assert_eq!(files[0].crc64xor, checksum);
         assert_eq!(files[0].get_start_key(), file_start);
         assert_eq!(files[0].get_end_key(), file_end);
@@ -1729,41 +2023,71 @@ pub mod tests {
         } as u64;
         assert_eq!(
             files[0].total_bytes,
-            (end_key_idx - start_key_idx - 1) * kv_backup_size + first_kv_backup_size
+            (expect_cnt - 1) * kv_backup_size + first_kv_backup_size
         );
         let (none, _rx) = block_on(rx.into_future());
         assert!(none.is_none(), "{:?}", none);
-        assert_eq!(stats.fetch(IOType::Export, IOOp::Write), 0);
-        assert_ne!(stats.fetch(IOType::Export, IOOp::Read), 0);
+        assert_eq!(stats.fetch(IoType::Export, IoOp::Write), 0);
+        assert_ne!(stats.fetch(IoType::Export, IoOp::Read), 0);
         true
     }
 
     #[test]
     fn test_handle_backup_raw() {
-        // (src_api_version, dst_api_version, result)
+        // (src_api_version, dst_api_version, test_ttl, result)
         let test_backup_cases = vec![
-            (ApiVersion::V1, ApiVersion::V1, true),
-            (ApiVersion::V1ttl, ApiVersion::V1ttl, true),
-            (ApiVersion::V2, ApiVersion::V2, true),
-            (ApiVersion::V1, ApiVersion::V2, true),
-            (ApiVersion::V1ttl, ApiVersion::V2, true),
-            (ApiVersion::V1, ApiVersion::V1ttl, false),
-            (ApiVersion::V2, ApiVersion::V1, false),
-            (ApiVersion::V2, ApiVersion::V1ttl, false),
-            (ApiVersion::V1ttl, ApiVersion::V1, false),
+            (ApiVersion::V1, ApiVersion::V1, false, true),
+            (ApiVersion::V1ttl, ApiVersion::V1ttl, true, true),
+            (ApiVersion::V2, ApiVersion::V2, true, true),
+            (ApiVersion::V1, ApiVersion::V2, false, true),
+            (ApiVersion::V1ttl, ApiVersion::V2, false, true),
+            (ApiVersion::V1, ApiVersion::V1ttl, false, false),
+            (ApiVersion::V2, ApiVersion::V1, false, false),
+            (ApiVersion::V2, ApiVersion::V1ttl, false, false),
+            (ApiVersion::V1ttl, ApiVersion::V1, false, false),
         ];
-        for test_case in test_backup_cases {
+        for (idx, (src_api, dst_api, test_ttl, result)) in test_backup_cases.into_iter().enumerate()
+        {
             assert_eq!(
-                test_handle_backup_raw_task_impl(test_case.0, test_case.1),
-                test_case.2
+                test_handle_backup_raw_task_impl(src_api, dst_api, test_ttl),
+                result,
+                "case {}",
+                idx,
             );
         }
     }
 
     #[test]
+    fn test_backup_raw_apiv2_causal_ts() {
+        let limiter = Arc::new(IoRateLimiter::new_for_test());
+        let ts_provider: Arc<CausalTsProviderImpl> =
+            Arc::new(causal_ts::tests::TestProvider::default().into());
+        let start_ts = block_on(ts_provider.async_get_ts()).unwrap();
+        let (tmp, endpoint) = new_endpoint_with_limiter(
+            Some(limiter),
+            ApiVersion::V2,
+            true,
+            Some(ts_provider.clone()),
+        );
+
+        let mut req = BackupRequest::default();
+        let (tx, _) = unbounded();
+        let tmp1 = make_unique_dir(tmp.path());
+        req.set_storage_backend(make_local_backend(&tmp1));
+        req.set_start_key(b"r".to_vec());
+        req.set_end_key(b"s".to_vec());
+        req.set_is_raw_kv(true);
+        req.set_dst_api_version(ApiVersion::V2);
+        let (task, _) = Task::new(req, tx).unwrap();
+        endpoint.handle_backup_task(task);
+        let end_ts = block_on(ts_provider.async_get_ts()).unwrap();
+        assert_eq!(end_ts.into_inner(), start_ts.next().into_inner() + 101);
+    }
+
+    #[test]
     fn test_scan_error() {
         let (tmp, endpoint) = new_endpoint();
-        let engine = endpoint.engine.clone();
+        let mut engine = endpoint.engine.clone();
 
         endpoint
             .region_info
@@ -1774,7 +2098,7 @@ pub mod tests {
         let start = alloc_ts();
         let key = format!("{}", start);
         must_prewrite_put(
-            &engine,
+            &mut engine,
             key.as_bytes(),
             key.as_bytes(),
             key.as_bytes(),
@@ -1802,7 +2126,7 @@ pub mod tests {
 
         // Commit the perwrite.
         let commit = alloc_ts();
-        must_commit(&engine, key.as_bytes(), start, commit);
+        must_commit(&mut engine, key.as_bytes(), start, commit);
 
         // Test whether it can correctly convert not leader to region error.
         engine.trigger_not_leader();
@@ -1828,7 +2152,7 @@ pub mod tests {
     #[test]
     fn test_cancel() {
         let (temp, mut endpoint) = new_endpoint();
-        let engine = endpoint.engine.clone();
+        let mut engine = endpoint.engine.clone();
 
         endpoint
             .region_info
@@ -1839,7 +2163,7 @@ pub mod tests {
         let start = alloc_ts();
         let key = format!("{}", start);
         must_prewrite_put(
-            &engine,
+            &mut engine,
             key.as_bytes(),
             key.as_bytes(),
             key.as_bytes(),
@@ -1847,7 +2171,7 @@ pub mod tests {
         );
         // Commit the perwrite.
         let commit = alloc_ts();
-        must_commit(&engine, key.as_bytes(), start, commit);
+        must_commit(&mut engine, key.as_bytes(), start, commit);
 
         let now = alloc_ts();
         let mut req = BackupRequest::default();
@@ -1952,7 +2276,8 @@ pub mod tests {
         assert_eq!(responses.len(), 3, "{:?}", responses);
 
         // for testing whether dropping the pool before all tasks finished causes panic.
-        // but the panic must be checked manually... (It may panic at tokio runtime threads...)
+        // but the panic must be checked manually. (It may panic at tokio runtime
+        // threads)
         let mut pool = ControlThreadPool::new();
         pool.adjust_with(1);
         pool.spawn(async { tokio::time::sleep(Duration::from_millis(100)).await });

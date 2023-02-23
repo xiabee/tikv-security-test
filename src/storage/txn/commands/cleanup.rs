@@ -38,6 +38,7 @@ command! {
 impl CommandExt for Cleanup {
     ctx!();
     tag!(cleanup);
+    request_type!(KvCleanup);
     ts!(start_ts);
     write_bytes!(key);
     gen_lock!(key);
@@ -45,8 +46,8 @@ impl CommandExt for Cleanup {
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Cleanup {
     fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
-        // It is not allowed for commit to overwrite a protected rollback. So we update max_ts
-        // to prevent this case from happening.
+        // It is not allowed for commit to overwrite a protected rollback. So we update
+        // max_ts to prevent this case from happening.
         context.concurrency_manager.update_max_ts(self.start_ts);
 
         let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
@@ -55,7 +56,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Cleanup {
             context.statistics,
         );
 
-        let mut released_locks = ReleasedLocks::new(self.start_ts, TimeStamp::zero());
+        let mut released_locks = ReleasedLocks::new();
         // The rollback must be protected, see more on
         // [issue #7364](https://github.com/tikv/tikv/issues/7364)
         released_locks.push(cleanup(
@@ -65,7 +66,6 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Cleanup {
             self.current_ts,
             true,
         )?);
-        released_locks.wake_up(context.lock_mgr);
 
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
         write_data.set_allowed_on_disk_almost_full();
@@ -74,7 +74,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Cleanup {
             to_be_write: write_data,
             rows: 1,
             pr: ProcessResult::Res,
-            lock_info: None,
+            lock_info: vec![],
+            released_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
         })

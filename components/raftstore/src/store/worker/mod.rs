@@ -6,10 +6,8 @@ mod cleanup_snapshot;
 mod cleanup_sst;
 mod compact;
 mod consistency_check;
-mod metrics;
+pub mod metrics;
 mod pd;
-mod query_stats;
-mod raftlog_fetch;
 mod raftlog_gc;
 mod read;
 mod refresh_config;
@@ -18,6 +16,8 @@ mod split_check;
 mod split_config;
 mod split_controller;
 
+#[cfg(test)]
+pub use self::region::tests::make_raftstore_cfg as make_region_worker_raftstore_cfg;
 pub use self::{
     check_leader::{Runner as CheckLeaderRunner, Task as CheckLeaderTask},
     cleanup::{Runner as CleanupRunner, Task as CleanupTask},
@@ -29,10 +29,12 @@ pub use self::{
         new_change_peer_v2_request, FlowStatistics, FlowStatsReporter, HeartbeatTask,
         Runner as PdRunner, Task as PdTask,
     },
-    query_stats::QueryStats,
-    raftlog_fetch::{Runner as RaftlogFetchRunner, Task as RaftlogFetchTask},
     raftlog_gc::{Runner as RaftlogGcRunner, Task as RaftlogGcTask},
-    read::{LocalReader, Progress as ReadProgress, ReadDelegate, ReadExecutor, TrackVer},
+    read::{
+        CachedReadDelegate, LocalReadContext, LocalReader, LocalReaderCore,
+        Progress as ReadProgress, ReadDelegate, ReadExecutor, ReadExecutorProvider,
+        StoreMetaDelegate, TrackVer,
+    },
     refresh_config::{
         BatchComponent as RaftStoreBatchComponent, Runner as RefreshConfigRunner,
         Task as RefreshConfigTask,
@@ -42,5 +44,5 @@ pub use self::{
         Bucket, BucketRange, KeyEntry, Runner as SplitCheckRunner, Task as SplitCheckTask,
     },
     split_config::{SplitConfig, SplitConfigManager},
-    split_controller::{AutoSplitController, ReadStats, WriteStats},
+    split_controller::{AutoSplitController, ReadStats, SplitConfigChange, WriteStats},
 };

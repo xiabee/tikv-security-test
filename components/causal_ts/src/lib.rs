@@ -1,5 +1,7 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
+#![feature(div_duration)]
+
 #[macro_use]
 extern crate tikv_util;
 
@@ -10,22 +12,32 @@ pub use errors::*;
 mod tso;
 pub use tso::*;
 mod metrics;
+use async_trait::async_trait;
+use enum_dispatch::enum_dispatch;
 pub use metrics::*;
-mod observer;
-pub use observer::*;
+#[cfg(any(test, feature = "testexport"))]
+use test_pd_client::TestPdClient;
 use txn_types::TimeStamp;
 
-use crate::errors::Result;
-
+pub use crate::errors::Result;
 /// Trait of causal timestamp provider.
+#[async_trait]
+#[enum_dispatch]
 pub trait CausalTsProvider: Send + Sync {
     /// Get a new timestamp.
-    fn get_ts(&self) -> Result<TimeStamp>;
+    async fn async_get_ts(&self) -> Result<TimeStamp>;
 
-    /// Flush (cached) timestamps to keep causality on some events, such as "leader transfer".
-    fn flush(&self) -> Result<()> {
-        Ok(())
-    }
+    /// Flush (cached) timestamps and return first timestamp to keep causality
+    /// on some events, such as "leader transfer".
+    async fn async_flush(&self) -> Result<TimeStamp>;
+}
+
+#[enum_dispatch(CausalTsProvider)]
+pub enum CausalTsProviderImpl {
+    BatchTsoProvider(BatchTsoProvider<pd_client::RpcClient>),
+    #[cfg(any(test, feature = "testexport"))]
+    BatchTsoProviderTest(BatchTsoProvider<TestPdClient>),
+    TestProvider(tests::TestProvider),
 }
 
 pub mod tests {
@@ -37,6 +49,7 @@ pub mod tests {
     use super::*;
 
     /// for TEST purpose.
+    #[derive(Clone)]
     pub struct TestProvider {
         ts: Arc<AtomicU64>,
     }
@@ -50,9 +63,17 @@ pub mod tests {
         }
     }
 
+    #[async_trait]
     impl CausalTsProvider for TestProvider {
-        fn get_ts(&self) -> Result<TimeStamp> {
+        async fn async_get_ts(&self) -> Result<TimeStamp> {
             Ok(self.ts.fetch_add(1, Ordering::Relaxed).into())
+        }
+
+        // This is used for unit test. Add 100 from current.
+        // Do not modify this value as several test cases depend on it.
+        async fn async_flush(&self) -> Result<TimeStamp> {
+            self.ts.fetch_add(100, Ordering::Relaxed);
+            self.async_get_ts().await
         }
     }
 }

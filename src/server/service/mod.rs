@@ -2,7 +2,7 @@
 
 mod batch;
 mod debug;
-mod diagnostics;
+pub mod diagnostics;
 mod kv;
 
 pub use self::{
@@ -18,7 +18,7 @@ pub use self::{
 macro_rules! log_net_error {
     ($err:expr, $($args:tt)*) => {{
         let e = $err;
-        if let crate::server::Error::Grpc(e) = e {
+        if let $crate::server::Error::Grpc(e) = e {
             info!($($args)*, "err" => %e);
         } else {
             debug!($($args)*, "err" => %e);

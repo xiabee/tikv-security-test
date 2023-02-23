@@ -9,6 +9,7 @@
 extern crate test;
 
 use std::{
+    cmp,
     collections::{
         hash_map::Entry,
         vec_deque::{Iter, VecDeque},
@@ -32,6 +33,8 @@ use nix::{
 };
 use rand::rngs::ThreadRng;
 
+use crate::sys::thread::StdThreadBuildWrapper;
+
 #[macro_use]
 pub mod log;
 pub mod buffer_vec;
@@ -50,6 +53,7 @@ pub mod memory;
 pub mod metrics;
 pub mod mpsc;
 pub mod quota_limiter;
+pub mod store;
 pub mod stream;
 pub mod sys;
 pub mod thread_group;
@@ -87,7 +91,7 @@ pub fn panic_mark_file_path<P: AsRef<Path>>(data_dir: P) -> PathBuf {
 
 pub fn create_panic_mark_file<P: AsRef<Path>>(data_dir: P) {
     let file = panic_mark_file_path(data_dir);
-    File::create(&file).unwrap();
+    File::create(file).unwrap();
 }
 
 // Copied from file_system to avoid cyclic dependency
@@ -468,7 +472,7 @@ pub fn set_panic_hook(panic_abort: bool, data_dir: &str) {
     // Caching is slow, spawn it in another thread to speed up.
     thread::Builder::new()
         .name(thd_name!("backtrace-loader"))
-        .spawn(::backtrace::Backtrace::new)
+        .spawn_wrapper(::backtrace::Backtrace::new)
         .unwrap();
 
     let data_dir = data_dir.to_string();
@@ -495,10 +499,11 @@ pub fn set_panic_hook(panic_abort: bool, data_dir: &str) {
         );
 
         // There might be remaining logs in the async logger.
-        // To collect remaining logs and also collect future logs, replace the old one with a
-        // terminal logger.
-        // When the old global async logger is replaced, the old async guard will be taken and dropped.
-        // In the drop() the async guard, it waits for the finish of the remaining logs in the async logger.
+        // To collect remaining logs and also collect future logs, replace the old one
+        // with a terminal logger.
+        // When the old global async logger is replaced, the old async guard will be
+        // taken and dropped. In the drop() the async guard, it waits for the
+        // finish of the remaining logs in the async logger.
         if let Some(level) = ::log::max_level().to_level() {
             let drainer = logger::text_format(logger::term_writer(), true);
             let _ = logger::init_log(
@@ -580,6 +585,16 @@ pub fn empty_shared_slice<T>() -> Arc<[T]> {
 /// A useful hook to check if master branch is being built.
 pub fn build_on_master_branch() -> bool {
     option_env!("TIKV_BUILD_GIT_BRANCH").map_or(false, |b| "master" == b)
+}
+
+/// Set the capacity of a vector to the given capacity.
+#[inline]
+pub fn set_vec_capacity<T>(v: &mut Vec<T>, cap: usize) {
+    match cap.cmp(&v.capacity()) {
+        cmp::Ordering::Less => v.shrink_to(cap),
+        cmp::Ordering::Greater => v.reserve_exact(cap - v.len()),
+        cmp::Ordering::Equal => {}
+    }
 }
 
 #[cfg(test)]
@@ -714,7 +729,7 @@ mod tests {
             match foo(&mu.rl()) {
                 Some(_) | None => {
                     let res = mu.try_write();
-                    assert!(res.is_err());
+                    res.unwrap_err();
                 }
             }
         }

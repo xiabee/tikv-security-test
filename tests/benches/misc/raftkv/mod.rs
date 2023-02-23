@@ -4,8 +4,9 @@ use std::sync::{Arc, RwLock};
 
 use collections::HashSet;
 use crossbeam::channel::TrySendError;
-use engine_rocks::{raw::DB, RocksEngine, RocksSnapshot};
-use engine_traits::{ALL_CFS, CF_DEFAULT};
+use engine_rocks::{RocksEngine, RocksSnapshot};
+use engine_traits::{KvEngine, ALL_CFS, CF_DEFAULT};
+use futures::future::FutureExt;
 use kvproto::{
     kvrpcpb::{Context, ExtraOp as TxnExtraOp},
     metapb::Region,
@@ -15,9 +16,9 @@ use kvproto::{
 use raftstore::{
     router::{LocalReadRouter, RaftStoreRouter},
     store::{
-        cmd_resp, util, Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter,
-        RaftCmdExtraOpts, RaftCommand, ReadResponse, RegionSnapshot, SignificantMsg,
-        SignificantRouter, StoreMsg, StoreRouter, WriteResponse,
+        cmd_resp, Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter, RaftCmdExtraOpts,
+        RaftCommand, ReadResponse, RegionSnapshot, SignificantMsg, SignificantRouter, StoreMsg,
+        StoreRouter, WriteResponse,
     },
     Result,
 };
@@ -29,19 +30,19 @@ use tikv::{
         Engine,
     },
 };
-use tikv_util::time::ThreadReadId;
+use tikv_util::{store::new_peer, time::ThreadReadId};
 use txn_types::Key;
 
 use crate::test;
 
 #[derive(Clone)]
 struct SyncBenchRouter {
-    db: Arc<DB>,
+    db: RocksEngine,
     region: Region,
 }
 
 impl SyncBenchRouter {
-    fn new(region: Region, db: Arc<DB>) -> SyncBenchRouter {
+    fn new(region: Region, db: RocksEngine) -> SyncBenchRouter {
         SyncBenchRouter { db, region }
     }
 }
@@ -51,8 +52,8 @@ impl SyncBenchRouter {
         let mut response = RaftCmdResponse::default();
         cmd_resp::bind_term(&mut response, 1);
         match cmd.callback {
-            Callback::Read(cb) => {
-                let snapshot = RocksSnapshot::new(Arc::clone(&self.db));
+            Callback::Read { cb, .. } => {
+                let snapshot = self.db.snapshot();
                 let region = Arc::new(self.region.to_owned());
                 cb(ReadResponse {
                     response,
@@ -119,7 +120,7 @@ impl RaftStoreRouter<RocksEngine> for SyncBenchRouter {
 
 impl LocalReadRouter<RocksEngine> for SyncBenchRouter {
     fn read(
-        &self,
+        &mut self,
         _: Option<ThreadReadId>,
         req: RaftCmdRequest,
         cb: Callback<RocksSnapshot>,
@@ -127,21 +128,21 @@ impl LocalReadRouter<RocksEngine> for SyncBenchRouter {
         self.send_command(req, cb, RaftCmdExtraOpts::default())
     }
 
-    fn release_snapshot_cache(&self) {}
+    fn release_snapshot_cache(&mut self) {}
 }
 
-fn new_engine() -> (TempDir, Arc<DB>) {
+fn new_engine() -> (TempDir, RocksEngine) {
     let dir = Builder::new().prefix("bench_rafkv").tempdir().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
-    let db = engine_rocks::raw_util::new_engine(&path, None, ALL_CFS, None).unwrap();
-    (dir, Arc::new(db))
+    let db = engine_rocks::util::new_engine(&path, ALL_CFS).unwrap();
+    (dir, db)
 }
 
 // The lower limit of time a async_snapshot may take.
 #[bench]
 fn bench_async_snapshots_noop(b: &mut test::Bencher) {
     let (_dir, db) = new_engine();
-    let snapshot = RocksSnapshot::new(Arc::clone(&db));
+    let snapshot = db.snapshot();
     let resp = ReadResponse {
         response: RaftCmdResponse::default(),
         snapshot: Some(RegionSnapshot::from_snapshot(
@@ -153,7 +154,7 @@ fn bench_async_snapshots_noop(b: &mut test::Bencher) {
 
     b.iter(|| {
         let cb1: EngineCallback<RegionSnapshot<RocksSnapshot>> = Box::new(move |res| {
-            assert!(res.is_ok());
+            res.unwrap();
         });
         let cb2: EngineCallback<CmdRes<RocksSnapshot>> = Box::new(move |res| {
             if let Ok(CmdRes::Snap(snap)) = res {
@@ -161,7 +162,7 @@ fn bench_async_snapshots_noop(b: &mut test::Bencher) {
             }
         });
         let cb: Callback<RocksSnapshot> =
-            Callback::Read(Box::new(move |resp: ReadResponse<RocksSnapshot>| {
+            Callback::read(Box::new(move |resp: ReadResponse<RocksSnapshot>| {
                 let res = CmdRes::Snap(resp.snapshot.unwrap());
                 cb2(Ok(res));
             }));
@@ -171,7 +172,7 @@ fn bench_async_snapshots_noop(b: &mut test::Bencher) {
 
 #[bench]
 fn bench_async_snapshot(b: &mut test::Bencher) {
-    let leader = util::new_peer(2, 3);
+    let leader = new_peer(2, 3);
     let mut region = Region::default();
     region.set_id(1);
     region.set_start_key(vec![]);
@@ -180,9 +181,9 @@ fn bench_async_snapshot(b: &mut test::Bencher) {
     region.mut_region_epoch().set_version(2);
     region.mut_region_epoch().set_conf_ver(5);
     let (_tmp, db) = new_engine();
-    let kv = RaftKv::new(
+    let mut kv = RaftKv::new(
         SyncBenchRouter::new(region.clone(), db.clone()),
-        RocksEngine::from_db(db),
+        db,
         Arc::new(RwLock::new(HashSet::default())),
     );
 
@@ -191,20 +192,21 @@ fn bench_async_snapshot(b: &mut test::Bencher) {
     ctx.set_region_epoch(region.get_region_epoch().clone());
     ctx.set_peer(leader);
     b.iter(|| {
-        let on_finished: EngineCallback<RegionSnapshot<RocksSnapshot>> = Box::new(move |results| {
-            let _ = test::black_box(results);
-        });
         let snap_ctx = SnapContext {
             pb_ctx: &ctx,
             ..Default::default()
         };
-        kv.async_snapshot(snap_ctx, on_finished).unwrap();
+        let f = kv.async_snapshot(snap_ctx);
+        let res = f.map(|res| {
+            let _ = test::black_box(res);
+        });
+        let _ = test::black_box(res);
     });
 }
 
 #[bench]
 fn bench_async_write(b: &mut test::Bencher) {
-    let leader = util::new_peer(2, 3);
+    let leader = new_peer(2, 3);
     let mut region = Region::default();
     region.set_id(1);
     region.set_start_key(vec![]);
@@ -215,7 +217,7 @@ fn bench_async_write(b: &mut test::Bencher) {
     let (_tmp, db) = new_engine();
     let kv = RaftKv::new(
         SyncBenchRouter::new(region.clone(), db.clone()),
-        RocksEngine::from_db(db),
+        db,
         Arc::new(RwLock::new(HashSet::default())),
     );
 
@@ -224,17 +226,18 @@ fn bench_async_write(b: &mut test::Bencher) {
     ctx.set_region_epoch(region.get_region_epoch().clone());
     ctx.set_peer(leader);
     b.iter(|| {
-        let on_finished: EngineCallback<()> = Box::new(|_| {
-            test::black_box(());
-        });
-        kv.async_write(
+        let f = tikv_kv::write(
+            &kv,
             &ctx,
             WriteData::from_modifies(vec![Modify::Delete(
                 CF_DEFAULT,
                 Key::from_encoded(b"fooo".to_vec()),
             )]),
-            on_finished,
-        )
-        .unwrap();
+            None,
+        );
+        let res = f.map(|res| {
+            let _ = test::black_box(res);
+        });
+        let _ = test::black_box(res);
     });
 }
