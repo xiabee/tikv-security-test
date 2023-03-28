@@ -1,6 +1,5 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 use tikv_util::numeric_enum_serializing_mod;
-use tracker::TrackerToken;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PerfLevel {
@@ -8,7 +7,7 @@ pub enum PerfLevel {
     Disable,
     EnableCount,
     EnableTimeExceptForMutex,
-    EnableTimeAndCpuTimeExceptForMutex,
+    EnableTimeAndCPUTimeExceptForMutex,
     EnableTime,
     OutOfBounds,
 }
@@ -18,7 +17,7 @@ numeric_enum_serializing_mod! {perf_level_serde PerfLevel {
     Disable = 1,
     EnableCount = 2,
     EnableTimeExceptForMutex = 3,
-    EnableTimeAndCpuTimeExceptForMutex = 4,
+    EnableTimeAndCPUTimeExceptForMutex = 4,
     EnableTime = 5,
     OutOfBounds = 6,
 }}
@@ -44,15 +43,11 @@ pub trait PerfContextExt {
 ///
 /// This is a leaky abstraction that supports the encapsulation of metrics
 /// reporting by the subsystems that use PerfContext.
-#[derive(PartialEq, Copy, Clone, Debug)]
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
 pub enum PerfContextKind {
     RaftstoreApply,
     RaftstoreStore,
-    /// Commands in tikv::storage, the inner str is the command tag.
-    Storage(&'static str),
-    /// Coprocessor requests in tikv::coprocessor, the inner str is the request
-    /// type.
-    Coprocessor(&'static str),
+    GenericRead,
 }
 
 /// Reports metrics to prometheus
@@ -63,6 +58,6 @@ pub trait PerfContext: Send {
     /// Reinitializes statistics and the perf level
     fn start_observe(&mut self);
 
-    /// Reports the current collected metrics to prometheus and trackers
-    fn report_metrics(&mut self, trackers: &[TrackerToken]);
+    /// Reports the current collected metrics to prometheus
+    fn report_metrics(&mut self);
 }

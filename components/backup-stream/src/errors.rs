@@ -6,7 +6,6 @@ use std::{
 
 use error_code::ErrorCodeExt;
 use etcd_client::Error as EtcdError;
-use grpcio::Error as GrpcError;
 use kvproto::{errorpb::Error as StoreError, metapb::*};
 use pd_client::Error as PdError;
 use protobuf::ProtobufError;
@@ -19,10 +18,8 @@ use crate::{endpoint::Task, metrics};
 
 #[derive(ThisError, Debug)]
 pub enum Error {
-    #[error("gRPC meet error {0}")]
-    Grpc(#[from] GrpcError),
     #[error("Etcd meet error {0}")]
-    Etcd(#[from] EtcdErrorExt),
+    Etcd(#[from] EtcdError),
     #[error("Protobuf meet error {0}")]
     Protobuf(#[from] ProtobufError),
     #[error("No such task {task_name:?}")]
@@ -52,22 +49,6 @@ pub enum Error {
     Other(#[from] Box<dyn StdError + Send + Sync + 'static>),
 }
 
-impl From<EtcdError> for Error {
-    fn from(value: EtcdError) -> Self {
-        Self::Etcd(value.into())
-    }
-}
-
-#[derive(ThisError, Debug)]
-pub enum EtcdErrorExt {
-    #[error("{0}")]
-    Normal(#[from] EtcdError),
-    #[error("the watch canceled")]
-    WatchCanceled,
-    #[error("the required revision has been compacted, current is {current}")]
-    RevisionCompacted { current: i64 },
-}
-
 impl ErrorCodeExt for Error {
     fn error_code(&self) -> error_code::ErrorCode {
         use error_code::backup_stream::*;
@@ -85,7 +66,6 @@ impl ErrorCodeExt for Error {
             Error::Other(_) => OTHER,
             Error::RaftStore(_) => RAFTSTORE,
             Error::ObserveCanceled(..) => OBSERVE_CANCELED,
-            Error::Grpc(_) => GRPC,
         }
     }
 }
@@ -135,31 +115,12 @@ where
     }
 }
 
-pub trait ReportableResult {
-    fn report_if_err(self, context: impl ToString);
-}
-
-impl<E> ReportableResult for StdResult<(), E>
-where
-    Error: From<E>,
-{
-    #[inline(always)]
-    fn report_if_err(self, context: impl ToString) {
-        if let Err(err) = self {
-            Error::from(err).report(context.to_string())
-        }
-    }
-}
-
 /// Like `errors.Annotate` in Go.
 /// Wrap an unknown error with [`Error::Other`].
 #[macro_export(crate)]
 macro_rules! annotate {
     ($inner: expr, $message: expr) => {
-        {
-            use tikv_util::box_err;
-            $crate::errors::Error::Other(box_err!("{}: {}", $message, $inner))
-        }
+        Error::Other(tikv_util::box_err!("{}: {}", $message, $inner))
     };
     ($inner: expr, $format: literal, $($args: expr),+) => {
         annotate!($inner, format_args!($format, $($args),+))
@@ -168,14 +129,14 @@ macro_rules! annotate {
 
 impl Error {
     pub fn report(&self, context: impl Display) {
-        warn!("backup stream meet error"; "context" => %context, "err" => %self, "verbose_err" => ?self);
+        warn!("backup stream meet error"; "context" => %context, "err" => %self);
         metrics::STREAM_ERROR
             .with_label_values(&[self.kind()])
             .inc()
     }
 
     pub fn report_fatal(&self) {
-        error!(%self; "backup stream meet fatal error"; "verbose" => ?self, );
+        error!(%self; "backup stream meet fatal error");
         metrics::STREAM_FATAL_ERROR
             .with_label_values(&[self.kind()])
             .inc()
@@ -321,9 +282,8 @@ mod test {
         b.iter(|| {
             let result: Result<()> = Ok(());
             let lucky_number = rand::random::<u8>();
-            result
-                .context_with(|| format!("lucky: the number is {}", lucky_number))
-                .unwrap();
+            let result = result.context_with(|| format!("lucky: the number is {}", lucky_number));
+            assert!(result.is_ok());
         })
     }
 }

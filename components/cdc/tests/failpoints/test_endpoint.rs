@@ -1,21 +1,15 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::{mpsc, Arc},
-    thread,
-    time::Duration,
-};
+use std::{sync::mpsc, thread, time::Duration};
 
 use api_version::{test_kv_format_impl, KvFormat};
-use causal_ts::CausalTsProvider;
-use cdc::{recv_timeout, Delegate, OldValueCache, Task, Validate};
+use cdc::{recv_timeout, OldValueCache, Task, Validate};
 use futures::{executor::block_on, sink::SinkExt};
-use grpcio::{ChannelBuilder, Environment, WriteFlags};
-use kvproto::{cdcpb::*, kvrpcpb::*, tikvpb_grpc::TikvClient};
+use grpcio::WriteFlags;
+use kvproto::{cdcpb::*, kvrpcpb::*};
 use pd_client::PdClient;
 use test_raftstore::*;
-use tikv_util::{debug, worker::Scheduler, HandyRwLock};
-use txn_types::TimeStamp;
+use tikv_util::{debug, worker::Scheduler};
 
 use crate::{new_event_feed, ClientReceiver, TestSuite, TestSuiteBuilder};
 
@@ -57,12 +51,6 @@ fn test_cdc_double_scan_deregister_impl<F: KvFormat>() {
     let (mut req_tx_1, event_feed_wrap_1, receive_event_1) =
         new_event_feed(suite.get_region_cdc_client(1));
     block_on(req_tx_1.send((req, WriteFlags::default()))).unwrap();
-
-    // wait for the second connection register to the delegate.
-    suite.must_wait_delegate_condition(
-        1,
-        Arc::new(|d: Option<&Delegate>| d.unwrap().downstreams().len() == 2),
-    );
 
     // close connection
     block_on(req_tx.close()).unwrap();
@@ -318,12 +306,11 @@ fn do_test_no_resolved_ts_before_downstream_initialized(version: &str) {
     }
 
     let th = thread::spawn(move || {
-        // The first downstream can receive timestamps but the second should receive
-        // nothing.
+        // The first downstream can receive timestamps but the second should receive nothing.
         let mut rx = event_feeds[0].replace(None).unwrap();
-        recv_timeout(&mut rx, Duration::from_secs(1)).unwrap();
+        assert!(recv_timeout(&mut rx, Duration::from_secs(1)).is_ok());
         let mut rx = event_feeds[1].replace(None).unwrap();
-        recv_timeout(&mut rx, Duration::from_secs(3)).unwrap_err();
+        assert!(recv_timeout(&mut rx, Duration::from_secs(3)).is_err());
     });
 
     th.join().unwrap();
@@ -331,11 +318,11 @@ fn do_test_no_resolved_ts_before_downstream_initialized(version: &str) {
     suite.stop();
 }
 
-// When a new CDC downstream is installed, delta changes for other downstreams
-// on the same region should be flushed so that the new downstream can gets a
-// fresh snapshot to performs a incremental scan. CDC can ensure that those
-// delta changes are sent to CDC's `Endpoint` before the incremental scan, but
-// `Sink` may break this rule. This case tests it won't happen any more.
+// When a new CDC downstream is installed, delta changes for other downstreams on the same
+// region should be flushed so that the new downstream can gets a fresh snapshot to performs
+// a incremental scan. CDC can ensure that those delta changes are sent to CDC's `Endpoint`
+// before the incremental scan, but `Sink` may break this rule. This case tests it won't
+// happen any more.
 #[test]
 fn test_cdc_observed_before_incremental_scan_snapshot() {
     let cluster = new_server_cluster(0, 1);
@@ -344,8 +331,7 @@ fn test_cdc_observed_before_incremental_scan_snapshot() {
     let region = suite.cluster.get_region(b"");
     let lead_client = PeerClient::new(&suite.cluster, region.id, new_peer(1, 1));
 
-    // So that the second changefeed can get some delta changes elder than its
-    // snapshot.
+    // So that the second changefeed can get some delta changes elder than its snapshot.
     let (mut req_tx_0, event_feed_0, _) = new_event_feed(suite.get_region_cdc_client(region.id));
     let req_0 = suite.new_changedata_request(region.id);
     block_on(req_tx_0.send((req_0, WriteFlags::default()))).unwrap();
@@ -448,80 +434,4 @@ fn test_old_value_cache_without_downstreams() {
     check_old_value_cache(&scheduler, 1);
 
     fail::remove("cdc_flush_old_value_metrics");
-}
-
-#[test]
-fn test_cdc_rawkv_resolved_ts() {
-    let mut suite = TestSuite::new(1, ApiVersion::V2);
-    let cluster = &suite.cluster;
-
-    let region = cluster.get_region(b"");
-    let region_id = region.get_id();
-    let leader = region.get_peers()[0].clone();
-    let node_id = leader.get_id();
-    let ts_provider = cluster.sim.rl().get_causal_ts_provider(node_id).unwrap();
-
-    let env = Arc::new(Environment::new(1));
-    let channel =
-        ChannelBuilder::new(env).connect(&cluster.sim.rl().get_addr(leader.get_store_id()));
-    let client = TikvClient::new(channel);
-
-    let mut req = suite.new_changedata_request(region_id);
-    req.set_kv_api(ChangeDataRequestKvApi::RawKv);
-    let (mut req_tx, _event_feed_wrap, receive_event) =
-        new_event_feed(suite.get_region_cdc_client(region_id));
-    block_on(req_tx.send((req, WriteFlags::default()))).unwrap();
-
-    let event = receive_event(false);
-    event
-        .events
-        .into_iter()
-        .for_each(|e| match e.event.unwrap() {
-            Event_oneof_event::Entries(es) => {
-                assert!(es.entries.len() == 1, "{:?}", es);
-                let e = &es.entries[0];
-                assert_eq!(e.get_type(), EventLogType::Initialized, "{:?}", es);
-            }
-            other => panic!("unknown event {:?}", other),
-        });
-    // Sleep a while to make sure the stream is registered.
-    sleep_ms(1000);
-
-    let mut ctx = Context::default();
-    ctx.set_region_id(region.get_id());
-    ctx.set_region_epoch(region.get_region_epoch().clone());
-    ctx.set_peer(leader);
-    ctx.set_api_version(ApiVersion::V2);
-    let mut put_req = RawPutRequest::default();
-    put_req.set_context(ctx);
-    put_req.key = b"rk3".to_vec();
-    put_req.value = b"v3".to_vec();
-
-    let pause_write_fp = "raftkv_async_write";
-    fail::cfg(pause_write_fp, "pause").unwrap();
-    let ts = block_on(ts_provider.async_get_ts()).unwrap();
-    let handle = thread::spawn(move || {
-        let _ = client.raw_put(&put_req).unwrap();
-    });
-
-    sleep_ms(100);
-
-    let event = receive_event(true).resolved_ts.unwrap();
-    assert!(
-        ts.next() >= TimeStamp::from(event.ts),
-        "{} {}",
-        ts,
-        TimeStamp::from(event.ts)
-    );
-    // Receive again to make sure resolved ts <= ongoing request's ts.
-    let event = receive_event(true).resolved_ts.unwrap();
-    assert!(
-        ts.next() >= TimeStamp::from(event.ts),
-        "{} {}",
-        ts,
-        TimeStamp::from(event.ts)
-    );
-
-    fail::remove(pause_write_fp);
-    handle.join().unwrap();
 }

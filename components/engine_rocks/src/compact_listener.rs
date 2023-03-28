@@ -7,7 +7,6 @@ use std::{
         Bound::{Excluded, Included, Unbounded},
     },
     path::Path,
-    sync::Arc,
 };
 
 use collections::hash_set_with_capacity;
@@ -17,7 +16,10 @@ use rocksdb::{
 };
 use tikv_util::warn;
 
-use crate::properties::{RangeProperties, UserCollectedPropertiesDecoder};
+use crate::{
+    properties::{RangeProperties, UserCollectedPropertiesDecoder},
+    raw::EventListener,
+};
 
 pub struct RocksCompactionJobInfo<'a>(&'a RawCompactionJobInfo);
 
@@ -197,36 +199,27 @@ impl CompactedEvent for RocksCompactedEvent {
     }
 
     fn cf(&self) -> &str {
-        &self.cf
+        &*self.cf
     }
 }
 
 pub type Filter = fn(&RocksCompactionJobInfo<'_>) -> bool;
 
-/// The trait for sending RocksCompactedEvent event
-/// This is to workaround Box<dyn Fn> cannot be cloned
-pub trait CompactedEventSender {
-    fn send(&self, event: RocksCompactedEvent);
-}
-
 pub struct CompactionListener {
-    event_sender: Arc<dyn CompactedEventSender + Send + Sync>,
+    ch: Box<dyn Fn(RocksCompactedEvent) + Send + Sync>,
     filter: Option<Filter>,
 }
 
 impl CompactionListener {
     pub fn new(
-        event_sender: Arc<dyn CompactedEventSender + Send + Sync>,
+        ch: Box<dyn Fn(RocksCompactedEvent) + Send + Sync>,
         filter: Option<Filter>,
     ) -> CompactionListener {
-        CompactionListener {
-            event_sender,
-            filter,
-        }
+        CompactionListener { ch, filter }
     }
 }
 
-impl rocksdb::EventListener for CompactionListener {
+impl EventListener for CompactionListener {
     fn on_compaction_completed(&self, info: &RawCompactionJobInfo) {
         let info = &RocksCompactionJobInfo::from_raw(info);
         if info.status().is_err() {
@@ -295,7 +288,7 @@ impl rocksdb::EventListener for CompactionListener {
             return;
         }
 
-        self.event_sender.send(RocksCompactedEvent::new(
+        (self.ch)(RocksCompactedEvent::new(
             info,
             smallest_key.unwrap(),
             largest_key.unwrap(),

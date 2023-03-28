@@ -5,9 +5,9 @@ use std::{
     sync::Arc,
 };
 
-use engine_rocks::RocksCfOptions;
+use engine_rocks::{raw::ColumnFamilyOptions, raw_util::CFOptions};
 use engine_traits::{CfName, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-use file_system::IoRateLimiter;
+use file_system::IORateLimiter;
 use kvproto::kvrpcpb::ApiVersion;
 use tikv_util::config::ReadableSize;
 
@@ -26,7 +26,7 @@ const TEMP_DIR: &str = "";
 pub struct TestEngineBuilder {
     path: Option<PathBuf>,
     cfs: Option<Vec<CfName>>,
-    io_rate_limiter: Option<Arc<IoRateLimiter>>,
+    io_rate_limiter: Option<Arc<IORateLimiter>>,
     api_version: ApiVersion,
 }
 
@@ -61,9 +61,20 @@ impl TestEngineBuilder {
         self
     }
 
-    pub fn io_rate_limiter(mut self, limiter: Option<Arc<IoRateLimiter>>) -> Self {
+    pub fn io_rate_limiter(mut self, limiter: Option<Arc<IORateLimiter>>) -> Self {
         self.io_rate_limiter = limiter;
         self
+    }
+
+    /// Register causal observer for RawKV API V2.
+    // TODO: `RocksEngine` is coupling with RawKV features including GC (compaction filter) & CausalObserver.
+    // Consider decoupling them.
+    fn register_causal_observer(engine: &mut RocksEngine) {
+        let causal_ts_provider = Arc::new(causal_ts::tests::TestProvider::default());
+        let causal_ob = causal_ts::CausalObserver::new(causal_ts_provider);
+        engine.register_observer(|host| {
+            causal_ob.register_to(host);
+        });
     }
 
     /// Build a `RocksEngine`.
@@ -100,18 +111,29 @@ impl TestEngineBuilder {
         let cfs_opts = cfs
             .iter()
             .map(|cf| match *cf {
-                CF_DEFAULT => (
+                CF_DEFAULT => CFOptions::new(
                     CF_DEFAULT,
                     cfg_rocksdb.defaultcf.build_opt(&cache, None, api_version),
                 ),
-                CF_LOCK => (CF_LOCK, cfg_rocksdb.lockcf.build_opt(&cache)),
-                CF_WRITE => (CF_WRITE, cfg_rocksdb.writecf.build_opt(&cache, None)),
-                CF_RAFT => (CF_RAFT, cfg_rocksdb.raftcf.build_opt(&cache)),
-                _ => (*cf, RocksCfOptions::default()),
+                CF_LOCK => CFOptions::new(CF_LOCK, cfg_rocksdb.lockcf.build_opt(&cache)),
+                CF_WRITE => CFOptions::new(CF_WRITE, cfg_rocksdb.writecf.build_opt(&cache, None)),
+                CF_RAFT => CFOptions::new(CF_RAFT, cfg_rocksdb.raftcf.build_opt(&cache)),
+                _ => CFOptions::new(*cf, ColumnFamilyOptions::new()),
             })
             .collect();
-        let engine =
-            RocksEngine::new(&path, None, cfs_opts, cache.is_some(), self.io_rate_limiter)?;
+        let mut engine = RocksEngine::new(
+            &path,
+            &cfs,
+            Some(cfs_opts),
+            cache.is_some(),
+            self.io_rate_limiter,
+            None, /* CFOptions */
+        )?;
+
+        if let ApiVersion::V2 = api_version {
+            Self::register_causal_observer(&mut engine);
+        }
+
         Ok(engine)
     }
 }
@@ -138,29 +160,29 @@ mod tests {
 
     #[test]
     fn test_rocksdb() {
-        let mut engine = TestEngineBuilder::new()
+        let engine = TestEngineBuilder::new()
             .cfs(TEST_ENGINE_CFS)
             .build()
             .unwrap();
-        test_base_curd_options(&mut engine)
+        test_base_curd_options(&engine)
     }
 
     #[test]
     fn test_rocksdb_linear() {
-        let mut engine = TestEngineBuilder::new()
+        let engine = TestEngineBuilder::new()
             .cfs(TEST_ENGINE_CFS)
             .build()
             .unwrap();
-        test_linear(&mut engine);
+        test_linear(&engine);
     }
 
     #[test]
     fn test_rocksdb_statistic() {
-        let mut engine = TestEngineBuilder::new()
+        let engine = TestEngineBuilder::new()
             .cfs(TEST_ENGINE_CFS)
             .build()
             .unwrap();
-        test_cfs_statistics(&mut engine);
+        test_cfs_statistics(&engine);
     }
 
     #[test]
@@ -178,27 +200,27 @@ mod tests {
             must_put_cf(&engine, "cf", b"k", b"v1");
         }
         {
-            let mut engine = TestEngineBuilder::new()
+            let engine = TestEngineBuilder::new()
                 .path(dir.path())
                 .cfs(TEST_ENGINE_CFS)
                 .build()
                 .unwrap();
-            assert_has_cf(&mut engine, "cf", b"k", b"v1");
+            assert_has_cf(&engine, "cf", b"k", b"v1");
         }
     }
 
     #[test]
     fn test_rocksdb_perf_statistics() {
-        let mut engine = TestEngineBuilder::new()
+        let engine = TestEngineBuilder::new()
             .cfs(TEST_ENGINE_CFS)
             .build()
             .unwrap();
-        test_perf_statistics(&mut engine);
+        test_perf_statistics(&engine);
     }
 
     #[test]
     fn test_max_skippable_internal_keys_error() {
-        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         must_put(&engine, b"foo", b"bar");
         must_delete(&engine, b"foo");
         must_put(&engine, b"foo1", b"bar1");
@@ -208,11 +230,7 @@ mod tests {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut iter_opt = IterOptions::default();
         iter_opt.set_max_skippable_internal_keys(1);
-        let mut iter = Cursor::new(
-            snapshot.iter(CF_DEFAULT, iter_opt).unwrap(),
-            ScanMode::Forward,
-            false,
-        );
+        let mut iter = Cursor::new(snapshot.iter(iter_opt).unwrap(), ScanMode::Forward, false);
 
         let mut statistics = CfStatistics::default();
         let res = iter.seek(&Key::from_raw(b"foo"), &mut statistics);
@@ -224,7 +242,7 @@ mod tests {
         );
     }
 
-    fn test_perf_statistics<E: Engine>(engine: &mut E) {
+    fn test_perf_statistics<E: Engine>(engine: &E) {
         must_put(engine, b"foo", b"bar1");
         must_put(engine, b"foo2", b"bar2");
         must_put(engine, b"foo3", b"bar3"); // deleted
@@ -238,7 +256,7 @@ mod tests {
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut iter = Cursor::new(
-            snapshot.iter(CF_DEFAULT, IterOptions::default()).unwrap(),
+            snapshot.iter(IterOptions::default()).unwrap(),
             ScanMode::Forward,
             false,
         );
@@ -268,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_prefix_seek_skip_tombstone() {
-        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         engine
             .put_cf(
                 &Context::default(),

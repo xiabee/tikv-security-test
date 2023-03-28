@@ -3,10 +3,10 @@
 use std::{error::Error as StdError, io::Error as IoError, net::AddrParseError, result};
 
 use engine_traits::Error as EngineTraitError;
-use futures::channel::{mpsc::SendError, oneshot::Canceled};
+use futures::channel::oneshot::Canceled;
 use grpcio::Error as GrpcError;
 use hyper::Error as HttpError;
-use openssl::error::ErrorStack as OpenSslError;
+use openssl::error::ErrorStack as OpenSSLError;
 use pd_client::Error as PdError;
 use protobuf::ProtobufError;
 use raftstore::Error as RaftServerError;
@@ -65,10 +65,7 @@ pub enum Error {
     Http(#[from] HttpError),
 
     #[error("{0:?}")]
-    OpenSsl(#[from] OpenSslError),
-
-    #[error("{0:?}")]
-    StreamDisconnect(#[from] SendError),
+    OpenSSL(#[from] OpenSSLError),
 }
 
 pub type Result<T> = result::Result<T, Error>;

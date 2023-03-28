@@ -1,12 +1,8 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
-
-#![feature(let_chains)]
-
 #[allow(unused_extern_crates)]
 extern crate tikv_alloc;
 
 mod client;
-mod client_v2;
 mod feature_gate;
 pub mod metrics;
 mod tso;
@@ -27,8 +23,7 @@ use tikv_util::time::{Instant, UnixSecs};
 use txn_types::TimeStamp;
 
 pub use self::{
-    client::RpcClient,
-    client_v2::{PdClient as PdClientV2, RpcClient as RpcClientV2},
+    client::{DummyPdClient, RpcClient},
     config::Config,
     errors::{Error, Result},
     feature_gate::{Feature, FeatureGate},
@@ -229,10 +224,10 @@ pub trait PdClient: Send + Sync {
     }
 
     /// Creates the cluster with cluster ID, node, stores and first Region.
-    /// If the cluster is already bootstrapped, return ClusterBootstrapped
-    /// error. When a node starts, if it finds nothing in the node and
-    /// cluster is not bootstrapped, it begins to create node, stores, first
-    /// Region and then call bootstrap_cluster to let PD know it.
+    /// If the cluster is already bootstrapped, return ClusterBootstrapped error.
+    /// When a node starts, if it finds nothing in the node and
+    /// cluster is not bootstrapped, it begins to create node, stores, first Region
+    /// and then call bootstrap_cluster to let PD know it.
     /// It may happen that multi nodes start at same time to try to
     /// bootstrap, but only one can succeed, while others will fail
     /// and must remove their created local Region data themselves.
@@ -258,18 +253,6 @@ pub trait PdClient: Send + Sync {
         unimplemented!();
     }
 
-    /// Returns whether the cluster is marked to start with snapshot recovery.
-    ///
-    /// Cluster is marked as recovering data before start up
-    /// Nomally, marker has been set by BR (from now), and tikv have to run in
-    /// recovery mode recovery mode will do
-    /// 1. update tikv cluster id from pd
-    /// 2. all peer apply the log to last of the leader peer which has the most
-    /// log appended. 3. delete data to some point of time (resolved_ts)
-    fn is_recovering_marked(&self) -> Result<bool> {
-        unimplemented!();
-    }
-
     /// Informs PD when the store starts or some store information changes.
     fn put_store(&self, _store: metapb::Store) -> Result<Option<ReplicationStatus>> {
         unimplemented!();
@@ -280,12 +263,11 @@ pub trait PdClient: Send + Sync {
     /// - For bootstrapping, PD knows first Region with `bootstrap_cluster`.
     /// - For changing Peer, PD determines where to add a new Peer in some store
     ///   for this Region.
-    /// - For Region splitting, PD determines the new Region id and Peer id for
-    ///   the split Region.
-    /// - For Region merging, PD knows which two Regions will be merged and
-    ///   which Region and Peers will be removed.
-    /// - For auto-balance, PD determines how to move the Region from one store
-    ///   to another.
+    /// - For Region splitting, PD determines the new Region id and Peer id for the
+    ///   split Region.
+    /// - For Region merging, PD knows which two Regions will be merged and which Region
+    ///   and Peers will be removed.
+    /// - For auto-balance, PD determines how to move the Region from one store to another.
 
     /// Gets store information if it is not a tombstone store.
     fn get_store(&self, _store_id: u64) -> Result<metapb::Store> {
@@ -398,8 +380,7 @@ pub trait PdClient: Send + Sync {
         unimplemented!();
     }
 
-    /// Registers a handler to the client, which will be invoked after
-    /// reconnecting to PD.
+    /// Registers a handler to the client, which will be invoked after reconnecting to PD.
     ///
     /// Please note that this method should only be called once.
     fn handle_reconnect<F: Fn() + Sync + Send + 'static>(&self, _: F)
@@ -428,9 +409,8 @@ pub trait PdClient: Send + Sync {
     }
 
     /// Gets a batch of timestamps from PD.
-    /// Return a timestamp with (physical, logical), indicating that timestamps
-    /// allocated are: [Timestamp(physical, logical - count + 1),
-    /// Timestamp(physical, logical)]
+    /// Return a timestamp with (physical, logical), indicating that timestamps allocated are:
+    /// [Timestamp(physical, logical - count + 1), Timestamp(physical, logical)]
     fn batch_get_tso(&self, _count: u32) -> PdFuture<TimeStamp> {
         unimplemented!()
     }

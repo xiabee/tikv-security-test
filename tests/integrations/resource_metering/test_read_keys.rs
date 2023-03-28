@@ -8,7 +8,7 @@ use grpcio::{ChannelBuilder, Environment};
 use kvproto::{coprocessor, kvrpcpb::*, resource_usage_agent::ResourceUsageRecord, tikvpb::*};
 use protobuf::Message;
 use resource_metering::ResourceTagFactory;
-use test_coprocessor::{DagSelect, ProductTable, Store};
+use test_coprocessor::{DAGSelect, ProductTable, Store};
 use test_raftstore::*;
 use test_util::alloc_port;
 use tidb_query_datatype::codec::Datum;
@@ -50,7 +50,31 @@ pub fn test_read_keys() {
         let (k, v) = (n.clone(), n);
 
         // Prewrite.
-        write_and_read_key(&client, &ctx, &mut ts, k.clone(), v.clone());
+        ts += 1;
+        let prewrite_start_version = ts;
+        let mut mutation = Mutation::default();
+        mutation.set_op(Op::Put);
+        mutation.set_key(k.clone());
+        mutation.set_value(v.clone());
+        must_kv_prewrite(
+            &client,
+            ctx.clone(),
+            vec![mutation],
+            k.clone(),
+            prewrite_start_version,
+        );
+
+        // Commit.
+        ts += 1;
+        let commit_version = ts;
+        must_kv_commit(
+            &client,
+            ctx.clone(),
+            vec![k.clone()],
+            prewrite_start_version,
+            commit_version,
+            commit_version,
+        );
     }
 
     // PointGet
@@ -178,7 +202,7 @@ fn test_read_keys_coprocessor() {
         .unwrap();
 
     // Do DAG select to register runtime thread.
-    let mut req = DagSelect::from(&product).build();
+    let mut req = DAGSelect::from(&product).build();
     let mut ctx = Context::default();
     ctx.set_resource_group_tag("TEST-TAG".into());
     req.set_context(ctx);

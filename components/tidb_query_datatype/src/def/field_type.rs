@@ -10,10 +10,9 @@ use crate::error::DataTypeError;
 ///
 /// `FieldType` is the field type of a column defined by schema.
 ///
-/// `ColumnInfo` describes a column. It contains `FieldType` and some other
-/// column specific information. However for historical reasons, fields in
-/// `FieldType` (for example, `tp`) are flattened into `ColumnInfo`.
-/// Semantically these fields are identical.
+/// `ColumnInfo` describes a column. It contains `FieldType` and some other column specific
+/// information. However for historical reasons, fields in `FieldType` (for example, `tp`)
+/// are flattened into `ColumnInfo`. Semantically these fields are identical.
 ///
 /// Please refer to [mysql/type.go](https://github.com/pingcap/parser/blob/master/mysql/type.go).
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -36,7 +35,7 @@ pub enum FieldTypeTp {
     NewDate = 14,
     VarChar = 15,
     Bit = 16,
-    Json = 0xf5,
+    JSON = 0xf5,
     NewDecimal = 0xf6,
     Enum = 0xf7,
     Set = 0xf8,
@@ -52,7 +51,7 @@ pub enum FieldTypeTp {
 impl FieldTypeTp {
     fn from_i32(i: i32) -> Option<FieldTypeTp> {
         if (i >= FieldTypeTp::Unspecified as i32 && i <= FieldTypeTp::Bit as i32)
-            || (i >= FieldTypeTp::Json as i32 && i <= FieldTypeTp::Geometry as i32)
+            || (i >= FieldTypeTp::JSON as i32 && i <= FieldTypeTp::Geometry as i32)
         {
             Some(unsafe { ::std::mem::transmute::<i32, FieldTypeTp>(i) })
         } else {
@@ -61,7 +60,7 @@ impl FieldTypeTp {
     }
 
     pub fn from_u8(i: u8) -> Option<FieldTypeTp> {
-        if i <= FieldTypeTp::Bit as u8 || i >= FieldTypeTp::Json as u8 {
+        if i <= FieldTypeTp::Bit as u8 || i >= FieldTypeTp::JSON as u8 {
             Some(unsafe { ::std::mem::transmute::<i32, FieldTypeTp>(i32::from(i)) })
         } else {
             None
@@ -118,9 +117,9 @@ pub enum Collation {
 impl Collation {
     /// Parse from collation id.
     ///
-    /// These are magic numbers defined in tidb, where positive numbers are for
-    /// legacy compatibility, and all new clusters with padding configuration
-    /// enabled will use negative numbers to indicate the padding behavior.
+    /// These are magic numbers defined in tidb, where positive numbers are for legacy
+    /// compatibility, and all new clusters with padding configuration enabled will
+    /// use negative numbers to indicate the padding behavior.
     pub fn from_i32(n: i32) -> Result<Self, DataTypeError> {
         match n {
             -33 | -45 => Ok(Collation::Utf8Mb4GeneralCi),
@@ -148,10 +147,10 @@ impl fmt::Display for Collation {
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum Charset {
-    Utf8,
-    Utf8Mb4,
+    UTF8,
+    UTF8Mb4,
     Latin1,
-    Gbk,
+    GBK,
     Binary,
     Ascii,
 }
@@ -159,10 +158,10 @@ pub enum Charset {
 impl Charset {
     pub fn from_name(name: &str) -> Result<Self, DataTypeError> {
         match name {
-            "utf8mb4" => Ok(Charset::Utf8Mb4),
-            "utf8" => Ok(Charset::Utf8),
+            "utf8mb4" => Ok(Charset::UTF8Mb4),
+            "utf8" => Ok(Charset::UTF8),
             "latin1" => Ok(Charset::Latin1),
-            "gbk" => Ok(Charset::Gbk),
+            "gbk" => Ok(Charset::GBK),
             "binary" => Ok(Charset::Binary),
             "ascii" => Ok(Charset::Ascii),
             _ => Err(DataTypeError::UnsupportedCharset {
@@ -216,9 +215,8 @@ pub trait FieldTypeAccessor {
 
     fn set_collation(&mut self, collation: Collation) -> &mut dyn FieldTypeAccessor;
 
-    /// Convert reference to `FieldTypeAccessor` interface. Useful when an
-    /// implementer provides inherent methods with the same name as the accessor
-    /// trait methods.
+    /// Convert reference to `FieldTypeAccessor` interface. Useful when an implementer
+    /// provides inherent methods with the same name as the accessor trait methods.
     fn as_accessor(&self) -> &dyn FieldTypeAccessor
     where
         Self: Sized,
@@ -234,8 +232,8 @@ pub trait FieldTypeAccessor {
         self as &mut dyn FieldTypeAccessor
     }
 
-    /// Whether this type is a hybrid type, which can represent different types
-    /// of value in specific context.
+    /// Whether this type is a hybrid type, which can represent different types of value in
+    /// specific context.
     ///
     /// Please refer to `Hybrid` in TiDB.
     #[inline]
@@ -256,8 +254,7 @@ pub trait FieldTypeAccessor {
             || tp == FieldTypeTp::LongBlob
     }
 
-    /// Whether this type is a char-like type like a string type or a varchar
-    /// type.
+    /// Whether this type is a char-like type like a string type or a varchar type.
     ///
     /// Please refer to `IsTypeChar` in TiDB.
     #[inline]
@@ -266,8 +263,7 @@ pub trait FieldTypeAccessor {
         tp == FieldTypeTp::String || tp == FieldTypeTp::VarChar
     }
 
-    /// Whether this type is a varchar-like type like a varstring type or a
-    /// varchar type.
+    /// Whether this type is a varchar-like type like a varstring type or a varchar type.
     ///
     /// Please refer to `IsTypeVarchar` in TiDB.
     #[inline]
@@ -471,7 +467,7 @@ mod tests {
             FieldTypeTp::NewDate,
             FieldTypeTp::VarChar,
             FieldTypeTp::Bit,
-            FieldTypeTp::Json,
+            FieldTypeTp::JSON,
             FieldTypeTp::NewDecimal,
             FieldTypeTp::Enum,
             FieldTypeTp::Set,
@@ -548,7 +544,7 @@ mod tests {
             if let Some(c) = expected {
                 assert_eq!(coll.unwrap(), c);
             } else {
-                coll.unwrap_err();
+                assert!(coll.is_err());
             }
         }
     }
@@ -556,9 +552,9 @@ mod tests {
     #[test]
     fn test_charset_from_str() {
         let cases = vec![
-            ("gbk", Some(Charset::Gbk)),
-            ("utf8mb4", Some(Charset::Utf8Mb4)),
-            ("utf8", Some(Charset::Utf8)),
+            ("gbk", Some(Charset::GBK)),
+            ("utf8mb4", Some(Charset::UTF8Mb4)),
+            ("utf8", Some(Charset::UTF8)),
             ("binary", Some(Charset::Binary)),
             ("latin1", Some(Charset::Latin1)),
             ("ascii", Some(Charset::Ascii)),
@@ -574,7 +570,7 @@ mod tests {
             if let Some(c) = expected {
                 assert_eq!(charset.unwrap(), c);
             } else {
-                charset.unwrap_err();
+                assert!(charset.is_err());
             }
         }
     }

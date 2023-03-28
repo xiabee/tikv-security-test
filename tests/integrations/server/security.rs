@@ -24,7 +24,8 @@ fn test_check_cn_success() {
     let channel = ChannelBuilder::new(env).secure_connect(&addr, cred);
 
     let client = TikvClient::new(channel);
-    client.kv_get(&GetRequest::default()).unwrap();
+    let status = client.kv_get(&GetRequest::default());
+    assert!(status.is_ok());
 }
 
 #[test]
@@ -44,5 +45,5 @@ fn test_check_cn_fail() {
 
     let client = TikvClient::new(channel);
     let status = client.kv_get(&GetRequest::default());
-    status.unwrap_err();
+    assert!(status.is_err());
 }

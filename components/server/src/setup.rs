@@ -10,14 +10,13 @@ use std::{
 use chrono::Local;
 use clap::ArgMatches;
 use collections::HashMap;
-use tikv::config::{check_critical_config, persist_config, MetricConfig, TikvConfig};
+use tikv::config::{check_critical_config, persist_config, MetricConfig, TiKvConfig};
 use tikv_util::{self, config, logger};
 
 // A workaround for checking if log is initialized.
 pub static LOG_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-// The info log file names does not end with ".log" since it conflict with
-// rocksdb WAL files.
+// The info log file names does not end with ".log" since it conflict with rocksdb WAL files.
 pub const DEFAULT_ROCKSDB_LOG_FILE: &str = "rocksdb.info";
 pub const DEFAULT_RAFTDB_LOG_FILE: &str = "raftdb.info";
 
@@ -34,12 +33,11 @@ macro_rules! fatal {
     })
 }
 
-// TODO: There is a very small chance that duplicate files will be generated if
-// there are a lot of logs written in a very short time. Consider rename the
-// rotated file with a version number while rotate by size.
+// TODO: There is a very small chance that duplicate files will be generated if there are
+// a lot of logs written in a very short time. Consider rename the rotated file with a version
+// number while rotate by size.
 //
-// The file name format after rotated is as follows:
-// "{original name}.{"%Y-%m-%dT%H-%M-%S%.3f"}"
+// The file name format after rotated is as follows: "{original name}.{"%Y-%m-%dT%H-%M-%S%.3f"}"
 fn rename_by_timestamp(path: &Path) -> io::Result<PathBuf> {
     let mut new_path = path.parent().unwrap().to_path_buf();
     let mut new_fname = path.file_stem().unwrap().to_os_string();
@@ -74,12 +72,11 @@ fn make_engine_log_path(path: &str, sub_path: &str, filename: &str) -> String {
 }
 
 #[allow(dead_code)]
-pub fn initial_logger(config: &TikvConfig) {
+pub fn initial_logger(config: &TiKvConfig) {
     let rocksdb_info_log_path = if !config.rocksdb.info_log_dir.is_empty() {
         make_engine_log_path(&config.rocksdb.info_log_dir, "", DEFAULT_ROCKSDB_LOG_FILE)
     } else {
-        // Don't use `DEFAULT_ROCKSDB_SUB_DIR`, because of the logic of
-        // `RocksEngine::exists`.
+        // Don't use `DEFAULT_ROCKSDB_SUB_DIR`, because of the logic of `RocksEngine::exists`.
         make_engine_log_path(&config.storage.data_dir, "", DEFAULT_ROCKSDB_LOG_FILE)
     };
     let raftdb_info_log_path = if !config.raftdb.info_log_dir.is_empty() {
@@ -142,7 +139,7 @@ pub fn initial_logger(config: &TikvConfig) {
         rocksdb: R,
         raftdb: T,
         slow: Option<S>,
-        config: &TikvConfig,
+        config: &TiKvConfig,
     ) where
         N: slog::Drain<Ok = (), Err = io::Error> + Send + 'static,
         R: slog::Drain<Ok = (), Err = io::Error> + Send + 'static,
@@ -153,11 +150,9 @@ pub fn initial_logger(config: &TikvConfig) {
         let drainer = logger::LogDispatcher::new(normal, rocksdb, raftdb, slow);
         let level = config.log.level;
         let slow_threshold = config.slow_log_threshold.as_millis();
-        logger::init_log(drainer, level.into(), true, true, vec![], slow_threshold).unwrap_or_else(
-            |e| {
-                fatal!("failed to initialize log: {}", e);
-            },
-        );
+        logger::init_log(drainer, level, true, true, vec![], slow_threshold).unwrap_or_else(|e| {
+            fatal!("failed to initialize log: {}", e);
+        });
     }
 
     macro_rules! do_build {
@@ -238,10 +233,10 @@ pub fn initial_metric(cfg: &MetricConfig) {
 }
 
 #[allow(dead_code)]
-pub fn overwrite_config_with_cmd_args(config: &mut TikvConfig, matches: &ArgMatches<'_>) {
+pub fn overwrite_config_with_cmd_args(config: &mut TiKvConfig, matches: &ArgMatches<'_>) {
     if let Some(level) = matches.value_of("log-level") {
-        config.log.level = logger::get_level_by_string(level).unwrap().into();
-        config.log_level = slog::Level::Info.into();
+        config.log.level = logger::get_level_by_string(level).unwrap();
+        config.log_level = slog::Level::Info;
     }
 
     if let Some(file) = matches.value_of("log-file") {
@@ -303,7 +298,7 @@ pub fn overwrite_config_with_cmd_args(config: &mut TikvConfig, matches: &ArgMatc
 }
 
 #[allow(dead_code)]
-pub fn validate_and_persist_config(config: &mut TikvConfig, persist: bool) {
+pub fn validate_and_persist_config(config: &mut TiKvConfig, persist: bool) {
     config.compatible_adjust();
     if let Err(e) = config.validate() {
         fatal!("invalid configuration: {}", e);

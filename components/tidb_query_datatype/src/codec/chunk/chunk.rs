@@ -10,9 +10,8 @@ use super::{
 use crate::{codec::Datum, FieldTypeAccessor};
 
 /// `Chunk` stores multiple rows of data.
-/// Values are appended in compact format and can be directly accessed without
-/// decoding. When the chunk is done processing, we can reuse the allocated
-/// memory by resetting it.
+/// Values are appended in compact format and can be directly accessed without decoding.
+/// When the chunk is done processing, we can reuse the allocated memory by resetting it.
 pub struct Chunk {
     columns: Vec<Column>,
 }
@@ -33,8 +32,7 @@ impl Chunk {
     }
 
     /// Reset the chunk, so the memory it allocated can be reused.
-    /// Make sure all the data in the chunk is not used anymore before you reuse
-    /// this chunk.
+    /// Make sure all the data in the chunk is not used anymore before you reuse this chunk.
     pub fn reset(&mut self) {
         for column in &mut self.columns {
             column.reset();
@@ -188,7 +186,7 @@ mod tests {
             FieldTypeTp::DateTime.into(),
             FieldTypeTp::Duration.into(),
             FieldTypeTp::NewDecimal.into(),
-            FieldTypeTp::Json.into(),
+            FieldTypeTp::JSON.into(),
             FieldTypeTp::String.into(),
         ];
         let json: Json = r#"{"k1":"v1"}"#.parse().unwrap();
@@ -229,7 +227,7 @@ mod tests {
             FieldTypeTp::DateTime.into(),
             FieldTypeTp::Duration.into(),
             FieldTypeTp::NewDecimal.into(),
-            FieldTypeTp::Json.into(),
+            FieldTypeTp::JSON.into(),
             FieldTypeTp::String.into(),
         ];
         let json: Json = r#"{"k1":"v1"}"#.parse().unwrap();
@@ -329,7 +327,7 @@ mod tests {
     fn bench_encode_from_raw_json_datum(b: &mut Bencher) {
         let json: Json = r#"{"k1":"v1"}"#.parse().unwrap();
         let datum = Datum::Json(json);
-        bench_encode_from_raw_datum_impl(b, datum, FieldTypeTp::Json);
+        bench_encode_from_raw_datum_impl(b, datum, FieldTypeTp::JSON);
     }
 
     #[test]
@@ -341,7 +339,7 @@ mod tests {
             FieldTypeTp::VarChar.into(),
             FieldTypeTp::VarChar.into(),
             FieldTypeTp::NewDecimal.into(),
-            FieldTypeTp::Json.into(),
+            FieldTypeTp::JSON.into(),
         ];
         let mut chunk = Chunk::new(&fields, rows);
 

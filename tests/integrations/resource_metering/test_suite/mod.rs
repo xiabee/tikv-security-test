@@ -19,9 +19,9 @@ use resource_metering::{Config, ResourceTagFactory};
 use tempfile::TempDir;
 use test_util::alloc_port;
 use tikv::{
-    config::{ConfigController, TikvConfig},
+    config::{ConfigController, TiKvConfig},
     storage::{
-        lock_manager::MockLockManager, RocksEngine, StorageApiV1, TestEngineBuilder,
+        lock_manager::DummyLockManager, RocksEngine, StorageApiV1, TestEngineBuilder,
         TestStorageBuilderApiV1,
     },
 };
@@ -32,7 +32,7 @@ pub struct TestSuite {
     pubsub_server_port: u16,
     receiver_server: Option<MockReceiverServer>,
 
-    storage: StorageApiV1<RocksEngine, MockLockManager>,
+    storage: StorageApiV1<RocksEngine, DummyLockManager>,
     cfg_controller: ConfigController,
     resource_tag_factory: ResourceTagFactory,
 
@@ -50,7 +50,7 @@ pub struct TestSuite {
 
 impl TestSuite {
     pub fn new(cfg: resource_metering::Config) -> Self {
-        let (mut tikv_cfg, dir) = TikvConfig::with_tmp().unwrap();
+        let (mut tikv_cfg, dir) = TiKvConfig::with_tmp().unwrap();
         tikv_cfg.resource_metering = cfg.clone();
         let cfg_controller = ConfigController::new(tikv_cfg);
 
@@ -84,11 +84,10 @@ impl TestSuite {
         );
 
         let engine = TestEngineBuilder::new().build().unwrap();
-        let storage =
-            TestStorageBuilderApiV1::from_engine_and_lock_mgr(engine, MockLockManager::new())
-                .set_resource_tag_factory(resource_tag_factory.clone())
-                .build()
-                .unwrap();
+        let storage = TestStorageBuilderApiV1::from_engine_and_lock_mgr(engine, DummyLockManager)
+            .set_resource_tag_factory(resource_tag_factory.clone())
+            .build()
+            .unwrap();
 
         let (tx, rx) = unbounded();
 
@@ -119,7 +118,7 @@ impl TestSuite {
         }
     }
 
-    pub fn get_storage(&self) -> StorageApiV1<RocksEngine, MockLockManager> {
+    pub fn get_storage(&self) -> StorageApiV1<RocksEngine, DummyLockManager> {
         self.storage.clone()
     }
 

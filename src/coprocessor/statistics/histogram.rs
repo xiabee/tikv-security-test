@@ -29,7 +29,7 @@ impl Bucket {
             upper_bound,
             lower_bound,
             repeats,
-            ndv: with_ndv as u64,
+            ndv: if with_ndv { 1 } else { 0 },
         }
     }
 

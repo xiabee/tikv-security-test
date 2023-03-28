@@ -1,9 +1,9 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{fmt::Display, io::Read};
+use std::{fmt::Display, io::Read, sync::Arc};
 
 use encryption::{EncrypterReader, Iv};
-use engine_rocks::{RocksEngine, RocksSstWriter, RocksSstWriterBuilder};
+use engine_rocks::{raw::DB, RocksEngine, RocksSstWriter, RocksSstWriterBuilder};
 use engine_traits::{
     CfName, ExternalSstFileInfo, SstCompressionType, SstWriter, SstWriterBuilder, CF_DEFAULT,
     CF_WRITE,
@@ -26,8 +26,9 @@ use crate::{backup_file_name, metrics::*, utils::KeyValueCodec, Error, Result};
 
 #[derive(Debug, Clone, Copy)]
 /// CfNameWrap wraps the CfName type.
-/// For removing the 'static lifetime bound in the async function, which doesn't
-/// compile due to 'captures lifetime that does not appear in bounds', see https://github.com/rust-lang/rust/issues/63033
+/// For removing the 'static lifetime bound in the async function,
+/// which doesn't compile due to 'captures lifetime that does not appear in bounds' :(.
+/// see https://github.com/rust-lang/rust/issues/63033
 /// FIXME: remove this.
 pub struct CfNameWrap(pub &'static str);
 
@@ -98,8 +99,8 @@ impl Writer {
         Ok(())
     }
 
-    // FIXME: we cannot get sst_info in [save_and_build_file], which may cause the
-    // !Send type [RocksEnternalSstFileInfo] sent between threads.
+    // FIXME: we cannot get sst_info in [save_and_build_file], which may cause the !Send type
+    // [RocksEnternalSstFileInfo] sent between threads.
     fn finish_read(writer: RocksSstWriter) -> Result<(u64, impl Read)> {
         let (sst_info, sst_reader) = writer.finish_read()?;
         Ok((sst_info.file_size(), sst_reader))
@@ -167,7 +168,7 @@ pub struct BackupWriterBuilder {
     store_id: u64,
     limiter: Limiter,
     region: Region,
-    db: RocksEngine,
+    db: Arc<DB>,
     compression_type: Option<SstCompressionType>,
     compression_level: i32,
     sst_max_size: u64,
@@ -179,7 +180,7 @@ impl BackupWriterBuilder {
         store_id: u64,
         limiter: Limiter,
         region: Region,
-        db: RocksEngine,
+        db: Arc<DB>,
         compression_type: Option<SstCompressionType>,
         compression_level: i32,
         sst_max_size: u64,
@@ -226,7 +227,7 @@ pub struct BackupWriter {
 impl BackupWriter {
     /// Create a new BackupWriter.
     pub fn new(
-        db: RocksEngine,
+        db: Arc<DB>,
         name: &str,
         compression_type: Option<SstCompressionType>,
         compression_level: i32,
@@ -237,14 +238,14 @@ impl BackupWriter {
         let default = RocksSstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(CF_DEFAULT)
-            .set_db(&db)
+            .set_db(RocksEngine::from_ref(&db))
             .set_compression_type(compression_type)
             .set_compression_level(compression_level)
             .build(name)?;
         let write = RocksSstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(CF_WRITE)
-            .set_db(&db)
+            .set_db(RocksEngine::from_ref(&db))
             .set_compression_type(compression_type)
             .set_compression_level(compression_level)
             .build(name)?;
@@ -350,7 +351,7 @@ pub struct BackupRawKvWriter {
 impl BackupRawKvWriter {
     /// Create a new BackupRawKvWriter.
     pub fn new(
-        db: RocksEngine,
+        db: Arc<DB>,
         name: &str,
         cf: CfNameWrap,
         limiter: Limiter,
@@ -362,7 +363,7 @@ impl BackupRawKvWriter {
         let writer = RocksSstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(cf.into())
-            .set_db(&db)
+            .set_db(RocksEngine::from_ref(&db))
             .set_compression_type(compression_type)
             .set_compression_level(compression_level)
             .build(name)?;
@@ -430,9 +431,9 @@ mod tests {
 
     use engine_traits::Iterable;
     use kvproto::encryptionpb;
+    use raftstore::store::util::new_peer;
     use tempfile::TempDir;
     use tikv::storage::TestEngineBuilder;
-    use tikv_util::store::new_peer;
     use txn_types::OldValue;
 
     use super::*;
@@ -443,7 +444,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let rocks = TestEngineBuilder::new()
             .path(temp.path())
-            .cfs([engine_traits::CF_DEFAULT, engine_traits::CF_WRITE])
+            .cfs(&[engine_traits::CF_DEFAULT, engine_traits::CF_WRITE])
             .build()
             .unwrap();
         let db = rocks.get_rocksdb();
@@ -457,7 +458,7 @@ mod tests {
         }
         for (cf, kv) in kvs {
             let mut map = BTreeMap::new();
-            db.scan(
+            db.scan_cf(
                 cf,
                 keys::DATA_MIN_KEY,
                 keys::DATA_MAX_KEY,
@@ -480,7 +481,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let rocks = TestEngineBuilder::new()
             .path(temp.path())
-            .cfs([
+            .cfs(&[
                 engine_traits::CF_DEFAULT,
                 engine_traits::CF_LOCK,
                 engine_traits::CF_WRITE,
@@ -497,7 +498,7 @@ mod tests {
         r.set_id(1);
         r.mut_peers().push(new_peer(1, 1));
         let mut writer = BackupWriter::new(
-            db.clone(),
+            db.get_sync_db(),
             "foo",
             None,
             0,
@@ -515,7 +516,7 @@ mod tests {
 
         // Test write only txn.
         let mut writer = BackupWriter::new(
-            db.clone(),
+            db.get_sync_db(),
             "foo1",
             None,
             0,
@@ -554,7 +555,7 @@ mod tests {
 
         // Test write and default.
         let mut writer = BackupWriter::new(
-            db,
+            db.get_sync_db(),
             "foo2",
             None,
             0,

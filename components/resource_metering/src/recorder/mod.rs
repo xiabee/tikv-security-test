@@ -288,9 +288,8 @@ impl ConfigChangeNotifier {
     }
 }
 
-/// Constructs a default [Recorder], spawn it and return the corresponding
-/// [ConfigChangeNotifier], [CollectorRegHandle], [ResourceTagFactory] and
-/// [LazyWorker].
+/// Constructs a default [Recorder], spawn it and return the corresponding [ConfigChangeNotifier],
+/// [CollectorRegHandle], [ResourceTagFactory] and [LazyWorker].
 ///
 /// This function is intended to simplify external use.
 pub fn init_recorder(
@@ -303,8 +302,8 @@ pub fn init_recorder(
 ) {
     let recorder = RecorderBuilder::default()
         .precision_ms(precision_ms)
-        .add_sub_recorder(Box::<CpuRecorder>::default())
-        .add_sub_recorder(Box::<SummaryRecorder>::default())
+        .add_sub_recorder(Box::new(CpuRecorder::default()))
+        .add_sub_recorder(Box::new(SummaryRecorder::default()))
         .build();
     let mut recorder_worker = WorkerBuilder::new("resource-metering-recorder")
         .pending_capacity(256)

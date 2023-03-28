@@ -2,13 +2,15 @@
 
 use std::{
     fs::File as StdFile,
-    io::{self, BufReader, Read, Seek},
+    io,
+    marker::Unpin,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use futures::io::AllowStdIo;
+use futures_io::AsyncRead;
 use futures_util::stream::TryStreamExt;
 use rand::Rng;
 use tikv_util::stream::error_stream;
@@ -82,9 +84,8 @@ impl ExternalStorage for LocalStorage {
             ));
         }
         // create the parent dir if there isn't one.
-        // note: we may write to arbitrary directory here if the path contains things
-        // like '../' but internally the file name should be fully controlled by
-        // TiKV, so maybe it is OK?
+        // note: we may write to arbitrary directory here if the path contains things like '../'
+        // but internally the file name should be fully controlled by TiKV, so maybe it is OK?
         if let Some(parent) = Path::new(name).parent() {
             fs::create_dir_all(self.base.join(parent))
                 .await
@@ -99,12 +100,12 @@ impl ExternalStorage for LocalStorage {
                     }
                 })?;
         }
-
-        // Because s3 could support writing(put_object) a existed object.
-        // For the interface consistent with s3, local storage need also support write a
-        // existed file.
+        // Sanitize check, do not save file if it is already exist.
         if fs::metadata(self.base.join(name)).await.is_ok() {
-            info!("[{}] is already exists in {}", name, self.base.display());
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("[{}] is already exists in {}", name, self.base.display()),
+            ));
         }
         let tmp_path = self.tmp_path(Path::new(name));
         let mut tmp_f = File::create(&tmp_path).await?;
@@ -117,33 +118,15 @@ impl ExternalStorage for LocalStorage {
         self.base_dir.sync_all().await
     }
 
-    fn read(&self, name: &str) -> crate::ExternalData<'_> {
+    fn read(&self, name: &str) -> Box<dyn AsyncRead + Unpin> {
         debug!("read file from local storage";
             "name" => %name, "base" => %self.base.display());
-        // We used std i/o here for removing the requirement of tokio reactor when
-        // restoring.
+        // We used std i/o here for removing the requirement of tokio reactor when restoring.
         // FIXME: when restore side get ready, use tokio::fs::File for returning.
         match StdFile::open(self.base.join(name)) {
             Ok(file) => Box::new(AllowStdIo::new(file)) as _,
             Err(e) => Box::new(error_stream(e).into_async_read()) as _,
         }
-    }
-
-    fn read_part(&self, name: &str, off: u64, len: u64) -> crate::ExternalData<'_> {
-        debug!("read part of file from local storage";
-            "name" => %name, "off" => %off, "len" => %len, "base" => %self.base.display());
-
-        let mut file = match StdFile::open(self.base.join(name)) {
-            Ok(file) => file,
-            Err(e) => return Box::new(error_stream(e).into_async_read()) as _,
-        };
-        match file.seek(std::io::SeekFrom::Start(off)) {
-            Ok(_) => (),
-            Err(e) => return Box::new(error_stream(e).into_async_read()) as _,
-        };
-        let reader = BufReader::new(file);
-        let take = reader.take(len);
-        Box::new(AllowStdIo::new(take)) as _
     }
 }
 
@@ -231,27 +214,5 @@ mod tests {
     #[test]
     fn test_url_of_backend() {
         assert_eq!(url_for(Path::new("/tmp/a")).to_string(), "local:///tmp/a");
-    }
-
-    #[tokio::test]
-    async fn test_write_existed_file() {
-        let temp_dir = Builder::new().tempdir().unwrap();
-        let path = temp_dir.path();
-        let ls = LocalStorage::new(path).unwrap();
-
-        let filename = "existed.file";
-        let buf1: &[u8] = b"pingcap";
-        let buf2: &[u8] = b"tikv";
-        ls.write(filename, UnpinReader(Box::new(buf1)), buf1.len() as _)
-            .await
-            .unwrap();
-        ls.write(filename, UnpinReader(Box::new(buf2)), buf2.len() as _)
-            .await
-            .unwrap();
-
-        let mut read_buff: Vec<u8> = Vec::new();
-        ls.read(filename).read_to_end(&mut read_buff).await.unwrap();
-        assert_eq!(read_buff.len(), 4);
-        assert_eq!(&read_buff, buf2);
     }
 }

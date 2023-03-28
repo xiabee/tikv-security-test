@@ -1,76 +1,28 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{marker::PhantomData, sync::atomic::*};
+use std::sync::atomic::*;
 
-use engine_traits::KvEngine;
 use futures::{channel::mpsc, FutureExt, SinkExt, StreamExt, TryFutureExt};
 use grpcio::{self, *};
 use kvproto::brpb::*;
-use raftstore::{
-    router::RaftStoreRouter,
-    store::msg::{PeerMsg, SignificantMsg},
-};
 use tikv_util::{error, info, worker::*};
 
 use super::Task;
 
 /// Service handles the RPC messages for the `Backup` service.
-
 #[derive(Clone)]
-pub struct Service<E, RR> {
+pub struct Service {
     scheduler: Scheduler<Task>,
-    router: RR,
-    _phantom: PhantomData<E>,
 }
 
-impl<E, RR> Service<E, RR>
-where
-    E: KvEngine,
-    RR: RaftStoreRouter<E>,
-{
+impl Service {
     /// Create a new backup service.
-    pub fn new(scheduler: Scheduler<Task>, router: RR) -> Self {
-        Service {
-            scheduler,
-            router,
-            _phantom: PhantomData,
-        }
+    pub fn new(scheduler: Scheduler<Task>) -> Service {
+        Service { scheduler }
     }
 }
 
-impl<E, RR> Backup for Service<E, RR>
-where
-    E: KvEngine,
-    RR: RaftStoreRouter<E>,
-{
-    fn check_pending_admin_op(
-        &mut self,
-        ctx: RpcContext<'_>,
-        _req: CheckAdminRequest,
-        mut sink: ServerStreamingSink<CheckAdminResponse>,
-    ) {
-        let (tx, rx) = mpsc::unbounded();
-        self.router.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(SignificantMsg::CheckPendingAdmin(tx.clone()))
-        });
-
-        let send_task = async move {
-            let mut s = rx.map(|resp| Ok((resp, WriteFlags::default())));
-            sink.send_all(&mut s).await?;
-            sink.close().await?;
-            Ok(())
-        }
-        .map(|res: Result<()>| match res {
-            Ok(_) => {
-                info!("check admin closed");
-            }
-            Err(e) => {
-                error!("check admin canceled"; "error" => ?e);
-            }
-        });
-        ctx.spawn(send_task);
-    }
-
+impl Backup for Service {
     fn backup(
         &mut self,
         ctx: RpcContext<'_>,
@@ -129,9 +81,7 @@ where
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use engine_rocks::RocksEngine;
     use external_storage_export::make_local_backend;
-    use raftstore::router::RaftStoreBlackHole;
     use tikv::storage::txn::tests::{must_commit, must_prewrite_put};
     use tikv_util::worker::{dummy_scheduler, ReceiverWrapper};
     use txn_types::TimeStamp;
@@ -142,8 +92,7 @@ mod tests {
     fn new_rpc_suite() -> (Server, BackupClient, ReceiverWrapper<Task>) {
         let env = Arc::new(EnvBuilder::new().build());
         let (scheduler, rx) = dummy_scheduler();
-        let backup_service =
-            super::Service::<RocksEngine, RaftStoreBlackHole>::new(scheduler, RaftStoreBlackHole);
+        let backup_service = super::Service::new(scheduler);
         let builder =
             ServerBuilder::new(env.clone()).register_service(create_backup(backup_service));
         let mut server = builder.bind("127.0.0.1", 0).build().unwrap();
@@ -160,7 +109,7 @@ mod tests {
         let (_server, client, mut rx) = new_rpc_suite();
 
         let (tmp, endpoint) = new_endpoint();
-        let mut engine = endpoint.engine.clone();
+        let engine = endpoint.engine.clone();
         endpoint.region_info.set_regions(vec![
             (b"".to_vec(), b"2".to_vec(), 1),
             (b"2".to_vec(), b"5".to_vec(), 2),
@@ -172,14 +121,14 @@ mod tests {
             let start = alloc_ts();
             let key = format!("{}", i);
             must_prewrite_put(
-                &mut engine,
+                &engine,
                 key.as_bytes(),
                 key.as_bytes(),
                 key.as_bytes(),
                 start,
             );
             let commit = alloc_ts();
-            must_commit(&mut engine, key.as_bytes(), start, commit);
+            must_commit(&engine, key.as_bytes(), start, commit);
         }
 
         let now = alloc_ts();

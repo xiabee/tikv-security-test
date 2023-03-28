@@ -19,18 +19,16 @@ use crate::storage::{
 
 /// Implementation of the [`RawStorage`] trait.
 ///
-/// It wraps TiKV's [`Storage`] into an API that is exposed to coprocessor
-/// plugins. The `RawStorageImpl` should be constructed for every invocation of
-/// a [`CoprocessorPlugin`] as it wraps a [`Context`] that is unique for every
-/// request.
+/// It wraps TiKV's [`Storage`] into an API that is exposed to coprocessor plugins.
+/// The `RawStorageImpl` should be constructed for every invocation of a [`CoprocessorPlugin`] as
+/// it wraps a [`Context`] that is unique for every request.
 pub struct RawStorageImpl<'a, E: Engine, L: LockManager, F: KvFormat> {
     context: Context,
     storage: &'a Storage<E, L, F>,
 }
 
 impl<'a, E: Engine, L: LockManager, F: KvFormat> RawStorageImpl<'a, E, L, F> {
-    /// Constructs a new `RawStorageImpl` that wraps a given [`Context`] and
-    /// [`Storage`].
+    /// Constructs a new `RawStorageImpl` that wraps a given [`Context`] and [`Storage`].
     pub fn new(context: Context, storage: &'a Storage<E, L, F>) -> Self {
         RawStorageImpl { context, storage }
     }
@@ -192,8 +190,7 @@ impl From<storage::errors::Error> for PluginErrorShim {
             storage::errors::ErrorInner::Kv(KvError(box KvErrorInner::Timeout(duration))) => {
                 PluginError::Timeout(duration)
             }
-            // Other errors are passed as-is inside their `Result` so we get a `&Result` when using
-            // `Any::downcast_ref`.
+            // Other errors are passed as-is inside their `Result` so we get a `&Result` when using `Any::downcast_ref`.
             _ => PluginError::Other(
                 format!("{}", &error),
                 Box::new(storage::Result::<()>::Err(error)),
@@ -215,11 +212,11 @@ mod test {
     use kvproto::kvrpcpb::{ApiVersion, Context};
 
     use super::*;
-    use crate::storage::{lock_manager::MockLockManager, TestStorageBuilder};
+    use crate::storage::{lock_manager::DummyLockManager, TestStorageBuilder};
 
     #[tokio::test]
     async fn test_storage_api() {
-        let storage = TestStorageBuilder::<_, _, ApiV2>::new(MockLockManager::new())
+        let storage = TestStorageBuilder::<_, _, ApiV2>::new(DummyLockManager)
             .build()
             .unwrap();
         let ctx = Context {
@@ -255,7 +252,7 @@ mod test {
 
     #[tokio::test]
     async fn test_storage_api_batch() {
-        let storage = TestStorageBuilder::<_, _, ApiV2>::new(MockLockManager::new())
+        let storage = TestStorageBuilder::<_, _, ApiV2>::new(DummyLockManager)
             .build()
             .unwrap();
         let ctx = Context {

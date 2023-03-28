@@ -26,7 +26,7 @@ use tikv_util::{error, info, warn, worker::*};
 
 use crate::{
     channel::{channel, MemoryQuota, Sink, CDC_CHANNLE_CAPACITY},
-    delegate::{Downstream, DownstreamId, DownstreamState},
+    delegate::{Downstream, DownstreamID, DownstreamState},
     endpoint::{Deregister, Task},
 };
 
@@ -34,15 +34,15 @@ static CONNECTION_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique identifier of a Connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct ConnId(usize);
+pub struct ConnID(usize);
 
-impl ConnId {
-    pub fn new() -> ConnId {
-        ConnId(CONNECTION_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
+impl ConnID {
+    pub fn new() -> ConnID {
+        ConnID(CONNECTION_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
     }
 }
 
-impl Default for ConnId {
+impl Default for ConnID {
     fn default() -> Self {
         Self::new()
     }
@@ -74,10 +74,10 @@ impl FeatureGate {
 }
 
 pub struct Conn {
-    id: ConnId,
+    id: ConnID,
     sink: Sink,
-    // region id -> DownstreamId
-    downstreams: HashMap<u64, (DownstreamId, Arc<AtomicCell<DownstreamState>>)>,
+    // region id -> DownstreamID
+    downstreams: HashMap<u64, (DownstreamID, Arc<AtomicCell<DownstreamState>>)>,
     peer: String,
     version: Option<(semver::Version, FeatureGate)>,
 }
@@ -85,7 +85,7 @@ pub struct Conn {
 impl Conn {
     pub fn new(sink: Sink, peer: String) -> Conn {
         Conn {
-            id: ConnId::new(),
+            id: ConnID::new(),
             sink,
             downstreams: HashMap::default(),
             version: None,
@@ -132,19 +132,19 @@ impl Conn {
         &self.peer
     }
 
-    pub fn get_id(&self) -> ConnId {
+    pub fn get_id(&self) -> ConnID {
         self.id
     }
 
     pub fn get_downstreams(
         &self,
-    ) -> &HashMap<u64, (DownstreamId, Arc<AtomicCell<DownstreamState>>)> {
+    ) -> &HashMap<u64, (DownstreamID, Arc<AtomicCell<DownstreamState>>)> {
         &self.downstreams
     }
 
     pub fn take_downstreams(
         self,
-    ) -> HashMap<u64, (DownstreamId, Arc<AtomicCell<DownstreamState>>)> {
+    ) -> HashMap<u64, (DownstreamID, Arc<AtomicCell<DownstreamState>>)> {
         self.downstreams
     }
 
@@ -155,7 +155,7 @@ impl Conn {
     pub fn subscribe(
         &mut self,
         region_id: u64,
-        downstream_id: DownstreamId,
+        downstream_id: DownstreamID,
         downstream_state: Arc<AtomicCell<DownstreamState>>,
     ) -> bool {
         match self.downstreams.entry(region_id) {
@@ -171,7 +171,7 @@ impl Conn {
         self.downstreams.remove(&region_id);
     }
 
-    pub fn downstream_id(&self, region_id: u64) -> Option<DownstreamId> {
+    pub fn downstream_id(&self, region_id: u64) -> Option<DownstreamID> {
         self.downstreams.get(&region_id).map(|x| x.0)
     }
 }
@@ -240,14 +240,8 @@ impl ChangeData for Service {
                     semver::Version::new(0, 0, 0)
                 }
             };
-            let downstream = Downstream::new(
-                peer.clone(),
-                region_epoch,
-                req_id,
-                conn_id,
-                req_kvapi,
-                request.filter_loop,
-            );
+            let downstream =
+                Downstream::new(peer.clone(), region_epoch, req_id, conn_id, req_kvapi);
             let ret = scheduler
                 .schedule(Task::Register {
                     request,

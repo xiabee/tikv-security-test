@@ -8,36 +8,35 @@ use tikv_util::time::Instant;
 use crate::{
     io_stats::fetch_io_bytes,
     metrics::{tls_flush, IO_BYTES_VEC},
-    IoBytes, IoOp, IoRateLimiterStatistics, IoType,
+    IOBytes, IOOp, IORateLimiterStatistics, IOType,
 };
 
 pub enum BytesFetcher {
-    /// Fetch IO statistics from IO rate limiter, which records passed-through
-    /// IOs in atomic counters.
-    FromRateLimiter(Arc<IoRateLimiterStatistics>),
+    /// Fetch IO statistics from IO rate limiter, which records passed-through IOs in atomic counters.
+    FromRateLimiter(Arc<IORateLimiterStatistics>),
     /// Fetch IO statistics from OS I/O stats collector.
-    FromIoStatsCollector(),
+    FromIOStatsCollector(),
 }
 
 impl BytesFetcher {
-    fn fetch(&self) -> [IoBytes; IoType::COUNT] {
+    fn fetch(&self) -> [IOBytes; IOType::COUNT] {
         match *self {
             BytesFetcher::FromRateLimiter(ref stats) => {
-                let mut bytes: [IoBytes; IoType::COUNT] = Default::default();
-                for t in IoType::iter() {
-                    bytes[t as usize].read = stats.fetch(t, IoOp::Read) as u64;
-                    bytes[t as usize].write = stats.fetch(t, IoOp::Write) as u64;
+                let mut bytes: [IOBytes; IOType::COUNT] = Default::default();
+                for t in IOType::iter() {
+                    bytes[t as usize].read = stats.fetch(t, IOOp::Read) as u64;
+                    bytes[t as usize].write = stats.fetch(t, IOOp::Write) as u64;
                 }
                 bytes
             }
-            BytesFetcher::FromIoStatsCollector() => fetch_io_bytes(),
+            BytesFetcher::FromIOStatsCollector() => fetch_io_bytes(),
         }
     }
 }
 
 pub struct MetricsManager {
     fetcher: BytesFetcher,
-    last_fetch: [IoBytes; IoType::COUNT],
+    last_fetch: [IOBytes; IOType::COUNT],
 }
 
 impl MetricsManager {
@@ -51,7 +50,7 @@ impl MetricsManager {
     pub fn flush(&mut self, _now: Instant) {
         tls_flush();
         let latest = self.fetcher.fetch();
-        for t in IoType::iter() {
+        for t in IOType::iter() {
             let delta_bytes = latest[t as usize] - self.last_fetch[t as usize];
             IO_BYTES_VEC
                 .with_label_values(&[t.as_str(), "read"])

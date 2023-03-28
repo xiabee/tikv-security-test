@@ -2,7 +2,7 @@
 
 use byteorder::{BigEndian, ByteOrder};
 use derive_more::Deref;
-use engine_traits::EncryptionMethod as EtEncryptionMethod;
+use engine_traits::EncryptionMethod as DBEncryptionMethod;
 use kvproto::encryptionpb::EncryptionMethod;
 use openssl::symm::{self, Cipher as OCipher};
 use rand::{rngs::OsRng, RngCore};
@@ -10,26 +10,28 @@ use tikv_util::{box_err, impl_display_as_debug};
 
 use crate::{Error, Result};
 
-pub fn to_engine_encryption_method(method: EncryptionMethod) -> EtEncryptionMethod {
+pub fn encryption_method_to_db_encryption_method(method: EncryptionMethod) -> DBEncryptionMethod {
     match method {
-        EncryptionMethod::Plaintext => EtEncryptionMethod::Plaintext,
-        EncryptionMethod::Aes128Ctr => EtEncryptionMethod::Aes128Ctr,
-        EncryptionMethod::Aes192Ctr => EtEncryptionMethod::Aes192Ctr,
-        EncryptionMethod::Aes256Ctr => EtEncryptionMethod::Aes256Ctr,
-        EncryptionMethod::Sm4Ctr => EtEncryptionMethod::Sm4Ctr,
-        EncryptionMethod::Unknown => EtEncryptionMethod::Unknown,
+        EncryptionMethod::Plaintext => DBEncryptionMethod::Plaintext,
+        EncryptionMethod::Aes128Ctr => DBEncryptionMethod::Aes128Ctr,
+        EncryptionMethod::Aes192Ctr => DBEncryptionMethod::Aes192Ctr,
+        EncryptionMethod::Aes256Ctr => DBEncryptionMethod::Aes256Ctr,
+        EncryptionMethod::Unknown => DBEncryptionMethod::Unknown,
     }
 }
 
-pub fn from_engine_encryption_method(method: EtEncryptionMethod) -> EncryptionMethod {
+pub fn encryption_method_from_db_encryption_method(method: DBEncryptionMethod) -> EncryptionMethod {
     match method {
-        EtEncryptionMethod::Plaintext => EncryptionMethod::Plaintext,
-        EtEncryptionMethod::Aes128Ctr => EncryptionMethod::Aes128Ctr,
-        EtEncryptionMethod::Aes192Ctr => EncryptionMethod::Aes192Ctr,
-        EtEncryptionMethod::Aes256Ctr => EncryptionMethod::Aes256Ctr,
-        EtEncryptionMethod::Sm4Ctr => EncryptionMethod::Sm4Ctr,
-        EtEncryptionMethod::Unknown => EncryptionMethod::Unknown,
+        DBEncryptionMethod::Plaintext => EncryptionMethod::Plaintext,
+        DBEncryptionMethod::Aes128Ctr => EncryptionMethod::Aes128Ctr,
+        DBEncryptionMethod::Aes192Ctr => EncryptionMethod::Aes192Ctr,
+        DBEncryptionMethod::Aes256Ctr => EncryptionMethod::Aes256Ctr,
+        DBEncryptionMethod::Unknown => EncryptionMethod::Unknown,
     }
+}
+
+pub fn compat(method: EncryptionMethod) -> EncryptionMethod {
+    method
 }
 
 pub fn get_method_key_length(method: EncryptionMethod) -> usize {
@@ -38,7 +40,6 @@ pub fn get_method_key_length(method: EncryptionMethod) -> usize {
         EncryptionMethod::Aes128Ctr => 16,
         EncryptionMethod::Aes192Ctr => 24,
         EncryptionMethod::Aes256Ctr => 32,
-        EncryptionMethod::Sm4Ctr => 16,
         unknown => panic!("bad EncryptionMethod {:?}", unknown),
     }
 }
@@ -52,7 +53,6 @@ const CTR_IV_16: usize = 16;
 pub enum Iv {
     Gcm([u8; GCM_IV_12]),
     Ctr([u8; CTR_IV_16]),
-    Empty,
 }
 
 impl Iv {
@@ -91,7 +91,6 @@ impl Iv {
         match self {
             Iv::Ctr(iv) => iv,
             Iv::Gcm(iv) => iv,
-            Iv::Empty => &[],
         }
     }
 
@@ -103,7 +102,6 @@ impl Iv {
                 Ok(())
             }
             Iv::Gcm(_) => Err(box_err!("offset addition is not supported for GCM mode")),
-            Iv::Empty => Err(box_err!("empty Iv")),
         }
     }
 }
@@ -149,7 +147,7 @@ impl<'k> AesGcmCrypter<'k> {
             cipher,
             &self.key.0,
             Some(self.iv.as_slice()),
-            &[], // AAD
+            &[], /* AAD */
             pt,
             &mut tag.0,
         )?;
@@ -162,7 +160,7 @@ impl<'k> AesGcmCrypter<'k> {
             cipher,
             &self.key.0,
             Some(self.iv.as_slice()),
-            &[], // AAD
+            &[], /* AAD */
             ct,
             &tag.0,
         )?;
@@ -275,7 +273,7 @@ mod tests {
         let crypter = AesGcmCrypter::new(&key, iv);
         let (ciphertext, gcm_tag) = crypter.encrypt(&pt).unwrap();
         assert_eq!(ciphertext, ct, "{}", hex::encode(&ciphertext));
-        assert_eq!(gcm_tag.0.to_vec(), tag, "{}", hex::encode(gcm_tag.0));
+        assert_eq!(gcm_tag.0.to_vec(), tag, "{}", hex::encode(&gcm_tag.0));
         let plaintext = crypter.decrypt(&ct, gcm_tag).unwrap();
         assert_eq!(plaintext, pt, "{}", hex::encode(&plaintext));
 

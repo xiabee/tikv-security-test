@@ -65,11 +65,11 @@ pub trait Extract: Sized {
 
 #[inline]
 fn type_error(eval_type: EvalType, expr_type: ExprType) -> Error {
-    other_err!(
+    return other_err!(
         "Unexpected ExprType {:?} and EvalType {:?}",
         expr_type,
         eval_type
-    )
+    );
 }
 
 impl Extract for Int {
@@ -161,8 +161,8 @@ impl InByCompare for Int {}
 impl InByCompare for Real {}
 impl InByCompare for Decimal {}
 impl InByCompare for Duration {}
-// DateTime requires TZInfo in context, and we cannot acquire it during
-// metadata_mapper. TODO: implement InByHash for DateTime.
+// DateTime requires TZInfo in context, and we cannot acquire it during metadata_mapper.
+// TODO: implement InByHash for DateTime.
 impl InByCompare for DateTime {}
 
 #[derive(Debug)]
@@ -821,15 +821,14 @@ mod tests {
         let logical_rows: &[usize] = &(0..1024).collect::<Vec<usize>>();
         profiler::start("./bench_compare_in.profile");
         b.iter(|| {
-            black_box(&exp)
-                .eval(
-                    black_box(&mut ctx),
-                    black_box(schema),
-                    black_box(&mut columns),
-                    black_box(logical_rows),
-                    black_box(1024),
-                )
-                .unwrap();
+            let result = black_box(&exp).eval(
+                black_box(&mut ctx),
+                black_box(schema),
+                black_box(&mut columns),
+                black_box(logical_rows),
+                black_box(1024),
+            );
+            assert!(result.is_ok());
         });
         profiler::stop();
     }

@@ -6,6 +6,7 @@
 #![feature(min_specialization)]
 #![feature(box_patterns)]
 #![feature(hash_drain_filter)]
+#![feature(vec_retain_mut)]
 #![feature(let_chains)]
 #![recursion_limit = "256"]
 
@@ -13,22 +14,18 @@
 extern crate test;
 #[macro_use]
 extern crate derivative;
-#[cfg(feature = "engine_rocks")]
-pub mod compacted_event_sender;
 
 pub mod coprocessor;
 pub mod errors;
 pub mod router;
 pub mod store;
-#[cfg(feature = "engine_rocks")]
-pub use self::compacted_event_sender::RaftRouterCompactedEventSender;
 pub use self::{
     coprocessor::{RegionInfo, RegionInfoAccessor, SeekRegionCallback},
     errors::{DiscardReason, Error, Result},
 };
 
 // `bytes::Bytes` is generated for `bytes` in protobuf.
-pub fn bytes_capacity(b: &bytes::Bytes) -> usize {
+fn bytes_capacity(b: &bytes::Bytes) -> usize {
     // NOTE: For deserialized raft messages, `len` equals capacity.
     // This is used to report memory usage to metrics.
     b.len()

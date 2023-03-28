@@ -23,20 +23,20 @@ failpoints = ["fail/failpoints"]
 nortcheck = []
 
 [dependencies]
-api_version = { workspace = true }
-case_macros = { workspace = true }
-collections = { workspace = true }
+api_version = { path = "../api_version", default-features = false }
+case_macros = { path = "../case_macros" }
+collections = { path = "../collections", default-features = false }
 derive_more = "0.99.3"
-encryption = { workspace = true }
-engine_traits = { workspace = true }
+encryption = { path = "../encryption", default-features = false }
+engine_traits = { path = "../engine_traits", default-features = false }
 fail = "0.5"
-file_system = { workspace = true }
-keys = { workspace = true }
-kvproto = { workspace = true }
+file_system = { path = "../file_system", default-features = false }
+keys = { path = "../keys", default-features = false }
+kvproto = { git = "https://github.com/pingcap/kvproto.git" }
 lazy_static = "1.4.0"
-log_wrappers = { workspace = true }
+log_wrappers = { path = "../log_wrappers" }
 num_cpus = "1"
-online_config = { workspace = true }
+online_config = { path = "../online_config" }
 prometheus = { version = "0.13", features = ["nightly"] }
 prometheus-static-metric = "0.5"
 protobuf = "2"
@@ -48,15 +48,15 @@ slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debu
 slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
 slog_derive = "0.2"
 tempfile = "3.0"
-tikv_alloc = { workspace = true }
-tikv_util = { workspace = true }
+tikv_alloc = { path = "../tikv_alloc" }
+tikv_util = { path = "../tikv_util", default-features = false }
 time = "0.1"
-tracker = { workspace = true }
-txn_types = { workspace = true }
+txn_types = { path = "../txn_types", default-features = false }
 
 [dependencies.rocksdb]
 git = "https://github.com/tikv/rust-rocksdb.git"
 package = "rocksdb"
+branch = "tikv-6.1"
 features = ["encryption"]
 
 [dev-dependencies]

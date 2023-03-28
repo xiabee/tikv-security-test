@@ -1,7 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use kvproto::kvrpcpb::IsolationLevel;
-use txn_types::{Key, KvPair, Lock, OldValue, TimeStamp, TsSet, Value, WriteRef};
+use txn_types::{Key, KvPair, OldValue, TimeStamp, TsSet, Value, WriteRef};
 
 use super::{Error, ErrorInner, Result};
 use crate::storage::{
@@ -20,8 +20,7 @@ pub trait Store: Send {
     /// Fetch the provided key.
     fn get(&self, key: &Key, statistics: &mut Statistics) -> Result<Option<Value>>;
 
-    /// Re-use last cursor to incrementally (if possible) fetch the provided
-    /// key.
+    /// Re-use last cursor to incrementally (if possible) fetch the provided key.
     fn incremental_get(&mut self, key: &Key) -> Result<Option<Value>>;
 
     /// Take the statistics. Currently only available for `incremental_get`.
@@ -50,15 +49,13 @@ pub trait Store: Send {
 
 /// [`Scanner`]s allow retrieving items or batches from a scan result.
 ///
-/// Commonly they are obtained as a result of a [`scanner`](Store::scanner)
-/// operation.
+/// Commonly they are obtained as a result of a [`scanner`](Store::scanner) operation.
 pub trait Scanner: Send {
     /// Get the next [`KvPair`](KvPair) if it exists.
     fn next(&mut self) -> Result<Option<(Key, Value)>>;
 
     /// Get the next [`KvPair`](KvPair)s up to `limit` if they exist.
-    /// If `sample_step` is greater than 0, skips `sample_step - 1` number of
-    /// keys after each returned key.
+    /// If `sample_step` is greater than 0, skips `sample_step - 1` number of keys after each returned key.
     fn scan(&mut self, limit: usize, sample_step: usize) -> Result<Vec<Result<KvPair>>> {
         let mut row_count = 0;
         let mut results = Vec::with_capacity(limit);
@@ -158,27 +155,6 @@ impl TxnEntry {
                 ref mut old_value, ..
             } => old_value,
         }
-    }
-
-    pub fn erasing_last_change_ts(&self) -> TxnEntry {
-        let mut e = self.clone();
-        match &mut e {
-            TxnEntry::Prewrite {
-                lock: (_, value), ..
-            } => {
-                let l = Lock::parse(value).unwrap();
-                *value = l.set_last_change(TimeStamp::zero(), 0).to_bytes();
-            }
-            TxnEntry::Commit {
-                write: (_, value), ..
-            } => {
-                let mut w = WriteRef::parse(value).unwrap();
-                w.last_change_ts = TimeStamp::zero();
-                w.versions_to_last_change = 0;
-                *value = w.to_bytes();
-            }
-        }
-        e
     }
 }
 
@@ -657,7 +633,7 @@ mod tests {
 
     use concurrency_manager::ConcurrencyManager;
     use engine_traits::{CfName, IterOptions, ReadOptions};
-    use kvproto::kvrpcpb::{AssertionLevel, Context, PrewriteRequestPessimisticAction::*};
+    use kvproto::kvrpcpb::{AssertionLevel, Context};
     use tikv_kv::DummySnapshotExt;
 
     use super::*;
@@ -684,7 +660,7 @@ mod tests {
 
     impl TestStore {
         fn new(key_num: u64) -> TestStore {
-            let mut engine = TestEngineBuilder::new().build().unwrap();
+            let engine = TestEngineBuilder::new().build().unwrap();
             let keys: Vec<String> = (START_ID..START_ID + key_num)
                 .map(|i| format!("{}{}", KEY_PREFIX, i))
                 .collect();
@@ -726,11 +702,10 @@ mod tests {
                             need_old_value: false,
                             is_retry_request: false,
                             assertion_level: AssertionLevel::Off,
-                            txn_source: 0,
                         },
                         Mutation::make_put(Key::from_raw(key), key.to_vec()),
                         &None,
-                        SkipPessimisticCheck,
+                        false,
                     )
                     .unwrap();
                 }
@@ -831,27 +806,24 @@ mod tests {
         fn get(&self, _: &Key) -> EngineResult<Option<Value>> {
             Ok(None)
         }
-
         fn get_cf(&self, _: CfName, _: &Key) -> EngineResult<Option<Value>> {
             Ok(None)
         }
-
         fn get_cf_opt(&self, _: ReadOptions, _: CfName, _: &Key) -> EngineResult<Option<Value>> {
             Ok(None)
         }
-
-        fn iter(&self, _: CfName, _: IterOptions) -> EngineResult<Self::Iter> {
+        fn iter(&self, _: IterOptions) -> EngineResult<Self::Iter> {
             Ok(MockRangeSnapshotIter::default())
         }
-
+        fn iter_cf(&self, _: CfName, _: IterOptions) -> EngineResult<Self::Iter> {
+            Ok(MockRangeSnapshotIter::default())
+        }
         fn lower_bound(&self) -> Option<&[u8]> {
             Some(self.start.as_slice())
         }
-
         fn upper_bound(&self) -> Option<&[u8]> {
             Some(self.end.as_slice())
         }
-
         fn ext(&self) -> DummySnapshotExt {
             DummySnapshotExt
         }
@@ -998,16 +970,18 @@ mod tests {
         let bound_b = Key::from_encoded(b"b".to_vec());
         let bound_c = Key::from_encoded(b"c".to_vec());
         let bound_d = Key::from_encoded(b"d".to_vec());
-        store.scanner(false, false, false, None, None).unwrap();
-        store
-            .scanner(
-                false,
-                false,
-                false,
-                Some(bound_b.clone()),
-                Some(bound_c.clone()),
-            )
-            .unwrap();
+        assert!(store.scanner(false, false, false, None, None).is_ok());
+        assert!(
+            store
+                .scanner(
+                    false,
+                    false,
+                    false,
+                    Some(bound_b.clone()),
+                    Some(bound_c.clone())
+                )
+                .is_ok()
+        );
         assert!(
             store
                 .scanner(
@@ -1047,16 +1021,22 @@ mod tests {
             Default::default(),
             false,
         );
-        store2.scanner(false, false, false, None, None).unwrap();
-        store2
-            .scanner(false, false, false, Some(bound_a.clone()), None)
-            .unwrap();
-        store2
-            .scanner(false, false, false, Some(bound_a), Some(bound_b))
-            .unwrap();
-        store2
-            .scanner(false, false, false, None, Some(bound_c))
-            .unwrap();
+        assert!(store2.scanner(false, false, false, None, None).is_ok());
+        assert!(
+            store2
+                .scanner(false, false, false, Some(bound_a.clone()), None)
+                .is_ok()
+        );
+        assert!(
+            store2
+                .scanner(false, false, false, Some(bound_a), Some(bound_b))
+                .is_ok()
+        );
+        assert!(
+            store2
+                .scanner(false, false, false, None, Some(bound_c))
+                .is_ok()
+        );
     }
 
     fn gen_fixture_store() -> FixtureStore {
@@ -1112,9 +1092,7 @@ mod tests {
             store.get(&Key::from_raw(b"ca"), &mut statistics).unwrap(),
             Some(b"hello".to_vec())
         );
-        store
-            .get(&Key::from_raw(b"bba"), &mut statistics)
-            .unwrap_err();
+        assert!(store.get(&Key::from_raw(b"bba"), &mut statistics).is_err());
         assert_eq!(
             store.get(&Key::from_raw(b"bbaa"), &mut statistics).unwrap(),
             None
@@ -1145,9 +1123,7 @@ mod tests {
             store.get(&Key::from_raw(b"ab"), &mut statistics).unwrap(),
             Some(b"bar".to_vec())
         );
-        store
-            .get(&Key::from_raw(b"zz"), &mut statistics)
-            .unwrap_err();
+        assert!(store.get(&Key::from_raw(b"zz"), &mut statistics).is_err());
         assert_eq!(
             store.get(&Key::from_raw(b"z"), &mut statistics).unwrap(),
             Some(b"beta".to_vec())
@@ -1179,7 +1155,7 @@ mod tests {
             scanner.next().unwrap(),
             Some((Key::from_raw(b"bb"), b"alphaalpha".to_vec()))
         );
-        scanner.next().unwrap_err();
+        assert!(scanner.next().is_err());
         assert_eq!(
             scanner.next().unwrap(),
             Some((Key::from_raw(b"ca"), b"hello".to_vec()))
@@ -1188,15 +1164,13 @@ mod tests {
             scanner.next().unwrap(),
             Some((Key::from_raw(b"z"), b"beta".to_vec()))
         );
-        scanner.next().unwrap_err();
-        // note: mvcc impl does not guarantee to work any more after meeting a non lock
-        // error
+        assert!(scanner.next().is_err());
+        // note: mvcc impl does not guarantee to work any more after meeting a non lock error
         assert_eq!(scanner.next().unwrap(), None);
 
         let mut scanner = store.scanner(true, false, false, None, None).unwrap();
-        scanner.next().unwrap_err();
-        // note: mvcc impl does not guarantee to work any more after meeting a non lock
-        // error
+        assert!(scanner.next().is_err());
+        // note: mvcc impl does not guarantee to work any more after meeting a non lock error
         assert_eq!(
             scanner.next().unwrap(),
             Some((Key::from_raw(b"z"), b"beta".to_vec()))
@@ -1205,7 +1179,7 @@ mod tests {
             scanner.next().unwrap(),
             Some((Key::from_raw(b"ca"), b"hello".to_vec()))
         );
-        scanner.next().unwrap_err();
+        assert!(scanner.next().is_err());
         assert_eq!(
             scanner.next().unwrap(),
             Some((Key::from_raw(b"bb"), b"alphaalpha".to_vec()))
@@ -1246,15 +1220,14 @@ mod tests {
             scanner.next().unwrap(),
             Some((Key::from_raw(b"bb"), vec![]))
         );
-        scanner.next().unwrap_err();
+        assert!(scanner.next().is_err());
         assert_eq!(
             scanner.next().unwrap(),
             Some((Key::from_raw(b"ca"), vec![]))
         );
         assert_eq!(scanner.next().unwrap(), Some((Key::from_raw(b"z"), vec![])));
-        scanner.next().unwrap_err();
-        // note: mvcc impl does not guarantee to work any more after meeting a non lock
-        // error
+        assert!(scanner.next().is_err());
+        // note: mvcc impl does not guarantee to work any more after meeting a non lock error
         assert_eq!(scanner.next().unwrap(), None);
 
         let mut scanner = store
@@ -1310,7 +1283,7 @@ mod tests {
             scanner.next().unwrap(),
             Some((Key::from_raw(b"bb"), vec![]))
         );
-        scanner.next().unwrap_err();
+        assert!(scanner.next().is_err());
         assert_eq!(scanner.next().unwrap(), None);
 
         let mut scanner = store
@@ -1348,7 +1321,7 @@ mod tests {
                 Some(Key::from_raw(b"bba")),
             )
             .unwrap();
-        scanner.next().unwrap_err();
+        assert!(scanner.next().is_err());
         assert_eq!(
             scanner.next().unwrap(),
             Some((Key::from_raw(b"bb"), vec![]))

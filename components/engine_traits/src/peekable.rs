@@ -10,17 +10,16 @@ use crate::*;
 /// to read from, or to encode the value as a protobuf message.
 pub trait Peekable {
     /// The byte-vector type through which the database returns read values.
-    type DbVector: DbVector;
+    type DBVector: DBVector;
 
     /// Read a value for a key, given a set of options.
     ///
     /// Reads from the default column family.
     ///
     /// Returns `None` if they key does not exist.
-    fn get_value_opt(&self, opts: &ReadOptions, key: &[u8]) -> Result<Option<Self::DbVector>>;
+    fn get_value_opt(&self, opts: &ReadOptions, key: &[u8]) -> Result<Option<Self::DBVector>>;
 
-    /// Read a value for a key from a given column family, given a set of
-    /// options.
+    /// Read a value for a key from a given column family, given a set of options.
     ///
     /// Returns `None` if the key does not exist.
     fn get_value_cf_opt(
@@ -28,14 +27,14 @@ pub trait Peekable {
         opts: &ReadOptions,
         cf: &str,
         key: &[u8],
-    ) -> Result<Option<Self::DbVector>>;
+    ) -> Result<Option<Self::DBVector>>;
 
     /// Read a value for a key.
     ///
     /// Uses the default options and column family.
     ///
     /// Returns `None` if the key does not exist.
-    fn get_value(&self, key: &[u8]) -> Result<Option<Self::DbVector>> {
+    fn get_value(&self, key: &[u8]) -> Result<Option<Self::DBVector>> {
         self.get_value_opt(&ReadOptions::default(), key)
     }
 
@@ -44,7 +43,7 @@ pub trait Peekable {
     /// Uses the default options.
     ///
     /// Returns `None` if the key does not exist.
-    fn get_value_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Self::DbVector>> {
+    fn get_value_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Self::DBVector>> {
         self.get_value_cf_opt(&ReadOptions::default(), cf, key)
     }
 

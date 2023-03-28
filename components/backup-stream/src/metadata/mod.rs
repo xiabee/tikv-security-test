@@ -4,7 +4,6 @@ mod client;
 pub mod keys;
 mod metrics;
 pub mod store;
-pub mod test;
+mod test;
 
-pub use client::{Checkpoint, CheckpointProvider, MetadataClient, MetadataEvent, StreamTask};
-pub use store::lazy_etcd::{ConnectionConfig, LazyEtcdClient};
+pub use client::{MetadataClient, MetadataEvent, StreamTask};

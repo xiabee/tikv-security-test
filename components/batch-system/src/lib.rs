@@ -16,7 +16,7 @@ pub use self::{
         PollHandler, Poller, PoolState,
     },
     config::Config,
-    fsm::{Fsm, FsmScheduler, Priority},
+    fsm::{Fsm, Priority},
     mailbox::{BasicMailbox, Mailbox},
     router::Router,
 };

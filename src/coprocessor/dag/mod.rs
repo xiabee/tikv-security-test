@@ -11,7 +11,7 @@ use tidb_query_common::{execute_stats::ExecSummary, storage::IntervalRange};
 use tikv_alloc::trace::MemoryTraceGuard;
 use tipb::{DagRequest, SelectResponse, StreamResponse};
 
-pub use self::storage_impl::TikvStorage;
+pub use self::storage_impl::TiKvStorage;
 use crate::{
     coprocessor::{metrics::*, Deadline, RequestHandler, Result},
     storage::{Statistics, Store},
@@ -65,7 +65,7 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
 
     pub fn build(self) -> Result<Box<dyn RequestHandler>> {
         COPR_DAG_REQ_COUNT.with_label_values(&["batch"]).inc();
-        Ok(BatchDagHandler::new(
+        Ok(BatchDAGHandler::new(
             self.req,
             self.ranges,
             self.store,
@@ -81,12 +81,12 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
     }
 }
 
-pub struct BatchDagHandler {
+pub struct BatchDAGHandler {
     runner: tidb_query_executors::runner::BatchExecutorsRunner<Statistics>,
     data_version: Option<u64>,
 }
 
-impl BatchDagHandler {
+impl BatchDAGHandler {
     pub fn new<S: Store + 'static>(
         req: DagRequest,
         ranges: Vec<KeyRange>,
@@ -103,7 +103,7 @@ impl BatchDagHandler {
             runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request(
                 req,
                 ranges,
-                TikvStorage::new(store, is_cache_enabled),
+                TiKvStorage::new(store, is_cache_enabled),
                 deadline,
                 streaming_batch_limit,
                 is_streaming,
@@ -116,14 +116,14 @@ impl BatchDagHandler {
 }
 
 #[async_trait]
-impl RequestHandler for BatchDagHandler {
+impl RequestHandler for BatchDAGHandler {
     async fn handle_request(&mut self) -> Result<MemoryTraceGuard<Response>> {
         let result = self.runner.handle_request().await;
         handle_qe_response(result, self.runner.can_be_cached(), self.data_version).map(|x| x.into())
     }
 
-    async fn handle_streaming_request(&mut self) -> Result<(Option<Response>, bool)> {
-        handle_qe_stream_response(self.runner.handle_streaming_request().await)
+    fn handle_streaming_request(&mut self) -> Result<(Option<Response>, bool)> {
+        handle_qe_stream_response(self.runner.handle_streaming_request())
     }
 
     fn collect_scan_statistics(&mut self, dest: &mut Statistics) {

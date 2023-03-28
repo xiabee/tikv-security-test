@@ -39,8 +39,7 @@ pub struct SecurityConfig {
 ///
 ///  # Arguments
 ///
-///  - `tag`: only used in the error message, like "ca key", "cert key",
-///    "private key", etc.
+///  - `tag`: only used in the error message, like "ca key", "cert key", "private key", etc.
 fn check_key_file(tag: &str, path: &str) -> Result<Option<File>, Box<dyn Error>> {
     if path.is_empty() {
         return Ok(None);
@@ -67,23 +66,6 @@ fn load_key(tag: &str, path: &str) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 type CertResult = Result<(Vec<u8>, Vec<u8>, Vec<u8>), Box<dyn Error>>;
-
-type Pem = Box<[u8]>;
-
-pub struct Secret(pub Pem);
-
-impl std::fmt::Debug for Secret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Secret").finish()
-    }
-}
-
-#[derive(Debug)]
-pub struct ClientSuite {
-    pub ca: Pem,
-    pub client_cert: Pem,
-    pub client_key: Secret,
-}
 
 impl SecurityConfig {
     /// Validates ca, cert and private key.
@@ -139,15 +121,6 @@ impl SecurityManager {
         })
     }
 
-    pub fn client_suite(&self) -> Result<ClientSuite, Box<dyn Error>> {
-        let (ca, cert, key) = self.cfg.load_certs()?;
-        Ok(ClientSuite {
-            ca: ca.into_boxed_slice(),
-            client_cert: cert.into_boxed_slice(),
-            client_key: Secret(key.into_boxed_slice()),
-        })
-    }
-
     pub fn connect(&self, mut cb: ChannelBuilder, addr: &str) -> Channel {
         if self.cfg.ca_path.is_empty() {
             cb.connect(addr)
@@ -173,7 +146,7 @@ impl SecurityManager {
             sb.bind(addr, port)
         } else {
             if !self.cfg.cert_allowed_cn.is_empty() {
-                let cn_checker = CnChecker {
+                let cn_checker = CNChecker {
                     allowed_cn: Arc::new(self.cfg.cert_allowed_cn.clone()),
                 };
                 sb = sb.add_checker(cn_checker);
@@ -190,18 +163,14 @@ impl SecurityManager {
             )
         }
     }
-
-    pub fn get_config(&self) -> &SecurityConfig {
-        &self.cfg
-    }
 }
 
 #[derive(Clone)]
-struct CnChecker {
+struct CNChecker {
     allowed_cn: Arc<HashSet<String>>,
 }
 
-impl ServerChecker for CnChecker {
+impl ServerChecker for CNChecker {
     fn check(&mut self, ctx: &RpcContext<'_>) -> CheckResult {
         match check_common_name(&self.allowed_cn, ctx) {
             Ok(()) => CheckResult::Continue,
@@ -328,7 +297,7 @@ mod tests {
             .iter()
             .enumerate()
         {
-            fs::write(f, [id as u8]).unwrap();
+            fs::write(f, &[id as u8]).unwrap();
         }
 
         let mut c = cfg.clone();

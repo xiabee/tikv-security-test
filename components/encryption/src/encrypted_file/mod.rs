@@ -34,8 +34,8 @@ impl<'a> EncryptedFile<'a> {
         EncryptedFile { base, name }
     }
 
-    /// Read and decrypt the file. Caller need to handle the NotFound io error
-    /// in case file not exists.
+    /// Read and decrypt the file. Caller need to handle the NotFound io error in case file not
+    /// exists.
     pub fn read(&self, master_key: &dyn Backend) -> Result<Vec<u8>> {
         let start = Instant::now();
         let res = OpenOptions::new()
@@ -64,7 +64,7 @@ impl<'a> EncryptedFile<'a> {
         let start = Instant::now();
         // Write to a tmp file.
         // TODO what if a tmp file already exists?
-        let origin_path = self.base.join(self.name);
+        let origin_path = self.base.join(&self.name);
         let mut tmp_path = origin_path.clone();
         tmp_path.set_extension(format!("{}.{}", thread_rng().next_u64(), TMP_FILE_SUFFIX));
         let mut tmp_file = OpenOptions::new()
@@ -92,7 +92,7 @@ impl<'a> EncryptedFile<'a> {
 
         // Replace old file with the tmp file aomticlly.
         rename(tmp_path, origin_path)?;
-        let base_dir = File::open(self.base)?;
+        let base_dir = File::open(&self.base)?;
         base_dir.sync_all()?;
 
         ENCRYPT_DECRPTION_FILE_HISTOGRAM
@@ -127,6 +127,7 @@ mod tests {
 
         let content = b"test content";
         file.write(content, &PlaintextBackend::default()).unwrap();
+        drop(file);
 
         let file = EncryptedFile::new(tmp.path(), "encrypted");
         assert_eq!(file.read(&PlaintextBackend::default()).unwrap(), content);

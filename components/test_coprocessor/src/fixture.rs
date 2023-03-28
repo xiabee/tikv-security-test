@@ -12,7 +12,7 @@ use tikv::{
     read_pool::ReadPool,
     server::Config,
     storage::{
-        kv::RocksEngine, lock_manager::MockLockManager, Engine, TestEngineBuilder,
+        kv::RocksEngine, lock_manager::DummyLockManager, Engine, TestEngineBuilder,
         TestStorageBuilderApiV1,
     },
 };
@@ -67,7 +67,7 @@ pub fn init_data_with_engine_and_commit<E: Engine>(
     tbl: &ProductTable,
     vals: &[(i64, Option<&str>, i64)],
     commit: bool,
-) -> (Store<E>, Endpoint<E>, Arc<QuotaLimiter>) {
+) -> (Store<E>, Endpoint<E>) {
     init_data_with_details(ctx, engine, tbl, vals, commit, &Config::default())
 }
 
@@ -78,8 +78,8 @@ pub fn init_data_with_details<E: Engine>(
     vals: &[(i64, Option<&str>, i64)],
     commit: bool,
     cfg: &Config,
-) -> (Store<E>, Endpoint<E>, Arc<QuotaLimiter>) {
-    let storage = TestStorageBuilderApiV1::from_engine_and_lock_mgr(engine, MockLockManager::new())
+) -> (Store<E>, Endpoint<E>) {
+    let storage = TestStorageBuilderApiV1::from_engine_and_lock_mgr(engine, DummyLockManager)
         .build()
         .unwrap();
     let mut store = Store::from_storage(storage);
@@ -103,40 +103,29 @@ pub fn init_data_with_details<E: Engine>(
         store.get_engine(),
     ));
     let cm = ConcurrencyManager::new(1.into());
-    let limiter = Arc::new(QuotaLimiter::default());
     let copr = Endpoint::new(
         cfg,
         pool.handle(),
         cm,
         ResourceTagFactory::new_for_test(),
-        limiter.clone(),
+        Arc::new(QuotaLimiter::default()),
     );
-    (store, copr, limiter)
+    (store, copr)
 }
 
 pub fn init_data_with_commit(
     tbl: &ProductTable,
     vals: &[(i64, Option<&str>, i64)],
     commit: bool,
-) -> (Store<RocksEngine>, Endpoint<RocksEngine>, Arc<QuotaLimiter>) {
+) -> (Store<RocksEngine>, Endpoint<RocksEngine>) {
     let engine = TestEngineBuilder::new().build().unwrap();
     init_data_with_engine_and_commit(Context::default(), engine, tbl, vals, commit)
 }
 
-// This function will create a Product table and initialize with the specified
-// data.
+// This function will create a Product table and initialize with the specified data.
 pub fn init_with_data(
     tbl: &ProductTable,
     vals: &[(i64, Option<&str>, i64)],
 ) -> (Store<RocksEngine>, Endpoint<RocksEngine>) {
-    let (store, endpoint, _) = init_data_with_commit(tbl, vals, true);
-    (store, endpoint)
-}
-
-// Same as init_with_data except returned values include Arc<QuotaLimiter>
-pub fn init_with_data_ext(
-    tbl: &ProductTable,
-    vals: &[(i64, Option<&str>, i64)],
-) -> (Store<RocksEngine>, Endpoint<RocksEngine>, Arc<QuotaLimiter>) {
     init_data_with_commit(tbl, vals, true)
 }

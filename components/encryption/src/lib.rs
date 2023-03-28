@@ -13,8 +13,9 @@ mod metrics;
 pub use self::{
     config::*,
     crypter::{
-        from_engine_encryption_method, to_engine_encryption_method, verify_encryption_config,
-        AesGcmCrypter, Iv, PlainKey,
+        compat, encryption_method_from_db_encryption_method,
+        encryption_method_to_db_encryption_method, verify_encryption_config, AesGcmCrypter, Iv,
+        PlainKey,
     },
     encrypted_file::EncryptedFile,
     errors::{Error, Result, RetryCodedError},

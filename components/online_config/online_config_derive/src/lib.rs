@@ -123,7 +123,11 @@ fn encoder(
             }
         };
         // Only reserve attributes that related to `serde`
-        field.attrs.retain(|f| is_attr("serde", f));
+        field.attrs = field
+            .attrs
+            .into_iter()
+            .filter(|f| is_attr("serde", f))
+            .collect();
         serialize_fields.push(field);
     }
     // Only reserve attributes that related to `serde`
@@ -168,7 +172,7 @@ fn update(fields: &Punctuated<Field, Comma>, crate_name: &Ident) -> Result<Token
         let f = if submodule {
             quote! {
                 if let Some(#crate_name::ConfigValue::Module(v)) = #incoming.remove(#name_lit) {
-                    #crate_name::OnlineConfig::update(&mut self.#name, v)?;
+                    #crate_name::OnlineConfig::update(&mut self.#name, v);
                 }
             }
         } else if is_option_type(&field.ty) {
@@ -177,23 +181,22 @@ fn update(fields: &Punctuated<Field, Comma>, crate_name: &Ident) -> Result<Token
                     if #crate_name::ConfigValue::None == v {
                         self.#name = None;
                     } else {
-                        self.#name = Some(std::convert::TryInto::try_into(v)?);
+                        self.#name = Some(v.into());
                     }
                 }
             }
         } else {
             quote! {
                 if let Some(v) = #incoming.remove(#name_lit) {
-                    self.#name = std::convert::TryInto::try_into(v)?;
+                    self.#name = v.into();
                 }
             }
         };
         update_fields.push(f);
     }
     Ok(quote! {
-        fn update(&mut self, mut #incoming: #crate_name::ConfigChange) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        fn update(&mut self, mut #incoming: #crate_name::ConfigChange) {
             #(#update_fields)*
-            Ok(())
         }
     })
 }

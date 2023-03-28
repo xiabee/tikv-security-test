@@ -5,7 +5,7 @@
 use std::fs;
 
 use engine_test::{
-    ctor::{CfOptions, DbOptions, KvEngineConstructorExt},
+    ctor::{CFOptions, ColumnFamilyOptions, DBOptions, KvEngineConstructorExt},
     kv::KvTestEngine,
 };
 use engine_traits::{KvEngine, SyncMutable, ALL_CFS};
@@ -16,15 +16,18 @@ use super::tempdir;
 fn new_engine_basic() {
     let dir = tempdir();
     let path = dir.path().to_str().unwrap();
-    let _db = KvTestEngine::new_kv_engine(path, ALL_CFS).unwrap();
+    let _db = KvTestEngine::new_kv_engine(path, None, ALL_CFS, None).unwrap();
 }
 
 #[test]
 fn new_engine_opt_basic() {
     let dir = tempdir();
     let path = dir.path().to_str().unwrap();
-    let db_opts = DbOptions::default();
-    let cf_opts = ALL_CFS.iter().map(|cf| (*cf, CfOptions::new())).collect();
+    let db_opts = DBOptions::default();
+    let cf_opts = ALL_CFS
+        .iter()
+        .map(|cf| CFOptions::new(cf, ColumnFamilyOptions::new()))
+        .collect();
     let _db = KvTestEngine::new_kv_engine_opt(path, db_opts, cf_opts).unwrap();
 }
 
@@ -34,7 +37,7 @@ fn new_engine_missing_dir() {
     let dir = tempdir();
     let path = dir.path();
     let path = path.join("missing").to_str().unwrap().to_owned();
-    let db = KvTestEngine::new_kv_engine(&path, ALL_CFS).unwrap();
+    let db = KvTestEngine::new_kv_engine(&path, None, ALL_CFS, None).unwrap();
     db.put(b"foo", b"bar").unwrap();
     db.sync().unwrap();
 }
@@ -44,8 +47,11 @@ fn new_engine_opt_missing_dir() {
     let dir = tempdir();
     let path = dir.path();
     let path = path.join("missing").to_str().unwrap().to_owned();
-    let db_opts = DbOptions::default();
-    let cf_opts = ALL_CFS.iter().map(|cf| (*cf, CfOptions::new())).collect();
+    let db_opts = DBOptions::default();
+    let cf_opts = ALL_CFS
+        .iter()
+        .map(|cf| CFOptions::new(cf, ColumnFamilyOptions::new()))
+        .collect();
     let db = KvTestEngine::new_kv_engine_opt(&path, db_opts, cf_opts).unwrap();
     db.put(b"foo", b"bar").unwrap();
     db.sync().unwrap();
@@ -65,9 +71,9 @@ fn new_engine_readonly_dir() {
     fs::set_permissions(&path, perms).unwrap();
 
     let path = path.to_str().unwrap();
-    let err = KvTestEngine::new_kv_engine(path, ALL_CFS);
+    let err = KvTestEngine::new_kv_engine(path, None, ALL_CFS, None);
 
-    err.unwrap_err();
+    assert!(err.is_err());
 }
 
 #[test]
@@ -84,9 +90,12 @@ fn new_engine_opt_readonly_dir() {
     fs::set_permissions(&path, perms).unwrap();
 
     let path = path.to_str().unwrap();
-    let db_opts = DbOptions::default();
-    let cf_opts = ALL_CFS.iter().map(|cf| (*cf, CfOptions::new())).collect();
+    let db_opts = DBOptions::default();
+    let cf_opts = ALL_CFS
+        .iter()
+        .map(|cf| CFOptions::new(cf, ColumnFamilyOptions::new()))
+        .collect();
     let err = KvTestEngine::new_kv_engine_opt(path, db_opts, cf_opts);
 
-    err.unwrap_err();
+    assert!(err.is_err());
 }

@@ -240,13 +240,14 @@ mod tests {
 
         let observer = SplitObserver;
 
+        let resp = observer.pre_propose_admin(&mut ctx, &mut req);
         // since no split is defined, actual coprocessor won't be invoke.
-        observer.pre_propose_admin(&mut ctx, &mut req).unwrap();
+        assert!(resp.is_ok());
         assert!(!req.has_split(), "only split req should be handle.");
 
         req = new_split_request(new_row_key(1, 2, 0));
         // For compatible reason, split should supported too.
-        observer.pre_propose_admin(&mut ctx, &mut req).unwrap();
+        assert!(observer.pre_propose_admin(&mut ctx, &mut req).is_ok());
 
         // Empty key should be skipped.
         let mut split_keys = vec![vec![]];
@@ -256,7 +257,7 @@ mod tests {
         req = new_batch_split_request(split_keys.clone());
         // Although invalid keys should be skipped, but if all keys are
         // invalid, errors should be reported.
-        observer.pre_propose_admin(&mut ctx, &mut req).unwrap_err();
+        assert!(observer.pre_propose_admin(&mut ctx, &mut req).is_err());
 
         let mut key = new_row_key(1, 2, 0);
         let mut expected_key = key[..key.len() - 8].to_vec();

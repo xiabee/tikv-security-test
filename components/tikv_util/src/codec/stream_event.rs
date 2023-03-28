@@ -16,8 +16,8 @@ pub trait Iterator {
     fn value(&self) -> &[u8];
 }
 
-pub struct EventIterator<'a> {
-    buf: &'a [u8],
+pub struct EventIterator {
+    buf: Vec<u8>,
     offset: usize,
     key_offset: usize,
     value_offset: usize,
@@ -25,8 +25,8 @@ pub struct EventIterator<'a> {
     value_len: usize,
 }
 
-impl EventIterator<'_> {
-    pub fn new(buf: &[u8]) -> EventIterator<'_> {
+impl EventIterator {
+    pub fn new(buf: Vec<u8>) -> EventIterator {
         EventIterator {
             buf,
             offset: 0,
@@ -44,7 +44,7 @@ impl EventIterator<'_> {
     }
 }
 
-impl Iterator for EventIterator<'_> {
+impl Iterator for EventIterator {
     fn next(&mut self) -> Result<()> {
         if self.valid() {
             self.key_len = self.get_size() as usize;
@@ -141,7 +141,7 @@ mod tests {
             vals.push(val);
         }
 
-        let mut iter = EventIterator::new(&event);
+        let mut iter = EventIterator::new(event);
 
         let mut index = 0_usize;
         loop {

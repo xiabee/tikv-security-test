@@ -2,8 +2,7 @@
 
 use super::*;
 
-/// Collator for `utf8mb4_unicode_ci` collation with padding behavior (trims
-/// right spaces).
+/// Collator for `utf8mb4_unicode_ci` collation with padding behavior (trims right spaces).
 #[derive(Debug)]
 pub struct CollatorUtf8Mb4UnicodeCi;
 

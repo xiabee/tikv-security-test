@@ -1,7 +1,7 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-/// Provides profilers for TiKV.
 mod profile;
+pub mod region_meta;
 use std::{
     error::Error as StdError,
     marker::PhantomData,
@@ -40,10 +40,6 @@ use openssl::{
     x509::X509,
 };
 use pin_project::pin_project;
-pub use profile::{
-    activate_heap_profile, deactivate_heap_profile, jeprof_heap_profile, list_heap_profiles,
-    read_file, start_one_cpu_profile, start_one_heap_profile,
-};
 use prometheus::TEXT_FORMAT;
 use raftstore::store::{transport::CasualRouter, CasualMessage};
 use regex::Regex;
@@ -61,10 +57,13 @@ use tokio::{
 };
 use tokio_openssl::SslStream;
 
+use self::profile::{
+    activate_heap_profile, deactivate_heap_profile, jeprof_heap_profile, list_heap_profiles,
+    read_file, start_one_cpu_profile, start_one_heap_profile,
+};
 use crate::{
-    config::{ConfigController, LogLevel},
+    config::{log_level_serde, ConfigController},
     server::Result,
-    tikv_util::sys::thread::ThreadBuildWrapper,
 };
 
 static TIMER_CANCELED: &str = "tokio timer canceled";
@@ -79,7 +78,8 @@ static FAIL_POINTS_REQUEST_PATH: &str = "/fail";
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct LogLevelRequest {
-    pub log_level: LogLevel,
+    #[serde(with = "log_level_serde")]
+    pub log_level: slog::Level,
 }
 
 pub struct StatusServer<E, R> {
@@ -110,8 +110,8 @@ where
             .enable_all()
             .worker_threads(status_thread_pool_size)
             .thread_name("status-server")
-            .after_start_wrapper(|| debug!("Status server started"))
-            .before_stop_wrapper(|| debug!("stopping status server"))
+            .on_thread_start(|| debug!("Status server started"))
+            .on_thread_stop(|| debug!("stopping status server"))
             .build()?;
 
         let (tx, rx) = oneshot::channel::<()>();
@@ -352,8 +352,7 @@ where
                 Ok(val) => val,
                 Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
             },
-            None => 99, /* Default frequency of sampling. 99Hz to avoid coincide with special
-                         * periods */
+            None => 99, // Default frequency of sampling. 99Hz to avoid coincide with special periods
         };
 
         let prototype_content_type: hyper::http::HeaderValue =
@@ -403,7 +402,7 @@ where
 
         match log_level_request {
             Ok(req) => {
-                set_log_level(req.log_level.into());
+                set_log_level(req.log_level);
                 Ok(Response::new(Body::empty()))
             }
             Err(err) => Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
@@ -454,8 +453,8 @@ where
         let (tx, rx) = oneshot::channel();
         match router.send(
             id,
-            CasualMessage::AccessPeer(Box::new(move |meta| {
-                if let Err(meta) = tx.send(meta) {
+            CasualMessage::AccessPeer(Box::new(move |peer| {
+                if let Err(meta) = tx.send(region_meta::RegionMeta::new(peer)) {
                     error!("receiver dropped, region meta: {:?}", meta)
                 }
             })),
@@ -566,9 +565,8 @@ where
                         }
 
                         // 1. POST "/config" will modify the configuration of TiKV.
-                        // 2. GET "/region" will get start key and end key. These keys could be
-                        // actual user data since in some cases the data itself is stored in the
-                        // key.
+                        // 2. GET "/region" will get start key and end key. These keys could be actual
+                        // user data since in some cases the data itself is stored in the key.
                         let should_check_cert = !matches!(
                             (&method, path.as_ref()),
                             (&Method::GET, "/metrics")
@@ -860,8 +858,7 @@ async fn handle_fail_points_request(req: Request<Body>) -> hyper::Result<Respons
             Ok(Response::new(body.into()))
         }
         (Method::GET, _) => {
-            // In this scope the path must be like /fail...(/...), which starts with
-            // FAIL_POINTS_REQUEST_PATH and may or may not have a sub path
+            // In this scope the path must be like /fail...(/...), which starts with FAIL_POINTS_REQUEST_PATH and may or may not have a sub path
             // Now we return 404 when path is neither /fail nor /fail/
             if path != FAIL_POINTS_REQUEST_PATH && path != fail_path {
                 return Ok(Response::builder()
@@ -952,7 +949,7 @@ mod tests {
     use tikv_util::logger::get_log_level;
 
     use crate::{
-        config::{ConfigController, TikvConfig},
+        config::{ConfigController, TiKvConfig},
         server::status_server::{profile::TEST_PROFILE_MUTEX, LogLevelRequest, StatusServer},
     };
 
@@ -1045,12 +1042,12 @@ mod tests {
                 .await
                 .unwrap();
             let resp_json = String::from_utf8_lossy(&v).to_string();
-            let cfg = TikvConfig::default();
+            let cfg = TiKvConfig::default();
             serde_json::to_string(&cfg.get_encoder())
                 .map(|cfg_json| {
                     assert_eq!(resp_json, cfg_json);
                 })
-                .expect("Could not convert TikvConfig to string");
+                .expect("Could not convert TiKvConfig to string");
         });
         block_on(handle).unwrap();
         status_server.stop();
@@ -1420,7 +1417,7 @@ mod tests {
         let resp = block_on(handle).unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body_bytes = block_on(hyper::body::to_bytes(resp.into_body())).unwrap();
-        String::from_utf8(body_bytes.as_ref().to_owned()).unwrap();
+        assert!(String::from_utf8(body_bytes.as_ref().to_owned()).is_ok());
 
         // test gzip
         let handle = status_server.thread_pool.spawn(async move {
@@ -1440,7 +1437,7 @@ mod tests {
         GzDecoder::new(body_bytes.reader())
             .read_to_end(&mut decoded_bytes)
             .unwrap();
-        String::from_utf8(decoded_bytes).unwrap();
+        assert!(String::from_utf8(decoded_bytes).is_ok());
 
         status_server.stop();
     }
@@ -1466,7 +1463,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let new_log_level = slog::Level::Debug.into();
+        let new_log_level = slog::Level::Debug;
         let mut log_level_request = Request::new(Body::from(
             serde_json::to_string(&LogLevelRequest {
                 log_level: new_log_level,
@@ -1486,7 +1483,7 @@ mod tests {
                 .await
                 .map(move |res| {
                     assert_eq!(res.status(), StatusCode::OK);
-                    assert_eq!(get_log_level(), Some(new_log_level.into()));
+                    assert_eq!(get_log_level(), Some(new_log_level));
                 })
                 .unwrap()
         });

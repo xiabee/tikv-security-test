@@ -21,8 +21,7 @@ pub type Callback = Box<dyn Fn(DeadlockResponse) + Send>;
 const CQ_COUNT: usize = 1;
 const CLIENT_PREFIX: &str = "deadlock";
 
-/// Builds the `Environment` of deadlock clients. All clients should use the
-/// same instance.
+/// Builds the `Environment` of deadlock clients. All clients should use the same instance.
 pub fn env() -> Arc<Environment> {
     Arc::new(
         EnvBuilder::new()
@@ -59,13 +58,14 @@ impl Client {
         let (sink, receiver) = self.client.detect().unwrap();
         let send_task = Box::pin(async move {
             let mut sink = sink.sink_map_err(Error::Grpc);
-
-            sink.send_all(&mut rx.map(|r| Ok((r, WriteFlags::default()))))
+            let res = sink
+                .send_all(&mut rx.map(|r| Ok((r, WriteFlags::default()))))
                 .await
                 .map(|_| {
                     info!("cancel detect sender");
                     sink.get_mut().cancel();
-                })
+                });
+            res
         });
         self.sender = Some(tx);
 

@@ -5,13 +5,13 @@ use std::{collections::HashMap, string::ToString};
 use kvproto::diagnosticspb::{ServerInfoItem, ServerInfoPair};
 use tikv_util::{
     config::KIB,
-    sys::{cpu_time::LinuxStyleCpuTime, ioload, SysQuota, *},
+    sys::{cpu_time::LiunxStyleCpuTime, SysQuota, *},
 };
 use walkdir::WalkDir;
 
-use crate::server::service::diagnostics::SYS_INFO;
+use crate::server::service::diagnostics::{ioload, SYS_INFO};
 
-type CpuTimeSnapshot = Option<LinuxStyleCpuTime>;
+type CpuTimeSnapshot = Option<LiunxStyleCpuTime>;
 
 #[derive(Clone, Debug)]
 pub struct NicSnapshot {
@@ -37,7 +37,7 @@ impl NicSnapshot {
 
     fn into_pairs(self, prev: &NicSnapshot) -> Vec<ServerInfoPair> {
         macro_rules! pair {
-            ($label:literal, $value:expr, $old_value:expr) => {{
+            ($label: literal, $value: expr, $old_value: expr) => {{
                 let mut pair = ServerInfoPair::default();
                 pair.set_key($label.to_owned());
                 pair.set_value(format!("{:.2}", ($value - $old_value) as f64));
@@ -87,7 +87,7 @@ fn cpu_load_info(prev_cpu: CpuTimeSnapshot, collector: &mut Vec<ServerInfoItem>)
         return;
     }
 
-    let t2 = LinuxStyleCpuTime::current();
+    let t2 = LiunxStyleCpuTime::current();
     if t2.is_err() {
         return;
     }
@@ -201,7 +201,7 @@ fn nic_load_info(prev_nic: HashMap<String, NicSnapshot>, collector: &mut Vec<Ser
 
 fn io_load_info(prev_io: HashMap<String, ioload::IoLoad>, collector: &mut Vec<ServerInfoItem>) {
     let current = ioload::IoLoad::snapshot();
-    let rate = |cur, prev| (cur - prev);
+    let rate = |cur, prev| (cur - prev) as f64;
     for (name, cur) in current.into_iter() {
         let prev = match prev_io.get(&name) {
             Some(p) => p,
@@ -265,7 +265,7 @@ fn io_load_info(prev_io: HashMap<String, ioload::IoLoad>, collector: &mut Vec<Se
 }
 
 pub fn cpu_time_snapshot() -> CpuTimeSnapshot {
-    let t1 = LinuxStyleCpuTime::current();
+    let t1 = LiunxStyleCpuTime::current();
     if t1.is_err() {
         return None;
     }
@@ -350,7 +350,7 @@ fn mem_hardware_info(collector: &mut Vec<ServerInfoItem>) {
     system.refresh_memory();
     let mut pair = ServerInfoPair::default();
     pair.set_key("capacity".to_string());
-    pair.set_value(SysQuota::memory_limit_in_bytes().to_string());
+    pair.set_value((system.get_total_memory() * KIB).to_string());
     let mut item = ServerInfoItem::default();
     item.set_tp("memory".to_string());
     item.set_name("memory".to_string());
