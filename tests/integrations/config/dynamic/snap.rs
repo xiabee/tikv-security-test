@@ -12,9 +12,10 @@ use raftstore::store::{fsm::create_raft_batch_system, SnapManager};
 use security::SecurityManager;
 use tempfile::TempDir;
 use tikv::{
-    config::{ConfigController, TiKvConfig},
+    config::{ConfigController, TikvConfig},
     server::{
         config::{Config as ServerConfig, ServerConfigManager},
+        raftkv::RaftRouterWrap,
         snap::{Runner as SnapHandler, Task as SnapTask},
     },
 };
@@ -24,7 +25,7 @@ use tikv_util::{
 };
 
 fn start_server(
-    cfg: TiKvConfig,
+    cfg: TikvConfig,
     dir: &TempDir,
 ) -> (ConfigController, LazyWorker<SnapTask>, SnapManager) {
     let snap_mgr = {
@@ -60,7 +61,7 @@ fn start_server(
     let snap_runner = SnapHandler::new(
         Arc::clone(&env),
         snap_mgr.clone(),
-        raft_router,
+        RaftRouterWrap::new(raft_router),
         security_mgr,
         Arc::clone(&server_config),
     );
@@ -85,7 +86,7 @@ where
 
 #[test]
 fn test_update_server_config() {
-    let (mut config, _dir) = TiKvConfig::with_tmp().unwrap();
+    let (mut config, _dir) = TikvConfig::with_tmp().unwrap();
     config.validate().unwrap();
     let (cfg_controller, snap_worker, snap_mgr) = start_server(config.clone(), &_dir);
     let mut svr_cfg = config.server.clone();

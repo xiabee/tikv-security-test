@@ -9,7 +9,7 @@ use std::{
 };
 
 use api_version::{dispatch_api_version, KvFormat};
-use causal_ts::CausalTsProvider;
+use causal_ts::CausalTsProviderImpl;
 use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use encryption_export::DataKeyManager;
@@ -33,18 +33,19 @@ use pd_client::PdClient;
 use raftstore::{
     coprocessor::{CoprocessorHost, RegionInfoAccessor},
     errors::Error as RaftError,
-    router::{LocalReadRouter, RaftStoreBlackHole, RaftStoreRouter, ServerRaftStoreRouter},
+    router::{LocalReadRouter, RaftStoreRouter, ServerRaftStoreRouter},
     store::{
         fsm::{store::StoreMeta, ApplyRouter, RaftBatchSystem, RaftRouter},
         msg::RaftCmdExtraOpts,
         AutoSplitController, Callback, CheckLeaderRunner, LocalReader, RegionSnapshot, SnapManager,
-        SnapManagerBuilder, SplitCheckRunner, SplitConfigManager,
+        SnapManagerBuilder, SplitCheckRunner, SplitConfigManager, StoreMetaDelegate,
     },
     Result,
 };
 use resource_metering::{CollectorRegHandle, ResourceTagFactory};
 use security::SecurityManager;
 use tempfile::TempDir;
+use test_pd_client::TestPdClient;
 use tikv::{
     config::ConfigController,
     coprocessor, coprocessor_v2,
@@ -61,11 +62,17 @@ use tikv::{
         ConnectionBuilder, Error, Node, PdStoreAddrResolver, RaftClient, RaftKv,
         Result as ServerResult, Server, ServerTransport,
     },
-    storage::{self, kv::SnapContext, txn::flow_controller::FlowController, Engine},
+    storage::{
+        self,
+        kv::{FakeExtension, SnapContext},
+        txn::flow_controller::{EngineFlowController, FlowController},
+        Engine,
+    },
 };
 use tikv_util::{
     config::VersionTrack,
     quota_limiter::QuotaLimiter,
+    sys::thread::ThreadBuildWrapper,
     time::ThreadReadId,
     worker::{Builder as WorkerBuilder, LazyWorker},
     HandyRwLock,
@@ -77,10 +84,11 @@ use super::*;
 use crate::Config;
 
 type SimulateStoreTransport = SimulateTransport<ServerRaftStoreRouter<RocksEngine, RaftTestEngine>>;
-type SimulateServerTransport =
-    SimulateTransport<ServerTransport<SimulateStoreTransport, PdStoreAddrResolver, RocksEngine>>;
 
 pub type SimulateEngine = RaftKv<RocksEngine, SimulateStoreTransport>;
+type SimulateRaftExtension = <SimulateEngine as Engine>::RaftExtension;
+type SimulateServerTransport =
+    SimulateTransport<ServerTransport<SimulateRaftExtension, PdStoreAddrResolver>>;
 
 #[derive(Default, Clone)]
 pub struct AddressMap {
@@ -118,13 +126,13 @@ impl StoreAddrResolver for AddressMap {
 
 struct ServerMeta {
     node: Node<TestPdClient, RocksEngine, RaftTestEngine>,
-    server: Server<SimulateStoreTransport, PdStoreAddrResolver, SimulateEngine>,
+    server: Server<PdStoreAddrResolver, SimulateEngine>,
     sim_router: SimulateStoreTransport,
     sim_trans: SimulateServerTransport,
     raw_router: RaftRouter<RocksEngine, RaftTestEngine>,
     raw_apply_router: ApplyRouter<RocksEngine>,
-    gc_worker: GcWorker<RaftKv<RocksEngine, SimulateStoreTransport>, SimulateStoreTransport>,
-    rts_worker: Option<LazyWorker<resolved_ts::Task<RocksSnapshot>>>,
+    gc_worker: GcWorker<RaftKv<RocksEngine, SimulateStoreTransport>>,
+    rts_worker: Option<LazyWorker<resolved_ts::Task>>,
     rsmeter_cleanup: Box<dyn FnOnce()>,
 }
 
@@ -145,10 +153,10 @@ pub struct ServerCluster {
     snap_paths: HashMap<u64, TempDir>,
     snap_mgrs: HashMap<u64, SnapManager>,
     pd_client: Arc<TestPdClient>,
-    raft_client: RaftClient<AddressMap, RaftStoreBlackHole, RocksEngine>,
+    raft_client: RaftClient<AddressMap, FakeExtension>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
     env: Arc<Environment>,
-    pub causal_ts_providers: HashMap<u64, Arc<dyn CausalTsProvider>>,
+    pub causal_ts_providers: HashMap<u64, Arc<CausalTsProviderImpl>>,
 }
 
 impl ServerCluster {
@@ -161,14 +169,15 @@ impl ServerCluster {
         );
         let security_mgr = Arc::new(SecurityManager::new(&Default::default()).unwrap());
         let map = AddressMap::default();
-        // We don't actually need to handle snapshot message, just create a dead worker to make it compile.
+        // We don't actually need to handle snapshot message, just create a dead worker
+        // to make it compile.
         let worker = LazyWorker::new("snap-worker");
         let conn_builder = ConnectionBuilder::new(
             env.clone(),
             Arc::default(),
             security_mgr.clone(),
             map.clone(),
-            RaftStoreBlackHole,
+            FakeExtension,
             worker.scheduler(),
             Arc::new(ThreadLoadPool::with_threshold(usize::MAX)),
         );
@@ -210,7 +219,7 @@ impl ServerCluster {
     pub fn get_gc_worker(
         &self,
         node_id: u64,
-    ) -> &GcWorker<RaftKv<RocksEngine, SimulateStoreTransport>, SimulateStoreTransport> {
+    ) -> &GcWorker<RaftKv<RocksEngine, SimulateStoreTransport>> {
         &self.metas.get(&node_id).unwrap().gc_worker
     }
 
@@ -218,7 +227,7 @@ impl ServerCluster {
         self.concurrency_managers.get(&node_id).unwrap().clone()
     }
 
-    pub fn get_causal_ts_provider(&self, node_id: u64) -> Option<Arc<dyn CausalTsProvider>> {
+    pub fn get_causal_ts_provider(&self, node_id: u64) -> Option<Arc<CausalTsProviderImpl>> {
         self.causal_ts_providers.get(&node_id).cloned()
     }
 
@@ -277,11 +286,16 @@ impl ServerCluster {
             }
         }
 
+        let local_reader = LocalReader::new(
+            engines.kv.clone(),
+            StoreMetaDelegate::new(store_meta.clone(), engines.kv.clone()),
+            router.clone(),
+        );
+
         // Create coprocessor.
         let mut coprocessor_host = CoprocessorHost::new(router.clone(), cfg.coprocessor.clone());
         let region_info_accessor = RegionInfoAccessor::new(&mut coprocessor_host);
 
-        let local_reader = LocalReader::new(engines.kv.clone(), store_meta.clone(), router.clone());
         let raft_router = ServerRaftStoreRouter::new(router.clone(), local_reader);
         let sim_router = SimulateTransport::new(raft_router.clone());
         let raft_engine = RaftKv::new(
@@ -321,32 +335,30 @@ impl ServerCluster {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut gc_worker = GcWorker::new(
             engine.clone(),
-            sim_router.clone(),
             tx,
             cfg.gc.clone(),
             Default::default(),
+            Arc::new(region_info_accessor.clone()),
         );
-        gc_worker.start().unwrap();
-        gc_worker
-            .start_observe_lock_apply(&mut coprocessor_host, concurrency_manager.clone())
-            .unwrap();
+        gc_worker.start(node_id).unwrap();
 
         let rts_worker = if cfg.resolved_ts.enable {
             // Resolved ts worker
             let mut rts_worker = LazyWorker::new("resolved-ts");
             let rts_ob = resolved_ts::Observer::new(rts_worker.scheduler());
             rts_ob.register_to(&mut coprocessor_host);
+            // resolved ts endpoint needs store id.
+            store_meta.lock().unwrap().store_id = Some(node_id);
             // Resolved ts endpoint
             let rts_endpoint = resolved_ts::Endpoint::new(
                 &cfg.resolved_ts,
                 rts_worker.scheduler(),
-                raft_router.clone(),
+                raft_router,
                 store_meta.clone(),
                 self.pd_client.clone(),
                 concurrency_manager.clone(),
                 self.env.clone(),
                 self.security_mgr.clone(),
-                resolved_ts::DummySinker::new(),
             );
             // Start the worker
             rts_worker.start(rts_endpoint);
@@ -356,25 +368,26 @@ impl ServerCluster {
         };
 
         if ApiVersion::V2 == F::TAG {
-            let causal_ts_provider = Arc::new(
+            let causal_ts_provider: Arc<CausalTsProviderImpl> = Arc::new(
                 block_on(causal_ts::BatchTsoProvider::new_opt(
                     self.pd_client.clone(),
                     cfg.causal_ts.renew_interval.0,
+                    cfg.causal_ts.alloc_ahead_buffer.0,
                     cfg.causal_ts.renew_batch_min_size,
+                    cfg.causal_ts.renew_batch_max_size,
                 ))
-                .unwrap(),
+                .unwrap()
+                .into(),
             );
-            self.causal_ts_providers
-                .insert(node_id, causal_ts_provider.clone());
-            let causal_ob = causal_ts::CausalObserver::new(causal_ts_provider);
-            causal_ob.register_to(&mut coprocessor_host);
+            self.causal_ts_providers.insert(node_id, causal_ts_provider);
         }
 
         // Start resource metering.
         let (res_tag_factory, collector_reg_handle, rsmeter_cleanup) =
             self.init_resource_metering(&cfg.resource_metering);
 
-        let check_leader_runner = CheckLeaderRunner::new(store_meta.clone());
+        let check_leader_runner =
+            CheckLeaderRunner::new(store_meta.clone(), coprocessor_host.clone());
         let check_leader_scheduler = bg_worker.start("check-leader", check_leader_runner);
 
         let mut lock_mgr = LockManager::new(&cfg.pessimistic_txn);
@@ -382,20 +395,26 @@ impl ServerCluster {
             cfg.quota.foreground_cpu_time,
             cfg.quota.foreground_write_bandwidth,
             cfg.quota.foreground_read_bandwidth,
+            cfg.quota.background_cpu_time,
+            cfg.quota.background_write_bandwidth,
+            cfg.quota.background_read_bandwidth,
             cfg.quota.max_delay_duration,
+            cfg.quota.enable_auto_tune,
         ));
-        let store = create_raft_storage::<_, _, _, F>(
+        let extension = engine.raft_extension().clone();
+        let store = create_raft_storage::<_, _, _, F, _>(
             engine,
             &cfg.storage,
             storage_read_pool.handle(),
             lock_mgr.clone(),
             concurrency_manager.clone(),
             lock_mgr.get_storage_dynamic_configs(),
-            Arc::new(FlowController::empty()),
+            Arc::new(FlowController::Singleton(EngineFlowController::empty())),
             pd_sender,
             res_tag_factory.clone(),
             quota_limiter.clone(),
             self.pd_client.feature_gate().clone(),
+            self.get_causal_ts_provider(node_id),
         )?;
         self.storages.insert(node_id, raft_engine);
 
@@ -427,12 +446,13 @@ impl ServerCluster {
 
         // Create pd client, snapshot manager, server.
         let (resolver, state) =
-            resolve::new_resolver(Arc::clone(&self.pd_client), &bg_worker, router.clone());
+            resolve::new_resolver(Arc::clone(&self.pd_client), &bg_worker, extension.clone());
         let snap_mgr = SnapManagerBuilder::default()
             .max_write_bytes_per_sec(cfg.server.snap_max_write_bytes_per_sec.0 as i64)
             .max_total_size(cfg.server.snap_max_total_size.0)
             .encryption_key_manager(key_manager)
             .max_per_file_size(cfg.raft_store.max_snapshot_file_raw_size.0)
+            .enable_multi_snapshot_files(true)
             .build(tmp_str);
         self.snap_mgrs.insert(node_id, snap_mgr.clone());
         let server_cfg = Arc::new(VersionTrack::new(cfg.server.clone()));
@@ -455,6 +475,8 @@ impl ServerCluster {
             TokioBuilder::new_multi_thread()
                 .thread_name(thd_name!("debugger"))
                 .worker_threads(1)
+                .after_start_wrapper(|| {})
+                .before_stop_wrapper(|| {})
                 .build()
                 .unwrap(),
         );
@@ -462,7 +484,7 @@ impl ServerCluster {
         let debug_service = DebugService::new(
             engines.clone(),
             debug_thread_handle,
-            raft_router,
+            extension,
             ConfigController::default(),
         );
 
@@ -486,6 +508,7 @@ impl ServerCluster {
             state,
             bg_worker.clone(),
             Some(health_service.clone()),
+            None,
         );
         node.try_bootstrap_store(engines.clone())?;
         let node_id = node.id();
@@ -498,7 +521,6 @@ impl ServerCluster {
                 store.clone(),
                 copr.clone(),
                 copr_v2.clone(),
-                sim_router.clone(),
                 resolver.clone(),
                 snap_mgr.clone(),
                 gc_worker.clone(),
@@ -536,11 +558,13 @@ impl ServerCluster {
         cfg.server.addr = format!("{}", addr);
         let trans = server.transport();
         let simulate_trans = SimulateTransport::new(trans);
+        let max_grpc_thread_count = cfg.server.grpc_concurrency;
         let server_cfg = Arc::new(VersionTrack::new(cfg.server.clone()));
 
         // Register the role change observer of the lock manager.
         lock_mgr.register_detector_role_change_observer(&mut coprocessor_host);
 
+        let max_unified_read_pool_thread_count = cfg.readpool.unified.max_thread_count;
         let pessimistic_txn_cfg = cfg.tikv.pessimistic_txn;
 
         let split_check_runner =
@@ -548,7 +572,14 @@ impl ServerCluster {
         let split_check_scheduler = bg_worker.start("split-check", split_check_runner);
         let split_config_manager =
             SplitConfigManager::new(Arc::new(VersionTrack::new(cfg.tikv.split)));
-        let auto_split_controller = AutoSplitController::new(split_config_manager);
+        let auto_split_controller = AutoSplitController::new(
+            split_config_manager,
+            max_grpc_thread_count,
+            max_unified_read_pool_thread_count,
+            None,
+        );
+
+        let causal_ts_provider = self.get_causal_ts_provider(node_id);
         node.start(
             engines,
             simulate_trans.clone(),
@@ -561,6 +592,7 @@ impl ServerCluster {
             auto_split_controller,
             concurrency_manager.clone(),
             collector_reg_handle,
+            causal_ts_provider,
         )?;
         assert!(node_id == 0 || node_id == node.id());
         let node_id = node.id();
@@ -674,13 +706,13 @@ impl Simulator for ServerCluster {
     }
 
     fn async_read(
-        &self,
+        &mut self,
         node_id: u64,
         batch_id: Option<ThreadReadId>,
         request: RaftCmdRequest,
         cb: Callback<RocksSnapshot>,
     ) {
-        match self.metas.get(&node_id) {
+        match self.metas.get_mut(&node_id) {
             None => {
                 let e: RaftError = box_err!("missing sender for store {}", node_id);
                 let mut resp = RaftCmdResponse::default();
@@ -747,7 +779,7 @@ impl Cluster<ServerCluster> {
             ctx.set_peer(leader);
             ctx.set_region_epoch(epoch);
 
-            let storage = self.sim.rl().storages.get(&store_id).unwrap().clone();
+            let mut storage = self.sim.rl().storages.get(&store_id).unwrap().clone();
             let snap_ctx = SnapContext {
                 pb_ctx: &ctx,
                 ..Default::default()

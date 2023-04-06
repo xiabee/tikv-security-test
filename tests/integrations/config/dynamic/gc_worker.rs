@@ -1,10 +1,13 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::mpsc::channel, time::Duration};
+use std::{
+    sync::{mpsc::channel, Arc},
+    time::Duration,
+};
 
-use raftstore::router::RaftStoreBlackHole;
+use raftstore::coprocessor::region_info_accessor::MockRegionInfoProvider;
 use tikv::{
-    config::{ConfigController, Module, TiKvConfig},
+    config::{ConfigController, Module, TikvConfig},
     server::gc_worker::{GcConfig, GcTask, GcWorker},
     storage::kv::TestEngineBuilder,
 };
@@ -17,25 +20,22 @@ fn test_gc_config_validate() {
 
     let mut invalid_cfg = GcConfig::default();
     invalid_cfg.batch_keys = 0;
-    assert!(invalid_cfg.validate().is_err());
+    invalid_cfg.validate().unwrap_err();
 }
 
 fn setup_cfg_controller(
-    cfg: TiKvConfig,
-) -> (
-    GcWorker<tikv::storage::kv::RocksEngine, RaftStoreBlackHole>,
-    ConfigController,
-) {
+    cfg: TikvConfig,
+) -> (GcWorker<tikv::storage::kv::RocksEngine>, ConfigController) {
     let engine = TestEngineBuilder::new().build().unwrap();
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut gc_worker = GcWorker::new(
         engine,
-        RaftStoreBlackHole,
         tx,
         cfg.gc.clone(),
         Default::default(),
+        Arc::new(MockRegionInfoProvider::new(Vec::new())),
     );
-    gc_worker.start().unwrap();
+    gc_worker.start(0).unwrap();
 
     let cfg_controller = ConfigController::new(cfg);
     cfg_controller.register(Module::Gc, Box::new(gc_worker.get_config_manager()));
@@ -62,7 +62,7 @@ where
 #[allow(clippy::float_cmp)]
 #[test]
 fn test_gc_worker_config_update() {
-    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
     cfg.validate().unwrap();
     let (gc_worker, cfg_controller) = setup_cfg_controller(cfg);
     let scheduler = gc_worker.scheduler();
@@ -96,7 +96,7 @@ fn test_gc_worker_config_update() {
 #[test]
 #[allow(clippy::float_cmp)]
 fn test_change_io_limit_by_config_manager() {
-    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
     cfg.validate().unwrap();
     let (gc_worker, cfg_controller) = setup_cfg_controller(cfg);
     let scheduler = gc_worker.scheduler();
@@ -134,7 +134,7 @@ fn test_change_io_limit_by_config_manager() {
 #[allow(clippy::float_cmp)]
 fn test_change_io_limit_by_debugger() {
     // Debugger use GcWorkerConfigManager to change io limit
-    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
     cfg.validate().unwrap();
     let (gc_worker, _) = setup_cfg_controller(cfg);
     let scheduler = gc_worker.scheduler();
@@ -145,19 +145,28 @@ fn test_change_io_limit_by_debugger() {
     });
 
     // Enable io iolimit
-    config_manager.update(|cfg: &mut GcConfig| cfg.max_write_bytes_per_sec = ReadableSize(1024));
+    let _ = config_manager.update(|cfg: &mut GcConfig| -> Result<(), ()> {
+        cfg.max_write_bytes_per_sec = ReadableSize(1024);
+        Ok(())
+    });
     validate(&scheduler, move |_, limiter: &Limiter| {
         assert_eq!(limiter.speed_limit(), 1024.0);
     });
 
     // Change io iolimit
-    config_manager.update(|cfg: &mut GcConfig| cfg.max_write_bytes_per_sec = ReadableSize(2048));
+    let _ = config_manager.update(|cfg: &mut GcConfig| -> Result<(), ()> {
+        cfg.max_write_bytes_per_sec = ReadableSize(2048);
+        Ok(())
+    });
     validate(&scheduler, move |_, limiter: &Limiter| {
         assert_eq!(limiter.speed_limit(), 2048.0);
     });
 
     // Disable io iolimit
-    config_manager.update(|cfg: &mut GcConfig| cfg.max_write_bytes_per_sec = ReadableSize(0));
+    let _ = config_manager.update(|cfg: &mut GcConfig| -> Result<(), ()> {
+        cfg.max_write_bytes_per_sec = ReadableSize(0);
+        Ok(())
+    });
     validate(&scheduler, move |_, limiter: &Limiter| {
         assert_eq!(limiter.speed_limit(), f64::INFINITY);
     });

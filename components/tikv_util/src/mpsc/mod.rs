@@ -1,13 +1,9 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-/*!
-
-This module provides an implementation of mpsc channel based on
-crossbeam_channel. Comparing to the crossbeam_channel, this implementation
-supports closed detection and try operations.
-
-*/
-pub mod batch;
+//! This module provides an implementation of mpsc channel based on
+//! crossbeam_channel. Comparing to the crossbeam_channel, this implementation
+//! supports closed detection and try operations.
+pub mod future;
 
 use std::{
     cell::Cell,
@@ -100,7 +96,8 @@ impl<T> Sender<T> {
         self.sender.is_empty()
     }
 
-    /// Blocks the current thread until a message is sent or the channel is disconnected.
+    /// Blocks the current thread until a message is sent or the channel is
+    /// disconnected.
     #[inline]
     pub fn send(&self, t: T) -> Result<(), SendError<T>> {
         if self.state.is_sender_connected() {
