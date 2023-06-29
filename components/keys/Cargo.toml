@@ -6,10 +6,11 @@ publish = false
 
 [dependencies]
 byteorder = "1.2"
-kvproto = { workspace = true }
-log_wrappers = { workspace = true }
+kvproto = { git = "https://github.com/pingcap/kvproto.git" }
+log_wrappers = { path = "../log_wrappers" }
 thiserror = "1.0"
-tikv_alloc = { workspace = true }
+tikv_alloc = { path = "../tikv_alloc" }
+tikv_util = { path = "../tikv_util", default-features = false }
 
 [dev-dependencies]
-panic_hook = { workspace = true }
+panic_hook = { path = "../panic_hook" }

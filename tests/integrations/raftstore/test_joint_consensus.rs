@@ -11,9 +11,8 @@ use kvproto::{
 };
 use pd_client::PdClient;
 use raft::eraftpb::ConfChangeType;
-use raftstore::Result;
+use raftstore::{store::util::find_peer, Result};
 use test_raftstore::*;
-use tikv_util::store::find_peer;
 
 /// Tests multiple confchange commands can be done by one request
 #[test]

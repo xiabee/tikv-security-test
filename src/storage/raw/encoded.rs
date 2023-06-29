@@ -61,7 +61,10 @@ impl<S: Snapshot, F: KvFormat> RawEncodeSnapshot<S, F> {
 
 impl<S: Snapshot, F: KvFormat> Snapshot for RawEncodeSnapshot<S, F> {
     type Iter = RawEncodeIterator<S::Iter, F>;
-    type Ext<'a> = S::Ext<'a> where S: 'a;
+    type Ext<'a>
+    where
+        S: 'a,
+    = S::Ext<'a>;
 
     fn get(&self, key: &Key) -> Result<Option<Value>> {
         self.map_value(self.snap.get(key))
@@ -75,9 +78,16 @@ impl<S: Snapshot, F: KvFormat> Snapshot for RawEncodeSnapshot<S, F> {
         self.map_value(self.snap.get_cf_opt(opts, cf, key))
     }
 
-    fn iter(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter> {
+    fn iter(&self, iter_opt: IterOptions) -> Result<Self::Iter> {
         Ok(RawEncodeIterator::new(
-            self.snap.iter(cf, iter_opt)?,
+            self.snap.iter(iter_opt)?,
+            self.current_ts,
+        ))
+    }
+
+    fn iter_cf(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter> {
+        Ok(RawEncodeIterator::new(
+            self.snap.iter_cf(cf, iter_opt)?,
             self.current_ts,
         ))
     }

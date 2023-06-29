@@ -8,7 +8,7 @@ use encryption::Error as EncryptionError;
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use futures::channel::oneshot::Canceled;
 use grpcio::Error as GrpcError;
-use kvproto::{errorpb, import_sstpb, kvrpcpb::ApiVersion};
+use kvproto::{import_sstpb, kvrpcpb::ApiVersion};
 use tikv_util::codec::Error as CodecError;
 use uuid::Error as UuidError;
 
@@ -19,7 +19,7 @@ pub fn error_inc(type_: &str, err: &Error) {
         Error::Io(..) => "io",
         Error::Grpc(..) => "grpc",
         Error::Uuid(..) => "uuid",
-        Error::RocksDb(..) => "rocksdb",
+        Error::RocksDB(..) => "rocksdb",
         Error::EngineTraits(..) => "engine_traits",
         Error::ParseIntError(..) => "parse_int",
         Error::FileExists(..) => "file_exists",
@@ -52,7 +52,7 @@ pub enum Error {
 
     // FIXME: Remove concrete 'rocks' type
     #[error("RocksDB {0}")]
-    RocksDb(String),
+    RocksDB(String),
 
     #[error("Engine {0:?}")]
     EngineTraits(#[from] engine_traits::Error),
@@ -122,9 +122,6 @@ pub enum Error {
         storage_api_version: ApiVersion,
         key: String,
     },
-
-    #[error("resource is not enough {0}")]
-    ResourceNotEnough(String),
 }
 
 impl Error {
@@ -143,7 +140,7 @@ impl Error {
 
 impl From<String> for Error {
     fn from(msg: String) -> Self {
-        Self::RocksDb(msg)
+        Self::RocksDB(msg)
     }
 }
 
@@ -152,19 +149,7 @@ pub type Result<T> = result::Result<T, Error>;
 impl From<Error> for import_sstpb::Error {
     fn from(e: Error) -> import_sstpb::Error {
         let mut err = import_sstpb::Error::default();
-        match e {
-            Error::ResourceNotEnough(ref msg) => {
-                let mut import_err = errorpb::Error::default();
-                import_err.set_message(msg.clone());
-                import_err.set_server_is_busy(errorpb::ServerIsBusy::default());
-                err.set_store_error(import_err);
-                err.set_message(format!("{}", e));
-            }
-            _ => {
-                err.set_message(format!("{}", e));
-            }
-        }
-
+        err.set_message(format!("{}", e));
         err
     }
 }
@@ -176,7 +161,7 @@ impl ErrorCodeExt for Error {
             Error::Grpc(_) => error_code::sst_importer::GRPC,
             Error::Uuid(_) => error_code::sst_importer::UUID,
             Error::Future(_) => error_code::sst_importer::FUTURE,
-            Error::RocksDb(_) => error_code::sst_importer::ROCKSDB,
+            Error::RocksDB(_) => error_code::sst_importer::ROCKSDB,
             Error::EngineTraits(e) => e.error_code(),
             Error::ParseIntError(_) => error_code::sst_importer::PARSE_INT_ERROR,
             Error::FileExists(..) => error_code::sst_importer::FILE_EXISTS,
@@ -196,7 +181,6 @@ impl ErrorCodeExt for Error {
             Error::TtlLenNotEqualsToPairs => error_code::sst_importer::TTL_LEN_NOT_EQUALS_TO_PAIRS,
             Error::IncompatibleApiVersion => error_code::sst_importer::INCOMPATIBLE_API_VERSION,
             Error::InvalidKeyMode { .. } => error_code::sst_importer::INVALID_KEY_MODE,
-            Error::ResourceNotEnough(_) => error_code::sst_importer::RESOURCE_NOT_ENOUTH,
         }
     }
 }

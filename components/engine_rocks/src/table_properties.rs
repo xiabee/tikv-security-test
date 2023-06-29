@@ -1,8 +1,8 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{Range, Result};
+use engine_traits::{Error, Range, Result};
 
-use crate::{r2e, util, RangeProperties, RocksEngine};
+use crate::{util, RangeProperties, RocksEngine};
 
 #[repr(transparent)]
 pub struct UserCollectedProperties(rocksdb::UserCollectedProperties);
@@ -57,9 +57,11 @@ impl RocksEngine {
         let cf = util::get_cf_handle(self.as_inner(), cf)?;
         // FIXME: extra allocation
         let ranges: Vec<_> = ranges.iter().map(util::range_to_rocks_range).collect();
-        self.as_inner()
-            .get_properties_of_tables_in_range(cf, &ranges)
-            .map_err(r2e)
+        let raw = self
+            .as_inner()
+            .get_properties_of_tables_in_range(cf, &ranges);
+        let raw = raw.map_err(Error::Engine)?;
+        Ok(raw)
     }
 
     pub fn get_range_properties_cf(

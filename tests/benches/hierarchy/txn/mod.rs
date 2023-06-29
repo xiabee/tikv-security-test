@@ -2,7 +2,7 @@
 
 use concurrency_manager::ConcurrencyManager;
 use criterion::{black_box, BatchSize, Bencher, Criterion};
-use kvproto::kvrpcpb::{AssertionLevel, Context, PrewriteRequestPessimisticAction::*};
+use kvproto::kvrpcpb::{AssertionLevel, Context};
 use test_util::KvGenerator;
 use tikv::storage::{
     kv::{Engine, WriteData},
@@ -14,7 +14,7 @@ use txn_types::{Key, Mutation, TimeStamp};
 use super::{BenchConfig, EngineFactory, DEFAULT_ITERATIONS};
 
 fn setup_prewrite<E, F>(
-    engine: &mut E,
+    engine: &E,
     config: &BenchConfig<F>,
     start_ts: impl Into<TimeStamp>,
 ) -> Vec<Key>
@@ -43,7 +43,6 @@ where
             need_old_value: false,
             is_retry_request: false,
             assertion_level: AssertionLevel::Off,
-            txn_source: 0,
         };
         prewrite(
             &mut txn,
@@ -51,7 +50,7 @@ where
             &txn_props,
             Mutation::make_put(Key::from_raw(k), v.clone()),
             &None,
-            SkipPessimisticCheck,
+            false,
         )
         .unwrap();
     }
@@ -62,7 +61,7 @@ where
 }
 
 fn txn_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &BenchConfig<F>) {
-    let mut engine = config.engine_factory.build();
+    let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
     b.iter_batched(
@@ -91,17 +90,8 @@ fn txn_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &Be
                     need_old_value: false,
                     is_retry_request: false,
                     assertion_level: AssertionLevel::Off,
-                    txn_source: 0,
                 };
-                prewrite(
-                    &mut txn,
-                    &mut reader,
-                    &txn_props,
-                    mutation,
-                    &None,
-                    SkipPessimisticCheck,
-                )
-                .unwrap();
+                prewrite(&mut txn, &mut reader, &txn_props, mutation, &None, false).unwrap();
                 let write_data = WriteData::from_modifies(txn.into_modifies());
                 black_box(engine.write(&ctx, write_data)).unwrap();
             }
@@ -111,12 +101,11 @@ fn txn_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &Be
 }
 
 fn txn_commit<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &BenchConfig<F>) {
-    let mut engine = config.engine_factory.build();
-    let mut engine_clone = engine.clone();
+    let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
     b.iter_batched(
-        || setup_prewrite(&mut engine_clone, config, 1),
+        || setup_prewrite(&engine, config, 1),
         |keys| {
             for key in keys {
                 let snapshot = engine.snapshot(Default::default()).unwrap();
@@ -135,12 +124,11 @@ fn txn_rollback_prewrote<E: Engine, F: EngineFactory<E>>(
     b: &mut Bencher<'_>,
     config: &BenchConfig<F>,
 ) {
-    let mut engine = config.engine_factory.build();
-    let mut engine_clone = engine.clone();
+    let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
     b.iter_batched(
-        || setup_prewrite(&mut engine_clone, config, 1),
+        || setup_prewrite(&engine, config, 1),
         |keys| {
             for key in keys {
                 let snapshot = engine.snapshot(Default::default()).unwrap();
@@ -159,12 +147,11 @@ fn txn_rollback_conflict<E: Engine, F: EngineFactory<E>>(
     b: &mut Bencher<'_>,
     config: &BenchConfig<F>,
 ) {
-    let mut engine = config.engine_factory.build();
-    let mut engine_clone = engine.clone();
+    let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
     b.iter_batched(
-        || setup_prewrite(&mut engine_clone, config, 2),
+        || setup_prewrite(&engine, config, 2),
         |keys| {
             for key in keys {
                 let snapshot = engine.snapshot(Default::default()).unwrap();
@@ -183,7 +170,7 @@ fn txn_rollback_non_prewrote<E: Engine, F: EngineFactory<E>>(
     b: &mut Bencher<'_>,
     config: &BenchConfig<F>,
 ) {
-    let mut engine = config.engine_factory.build();
+    let engine = config.engine_factory.build();
     let ctx = Context::default();
     let cm = ConcurrencyManager::new(1.into());
     b.iter_batched(

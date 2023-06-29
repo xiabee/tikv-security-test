@@ -41,21 +41,18 @@ pub trait Rotator: Send {
     /// Return if the file need to be rotated.
     fn should_rotate(&self) -> bool;
 
-    /// Call by operator, update rotators' state while the operator try to write
-    /// some data.
+    /// Call by operator, update rotators' state while the operator try to write some data.
     fn on_write(&mut self, data: &[u8]) -> io::Result<()>;
 
-    /// Call by operator, update rotators' state while the operator execute a
-    /// rotation.
+    /// Call by operator, update rotators' state while the operator execute a rotation.
     fn on_rotate(&mut self) -> io::Result<()>;
 }
 
 /// This `FileLogger` will iterate over a series of `Rotators`,
 /// once the context trigger the `Rotator`, it will execute a rotation.
 ///
-/// After rotating, the original log file would be renamed to "{original
-/// name}.{"%Y-%m-%dT%H-%M-%S%.3f"}". Note: log file will *not* be compressed or
-/// otherwise modified.
+/// After rotating, the original log file would be renamed to "{original name}.{"%Y-%m-%dT%H-%M-%S%.3f"}".
+/// Note: log file will *not* be compressed or otherwise modified.
 pub struct RotatingFileLogger {
     path: PathBuf,
     file: File,
@@ -134,7 +131,7 @@ impl Write for RotatingFileLogger {
                 self.file.flush()?;
 
                 let new_path = (self.rename)(&self.path)?;
-                fs::rename(&self.path, new_path)?;
+                fs::rename(&self.path, &new_path)?;
                 self.file = open_log_file(&self.path)?;
 
                 // Updates all rotators' states.
@@ -376,7 +373,7 @@ mod tests {
 
         // Rename failed.
         logger.write_all(&[0xff; 1025]).unwrap();
-        logger.flush().unwrap_err();
+        assert!(logger.flush().is_err());
 
         // dropping the logger still should not panic.
         drop(logger);

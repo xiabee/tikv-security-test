@@ -1,13 +1,13 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 define_error_codes!(
-    "KV:SstImporter:",
+    "KV:SSTImporter:",
 
     IO => ("Io", "", ""),
-    GRPC => ("Grpc", "", ""),
+    GRPC => ("gRPC", "", ""),
     UUID => ("Uuid", "", ""),
     FUTURE => ("Future", "", ""),
-    ROCKSDB => ("RocksDb", "", ""),
+    ROCKSDB => ("RocksDB", "", ""),
     PARSE_INT_ERROR => ("ParseIntError", "", ""),
     FILE_EXISTS => ("FileExists", "", ""),
     FILE_CORRUPTED => ("FileCorrupted", "", ""),
@@ -21,6 +21,5 @@ define_error_codes!(
     TTL_NOT_ENABLED => ("TtlNotEnabled", "", ""),
     TTL_LEN_NOT_EQUALS_TO_PAIRS => ("TtlLenNotEqualsToPairs", "", ""),
     INCOMPATIBLE_API_VERSION => ("IncompatibleApiVersion", "", ""),
-    INVALID_KEY_MODE => ("InvalidKeyMode", "", ""),
-    RESOURCE_NOT_ENOUTH => ("ResourceNotEnough", "", "")
+    INVALID_KEY_MODE => ("InvalidKeyMode", "", "")
 );

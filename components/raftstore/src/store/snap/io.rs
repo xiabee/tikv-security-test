@@ -9,7 +9,8 @@ use std::{
 };
 
 use encryption::{
-    from_engine_encryption_method, DataKeyManager, DecrypterReader, EncrypterWriter, Iv,
+    encryption_method_from_db_encryption_method, DataKeyManager, DecrypterReader, EncrypterWriter,
+    Iv,
 };
 use engine_traits::{
     CfName, EncryptionKeyManager, Error as EngineError, Iterable, KvEngine, Mutable,
@@ -20,7 +21,7 @@ use tikv_util::{
     box_try,
     codec::bytes::{BytesEncoder, CompactBytesFromFileDecoder},
     debug, info,
-    time::{Instant, Limiter},
+    time::Limiter,
 };
 
 use super::{CfFile, Error, IO_LIMITER_CHUNK_SIZE};
@@ -60,7 +61,7 @@ where
 
     if let Some(key_mgr) = key_mgr {
         let enc_info = box_try!(key_mgr.new_file(path));
-        let mthd = from_engine_encryption_method(enc_info.method);
+        let mthd = encryption_method_from_db_encryption_method(enc_info.method);
         if mthd != EncryptionMethod::Plaintext {
             let writer = box_try!(EncrypterWriter::new(
                 file.take().unwrap(),
@@ -80,7 +81,7 @@ where
     };
 
     let mut stats = BuildStatistics::default();
-    box_try!(snap.scan(cf, start_key, end_key, false, |key, value| {
+    box_try!(snap.scan_cf(cf, start_key, end_key, false, |key, value| {
         stats.key_count += 1;
         stats.total_size += key.len() + value.len();
         box_try!(BytesEncoder::encode_compact_bytes(&mut writer, key));
@@ -132,9 +133,7 @@ where
         .to_string();
     let sst_writer = RefCell::new(create_sst_file_writer::<E>(engine, cf, &path)?);
     let mut file_length: usize = 0;
-
-    let instant = Instant::now();
-    box_try!(snap.scan(cf, start_key, end_key, false, |key, value| {
+    box_try!(snap.scan_cf(cf, start_key, end_key, false, |key, value| {
         let entry_len = key.len() + value.len();
         if file_length + entry_len > raw_size_per_file as usize {
             cf_file.add_file(file_id); // add previous file
@@ -152,7 +151,7 @@ where
                 Ok(new_sst_writer) => {
                     let old_writer = sst_writer.replace(new_sst_writer);
                     box_try!(old_writer.finish());
-                    box_try!(File::open(prev_path).and_then(|f| f.sync_all()));
+                    box_try!(File::open(&prev_path).and_then(|f| f.sync_all()));
                 }
                 Err(e) => {
                     let io_error = io::Error::new(io::ErrorKind::Other, e);
@@ -160,7 +159,6 @@ where
                 }
             }
         }
-
         while entry_len > remained_quota {
             // It's possible to acquire more than necessary, but let it be.
             io_limiter.blocking_consume(IO_LIMITER_CHUNK_SIZE);
@@ -182,13 +180,12 @@ where
         box_try!(sst_writer.into_inner().finish());
         box_try!(File::open(path).and_then(|f| f.sync_all()));
         info!(
-            "build_sst_cf_file_list builds {} files in cf {}. Total keys {}, total size {}. raw_size_per_file {}, total takes {:?}",
+            "build_sst_cf_file_list builds {} files in cf {}. Total keys {}, total size {}. raw_size_per_file {}",
             file_id + 1,
             cf,
             stats.key_count,
             stats.total_size,
             raw_size_per_file,
-            instant.saturating_elapsed(),
         );
     } else {
         box_try!(fs::remove_file(path));
@@ -196,8 +193,8 @@ where
     Ok(stats)
 }
 
-/// Apply the given snapshot file into a column family. `callback` will be
-/// invoked after each batch of key value pairs written to db.
+/// Apply the given snapshot file into a column family. `callback` will be invoked after each batch of
+/// key value pairs written to db.
 pub fn apply_plain_cf_file<E, F>(
     path: &str,
     key_mgr: Option<&Arc<DataKeyManager>>,
@@ -229,8 +226,7 @@ where
         Ok(())
     };
 
-    // Collect keys to a vec rather than wb so that we can invoke the callback less
-    // times.
+    // Collect keys to a vec rather than wb so that we can invoke the callback less times.
     let mut batch = Vec::with_capacity(1024);
     let mut batch_data_size = 0;
 
@@ -287,7 +283,7 @@ pub fn get_decrypter_reader(
     encryption_key_manager: &DataKeyManager,
 ) -> Result<Box<dyn Read + Send>, Error> {
     let enc_info = box_try!(encryption_key_manager.get_file(file));
-    let mthd = from_engine_encryption_method(enc_info.method);
+    let mthd = encryption_method_from_db_encryption_method(enc_info.method);
     debug!(
         "get_decrypter_reader gets enc_info for {:?}, method: {:?}",
         file, mthd
@@ -379,7 +375,7 @@ mod tests {
                 // Scan keys from db
                 let mut keys_in_db: HashMap<_, Vec<_>> = HashMap::new();
                 for cf in SNAPSHOT_CFS {
-                    snap.scan(
+                    snap.scan_cf(
                         cf,
                         &keys::data_key(b"a"),
                         &keys::data_end_key(b"z"),

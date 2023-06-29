@@ -6,14 +6,17 @@ use std::{
 };
 
 use encryption_export::data_key_manager_from_config;
-use engine_rocks::util::{db_exist, new_engine_opt};
+use engine_rocks::{
+    raw_util::{db_exist, new_engine_opt},
+    RocksEngine,
+};
 use engine_traits::{
     Engines, Error as EngineError, RaftEngine, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_CFS,
 };
 use futures::{executor::block_on, future, stream, Stream, StreamExt, TryStreamExt};
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::{
-    debugpb::{Db as DbType, *},
+    debugpb::{Db as DBType, *},
     kvrpcpb::MvccInfo,
     metapb::{Peer, Region},
     raft_cmdpb::RaftCmdRequest,
@@ -23,11 +26,11 @@ use pd_client::{Config as PdConfig, PdClient, RpcClient};
 use protobuf::Message;
 use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType};
 use raft_log_engine::RaftLogEngine;
-use raftstore::store::{util::build_key_range, INIT_EPOCH_CONF_VER};
+use raftstore::store::INIT_EPOCH_CONF_VER;
 use security::SecurityManager;
 use serde_json::json;
 use tikv::{
-    config::{ConfigController, TikvConfig},
+    config::{ConfigController, TiKvConfig},
     server::debug::{BottommostLevelCompaction, Debugger, RegionInfo},
 };
 use tikv_util::escape;
@@ -43,7 +46,7 @@ pub const LOCK_FILE_ERROR: &str = "IO error: While lock file";
 type MvccInfoStream = Pin<Box<dyn Stream<Item = Result<(Vec<u8>, MvccInfo), String>>>>;
 
 pub fn new_debug_executor(
-    cfg: &TikvConfig,
+    cfg: &TiKvConfig,
     data_dir: Option<&str>,
     skip_paranoid_checks: bool,
     host: Option<&str>,
@@ -64,7 +67,7 @@ pub fn new_debug_executor(
     let cache = cfg.storage.block_cache.build_shared_cache();
     let shared_block_cache = cache.is_some();
     let env = cfg
-        .build_shared_rocks_env(key_manager.clone(), None /* io_rate_limiter */)
+        .build_shared_rocks_env(key_manager.clone(), None /*io_rate_limiter*/)
         .unwrap();
 
     let mut kv_db_opts = cfg.rocksdb.build_opt();
@@ -75,10 +78,11 @@ pub fn new_debug_executor(
         .build_cf_opts(&cache, None, cfg.storage.api_version());
     let kv_path = PathBuf::from(kv_path).canonicalize().unwrap();
     let kv_path = kv_path.to_str().unwrap();
-    let mut kv_db = match new_engine_opt(kv_path, kv_db_opts, kv_cfs_opts) {
+    let kv_db = match new_engine_opt(kv_path, kv_db_opts, kv_cfs_opts) {
         Ok(db) => db,
         Err(e) => handle_engine_error(e),
     };
+    let mut kv_db = RocksEngine::from_db(Arc::new(kv_db));
     kv_db.set_shared_block_cache(shared_block_cache);
 
     let cfg_controller = ConfigController::default();
@@ -91,10 +95,11 @@ pub fn new_debug_executor(
             error!("raft db not exists: {}", raft_path);
             tikv_util::logger::exit_process_gracefully(-1);
         }
-        let mut raft_db = match new_engine_opt(&raft_path, raft_db_opts, raft_db_cf_opts) {
+        let raft_db = match new_engine_opt(&raft_path, raft_db_opts, raft_db_cf_opts) {
             Ok(db) => db,
             Err(e) => handle_engine_error(e),
         };
+        let mut raft_db = RocksEngine::from_db(Arc::new(raft_db));
         raft_db.set_shared_block_cache(shared_block_cache);
         let debugger = Debugger::new(Engines::new(kv_db, raft_db), cfg_controller);
         Box::new(debugger) as Box<dyn DebugExecutor>
@@ -105,7 +110,7 @@ pub fn new_debug_executor(
             error!("raft engine not exists: {}", config.dir);
             tikv_util::logger::exit_process_gracefully(-1);
         }
-        let raft_db = RaftLogEngine::new(config, key_manager, None /* io_rate_limiter */).unwrap();
+        let raft_db = RaftLogEngine::new(config, key_manager, None /*io_rate_limiter*/).unwrap();
         let debugger = Debugger::new(Engines::new(kv_db, raft_db), cfg_controller);
         Box::new(debugger) as Box<dyn DebugExecutor>
     }
@@ -151,37 +156,16 @@ pub trait DebugExecutor {
         println!("total region size: {}", convert_gbmb(total_size as u64));
     }
 
-    fn dump_region_info(
-        &self,
-        region_ids: Option<Vec<u64>>,
-        start_key: &[u8],
-        end_key: &[u8],
-        limit: usize,
-        skip_tombstone: bool,
-    ) {
+    fn dump_region_info(&self, region_ids: Option<Vec<u64>>, skip_tombstone: bool) {
         let region_ids = region_ids.unwrap_or_else(|| self.get_all_regions_in_store());
         let mut region_objects = serde_json::map::Map::new();
         for region_id in region_ids {
-            if limit > 0 && region_objects.len() >= limit {
-                break;
-            }
             let r = self.get_region_info(region_id);
             if skip_tombstone {
                 let region_state = r.region_local_state.as_ref();
                 if region_state.map_or(false, |s| s.get_state() == PeerState::Tombstone) {
-                    continue;
+                    return;
                 }
-            }
-            let region = r
-                .region_local_state
-                .as_ref()
-                .map(|s| s.get_region().clone())
-                .unwrap();
-            if !check_intersect_of_range(
-                &build_key_range(region.get_start_key(), region.get_end_key(), false),
-                &build_key_range(start_key, end_key, false),
-            ) {
-                continue;
             }
             let region_object = json!({
                 "region_id": region_id,
@@ -239,7 +223,7 @@ pub trait DebugExecutor {
         );
     }
 
-    fn dump_raft_log(&self, region: u64, index: u64) {
+    fn dump_raft_log(&self, region: u64, index: u64, binary: bool) {
         let idx_key = keys::raft_log_key(region, index);
         println!("idx_key: {}", escape(&idx_key));
         println!("region: {}", region);
@@ -251,6 +235,11 @@ pub trait DebugExecutor {
         println!("msg len: {}", data.len());
 
         if data.is_empty() {
+            return;
+        }
+
+        if binary {
+            println!("data: \n{}", hex::encode_upper(&data));
             return;
         }
 
@@ -380,7 +369,7 @@ pub trait DebugExecutor {
         region: u64,
         to_host: Option<&str>,
         to_data_dir: Option<&str>,
-        to_config: &TikvConfig,
+        to_config: &TiKvConfig,
         mgr: Arc<SecurityManager>,
     ) {
         let rhs_debug_executor = new_debug_executor(to_config, to_data_dir, false, to_host, mgr);
@@ -485,7 +474,7 @@ pub trait DebugExecutor {
     fn compact(
         &self,
         address: Option<&str>,
-        db: DbType,
+        db: DBType,
         cf: &str,
         from: Option<Vec<u8>>,
         to: Option<Vec<u8>>,
@@ -508,7 +497,7 @@ pub trait DebugExecutor {
     fn compact_region(
         &self,
         address: Option<&str>,
-        db: DbType,
+        db: DBType,
         cf: &str,
         region_id: u64,
         threads: u32,
@@ -625,7 +614,7 @@ pub trait DebugExecutor {
 
     fn do_compaction(
         &self,
-        db: DbType,
+        db: DBType,
         cf: &str,
         from: &[u8],
         to: &[u8],
@@ -670,7 +659,7 @@ impl DebugExecutor for DebugClient {
 
     fn get_value_by_key(&self, cf: &str, key: Vec<u8>) -> Vec<u8> {
         let mut req = GetRequest::default();
-        req.set_db(DbType::Kv);
+        req.set_db(DBType::Kv);
         req.set_cf(cf.to_owned());
         req.set_key(key);
         self.get(&req)
@@ -739,7 +728,7 @@ impl DebugExecutor for DebugClient {
 
     fn do_compaction(
         &self,
-        db: DbType,
+        db: DBType,
         cf: &str,
         from: &[u8],
         to: &[u8],
@@ -879,7 +868,7 @@ impl<ER: RaftEngine> DebugExecutor for Debugger<ER> {
     }
 
     fn get_value_by_key(&self, cf: &str, key: Vec<u8>) -> Vec<u8> {
-        self.get(DbType::Kv, cf, &key)
+        self.get(DBType::Kv, cf, &key)
             .unwrap_or_else(|e| perror_and_exit("Debugger::get", e))
     }
 
@@ -887,7 +876,7 @@ impl<ER: RaftEngine> DebugExecutor for Debugger<ER> {
         self.region_size(region, cfs)
             .unwrap_or_else(|e| perror_and_exit("Debugger::region_size", e))
             .into_iter()
-            .map(|(cf, size)| (cf.to_owned(), size))
+            .map(|(cf, size)| (cf.to_owned(), size as usize))
             .collect()
     }
 
@@ -923,7 +912,7 @@ impl<ER: RaftEngine> DebugExecutor for Debugger<ER> {
 
     fn do_compaction(
         &self,
-        db: DbType,
+        db: DBType,
         cf: &str,
         from: &[u8],
         to: &[u8],
@@ -1106,8 +1095,8 @@ impl<ER: RaftEngine> DebugExecutor for Debugger<ER> {
 
 fn handle_engine_error(err: EngineError) -> ! {
     error!("error while open kvdb: {}", err);
-    if let EngineError::Engine(s) = err {
-        if s.state().contains(LOCK_FILE_ERROR) {
+    if let EngineError::Engine(msg) = err {
+        if msg.starts_with(LOCK_FILE_ERROR) {
             error!(
                 "LOCK file conflict indicates TiKV process is running. \
                 Do NOT delete the LOCK file and force the command to run. \

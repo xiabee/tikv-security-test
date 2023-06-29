@@ -24,8 +24,7 @@ pub enum RpnExpressionNode {
         field_type: FieldType,
     },
 
-    /// Represents a reference to a column in the columns specified in
-    /// evaluation.
+    /// Represents a reference to a column in the columns specified in evaluation.
     ColumnRef { offset: usize },
 }
 
@@ -81,8 +80,7 @@ impl RpnExpressionNode {
     }
 }
 
-/// An expression in Reverse Polish notation, which is simply a list of RPN
-/// expression nodes.
+/// An expression in Reverse Polish notation, which is simply a list of RPN expression nodes.
 ///
 /// You may want to build it using `RpnExpressionBuilder`.
 #[derive(Debug)]

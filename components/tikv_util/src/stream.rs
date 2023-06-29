@@ -71,8 +71,7 @@ pub fn error_stream(e: io::Error) -> impl Stream<Item = io::Result<Bytes>> + Unp
 /// otherwise the executor's states may be disrupted.
 ///
 /// This means the future must only use async functions.
-// FIXME: get rid of this function, so that futures_executor::block_on is
-// sufficient.
+// FIXME: get rid of this function, so that futures_executor::block_on is sufficient.
 pub fn block_on_external_io<F: Future>(f: F) -> F::Output {
     // we need a Tokio runtime, Tokio futures require Tokio executor.
     Builder::new_current_thread()
@@ -91,8 +90,8 @@ pub trait RetryError {
 
 /// Retries a future execution.
 ///
-/// This method implements truncated exponential back-off retry strategies
-/// outlined in <https://docs.aws.amazon.com/general/latest/gr/api-retries.html> and
+/// This method implements truncated exponential back-off retry strategies outlined in
+/// <https://docs.aws.amazon.com/general/latest/gr/api-retries.html> and
 /// <https://cloud.google.com/storage/docs/exponential-backoff>
 /// Since rusoto does not have transparent auto-retry
 /// (<https://github.com/rusoto/rusoto/issues/234>), we need to implement this manually.
@@ -152,28 +151,24 @@ where
     })();
 
     let mut retry_wait_dur = Duration::from_secs(1);
-    let mut retry_time = 0;
-    loop {
-        match action().await {
-            Ok(r) => return Ok(r),
-            Err(e) => {
-                if let Some(ref mut f) = ext.on_failure {
-                    f(&e);
-                }
-                if !e.is_retryable() {
-                    return Err(e);
-                }
-                retry_time += 1;
-                if retry_time > max_retry_times {
-                    return Err(e);
-                }
+
+    let mut final_result = action().await;
+    for _ in 1..max_retry_times {
+        if let Err(e) = &final_result {
+            if let Some(ref mut f) = ext.on_failure {
+                f(e);
+            }
+            if e.is_retryable() {
+                let backoff = thread_rng().gen_range(0..1000);
+                sleep(retry_wait_dur + Duration::from_millis(backoff)).await;
+                retry_wait_dur = MAX_RETRY_DELAY.min(retry_wait_dur * 2);
+                final_result = action().await;
+                continue;
             }
         }
-
-        let backoff = thread_rng().gen_range(0..1000);
-        sleep(retry_wait_dur + Duration::from_millis(backoff)).await;
-        retry_wait_dur = MAX_RETRY_DELAY.min(retry_wait_dur * 2);
+        break;
     }
+    final_result
 }
 
 // Return an error if the future does not finish by the timeout
@@ -208,57 +203,5 @@ impl<E> RetryError for RusotoError<E> {
 impl RetryError for HttpDispatchError {
     fn is_retryable(&self) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{cell::RefCell, pin::Pin};
-
-    use futures::{Future, FutureExt};
-    use rusoto_core::HttpDispatchError;
-
-    use super::RetryError;
-    use crate::stream::retry;
-
-    #[derive(Debug)]
-    struct TriviallyRetry;
-
-    impl RetryError for TriviallyRetry {
-        fn is_retryable(&self) -> bool {
-            true
-        }
-    }
-
-    fn assert_send<T: Send>(_t: T) {}
-
-    #[test]
-    fn test_retry_is_send_even_return_type_not_sync() {
-        struct BangSync(Option<RefCell<()>>);
-        let fut = retry(|| futures::future::ok::<_, HttpDispatchError>(BangSync(None)));
-        assert_send(fut)
-    }
-
-    fn gen_action_fail_for(
-        n_times: usize,
-    ) -> impl FnMut() -> Pin<Box<dyn Future<Output = Result<(), TriviallyRetry>>>> {
-        let mut n = 0;
-        move || {
-            if n < n_times {
-                n += 1;
-                futures::future::err(TriviallyRetry).boxed()
-            } else {
-                futures::future::ok(()).boxed()
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_failure() {
-        fail::cfg("retry_count", "return(2)").unwrap();
-        let r = retry(gen_action_fail_for(3)).await;
-        assert!(r.is_err(), "{:?}", r);
-        let r = retry(gen_action_fail_for(1)).await;
-        assert!(r.is_ok(), "{:?}", r);
     }
 }

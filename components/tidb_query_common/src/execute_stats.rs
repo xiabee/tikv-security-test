@@ -4,7 +4,7 @@ use derive_more::{Add, AddAssign};
 
 /// Execution summaries to support `EXPLAIN ANALYZE` statements. We don't use
 /// `ExecutorExecutionSummary` directly since it is less efficient.
-#[derive(Debug, Default, Copy, Clone, Add, AddAssign, PartialEq)]
+#[derive(Debug, Default, Copy, Clone, Add, AddAssign, PartialEq, Eq)]
 pub struct ExecSummary {
     /// Total time cost in this executor.
     pub time_processed_ns: usize,
@@ -18,7 +18,7 @@ pub struct ExecSummary {
 
 /// A trait for all execution summary collectors.
 pub trait ExecSummaryCollector: Send {
-    type DurationRecorder: Send;
+    type DurationRecorder;
 
     /// Creates a new instance with specified output slot index.
     fn new(output_index: usize) -> Self
@@ -76,8 +76,7 @@ impl ExecSummaryCollector for ExecSummaryCollectorEnabled {
     }
 }
 
-/// A `ExecSummaryCollector` that does not collect anything. Acts like `collect
-/// = false`.
+/// A `ExecSummaryCollector` that does not collect anything. Acts like `collect = false`.
 pub struct ExecSummaryCollectorDisabled;
 
 impl ExecSummaryCollector for ExecSummaryCollectorDisabled {
@@ -106,11 +105,11 @@ pub struct WithSummaryCollector<C: ExecSummaryCollector, T> {
     pub inner: T,
 }
 
-/// Execution statistics to be flowed between parent and child executors at once
-/// during `collect_exec_stats()` invocation.
+/// Execution statistics to be flowed between parent and child executors at once during
+/// `collect_exec_stats()` invocation.
 pub struct ExecuteStats {
-    /// The execution summary of each executor. If execution summary is not
-    /// needed, it will be zero sized.
+    /// The execution summary of each executor. If execution summary is not needed, it will
+    /// be zero sized.
     pub summary_per_executor: Vec<ExecSummary>,
 
     /// For each range given in the request, how many rows are scanned.
@@ -120,8 +119,8 @@ pub struct ExecuteStats {
 impl ExecuteStats {
     /// Creates a new statistics instance.
     ///
-    /// If execution summary does not need to be collected, it is safe to pass 0
-    /// to the `executors` argument, which will avoid one allocation.
+    /// If execution summary does not need to be collected, it is safe to pass 0 to the `executors`
+    /// argument, which will avoid one allocation.
     pub fn new(executors_len: usize) -> Self {
         Self {
             summary_per_executor: vec![ExecSummary::default(); executors_len],

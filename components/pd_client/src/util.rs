@@ -43,22 +43,20 @@ use super::{
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1); // 1s
 const MAX_RETRY_TIMES: u64 = 5;
-// The max duration when retrying to connect to leader. No matter if the
-// MAX_RETRY_TIMES is reached.
+// The max duration when retrying to connect to leader. No matter if the MAX_RETRY_TIMES is reached.
 const MAX_RETRY_DURATION: Duration = Duration::from_secs(10);
 
 // FIXME: Use a request-independent way to handle reconnection.
 const GLOBAL_RECONNECT_INTERVAL: Duration = Duration::from_millis(100); // 0.1s
 pub const REQUEST_RECONNECT_INTERVAL: Duration = Duration::from_secs(1); // 1s
 
-#[derive(Clone)]
 pub struct TargetInfo {
     target_url: String,
     via: String,
 }
 
 impl TargetInfo {
-    pub(crate) fn new(target_url: String, via: &str) -> TargetInfo {
+    fn new(target_url: String, via: &str) -> TargetInfo {
         TargetInfo {
             target_url,
             via: trim_http_prefix(via).to_string(),
@@ -319,8 +317,7 @@ impl Client {
     /// Re-establishes connection with PD leader in asynchronized fashion.
     ///
     /// If `force` is false, it will reconnect only when members change.
-    /// Note: Retrying too quickly will return an error due to cancellation.
-    /// Please always try to reconnect after sending the request first.
+    /// Note: Retrying too quickly will return an error due to cancellation. Please always try to reconnect after sending the request first.
     pub async fn reconnect(&self, force: bool) -> Result<()> {
         PD_RECONNECT_COUNTER_VEC.with_label_values(&["try"]).inc();
         let start = Instant::now();
@@ -341,13 +338,7 @@ impl Client {
             async move {
                 let direct_connected = self.inner.rl().target_info().direct_connected();
                 connector
-                    .reconnect_pd(
-                        members,
-                        direct_connected,
-                        force,
-                        self.enable_forwarding,
-                        true,
-                    )
+                    .reconnect_pd(members, direct_connected, force, self.enable_forwarding)
                     .await
             }
         };
@@ -390,7 +381,7 @@ impl Client {
 
         fail_point!("pd_client_reconnect", |_| Ok(()));
 
-        self.update_client(client, target_info, members, tso.unwrap());
+        self.update_client(client, target_info, members, tso);
         info!("trying to update PD client done"; "spend" => ?start.saturating_elapsed());
         Ok(())
     }
@@ -528,13 +519,11 @@ pub type StubTuple = (
     PdClientStub,
     TargetInfo,
     GetMembersResponse,
-    // Only used by RpcClient, not by RpcClientV2.
-    Option<TimestampOracle>,
+    TimestampOracle,
 );
 
-#[derive(Clone)]
 pub struct PdConnector {
-    pub(crate) env: Arc<Environment>,
+    env: Arc<Environment>,
     security_mgr: Arc<SecurityManager>,
 }
 
@@ -543,7 +532,7 @@ impl PdConnector {
         PdConnector { env, security_mgr }
     }
 
-    pub async fn validate_endpoints(&self, cfg: &Config, build_tso: bool) -> Result<StubTuple> {
+    pub async fn validate_endpoints(&self, cfg: &Config) -> Result<StubTuple> {
         let len = cfg.endpoints.len();
         let mut endpoints_set = HashSet::with_capacity_and_hasher(len, Default::default());
         let mut members = None;
@@ -584,7 +573,7 @@ impl PdConnector {
         match members {
             Some(members) => {
                 let res = self
-                    .reconnect_pd(members, true, true, cfg.enable_forwarding, build_tso)
+                    .reconnect_pd(members, true, true, cfg.enable_forwarding)
                     .await?
                     .unwrap();
                 info!("all PD endpoints are consistent"; "endpoints" => ?cfg.endpoints);
@@ -602,9 +591,7 @@ impl PdConnector {
                 .max_send_message_len(-1)
                 .max_receive_message_len(-1)
                 .keepalive_time(Duration::from_secs(10))
-                .keepalive_timeout(Duration::from_secs(3))
-                .max_reconnect_backoff(Duration::from_secs(5))
-                .initial_reconnect_backoff(Duration::from_secs(1));
+                .keepalive_timeout(Duration::from_secs(3));
             self.security_mgr.connect(cb, addr_trim)
         };
         fail_point!("cluster_id_is_not_ready", |_| {
@@ -613,7 +600,7 @@ impl PdConnector {
                 GetMembersResponse::default(),
             ))
         });
-        let client = PdClientStub::new(channel.clone());
+        let client = PdClientStub::new(channel);
         let option = CallOption::default().timeout(Duration::from_secs(REQUEST_TIMEOUT));
         let response = client
             .get_members_async_opt(&GetMembersRequest::default(), option)
@@ -686,18 +673,15 @@ impl PdConnector {
     }
 
     // There are 3 kinds of situations we will return the new client:
-    // 1. the force is true which represents the client is newly created or the
-    // original connection has some problem 2. the previous forwarded host is
-    // not empty and it can connect the leader now which represents the network
-    // partition problem to leader may be recovered 3. the member information of
-    // PD has been changed
-    pub async fn reconnect_pd(
+    // 1. the force is true which represents the client is newly created or the original connection has some problem
+    // 2. the previous forwarded host is not empty and it can connect the leader now which represents the network partition problem to leader may be recovered
+    // 3. the member information of PD has been changed
+    async fn reconnect_pd(
         &self,
         members_resp: GetMembersResponse,
         direct_connected: bool,
         force: bool,
         enable_forwarding: bool,
-        build_tso: bool,
     ) -> Result<Option<StubTuple>> {
         let resp = self.load_members(&members_resp).await?;
         let leader = resp.get_leader();
@@ -711,15 +695,11 @@ impl PdConnector {
         match res {
             Some((client, target_url)) => {
                 let info = TargetInfo::new(target_url, "");
-                let tso = if build_tso {
-                    Some(TimestampOracle::new(
-                        resp.get_header().get_cluster_id(),
-                        &client,
-                        info.call_option(),
-                    )?)
-                } else {
-                    None
-                };
+                let tso = TimestampOracle::new(
+                    resp.get_header().get_cluster_id(),
+                    &client,
+                    info.call_option(),
+                )?;
                 return Ok(Some((client, info, resp, tso)));
             }
             None => {
@@ -730,15 +710,11 @@ impl PdConnector {
                 }
                 if enable_forwarding && has_network_error {
                     if let Ok(Some((client, info))) = self.try_forward(members, leader).await {
-                        let tso = if build_tso {
-                            Some(TimestampOracle::new(
-                                resp.get_header().get_cluster_id(),
-                                &client,
-                                info.call_option(),
-                            )?)
-                        } else {
-                            None
-                        };
+                        let tso = TimestampOracle::new(
+                            resp.get_header().get_cluster_id(),
+                            &client,
+                            info.call_option(),
+                        )?;
                         return Ok(Some((client, info, resp, tso)));
                     }
                 }
@@ -794,9 +770,7 @@ impl PdConnector {
         loop {
             let (res, has_network_err) = self.connect_member(leader).await?;
             match res {
-                Some((client, ep, _)) => {
-                    return Ok((Some((client, ep)), has_network_err));
-                }
+                Some((client, ep, _)) => return Ok((Some((client, ep)), has_network_err)),
                 None => {
                     if has_network_err
                         && retry_times > 0
@@ -870,13 +844,11 @@ pub fn check_resp_header(header: &ResponseHeader) -> Result<()> {
         ErrorType::IncompatibleVersion => Err(Error::Incompatible),
         ErrorType::StoreTombstone => Err(Error::StoreTombstone(err.get_message().to_owned())),
         ErrorType::RegionNotFound => Err(Error::RegionNotFound(vec![])),
+        ErrorType::Unknown => Err(box_err!(err.get_message())),
         ErrorType::GlobalConfigNotFound => {
             Err(Error::GlobalConfigNotFound(err.get_message().to_owned()))
         }
         ErrorType::Ok => Ok(()),
-        ErrorType::DuplicatedEntry | ErrorType::EntryNotFound => Err(box_err!(err.get_message())),
-        ErrorType::Unknown => Err(box_err!(err.get_message())),
-        ErrorType::InvalidValue => Err(box_err!(err.get_message())),
     }
 }
 
@@ -910,9 +882,8 @@ pub fn find_bucket_index<S: AsRef<[u8]>>(key: &[u8], bucket_keys: &[S]) -> Optio
         )
 }
 
-/// Merge incoming bucket stats. If a range in new buckets overlaps with
-/// multiple ranges in current buckets, stats of the new range will be added to
-/// all stats of current ranges.
+/// Merge incoming bucket stats. If a range in new buckets overlaps with multiple ranges in
+/// current buckets, stats of the new range will be added to all stats of current ranges.
 pub fn merge_bucket_stats<C: AsRef<[u8]>, I: AsRef<[u8]>>(
     cur: &[C],
     cur_stats: &mut BucketStats,

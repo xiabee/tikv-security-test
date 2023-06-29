@@ -5,19 +5,17 @@ pub use self::imp::wait_for_signal;
 #[cfg(unix)]
 mod imp {
     use engine_traits::{Engines, KvEngine, MiscExt, RaftEngine};
-    use signal_hook::{
-        consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2},
-        iterator::Signals,
-    };
+    use libc::c_int;
+    use signal::{trap::Trap, Signal::*};
     use tikv_util::metrics;
 
     #[allow(dead_code)]
     pub fn wait_for_signal(engines: Option<Engines<impl KvEngine, impl RaftEngine>>) {
-        let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2]).unwrap();
-        for signal in &mut signals {
-            match signal {
+        let trap = Trap::trap(&[SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2]);
+        for sig in trap {
+            match sig {
                 SIGTERM | SIGINT | SIGHUP => {
-                    info!("receive signal {}, stopping server...", signal);
+                    info!("receive signal {}, stopping server...", sig as c_int);
                     break;
                 }
                 SIGUSR1 => {

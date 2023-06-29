@@ -26,9 +26,7 @@ use futures_util::{
     TryStreamExt,
 };
 pub use kvproto::brpb::{AzureBlobStorage as InputConfig, Bucket as InputBucket, CloudDynamic};
-use lazy_static::lazy_static;
 use oauth2::{ClientId, ClientSecret};
-use regex::Regex;
 use tikv_util::{
     debug,
     stream::{retry, RetryError},
@@ -226,7 +224,6 @@ impl BlobConfig for Config {
 
 enum RequestError {
     InvalidInput(Box<dyn std::error::Error + Send + Sync>, String),
-    InternalError(String),
     TimeOut(String),
 }
 
@@ -236,7 +233,6 @@ impl From<RequestError> for io::Error {
             RequestError::InvalidInput(e, tag) => {
                 Self::new(io::ErrorKind::InvalidInput, format!("{}: {}", tag, &e))
             }
-            RequestError::InternalError(msg) => Self::new(io::ErrorKind::Other, msg),
             RequestError::TimeOut(msg) => Self::new(io::ErrorKind::TimedOut, msg),
         }
     }
@@ -244,24 +240,15 @@ impl From<RequestError> for io::Error {
 
 impl RetryError for RequestError {
     fn is_retryable(&self) -> bool {
-        matches!(self, Self::TimeOut(_) | Self::InternalError(_))
+        matches!(self, Self::TimeOut(_))
     }
-}
-
-fn err_is_retryable(err_info: &str) -> bool {
-    // HTTP Code 503: The server is busy
-    // HTTP Code 500: Operation could not be completed within the specified time.
-    // More details seen in https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes
-    lazy_static! {
-        static ref RE: Regex = Regex::new(r"status: 5[0-9][0-9],").unwrap();
-    }
-
-    RE.is_match(err_info)
 }
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// A helper for uploading a large file to Azure storage.
+///
+///
 struct AzureUploader {
     client_builder: Arc<dyn ContainerBuilder>,
     name: String,
@@ -270,8 +257,7 @@ struct AzureUploader {
 }
 
 impl AzureUploader {
-    /// Creates a new uploader with a given target location and upload
-    /// configuration.
+    /// Creates a new uploader with a given target location and upload configuration.
     fn new(client_builder: Arc<dyn ContainerBuilder>, config: &Config, name: String) -> Self {
         AzureUploader {
             client_builder,
@@ -302,8 +288,8 @@ impl AzureUploader {
 
     /// Uploads a file atomically.
     ///
-    /// This should be used only when the data is known to be short, and thus
-    /// relatively cheap to retry the entire upload.
+    /// This should be used only when the data is known to be short, and thus relatively cheap to
+    /// retry the entire upload.
     async fn upload(&self, data: &[u8]) -> Result<(), RequestError> {
         match timeout(Self::get_timeout(), async {
             self.client_builder
@@ -323,9 +309,10 @@ impl AzureUploader {
                 Ok(_) => Ok(()),
                 Err(err) => {
                     let err_info = ToString::to_string(&err);
-                    if err_is_retryable(&err_info) {
-                        Err(RequestError::InternalError(format!(
-                            "internal error: {}, retry later",
+                    if err_info.contains("busy") {
+                        // server is busy, retry later
+                        Err(RequestError::TimeOut(format!(
+                            "the resource is busy: {}, retry later",
                             err_info
                         )))
                     } else {
@@ -567,33 +554,6 @@ impl AzureStorage {
         }
         key.to_owned()
     }
-
-    fn get_range(
-        &self,
-        name: &str,
-        range: Option<std::ops::Range<u64>>,
-    ) -> cloud::blob::BlobStream<'_> {
-        let name = self.maybe_prefix_key(name);
-        debug!("read file from Azure storage"; "key" => %name);
-        let t = async move {
-            let blob_client = self.client_builder.get_client().await?.as_blob_client(name);
-
-            let builder = if let Some(r) = range {
-                blob_client.get().range(r)
-            } else {
-                blob_client.get()
-            };
-
-            builder
-                .execute()
-                .await
-                .map(|res| res.data)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))
-        };
-        let k = stream::once(t);
-        let t = k.boxed().into_async_read();
-        Box::new(t)
-    }
 }
 
 #[async_trait]
@@ -616,12 +576,23 @@ impl BlobStorage for AzureStorage {
         uploader.run(&mut reader, content_length).await
     }
 
-    fn get(&self, name: &str) -> cloud::blob::BlobStream<'_> {
-        self.get_range(name, None)
-    }
-
-    fn get_part(&self, name: &str, off: u64, len: u64) -> cloud::blob::BlobStream<'_> {
-        self.get_range(name, Some(off..off + len))
+    fn get(&self, name: &str) -> Box<dyn AsyncRead + Unpin + '_> {
+        let name = self.maybe_prefix_key(name);
+        debug!("read file from Azure storage"; "key" => %name);
+        let t = async move {
+            self.client_builder
+                .get_client()
+                .await?
+                .as_blob_client(name)
+                .get()
+                .execute()
+                .await
+                .map(|res| res.data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))
+        };
+        let k = stream::once(t);
+        let t = k.boxed().into_async_read();
+        Box::new(t)
     }
 }
 
@@ -778,25 +749,5 @@ mod tests {
         cd.set_attrs(attrs);
         cd.set_bucket(bucket);
         cd
-    }
-
-    #[tokio::test]
-    async fn test_error_retryable() {
-        let err_info = "HTTP error status (status: 503,... The server is busy.";
-        assert!(err_is_retryable(err_info));
-        let err_info = "HTTP error status (status: 500,... Operation could not be completed within the specified time.";
-        assert!(err_is_retryable(err_info));
-        let err_info =
-            "HTTP error status (status: 409,... The blob type is invalid for this operation.";
-        assert!(!err_is_retryable(err_info));
-        let err_info = "HTTP error status (status: 50,... ";
-        assert!(!err_is_retryable(err_info));
-        let err = "NaN".parse::<u32>().unwrap_err();
-        let err1 = RequestError::InvalidInput(Box::new(err), "invalid-input".to_owned());
-        let err2 = RequestError::InternalError("internal-error".to_owned());
-        let err3 = RequestError::TimeOut("time-out".to_owned());
-        assert!(!err1.is_retryable());
-        assert!(err2.is_retryable());
-        assert!(err3.is_retryable());
     }
 }

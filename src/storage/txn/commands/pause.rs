@@ -10,8 +10,8 @@ use crate::storage::{
     lock_manager::LockManager,
     txn::{
         commands::{
-            Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand,
-            WriteContext, WriteResult,
+            Command, CommandExt, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
+            WriteResult,
         },
         Result,
     },
@@ -48,8 +48,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Pause {
             to_be_write: WriteData::default(),
             rows: 0,
             pr: ProcessResult::Res,
-            lock_info: vec![],
-            released_locks: ReleasedLocks::new(),
+            lock_info: None,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
         })

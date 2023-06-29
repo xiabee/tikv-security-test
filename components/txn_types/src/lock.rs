@@ -3,7 +3,7 @@
 use std::{borrow::Cow, mem::size_of};
 
 use byteorder::ReadBytesExt;
-use kvproto::kvrpcpb::{IsolationLevel, LockInfo, Op, WriteConflictReason};
+use kvproto::kvrpcpb::{IsolationLevel, LockInfo, Op};
 use tikv_util::codec::{
     bytes::{self, BytesEncoder},
     number::{self, NumberEncoder, MAX_VAR_I64_LEN, MAX_VAR_U64_LEN},
@@ -33,8 +33,6 @@ const TXN_SIZE_PREFIX: u8 = b't';
 const MIN_COMMIT_TS_PREFIX: u8 = b'c';
 const ASYNC_COMMIT_PREFIX: u8 = b'a';
 const ROLLBACK_TS_PREFIX: u8 = b'r';
-const LAST_CHANGE_PREFIX: u8 = b'l';
-const TXN_SOURCE_PREFIX: u8 = b's';
 
 impl LockType {
     pub fn from_mutation(mutation: &Mutation) -> Option<LockType> {
@@ -87,22 +85,6 @@ pub struct Lock {
     // while committing is relatively expensive. So the solution is putting the ts of the rollback
     // to the lock.
     pub rollback_ts: Vec<TimeStamp>,
-
-    /// The commit TS of the latest PUT/DELETE record
-    pub last_change_ts: TimeStamp,
-    /// The number of versions that need skipping from the latest version to
-    /// find the latest PUT/DELETE record.
-    /// If versions_to_last_change > 0 but last_change_ts == 0, the key does not
-    /// have a PUT/DELETE record.
-    pub versions_to_last_change: u64,
-    /// The source of this txn. It is used by ticdc, if the value is 0 ticdc
-    /// will sync the kv change event to downstream, if it is not 0, ticdc
-    /// may ignore this change event.
-    ///
-    /// We use `u64` to reserve more space for future use. For now, the upper
-    /// application is limited to setting this value under `0x80`,
-    /// so there will no more cost to change it to `u64`.
-    pub txn_source: u64,
 }
 
 impl std::fmt::Debug for Lock {
@@ -126,9 +108,6 @@ impl std::fmt::Debug for Lock {
             .field("use_async_commit", &self.use_async_commit)
             .field("secondaries", &secondary_keys)
             .field("rollback_ts", &self.rollback_ts)
-            .field("last_change_ts", &self.last_change_ts)
-            .field("versions_to_last_change", &self.versions_to_last_change)
-            .field("txn_source", &self.txn_source)
             .finish()
     }
 }
@@ -156,9 +135,6 @@ impl Lock {
             use_async_commit: false,
             secondaries: Vec::default(),
             rollback_ts: Vec::default(),
-            last_change_ts: TimeStamp::zero(),
-            versions_to_last_change: 0,
-            txn_source: 0,
         }
     }
 
@@ -172,24 +148,6 @@ impl Lock {
     #[must_use]
     pub fn with_rollback_ts(mut self, rollback_ts: Vec<TimeStamp>) -> Self {
         self.rollback_ts = rollback_ts;
-        self
-    }
-
-    #[must_use]
-    pub fn set_last_change(
-        mut self,
-        last_change_ts: TimeStamp,
-        versions_to_last_change: u64,
-    ) -> Self {
-        self.last_change_ts = last_change_ts;
-        self.versions_to_last_change = versions_to_last_change;
-        self
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn set_txn_source(mut self, source: u64) -> Self {
-        self.txn_source = source;
         self
     }
 
@@ -230,15 +188,6 @@ impl Lock {
                 b.encode_u64(ts.into_inner()).unwrap();
             }
         }
-        if !self.last_change_ts.is_zero() || self.versions_to_last_change != 0 {
-            b.push(LAST_CHANGE_PREFIX);
-            b.encode_u64(self.last_change_ts.into_inner()).unwrap();
-            b.encode_var_u64(self.versions_to_last_change).unwrap();
-        }
-        if self.txn_source != 0 {
-            b.push(TXN_SOURCE_PREFIX);
-            b.encode_var_u64(self.txn_source).unwrap();
-        }
         b
     }
 
@@ -267,12 +216,6 @@ impl Lock {
         }
         if !self.rollback_ts.is_empty() {
             size += 1 + MAX_VAR_U64_LEN + size_of::<u64>() * self.rollback_ts.len();
-        }
-        if !self.last_change_ts.is_zero() || self.versions_to_last_change != 0 {
-            size += 1 + size_of::<u64>() + MAX_VAR_U64_LEN;
-        }
-        if self.txn_source != 0 {
-            size += 1 + MAX_VAR_U64_LEN;
         }
         size
     }
@@ -310,9 +253,6 @@ impl Lock {
         let mut use_async_commit = false;
         let mut secondaries = Vec::new();
         let mut rollback_ts = Vec::new();
-        let mut last_change_ts = TimeStamp::zero();
-        let mut versions_to_last_change = 0;
-        let mut txn_source = 0;
         while !b.is_empty() {
             match b.read_u8()? {
                 SHORT_VALUE_PREFIX => {
@@ -346,13 +286,6 @@ impl Lock {
                         rollback_ts.push(number::decode_u64(&mut b)?.into());
                     }
                 }
-                LAST_CHANGE_PREFIX => {
-                    last_change_ts = number::decode_u64(&mut b)?.into();
-                    versions_to_last_change = number::decode_var_u64(&mut b)?;
-                }
-                TXN_SOURCE_PREFIX => {
-                    txn_source = number::decode_var_u64(&mut b)?;
-                }
                 _ => {
                     // To support forward compatibility, all fields should be serialized in order
                     // and stop parsing if meets an unknown byte.
@@ -369,9 +302,7 @@ impl Lock {
             for_update_ts,
             txn_size,
             min_commit_ts,
-        )
-        .set_last_change(last_change_ts, versions_to_last_change)
-        .set_txn_source(txn_source);
+        );
         if use_async_commit {
             lock = lock.use_async_commit(secondaries);
         }
@@ -397,13 +328,10 @@ impl Lock {
         info.set_use_async_commit(self.use_async_commit);
         info.set_min_commit_ts(self.min_commit_ts.into_inner());
         info.set_secondaries(self.secondaries.into());
-        // The client does not care about last_change_ts, versions_to_last_version and
-        // txn_source.
         info
     }
 
-    /// Checks whether the lock conflicts with the given `ts`. If `ts ==
-    /// TimeStamp::max()`, the primary lock will be ignored.
+    /// Checks whether the lock conflicts with the given `ts`. If `ts == TimeStamp::max()`, the primary lock will be ignored.
     fn check_ts_conflict_si(
         lock: Cow<'_, Self>,
         key: &Key,
@@ -430,9 +358,8 @@ impl Lock {
         let raw_key = key.to_raw()?;
 
         if ts == TimeStamp::max() && raw_key == lock.primary && !lock.use_async_commit {
-            // When `ts == TimeStamp::max()` (which means to get latest committed version
-            // for primary key), and current key is the primary key, we ignore
-            // this lock.
+            // When `ts == TimeStamp::max()` (which means to get latest committed version for
+            // primary key), and current key is the primary key, we ignore this lock.
             return Ok(());
         }
 
@@ -466,7 +393,6 @@ impl Lock {
             conflict_commit_ts: Default::default(),
             key: key.to_raw()?,
             primary: lock.primary.to_vec(),
-            reason: WriteConflictReason::RcCheckTs,
         }))
     }
 
@@ -495,9 +421,9 @@ impl Lock {
     }
 }
 
-/// A specialized lock only for pessimistic lock. This saves memory for cases
-/// that only pessimistic locks exist.
-#[derive(Clone, PartialEq)]
+/// A specialized lock only for pessimistic lock. This saves memory for cases that only
+/// pessimistic locks exist.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PessimisticLock {
     /// The primary key in raw format.
     pub primary: Box<[u8]>,
@@ -505,9 +431,6 @@ pub struct PessimisticLock {
     pub ttl: u64,
     pub for_update_ts: TimeStamp,
     pub min_commit_ts: TimeStamp,
-
-    pub last_change_ts: TimeStamp,
-    pub versions_to_last_change: u64,
 }
 
 impl PessimisticLock {
@@ -522,7 +445,6 @@ impl PessimisticLock {
             0,
             self.min_commit_ts,
         )
-        .set_last_change(self.last_change_ts, self.versions_to_last_change)
     }
 
     // Same with `to_lock` but does not copy the primary key.
@@ -537,7 +459,6 @@ impl PessimisticLock {
             0,
             self.min_commit_ts,
         )
-        .set_last_change(self.last_change_ts, self.versions_to_last_change)
     }
 
     pub fn memory_size(&self) -> usize {
@@ -553,8 +474,6 @@ impl std::fmt::Debug for PessimisticLock {
             .field("ttl", &self.ttl)
             .field("for_update_ts", &self.for_update_ts)
             .field("min_commit_ts", &self.min_commit_ts)
-            .field("last_change_ts", &self.last_change_ts)
-            .field("versions_to_last_change", &self.versions_to_last_change)
             .finish()
     }
 }
@@ -765,29 +684,6 @@ mod tests {
                 555.into(),
             )
             .with_rollback_ts(vec![12.into(), 24.into(), 13.into()]),
-            Lock::new(
-                LockType::Lock,
-                b"pk".to_vec(),
-                1.into(),
-                10,
-                None,
-                6.into(),
-                16,
-                8.into(),
-            )
-            .set_last_change(0.into(), 2),
-            Lock::new(
-                LockType::Lock,
-                b"pk".to_vec(),
-                1.into(),
-                10,
-                None,
-                6.into(),
-                16,
-                8.into(),
-            )
-            .set_last_change(4.into(), 2)
-            .set_txn_source(1),
         ];
         for (i, lock) in locks.drain(..).enumerate() {
             let v = lock.to_bytes();
@@ -797,7 +693,7 @@ mod tests {
         }
 
         // Test `Lock::parse()` handles incorrect input.
-        Lock::parse(b"").unwrap_err();
+        assert!(Lock::parse(b"").is_err());
 
         let lock = Lock::new(
             LockType::Lock,
@@ -810,7 +706,7 @@ mod tests {
             TimeStamp::zero(),
         );
         let mut v = lock.to_bytes();
-        Lock::parse(&v[..4]).unwrap_err();
+        assert!(Lock::parse(&v[..4]).is_err());
         // Test `Lock::parse()` ignores unknown bytes.
         v.extend(b"unknown");
         let l = Lock::parse(&v).unwrap();
@@ -907,8 +803,7 @@ mod tests {
         )
         .unwrap();
 
-        // Ignore the primary lock when reading the latest committed version by setting
-        // u64::MAX as ts
+        // Ignore the primary lock when reading the latest committed version by setting u64::MAX as ts
         lock.lock_type = LockType::Put;
         lock.primary = b"foo".to_vec();
         Lock::check_ts_conflict(
@@ -920,8 +815,7 @@ mod tests {
         )
         .unwrap();
 
-        // Should not ignore the primary lock of an async commit transaction even if
-        // setting u64::MAX as ts
+        // Should not ignore the primary lock of an async commit transaction even if setting u64::MAX as ts
         let async_commit_lock = lock.clone().use_async_commit(vec![]);
         Lock::check_ts_conflict(
             Cow::Borrowed(&async_commit_lock),
@@ -1032,8 +926,7 @@ mod tests {
             b"secondary_kkkkk2".to_vec(),
             b"secondary_k3k3k3k3k3k3".to_vec(),
             b"secondary_k4".to_vec(),
-        ])
-        .set_last_change(80.into(), 4);
+        ]);
 
         assert_eq!(
             format!("{:?}", lock),
@@ -1041,8 +934,7 @@ mod tests {
             short_value: 73686F72745F76616C7565, for_update_ts: TimeStamp(101), txn_size: 10, \
             min_commit_ts: TimeStamp(127), use_async_commit: true, \
             secondaries: [7365636F6E646172795F6B31, 7365636F6E646172795F6B6B6B6B6B32, \
-            7365636F6E646172795F6B336B336B336B336B336B33, 7365636F6E646172795F6B34], rollback_ts: [], \
-            last_change_ts: TimeStamp(80), versions_to_last_change: 4, txn_source: 0 }"
+            7365636F6E646172795F6B336B336B336B336B336B33, 7365636F6E646172795F6B34], rollback_ts: [] }"
         );
         log_wrappers::set_redact_info_log(true);
         let redact_result = format!("{:?}", lock);
@@ -1051,8 +943,7 @@ mod tests {
             redact_result,
             "Lock { lock_type: Put, primary_key: ?, start_ts: TimeStamp(100), ttl: 3, \
             short_value: ?, for_update_ts: TimeStamp(101), txn_size: 10, min_commit_ts: TimeStamp(127), \
-            use_async_commit: true, secondaries: [?, ?, ?, ?], rollback_ts: [], \
-            last_change_ts: TimeStamp(80), versions_to_last_change: 4, txn_source: 0 }"
+            use_async_commit: true, secondaries: [?, ?, ?, ?], rollback_ts: [] }"
         );
 
         lock.short_value = None;
@@ -1061,8 +952,7 @@ mod tests {
             format!("{:?}", lock),
             "Lock { lock_type: Put, primary_key: 706B, start_ts: TimeStamp(100), ttl: 3, short_value: , \
             for_update_ts: TimeStamp(101), txn_size: 10, min_commit_ts: TimeStamp(127), \
-            use_async_commit: true, secondaries: [], rollback_ts: [], last_change_ts: TimeStamp(80), \
-            versions_to_last_change: 4, txn_source: 0 }"
+            use_async_commit: true, secondaries: [], rollback_ts: [] }"
         );
         log_wrappers::set_redact_info_log(true);
         let redact_result = format!("{:?}", lock);
@@ -1071,8 +961,7 @@ mod tests {
             redact_result,
             "Lock { lock_type: Put, primary_key: ?, start_ts: TimeStamp(100), ttl: 3, short_value: ?, \
             for_update_ts: TimeStamp(101), txn_size: 10, min_commit_ts: TimeStamp(127), \
-            use_async_commit: true, secondaries: [], rollback_ts: [], last_change_ts: TimeStamp(80), \
-            versions_to_last_change: 4, txn_source: 0 }"
+            use_async_commit: true, secondaries: [], rollback_ts: [] }"
         );
     }
 
@@ -1084,8 +973,6 @@ mod tests {
             ttl: 1000,
             for_update_ts: 10.into(),
             min_commit_ts: 20.into(),
-            last_change_ts: 8.into(),
-            versions_to_last_change: 2,
         };
         let expected_lock = Lock {
             lock_type: LockType::Pessimistic,
@@ -1099,9 +986,6 @@ mod tests {
             use_async_commit: false,
             secondaries: vec![],
             rollback_ts: vec![],
-            last_change_ts: 8.into(),
-            versions_to_last_change: 2,
-            txn_source: 0,
         };
         assert_eq!(pessimistic_lock.to_lock(), expected_lock);
         assert_eq!(pessimistic_lock.into_lock(), expected_lock);
@@ -1115,14 +999,11 @@ mod tests {
             ttl: 1000,
             for_update_ts: 10.into(),
             min_commit_ts: 20.into(),
-            last_change_ts: 8.into(),
-            versions_to_last_change: 2,
         };
         assert_eq!(
             format!("{:?}", pessimistic_lock),
             "PessimisticLock { primary_key: 7072696D617279, start_ts: TimeStamp(5), ttl: 1000, \
-            for_update_ts: TimeStamp(10), min_commit_ts: TimeStamp(20), last_change_ts: TimeStamp(8), \
-            versions_to_last_change: 2 }"
+            for_update_ts: TimeStamp(10), min_commit_ts: TimeStamp(20) }"
         );
         log_wrappers::set_redact_info_log(true);
         let redact_result = format!("{:?}", pessimistic_lock);
@@ -1130,8 +1011,7 @@ mod tests {
         assert_eq!(
             redact_result,
             "PessimisticLock { primary_key: ?, start_ts: TimeStamp(5), ttl: 1000, \
-            for_update_ts: TimeStamp(10), min_commit_ts: TimeStamp(20), last_change_ts: TimeStamp(8), \
-            versions_to_last_change: 2 }"
+            for_update_ts: TimeStamp(10), min_commit_ts: TimeStamp(20) }"
         );
     }
 
@@ -1143,10 +1023,8 @@ mod tests {
             ttl: 1000,
             for_update_ts: 10.into(),
             min_commit_ts: 20.into(),
-            last_change_ts: 8.into(),
-            versions_to_last_change: 2,
         };
-        // 7 bytes for primary key, 16 bytes for Box<[u8]>, and 6 8-byte integers.
-        assert_eq!(lock.memory_size(), 7 + 16 + 6 * 8);
+        // 7 bytes for primary key, 16 bytes for Box<[u8]>, and 4 8-byte integers.
+        assert_eq!(lock.memory_size(), 7 + 16 + 4 * 8);
     }
 }

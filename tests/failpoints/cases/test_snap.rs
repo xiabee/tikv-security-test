@@ -46,8 +46,8 @@ fn test_overlap_cleanup() {
     cluster.must_split(&region1, b"k2");
     // Wait till the snapshot of split region is applied, whose range is ["", "k2").
     must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
-    // Resume the fail point and pause it again. So only the paused snapshot is
-    // generated. And the paused snapshot's range is ["", ""), hence overlap.
+    // Resume the fail point and pause it again. So only the paused snapshot is generated.
+    // And the paused snapshot's range is ["", ""), hence overlap.
     fail::cfg(gen_snapshot_fp, "pause").unwrap();
     // Overlap snapshot should be deleted.
     assert_snapshot(&cluster.get_snap_dir(3), region_id, false);
@@ -163,7 +163,7 @@ fn assert_snapshot(snap_dir: &str, region_id: u64, exist: bool) {
     let region_id = format!("{}", region_id);
     let timer = Instant::now();
     loop {
-        for p in fs::read_dir(snap_dir).unwrap() {
+        for p in fs::read_dir(&snap_dir).unwrap() {
             let name = p.unwrap().file_name().into_string().unwrap();
             let mut parts = name.split('_');
             parts.next();
@@ -186,12 +186,11 @@ fn assert_snapshot(snap_dir: &str, region_id: u64, exist: bool) {
     }
 }
 
-// A peer on store 3 is isolated and is applying snapshot. (add failpoint so
-// it's always pending) Then two conf change happens, this peer is removed and a
-// new peer is added on store 3. Then isolation clear, this peer will be
-// destroyed because of a bigger peer id in msg. In previous implementation,
-// peer fsm can be destroyed synchronously because snapshot state is pending and
-// can be canceled, but panic may happen if the applyfsm runs very slow.
+// A peer on store 3 is isolated and is applying snapshot. (add failpoint so it's always pending)
+// Then two conf change happens, this peer is removed and a new peer is added on store 3.
+// Then isolation clear, this peer will be destroyed because of a bigger peer id in msg.
+// In previous implementation, peer fsm can be destroyed synchronously because snapshot state is
+// pending and can be canceled, but panic may happen if the applyfsm runs very slow.
 #[test]
 fn test_destroy_peer_on_pending_snapshot() {
     let mut cluster = new_server_cluster(0, 3);
@@ -253,11 +252,10 @@ fn test_destroy_peer_on_pending_snapshot() {
 }
 
 // The peer 3 in store 3 is isolated for a while and then recovered.
-// During its applying snapshot, however the peer is destroyed and thus applying
-// snapshot is canceled. And when it's destroyed (destroy is not finished
-// either), the machine restarted. After the restart, the snapshot should be
-// applied successfully.println! And new data should be written to store 3
-// successfully.
+// During its applying snapshot, however the peer is destroyed and thus applying snapshot is canceled.
+// And when it's destroyed (destroy is not finished either), the machine restarted.
+// After the restart, the snapshot should be applied successfully.println!
+// And new data should be written to store 3 successfully.
 #[test]
 fn test_destroy_peer_on_pending_snapshot_and_restart() {
     let mut cluster = new_server_cluster(0, 3);
@@ -317,8 +315,7 @@ fn test_destroy_peer_on_pending_snapshot_and_restart() {
     must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
     // After peer 3 has applied snapshot, data should be got.
     must_get_equal(&cluster.get_engine(3), b"k119", b"v1");
-    // In the end the snapshot file should be gc-ed anyway, either by new peer or by
-    // store
+    // In the end the snapshot file should be gc-ed anyway, either by new peer or by store
     let now = Instant::now();
     loop {
         let mut snap_files = vec![];
@@ -354,12 +351,12 @@ fn test_shutdown_when_snap_gc() {
     pd_client.must_add_peer(r1, new_learner_peer(2, 2));
 
     // Snapshot directory on store 2 shouldn't be empty.
-    let snap_dir = &cluster.get_snap_dir(2);
+    let snap_dir = cluster.get_snap_dir(2);
     for i in 0..=100 {
         if i == 100 {
             panic!("store 2 snap dir must not be empty");
         }
-        let dir = fs::read_dir(snap_dir).unwrap();
+        let dir = fs::read_dir(&snap_dir).unwrap();
         if dir.count() > 0 {
             break;
         }
@@ -377,7 +374,7 @@ fn test_shutdown_when_snap_gc() {
     cluster.stop_node(2);
 
     let snap_dir = cluster.get_snap_dir(2);
-    let dir = fs::read_dir(snap_dir).unwrap();
+    let dir = fs::read_dir(&snap_dir).unwrap();
     if dir.count() == 0 {
         panic!("store 2 snap dir must not be empty");
     }
@@ -467,9 +464,8 @@ fn test_receive_old_snapshot() {
     pd_client.must_add_peer(left.get_id(), new_peer(2, 4));
 
     cluster.must_put(b"k11", b"v1");
-    // If peer 2 handles previous old snapshot properly and does not leave over
-    // metadata in `pending_snapshot_regions`, peer 4 should be created
-    // normally.
+    // If peer 2 handles previous old snapshot properly and does not leave over metadata
+    // in `pending_snapshot_regions`, peer 4 should be created normally.
     must_get_equal(&cluster.get_engine(2), b"k11", b"v1");
 
     fail::remove(peer_2_handle_snap_mgr_gc_fp);
@@ -513,8 +509,7 @@ fn test_gen_snapshot_with_no_committed_entries_ready() {
 // 1. pause snapshot generating with a failpoint, and then add a new peer;
 // 2. append more Raft logs to the region to trigger raft log compactions;
 // 3. disable the failpoint to continue snapshot generating;
-// 4. the generated snapshot should have a larger index than the latest
-// `truncated_idx`.
+// 4. the generated snapshot should have a larger index than the latest `truncated_idx`.
 #[test]
 fn test_cancel_snapshot_generating() {
     let mut cluster = new_node_cluster(0, 5);
@@ -591,7 +586,7 @@ fn test_snapshot_gc_after_failed() {
             let mut snap_file_path = PathBuf::from(&snap_dir);
             snap_file_path.push(&f);
             let snap_file_path = snap_file_path.as_path();
-            let mut file = match File::create(snap_file_path) {
+            let mut file = match File::create(&snap_file_path) {
                 Err(why) => panic!("couldn't create {:?}: {}", snap_file_path, why),
                 Ok(file) => file,
             };
@@ -675,17 +670,15 @@ fn test_sending_fail_with_net_error() {
     // need to wait receiver handle the snapshot request
     sleep_ms(100);
 
-    // peer2 will not become learner so ti will has k1 key and receiving count will
-    // zero
+    // peer2 will not become learner so ti will has k1 key and receiving count will zero
     let engine2 = cluster.get_engine(2);
     must_get_none(&engine2, b"k1");
     assert_eq!(cluster.get_snap_mgr(2).stats().receiving_count, 0);
 }
 
 /// Logs scan are now moved to raftlog gc threads. The case is to test if logs
-/// are still cleaned up when there is stale logs before first index during
-/// applying snapshot. It's expected to schedule a gc task after applying
-/// snapshot.
+/// are still cleaned up when there is stale logs before first index during applying
+/// snapshot. It's expected to schedule a gc task after applying snapshot.
 #[test]
 fn test_snapshot_clean_up_logs_with_unfinished_log_gc() {
     let mut cluster = new_node_cluster(0, 3);
@@ -737,8 +730,7 @@ fn test_snapshot_clean_up_logs_with_unfinished_log_gc() {
     assert!(dest[0].get_index() > truncated_index, "{:?}", dest);
 }
 
-/// Redo snapshot apply after restart when kvdb state is updated but raftdb
-/// state is not.
+/// Redo snapshot apply after restart when kvdb state is updated but raftdb state is not.
 #[test]
 fn test_snapshot_recover_from_raft_write_failure() {
     let mut cluster = new_server_cluster(0, 3);

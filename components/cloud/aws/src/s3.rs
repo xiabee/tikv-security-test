@@ -50,7 +50,6 @@ pub struct Config {
     sse_kms_key_id: Option<StringNonEmpty>,
     storage_class: Option<StringNonEmpty>,
     multi_part_size: usize,
-    object_lock_enabled: bool,
 }
 
 impl Config {
@@ -65,7 +64,6 @@ impl Config {
             sse_kms_key_id: None,
             storage_class: None,
             multi_part_size: MINIMUM_PART_SIZE,
-            object_lock_enabled: false,
         }
     }
 
@@ -98,7 +96,6 @@ impl Config {
             force_path_style,
             sse_kms_key_id: StringNonEmpty::opt(attrs.get("sse_kms_key_id").unwrap_or(def).clone()),
             multi_part_size: MINIMUM_PART_SIZE,
-            object_lock_enabled: false,
         })
     }
 
@@ -131,7 +128,6 @@ impl Config {
             force_path_style: input.force_path_style,
             sse_kms_key_id: StringNonEmpty::opt(input.sse_kms_key_id),
             multi_part_size: MINIMUM_PART_SIZE,
-            object_lock_enabled: input.object_lock_enabled,
         })
     }
 }
@@ -221,37 +217,6 @@ impl S3Storage {
         }
         key.to_owned()
     }
-
-    fn get_range(&self, name: &str, range: Option<String>) -> cloud::blob::BlobStream<'_> {
-        let key = self.maybe_prefix_key(name);
-        let bucket = self.config.bucket.bucket.clone();
-        debug!("read file from s3 storage"; "key" => %key);
-        let req = GetObjectRequest {
-            key,
-            bucket: (*bucket).clone(),
-            range,
-            ..Default::default()
-        };
-        Box::new(
-            self.client
-                .get_object(req)
-                .map(move |future| match future {
-                    Ok(out) => out.body.unwrap(),
-                    Err(RusotoError::Service(GetObjectError::NoSuchKey(key))) => {
-                        ByteStream::new(error_stream(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("no key {} at bucket {}", key, *bucket),
-                        )))
-                    }
-                    Err(e) => ByteStream::new(error_stream(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("failed to get object {}", e),
-                    ))),
-                })
-                .flatten_stream()
-                .into_async_read(),
-        )
-    }
 }
 
 /// A helper for uploading a large files to S3 storage.
@@ -267,7 +232,6 @@ struct S3Uploader<'client> {
     sse_kms_key_id: Option<StringNonEmpty>,
     storage_class: Option<StringNonEmpty>,
     multi_part_size: usize,
-    object_lock_enabled: bool,
 
     upload_id: String,
     parts: Vec<CompletedPart>,
@@ -291,9 +255,8 @@ impl<T: 'static + StdError> From<RusotoError<T>> for UploadError {
 }
 
 /// try_read_exact tries to read exact length data as the buffer size.  
-/// like [`std::io::Read::read_exact`], but won't return `UnexpectedEof` when
-/// cannot read anything more from the `Read`. once returning a size less than
-/// the buffer length, implies a EOF was meet, or nothing read.
+/// like [`std::io::Read::read_exact`], but won't return `UnexpectedEof` when cannot read anything more from the `Read`.  
+/// once returning a size less than the buffer length, implies a EOF was meet, or nothing readed.
 async fn try_read_exact<R: AsyncRead + ?Sized + Unpin>(
     r: &mut R,
     buf: &mut [u8],
@@ -311,20 +274,12 @@ async fn try_read_exact<R: AsyncRead + ?Sized + Unpin>(
     }
 }
 
-fn get_content_md5(object_lock_enabled: bool, content: &[u8]) -> Option<String> {
-    object_lock_enabled.then(|| {
-        let digest = md5::compute(content);
-        base64::encode(digest.0)
-    })
-}
-
 /// Specifies the minimum size to use multi-part upload.
 /// AWS S3 requires each part to be at least 5 MiB.
 const MINIMUM_PART_SIZE: usize = 5 * 1024 * 1024;
 
 impl<'client> S3Uploader<'client> {
-    /// Creates a new uploader with a given target location and upload
-    /// configuration.
+    /// Creates a new uploader with a given target location and upload configuration.
     fn new(client: &'client S3Client, config: &Config, key: String) -> Self {
         Self {
             client,
@@ -335,7 +290,6 @@ impl<'client> S3Uploader<'client> {
             sse_kms_key_id: config.sse_kms_key_id.as_ref().cloned(),
             storage_class: config.storage_class.as_ref().cloned(),
             multi_part_size: config.multi_part_size,
-            object_lock_enabled: config.object_lock_enabled,
             upload_id: "".to_owned(),
             parts: Vec::new(),
         }
@@ -416,8 +370,7 @@ impl<'client> S3Uploader<'client> {
         }
     }
 
-    /// Completes a multipart upload process, asking S3 to join all parts into a
-    /// single file.
+    /// Completes a multipart upload process, asking S3 to join all parts into a single file.
     async fn complete(&self) -> Result<(), RusotoError<CompleteMultipartUploadError>> {
         let res = timeout(
             Self::get_timeout(),
@@ -476,7 +429,6 @@ impl<'client> S3Uploader<'client> {
                     upload_id: self.upload_id.clone(),
                     part_number,
                     content_length: Some(data.len() as i64),
-                    content_md5: get_content_md5(self.object_lock_enabled, data),
                     body: Some(data.to_vec().into()),
                     ..Default::default()
                 })
@@ -500,8 +452,8 @@ impl<'client> S3Uploader<'client> {
 
     /// Uploads a file atomically.
     ///
-    /// This should be used only when the data is known to be short, and thus
-    /// relatively cheap to retry the entire upload.
+    /// This should be used only when the data is known to be short, and thus relatively cheap to
+    /// retry the entire upload.
     async fn upload(&self, data: &[u8]) -> Result<(), RusotoError<PutObjectError>> {
         let res = timeout(Self::get_timeout(), async {
             #[cfg(feature = "failpoints")]
@@ -519,6 +471,7 @@ impl<'client> S3Uploader<'client> {
                 sleep(delay_duration).await;
             }
 
+            #[cfg(feature = "failpoints")]
             fail_point!("s3_put_obj_err", |_| {
                 Err(RusotoError::ParseError("failed to put object".to_owned()))
             });
@@ -537,7 +490,6 @@ impl<'client> S3Uploader<'client> {
                     ssekms_key_id: self.sse_kms_key_id.as_ref().map(|s| s.to_string()),
                     storage_class: self.storage_class.as_ref().map(|s| s.to_string()),
                     content_length: Some(data.len() as i64),
-                    content_md5: get_content_md5(self.object_lock_enabled, data),
                     body: Some(data.to_vec().into()),
                     ..Default::default()
                 })
@@ -588,20 +540,41 @@ impl BlobStorage for S3Storage {
             } else {
                 io::ErrorKind::Other
             };
-            // Even we can check whether there is an `io::Error` internal and extract it
-            // directly, We still need to keep the message 'failed to put object' here for
-            // adapting the string-matching based retry logic in BR :(
+            // Even we can check whether there is an `io::Error` internal and extract it directly,
+            // We still need to keep the message 'failed to put object' here for adapting the string-matching based
+            // retry logic in BR :(
             io::Error::new(error_code, format!("failed to put object {}", e))
         })
     }
 
-    fn get(&self, name: &str) -> cloud::blob::BlobStream<'_> {
-        self.get_range(name, None)
-    }
-
-    fn get_part(&self, name: &str, off: u64, len: u64) -> cloud::blob::BlobStream<'_> {
-        // inclusive, bytes=0-499 -> [0, 499]
-        self.get_range(name, Some(format!("bytes={}-{}", off, off + len - 1)))
+    fn get(&self, name: &str) -> Box<dyn AsyncRead + Unpin + '_> {
+        let key = self.maybe_prefix_key(name);
+        let bucket = self.config.bucket.bucket.clone();
+        debug!("read file from s3 storage"; "key" => %key);
+        let req = GetObjectRequest {
+            key,
+            bucket: (*bucket).clone(),
+            ..Default::default()
+        };
+        Box::new(
+            self.client
+                .get_object(req)
+                .map(move |future| match future {
+                    Ok(out) => out.body.unwrap(),
+                    Err(RusotoError::Service(GetObjectError::NoSuchKey(key))) => {
+                        ByteStream::new(error_stream(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("no key {} at bucket {}", key, *bucket),
+                        )))
+                    }
+                    Err(e) => ByteStream::new(error_stream(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failed to get object {}", e),
+                    ))),
+                })
+                .flatten_stream()
+                .into_async_read(),
+        )
     }
 }
 
@@ -614,18 +587,6 @@ mod tests {
     use tikv_util::stream::block_on_external_io;
 
     use super::*;
-
-    #[test]
-    fn test_s3_get_content_md5() {
-        // base64 encode md5sum "helloworld"
-        let code = "helloworld".to_string();
-        let expect = "/F4DjTilcDIIVEHn/nAQsA==".to_string();
-        let actual = get_content_md5(true, code.as_bytes()).unwrap();
-        assert_eq!(actual, expect);
-
-        let actual = get_content_md5(false, b"xxx");
-        assert!(actual.is_none())
-    }
 
     #[test]
     fn test_s3_config() {
@@ -667,8 +628,7 @@ mod tests {
         // set multi_part_size to use upload_part function
         config.multi_part_size = multi_part_size;
 
-        // split magic_contents into 3 parts, so we mock 5 requests here(1 begin + 3
-        // part + 1 complete)
+        // split magic_contents into 3 parts, so we mock 5 requests here(1 begin + 3 part + 1 complete)
         let dispatcher = MultipleMockRequestDispatcher::new(vec![
             MockRequestDispatcher::with_status(200).with_body(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -687,13 +647,14 @@ mod tests {
 
         let s = S3Storage::new_creds_dispatcher(config, dispatcher, credentials_provider).unwrap();
 
-        s.put(
-            "mykey",
-            PutResource(Box::new(magic_contents.as_bytes())),
-            magic_contents.len() as u64,
-        )
-        .await
-        .unwrap();
+        let resp = s
+            .put(
+                "mykey",
+                PutResource(Box::new(magic_contents.as_bytes())),
+                magic_contents.len() as u64,
+            )
+            .await;
+        assert!(resp.is_ok());
         assert_eq!(
             CLOUD_REQUEST_HISTOGRAM_VEC
                 .get_metric_with_label_values(&["s3", "upload_part"])
@@ -743,14 +704,15 @@ mod tests {
         // inject put error
         let s3_put_obj_err_fp = "s3_put_obj_err";
         fail::cfg(s3_put_obj_err_fp, "return").unwrap();
-        s.put(
-            "mykey",
-            PutResource(Box::new(magic_contents.as_bytes())),
-            magic_contents.len() as u64,
-        )
-        .await
-        .unwrap_err();
+        let resp = s
+            .put(
+                "mykey",
+                PutResource(Box::new(magic_contents.as_bytes())),
+                magic_contents.len() as u64,
+            )
+            .await;
         fail::remove(s3_put_obj_err_fp);
+        assert!(resp.is_err());
 
         // test timeout
         let s3_timeout_injected_fp = "s3_timeout_injected";
@@ -760,27 +722,30 @@ mod tests {
         fail::cfg(s3_timeout_injected_fp, "return(100)").unwrap();
         // inject 200ms delay
         fail::cfg(s3_sleep_injected_fp, "return(200)").unwrap();
-        // timeout occur due to delay 200ms
-        s.put(
-            "mykey",
-            PutResource(Box::new(magic_contents.as_bytes())),
-            magic_contents.len() as u64,
-        )
-        .await
-        .unwrap_err();
+        let resp = s
+            .put(
+                "mykey",
+                PutResource(Box::new(magic_contents.as_bytes())),
+                magic_contents.len() as u64,
+            )
+            .await;
         fail::remove(s3_sleep_injected_fp);
+        // timeout occur due to delay 200ms
+        assert!(resp.is_err());
 
         // inject 50ms delay
         fail::cfg(s3_sleep_injected_fp, "return(50)").unwrap();
-        s.put(
-            "mykey",
-            PutResource(Box::new(magic_contents.as_bytes())),
-            magic_contents.len() as u64,
-        )
-        .await
-        .unwrap();
+        let resp = s
+            .put(
+                "mykey",
+                PutResource(Box::new(magic_contents.as_bytes())),
+                magic_contents.len() as u64,
+            )
+            .await;
         fail::remove(s3_sleep_injected_fp);
         fail::remove(s3_timeout_injected_fp);
+        // no timeout
+        assert!(resp.is_ok());
     }
 
     #[test]
@@ -939,8 +904,7 @@ mod tests {
 
         use self::try_read_exact;
 
-        /// ThrottleRead throttles a `Read` -- make it emits 2 chars for each
-        /// `read` call.
+        /// ThrottleRead throttles a `Read` -- make it emits 2 chars for each `read` call.
         struct ThrottleRead<R>(R);
         impl<R: Read> Read for ThrottleRead<R> {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {

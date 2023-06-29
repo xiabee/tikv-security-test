@@ -10,18 +10,17 @@ define_error_codes!(
     SCHED_TOO_BUSY => ("SchedTooBusy", "", ""),
     GC_WORKER_TOO_BUSY => ("GcWorkerTooBusy", "", ""),
     KEY_TOO_LARGE => ("KeyTooLarge", "", ""),
-    INVALID_CF => ("InvalidCf", "", ""),
-    CF_DEPRECATED => ("CfDeprecated", "", ""),
+    INVALID_CF => ("InvalidCF", "", ""),
+    CF_DEPRECATED => ("CFDeprecated", "", ""),
     TTL_NOT_ENABLED => ("TtlNotEnabled", "", ""),
     TTL_LEN_NOT_EQUALS_TO_PAIRS => ("TtlLenNotEqualsToPairs", "", ""),
     PROTOBUF => ("Protobuf", "", ""),
-    INVALID_TXN_TSO => ("InvalidTxnTso", "", ""),
+    INVALID_TXN_TSO => ("INVALIDTXNTSO", "", ""),
     INVALID_REQ_RANGE => ("InvalidReqRange", "", ""),
     BAD_FORMAT_LOCK => ("BadFormatLock", "", ""),
     BAD_FORMAT_WRITE => ("BadFormatWrite", "",""),
     KEY_IS_LOCKED => ("KeyIsLocked", "", ""),
     MAX_TIMESTAMP_NOT_SYNCED => ("MaxTimestampNotSynced", "", ""),
-    FLASHBACK_NOT_PREPARED => ("FlashbackNotPrepared", "", ""),
     DEADLINE_EXCEEDED => ("DeadlineExceeded", "", ""),
     API_VERSION_NOT_MATCHED => ("ApiVersionNotMatched", "", ""),
     INVALID_KEY_MODE => ("InvalidKeyMode", "", ""),
@@ -41,7 +40,6 @@ define_error_codes!(
     COMMIT_TS_TOO_LARGE => ("CommitTsTooLarge", "", ""),
 
     ASSERTION_FAILED => ("AssertionFailed", "", ""),
-    LOCK_IF_EXISTS_FAILED => ("LockIfExistsFailed", "", ""),
 
     UNKNOWN => ("Unknown", "", "")
 );

@@ -5,11 +5,11 @@ use engine_traits::{DeleteStrategy, MiscExt, Range, Result};
 use crate::engine::PanicEngine;
 
 impl MiscExt for PanicEngine {
-    fn flush_cfs(&self, wait: bool) -> Result<()> {
+    fn flush(&self, sync: bool) -> Result<()> {
         panic!()
     }
 
-    fn flush_cf(&self, cf: &str, wait: bool) -> Result<()> {
+    fn flush_cf(&self, cf: &str, sync: bool) -> Result<()> {
         panic!()
     }
 
@@ -30,11 +30,11 @@ impl MiscExt for PanicEngine {
         panic!()
     }
 
-    fn get_sst_key_ranges(&self, cf: &str, level: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    fn get_engine_used_size(&self) -> Result<u64> {
         panic!()
     }
 
-    fn get_engine_used_size(&self) -> Result<u64> {
+    fn roughly_cleanup_ranges(&self, ranges: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         panic!()
     }
 

@@ -41,12 +41,12 @@ pub enum Error {
     InvalidRequest(String),
     ParseError(String),
     SearchError(String),
-    IoError(std::io::Error),
+    IOError(std::io::Error),
 }
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        Error::IoError(err)
+        Error::IOError(err)
     }
 }
 
@@ -173,8 +173,7 @@ impl Iterator for LogIterator {
                         if self.pre_log.time < self.begin_time {
                             continue;
                         }
-                        // treat the invalid log with the pre valid log time and level but its own
-                        // whole line content
+                        // treat the invalid log with the pre valid log time and level but its own whole line content
                         item.set_time(self.pre_log.time);
                         item.set_level(self.pre_log.get_level());
                         item.set_message(input.to_owned());
@@ -268,8 +267,8 @@ fn parse(input: &str) -> Result<(&str, (i64, LogLevel)), Error> {
     Ok((content, (timestamp, level)))
 }
 
-/// Parses the start time and end time of a log file and return the maximal and
-/// minimal timestamp in unix milliseconds.
+/// Parses the start time and end time of a log file and return the maximal and minimal
+/// timestamp in unix milliseconds.
 fn parse_time_range(file: &std::fs::File) -> Result<(i64, i64), Error> {
     let file_start_time = parse_start_time(file, 10)?;
     let file_end_time = parse_end_time(file, 10)?;
@@ -481,6 +480,7 @@ mod tests {
         ];
         for (input, time, level, content) in cs.into_iter() {
             let result = parse(input);
+            assert!(result.is_ok(), "expected OK, but got: {:?}", result);
             let timestamp = timestamp(time);
             let log = result.unwrap();
             assert_eq!(log.0, content);
@@ -559,7 +559,7 @@ Some invalid logs 2: Welcome to TiKV
         .unwrap();
 
         let log_file2 = dir.path().join("tikv.2019-08-23T18-10-00.387.log");
-        let mut file = File::create(log_file2).unwrap();
+        let mut file = File::create(&log_file2).unwrap();
         write!(
             file,
             r#"[2019/08/23 18:10:01.387 +08:00] [INFO] [foo.rs:100] [some message] [key=val]
@@ -736,7 +736,7 @@ Some invalid logs 4: Welcome to TiKV - test-filter"#
 
         // this file is ignored because its filename is not expected
         let log_file2 = dir.path().join("tikv.log.2");
-        let mut file = File::create(log_file2).unwrap();
+        let mut file = File::create(&log_file2).unwrap();
         write!(
             file,
             r#"[2019/08/23 18:10:01.387 +08:00] [INFO] [foo.rs:100] [some message] [key=val]
@@ -749,7 +749,7 @@ Some invalid logs 4: Welcome to TiKV - test-filter"#
         .unwrap();
 
         let log_file3 = dir.path().join("tikv.2019-08-23T18-11-02.123.log");
-        let mut file = File::create(log_file3).unwrap();
+        let mut file = File::create(&log_file3).unwrap();
         write!(
             file,
             r#"[2019/08/23 18:11:53.387 +08:00] [INFO] [foo.rs:100] [some message] [key=val]
@@ -766,7 +766,7 @@ Some invalid logs 2: Welcome to TiKV - test-filter"#
 
         // this file is ignored because its filename is not expected
         let log_file4 = dir.path().join("tikv.T.log");
-        let mut file = File::create(log_file4).unwrap();
+        let mut file = File::create(&log_file4).unwrap();
         write!(
             file,
             r#"[2019/08/23 18:10:01.387 +08:00] [INFO] [foo.rs:100] [some message] [key=val]

@@ -77,12 +77,6 @@ make test
 env EXTRA_CARGO_ARGS=$TESTNAME make test
 ```
 
-Alternatively, you can use [nextest](https://github.com/nextest-rs/nextest) to run tests:
-
-```bash
-env EXTRA_CARGO_ARGS=$TESTNAME make test_with_nextest
-```
-
 TiKV follows the Rust community coding style. We use Rustfmt and [Clippy](https://github.com/Manishearth/rust-clippy) to automatically format and lint our code. Using these tools is checked in our CI. These are as part of `make dev`, you can also run them alone:
 
 ```bash
@@ -95,20 +89,6 @@ make clippy
 See the [style doc](https://github.com/rust-lang/rfcs/blob/master/style-guide/README.md) and the [API guidelines](https://rust-lang-nursery.github.io/api-guidelines/) for details on the conventions.
 
 Please follow this style to make TiKV easy to review, maintain, and develop.
-
-### Run test in docker
-
-Alternatively, you can run test in a docker environment. Simply running the following command, it will build the pingcap/tikv_dev image and run the tikv unittests. And you may re-use the pingcap/tikv_dev image directly for ad-hoc test.
-
-```bash
-make docker_test
-```
-
-Note that you may find many messages below, which in fact are not errors. They're emitted by rustc or cargo.
-
-```bash
-<jemalloc>: Invalid conf pair: prof:true
-```
 
 ### Build issues
 

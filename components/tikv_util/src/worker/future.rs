@@ -16,7 +16,6 @@ use prometheus::IntGauge;
 use tokio::task::LocalSet;
 
 use super::metrics::*;
-use crate::sys::thread::StdThreadBuildWrapper;
 
 pub struct Stopped<T>(pub T);
 
@@ -157,7 +156,7 @@ impl<T: Display + Send + 'static> Worker<T> {
         let props = crate::thread_group::current_properties();
         let h = Builder::new()
             .name(thd_name!(self.scheduler.name.as_ref()))
-            .spawn_wrapper(move || {
+            .spawn(move || {
                 crate::thread_group::set_properties(props);
                 poll(runner, rx)
             })?;

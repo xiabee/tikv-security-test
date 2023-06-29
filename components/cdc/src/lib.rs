@@ -13,7 +13,6 @@ pub mod metrics;
 mod observer;
 mod old_value;
 mod service;
-mod txn_souce;
 
 pub use channel::{recv_timeout, CdcEvent, MemoryQuota};
 pub use config::CdcConfigManager;

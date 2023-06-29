@@ -5,10 +5,7 @@ use std::{collections::BTreeMap, convert::TryInto, f64, str};
 use codec::{number::NumberCodec, prelude::*};
 
 use super::{constants::*, Json, JsonRef, JsonType};
-use crate::{
-    codec::{Error, Result},
-    FieldTypeTp,
-};
+use crate::codec::{Error, Result};
 
 impl<'a> JsonRef<'a> {
     fn encoded_len(&self) -> usize {
@@ -214,14 +211,6 @@ pub trait JsonEncoder: NumberEncoder {
         self.write_bytes(bytes)?;
         Ok(())
     }
-
-    fn write_json_opaque(&mut self, typ: FieldTypeTp, bytes: &[u8]) -> Result<()> {
-        self.write_u8(typ.to_u8().unwrap())?;
-        let bytes_len = bytes.len() as u64;
-        self.write_var_u64(bytes_len)?;
-        self.write_bytes(bytes)?;
-        Ok(())
-    }
 }
 
 pub trait JsonDatumPayloadChunkEncoder: BufferWriter {
@@ -254,16 +243,6 @@ pub trait JsonDecoder: NumberDecoder {
             }
             JsonType::I64 | JsonType::U64 | JsonType::Double => self.read_bytes(NUMBER_LEN)?,
             JsonType::Literal => self.read_bytes(LITERAL_LEN)?,
-            JsonType::Opaque => {
-                let value = self.bytes();
-                // the first byte of opaque stores the MySQL type code
-                let (opaque_bytes_len, len_len) = NumberCodec::try_decode_var_u64(&value[1..])?;
-                self.read_bytes(opaque_bytes_len as usize + len_len + 1)?
-            }
-            JsonType::Date | JsonType::Datetime | JsonType::Timestamp => {
-                self.read_bytes(TIME_LEN)?
-            }
-            JsonType::Time => self.read_bytes(DURATION_LEN)?,
         };
         Ok(Json::new(tp, Vec::from(value)))
     }

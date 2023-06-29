@@ -242,19 +242,18 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
         let header = Service::header();
         let tso_logical = self.tso_logical.clone();
         let fut = async move {
-            // Tolerate errors like RpcFinished(None).
-            let _ = resp
-                .send_all(&mut req.map_ok(move |r| {
-                    let logical =
-                        tso_logical.fetch_add(r.count as i64, Ordering::SeqCst) + r.count as i64;
-                    let mut res = TsoResponse::default();
-                    res.set_header(header.clone());
-                    res.mut_timestamp().physical = 42;
-                    res.mut_timestamp().logical = logical;
-                    res.count = r.count;
-                    (res, WriteFlags::default())
-                }))
-                .await;
+            resp.send_all(&mut req.map_ok(move |r| {
+                let logical =
+                    tso_logical.fetch_add(r.count as i64, Ordering::SeqCst) + r.count as i64;
+                let mut res = TsoResponse::default();
+                res.set_header(header.clone());
+                res.mut_timestamp().physical = 42;
+                res.mut_timestamp().logical = logical;
+                res.count = r.count;
+                (res, WriteFlags::default())
+            }))
+            .await
+            .unwrap();
             let _ = resp.close().await;
         };
         ctx.spawn(fut);

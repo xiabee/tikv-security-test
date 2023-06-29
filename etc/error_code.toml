@@ -1,11 +1,11 @@
-["KV:Cloud:Io"]
+["KV:Cloud:IO"]
 error = '''
-KV:Cloud:Io
+KV:Cloud:IO
 '''
 
-["KV:Cloud:Ssl"]
+["KV:Cloud:SSL"]
 error = '''
-KV:Cloud:Ssl
+KV:Cloud:SSL
 '''
 
 ["KV:Cloud:Proto"]
@@ -143,9 +143,9 @@ error = '''
 KV:Encryption:Rocks
 '''
 
-["KV:Encryption:Io"]
+["KV:Encryption:IO"]
 error = '''
-KV:Encryption:Io
+KV:Encryption:IO
 '''
 
 ["KV:Encryption:Crypter"]
@@ -193,14 +193,14 @@ error = '''
 KV:Engine:Protobuf
 '''
 
-["KV:Engine:Io"]
+["KV:Engine:IO"]
 error = '''
-KV:Engine:Io
+KV:Engine:IO
 '''
 
-["KV:Engine:CfName"]
+["KV:Engine:CFName"]
 error = '''
-KV:Engine:CfName
+KV:Engine:CFName
 '''
 
 ["KV:Engine:Codec"]
@@ -218,54 +218,49 @@ error = '''
 KV:Engine:DataCompacted
 '''
 
-["KV:Pd:Io"]
+["KV:PD:IO"]
 error = '''
-KV:Pd:Io
+KV:PD:IO
 '''
 
-["KV:Pd:ClusterBootstraped"]
+["KV:PD:ClusterBootstraped"]
 error = '''
-KV:Pd:ClusterBootstraped
+KV:PD:ClusterBootstraped
 '''
 
-["KV:Pd:ClusterNotBootstraped"]
+["KV:PD:ClusterNotBootstraped"]
 error = '''
-KV:Pd:ClusterNotBootstraped
+KV:PD:ClusterNotBootstraped
 '''
 
-["KV:Pd:Imcompatible"]
+["KV:PD:Imcompatible"]
 error = '''
-KV:Pd:Imcompatible
+KV:PD:Imcompatible
 '''
 
-["KV:Pd:Grpc"]
+["KV:PD:gRPC"]
 error = '''
-KV:Pd:Grpc
+KV:PD:gRPC
 '''
 
-["KV:Pd:StreamDisconnect"]
+["KV:PD:RegionNotFound"]
 error = '''
-KV:Pd:StreamDisconnect
+KV:PD:RegionNotFound
 '''
 
-["KV:Pd:RegionNotFound"]
+["KV:PD:StoreTombstone"]
 error = '''
-KV:Pd:RegionNotFound
+KV:PD:StoreTombstone
 '''
 
-["KV:Pd:StoreTombstone"]
+["KV:PD:GlobalConfigNotFound"]
 error = '''
-KV:Pd:StoreTombstone
+KV:PD:GlobalConfigNotFound
 '''
 
-["KV:Pd:GlobalConfigNotFound"]
+["KV:PD:Unknown"]
 error = '''
-KV:Pd:GlobalConfigNotFound
-'''
-
-["KV:Pd:Unknown"]
-error = '''
-KV:Pd:Unknown
+KV:PD:Unknown
 '''
 
 ["KV:Raft:Io"]
@@ -378,9 +373,9 @@ error = '''
 KV:Raftstore:Coprocessor
 '''
 
-["KV:Raftstore:Io"]
+["KV:Raftstore:IO"]
 error = '''
-KV:Raftstore:Io
+KV:Raftstore:IO
 '''
 
 ["KV:Raftstore:Protobuf"]
@@ -433,16 +428,6 @@ error = '''
 KV:Raftstore:RecoveryInProgress
 '''
 
-["KV:Raftstore:FlashbackInProgress"]
-error = '''
-KV:Raftstore:FlashbackInProgress
-'''
-
-["KV:Raftstore:FlashbackNotPrepared"]
-error = '''
-KV:Raftstore:FlashbackNotPrepared
-'''
-
 ["KV:Raftstore:SnapAbort"]
 error = '''
 KV:Raftstore:SnapAbort
@@ -458,104 +443,94 @@ error = '''
 KV:Raftstore:SnapUnknown
 '''
 
-["KV:SstImporter:Io"]
+["KV:SSTImporter:Io"]
 error = '''
-KV:SstImporter:Io
+KV:SSTImporter:Io
 '''
 
-["KV:SstImporter:Grpc"]
+["KV:SSTImporter:gRPC"]
 error = '''
-KV:SstImporter:Grpc
+KV:SSTImporter:gRPC
 '''
 
-["KV:SstImporter:Uuid"]
+["KV:SSTImporter:Uuid"]
 error = '''
-KV:SstImporter:Uuid
+KV:SSTImporter:Uuid
 '''
 
-["KV:SstImporter:Future"]
+["KV:SSTImporter:Future"]
 error = '''
-KV:SstImporter:Future
+KV:SSTImporter:Future
 '''
 
-["KV:SstImporter:RocksDb"]
+["KV:SSTImporter:RocksDB"]
 error = '''
-KV:SstImporter:RocksDb
+KV:SSTImporter:RocksDB
 '''
 
-["KV:SstImporter:ParseIntError"]
+["KV:SSTImporter:ParseIntError"]
 error = '''
-KV:SstImporter:ParseIntError
+KV:SSTImporter:ParseIntError
 '''
 
-["KV:SstImporter:FileExists"]
+["KV:SSTImporter:FileExists"]
 error = '''
-KV:SstImporter:FileExists
+KV:SSTImporter:FileExists
 '''
 
-["KV:SstImporter:FileCorrupted"]
+["KV:SSTImporter:FileCorrupted"]
 error = '''
-KV:SstImporter:FileCorrupted
+KV:SSTImporter:FileCorrupted
 '''
 
-["KV:SstImporter:InvalidSstPath"]
+["KV:SSTImporter:InvalidSstPath"]
 error = '''
-KV:SstImporter:InvalidSstPath
+KV:SSTImporter:InvalidSstPath
 '''
 
-["KV:SstImporter:InvalidChunk"]
+["KV:SSTImporter:InvalidChunk"]
 error = '''
-KV:SstImporter:InvalidChunk
+KV:SSTImporter:InvalidChunk
 '''
 
-["KV:SstImporter:Engine"]
+["KV:SSTImporter:Engine"]
 error = '''
-KV:SstImporter:Engine
+KV:SSTImporter:Engine
 '''
 
-["KV:SstImporter:CannotReadExternalStorage"]
+["KV:SSTImporter:CannotReadExternalStorage"]
 error = '''
-KV:SstImporter:CannotReadExternalStorage
+KV:SSTImporter:CannotReadExternalStorage
 '''
 
-["KV:SstImporter:WrongKeyPrefix"]
+["KV:SSTImporter:WrongKeyPrefix"]
 error = '''
-KV:SstImporter:WrongKeyPrefix
+KV:SSTImporter:WrongKeyPrefix
 '''
 
-["KV:SstImporter:BadFormat"]
+["KV:SSTImporter:BadFormat"]
 error = '''
-KV:SstImporter:BadFormat
+KV:SSTImporter:BadFormat
 '''
 
-["KV:SstImporter:FileConflict"]
+["KV:SSTImporter:FileConflict"]
 error = '''
-KV:SstImporter:FileConflict
+KV:SSTImporter:FileConflict
 '''
 
-["KV:SstImporter:TtlNotEnabled"]
+["KV:SSTImporter:TtlNotEnabled"]
 error = '''
-KV:SstImporter:TtlNotEnabled
+KV:SSTImporter:TtlNotEnabled
 '''
 
-["KV:SstImporter:TtlLenNotEqualsToPairs"]
+["KV:SSTImporter:TtlLenNotEqualsToPairs"]
 error = '''
-KV:SstImporter:TtlLenNotEqualsToPairs
+KV:SSTImporter:TtlLenNotEqualsToPairs
 '''
 
-["KV:SstImporter:IncompatibleApiVersion"]
+["KV:SSTImporter:IncompatibleApiVersion"]
 error = '''
-KV:SstImporter:IncompatibleApiVersion
-'''
-
-["KV:SstImporter:InvalidKeyMode"]
-error = '''
-KV:SstImporter:InvalidKeyMode
-'''
-
-["KV:SstImporter:ResourceNotEnough"]
-error = '''
-KV:SstImporter:ResourceNotEnough
+KV:SSTImporter:IncompatibleApiVersion
 '''
 
 ["KV:Storage:Timeout"]
@@ -593,14 +568,14 @@ error = '''
 KV:Storage:KeyTooLarge
 '''
 
-["KV:Storage:InvalidCf"]
+["KV:Storage:InvalidCF"]
 error = '''
-KV:Storage:InvalidCf
+KV:Storage:InvalidCF
 '''
 
-["KV:Storage:CfDeprecated"]
+["KV:Storage:CFDeprecated"]
 error = '''
-KV:Storage:CfDeprecated
+KV:Storage:CFDeprecated
 '''
 
 ["KV:Storage:TtlNotEnabled"]
@@ -618,9 +593,9 @@ error = '''
 KV:Storage:Protobuf
 '''
 
-["KV:Storage:InvalidTxnTso"]
+["KV:Storage:INVALIDTXNTSO"]
 error = '''
-KV:Storage:InvalidTxnTso
+KV:Storage:INVALIDTXNTSO
 '''
 
 ["KV:Storage:InvalidReqRange"]
@@ -646,11 +621,6 @@ KV:Storage:KeyIsLocked
 ["KV:Storage:MaxTimestampNotSynced"]
 error = '''
 KV:Storage:MaxTimestampNotSynced
-'''
-
-["KV:Storage:FlashbackNotPrepared"]
-error = '''
-KV:Storage:FlashbackNotPrepared
 '''
 
 ["KV:Storage:DeadlineExceeded"]
@@ -736,11 +706,6 @@ KV:Storage:CommitTsTooLarge
 ["KV:Storage:AssertionFailed"]
 error = '''
 KV:Storage:AssertionFailed
-'''
-
-["KV:Storage:LockIfExistsFailed"]
-error = '''
-KV:Storage:LockIfExistsFailed
 '''
 
 ["KV:Storage:Unknown"]

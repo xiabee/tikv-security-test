@@ -21,7 +21,7 @@ pub struct Resolver {
     // The highest index `Resolver` had been tracked
     tracked_index: u64,
     // The region read progress used to utilize `resolved_ts` to serve stale read request
-    pub(crate) read_progress: Option<Arc<RegionReadProgress>>,
+    read_progress: Option<Arc<RegionReadProgress>>,
     // The timestamps that advance the resolved_ts when there is no more write.
     min_ts: TimeStamp,
     // Whether the `Resolver` is stopped
@@ -150,8 +150,7 @@ impl Resolver {
     /// `min_ts` advances the resolver even if there is no write.
     /// Return None means the resolver is not initialized.
     pub fn resolve(&mut self, min_ts: TimeStamp) -> TimeStamp {
-        // The `Resolver` is stopped, not need to advance, just return the current
-        // `resolved_ts`
+        // The `Resolver` is stopped, not need to advance, just return the current `resolved_ts`
         if self.stopped {
             return self.resolved_ts;
         }
@@ -162,6 +161,7 @@ impl Resolver {
 
         // No more commit happens before the ts.
         let new_resolved_ts = cmp::min(min_start_ts, min_ts);
+
         if self.resolved_ts >= new_resolved_ts {
             let label = if has_lock { "has_lock" } else { "stale_ts" };
             RTS_RESOLVED_FAIL_ADVANCE_VEC

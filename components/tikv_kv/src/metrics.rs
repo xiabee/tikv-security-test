@@ -3,13 +3,6 @@
 use prometheus_static_metric::*;
 
 make_auto_flush_static_metric! {
-    pub label_enum GcKeyMode {
-        // The enum 'txn' contains both TiDB and TxnKV scenarios statistics,
-        // as they have the same storage format, and use the same GC procedures.
-        txn,
-        raw,
-    }
-
     pub label_enum GcKeysCF {
         default,
         lock,
@@ -32,7 +25,6 @@ make_auto_flush_static_metric! {
     }
 
     pub struct GcKeysCounterVec: LocalIntCounter {
-        "key_mode" => GcKeyMode,
         "cf" => GcKeysCF,
         "tag" => GcKeysDetail,
     }

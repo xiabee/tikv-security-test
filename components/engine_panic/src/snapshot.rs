@@ -2,28 +2,33 @@
 
 use std::ops::Deref;
 
-use engine_traits::{IterOptions, Iterable, Iterator, Peekable, ReadOptions, Result, Snapshot};
+use engine_traits::{
+    IterOptions, Iterable, Iterator, Peekable, ReadOptions, Result, SeekKey, Snapshot,
+};
 
-use crate::{db_vector::PanicDbVector, engine::PanicEngine};
+use crate::{db_vector::PanicDBVector, engine::PanicEngine};
 
 #[derive(Clone, Debug)]
 pub struct PanicSnapshot;
 
-impl Snapshot for PanicSnapshot {}
-
-impl Peekable for PanicSnapshot {
-    type DbVector = PanicDbVector;
-
-    fn get_value_opt(&self, opts: &ReadOptions, key: &[u8]) -> Result<Option<Self::DbVector>> {
+impl Snapshot for PanicSnapshot {
+    fn cf_names(&self) -> Vec<&str> {
         panic!()
     }
+}
 
+impl Peekable for PanicSnapshot {
+    type DBVector = PanicDBVector;
+
+    fn get_value_opt(&self, opts: &ReadOptions, key: &[u8]) -> Result<Option<Self::DBVector>> {
+        panic!()
+    }
     fn get_value_cf_opt(
         &self,
         opts: &ReadOptions,
         cf: &str,
         key: &[u8],
-    ) -> Result<Option<Self::DbVector>> {
+    ) -> Result<Option<Self::DBVector>> {
         panic!()
     }
 }
@@ -31,7 +36,10 @@ impl Peekable for PanicSnapshot {
 impl Iterable for PanicSnapshot {
     type Iterator = PanicSnapshotIterator;
 
-    fn iterator_opt(&self, cf: &str, opts: IterOptions) -> Result<Self::Iterator> {
+    fn iterator_opt(&self, opts: IterOptions) -> Result<Self::Iterator> {
+        panic!()
+    }
+    fn iterator_cf_opt(&self, cf: &str, opts: IterOptions) -> Result<Self::Iterator> {
         panic!()
     }
 }
@@ -39,18 +47,10 @@ impl Iterable for PanicSnapshot {
 pub struct PanicSnapshotIterator;
 
 impl Iterator for PanicSnapshotIterator {
-    fn seek(&mut self, key: &[u8]) -> Result<bool> {
+    fn seek(&mut self, key: SeekKey<'_>) -> Result<bool> {
         panic!()
     }
-    fn seek_for_prev(&mut self, key: &[u8]) -> Result<bool> {
-        panic!()
-    }
-
-    fn seek_to_first(&mut self) -> Result<bool> {
-        panic!()
-    }
-
-    fn seek_to_last(&mut self) -> Result<bool> {
+    fn seek_for_prev(&mut self, key: SeekKey<'_>) -> Result<bool> {
         panic!()
     }
 

@@ -7,7 +7,6 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct Engines<K, R> {
-    // kv can be either global kv store, or the tablet in multirocks version.
     pub kv: K,
     pub raft: R,
 }
@@ -20,11 +19,11 @@ impl<K: KvEngine, R: RaftEngine> Engines<K, R> {
         }
     }
 
-    pub fn write_kv(&self, wb: &mut K::WriteBatch) -> Result<u64> {
+    pub fn write_kv(&self, wb: &K::WriteBatch) -> Result<()> {
         wb.write()
     }
 
-    pub fn write_kv_opt(&self, wb: &mut K::WriteBatch, opts: &WriteOptions) -> Result<u64> {
+    pub fn write_kv_opt(&self, wb: &K::WriteBatch, opts: &WriteOptions) -> Result<()> {
         wb.write_opt(opts)
     }
 

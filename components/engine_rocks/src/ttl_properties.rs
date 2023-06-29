@@ -182,10 +182,10 @@ mod tests {
         }
 
         let case2 = [("zr\0a", 0)];
-        get_properties(&case2).unwrap_err();
+        assert!(get_properties(&case2).is_err());
 
         let case3 = [];
-        get_properties(&case3).unwrap_err();
+        assert!(get_properties(&case3).is_err());
 
         let case4 = [("zr\0a", 1)];
         let props = get_properties(&case4).unwrap();

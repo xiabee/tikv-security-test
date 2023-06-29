@@ -6,7 +6,6 @@ mod raft_client;
 pub mod config;
 pub mod debug;
 mod engine_factory;
-mod engine_factory_v2;
 pub mod errors;
 pub mod gc_worker;
 pub mod load_statistics;
@@ -20,7 +19,6 @@ pub mod server;
 pub mod service;
 pub mod snap;
 pub mod status_server;
-pub mod tablet_snap;
 pub mod transport;
 pub mod ttl;
 

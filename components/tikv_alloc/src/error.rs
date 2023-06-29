@@ -5,10 +5,9 @@ use std::{error, fmt};
 #[derive(Debug)]
 pub enum ProfError {
     MemProfilingNotEnabled,
-    IoError(std::io::Error),
+    IOError(std::io::Error),
     JemallocError(String),
-    PathEncodingError(std::ffi::OsString), /* When temp files are in a non-unicode directory,
-                                            * OsString.into_string() will cause this error, */
+    PathEncodingError(std::ffi::OsString), // When temp files are in a non-unicode directory, OsString.into_string() will cause this error,
     PathWithNulError(std::ffi::NulError),
 }
 
@@ -18,7 +17,7 @@ impl fmt::Display for ProfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProfError::MemProfilingNotEnabled => write!(f, "mem-profiling was not enabled"),
-            ProfError::IoError(e) => write!(f, "io error occurred {:?}", e),
+            ProfError::IOError(e) => write!(f, "io error occurred {:?}", e),
             ProfError::JemallocError(e) => write!(f, "jemalloc error {}", e),
             ProfError::PathEncodingError(path) => {
                 write!(f, "Dump target path {:?} is not unicode encoding", path)
@@ -32,7 +31,7 @@ impl fmt::Display for ProfError {
 
 impl From<std::io::Error> for ProfError {
     fn from(e: std::io::Error) -> Self {
-        ProfError::IoError(e)
+        ProfError::IOError(e)
     }
 }
 
