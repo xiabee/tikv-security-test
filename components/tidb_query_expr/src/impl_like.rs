@@ -1,10 +1,8 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use regex::{bytes::Regex as BytesRegex, Regex};
 use tidb_query_codegen::rpn_fn;
 use tidb_query_common::Result;
 use tidb_query_datatype::codec::{collation::*, data_type::*};
-use tipb::{Expr, ExprType};
 
 #[rpn_fn]
 #[inline]
@@ -68,92 +66,6 @@ pub fn like<C: Collator, CS: Charset>(
     }
 
     Ok(Some(true as i64))
-}
-
-#[rpn_fn(capture = [metadata], metadata_mapper = init_regexp_utf8_data)]
-#[inline]
-pub fn regexp_utf8(
-    metadata: &Option<Regex>,
-    target: BytesRef,
-    pattern: BytesRef,
-) -> Result<Option<i64>> {
-    let target = String::from_utf8(target.to_vec())?;
-
-    match metadata {
-        Some(regex) => Ok(Some(regex.is_match(target.as_ref()) as i64)),
-        None => {
-            let pattern = String::from_utf8(pattern.to_vec())?;
-            let pattern = format!("(?i){}", pattern);
-
-            match Regex::new(&pattern) {
-                Ok(regex) => Ok(Some(regex.is_match(target.as_ref()) as i64)),
-                Err(err) => Err(box_err!("invalid regex pattern: {:?}", err)),
-            }
-        }
-    }
-}
-
-#[rpn_fn(capture = [metadata], metadata_mapper = init_regexp_data)]
-#[inline]
-pub fn regexp(
-    metadata: &Option<BytesRegex>,
-    target: BytesRef,
-    pattern: BytesRef,
-) -> Result<Option<i64>> {
-    match metadata {
-        Some(regex) => Ok(Some(regex.is_match(target.as_ref()) as i64)),
-        None => {
-            let pattern = String::from_utf8(pattern.to_vec())?;
-            match BytesRegex::new(&pattern) {
-                Ok(bytes_regex) => Ok(Some(bytes_regex.is_match(target.as_ref()) as i64)),
-                Err(err) => Err(box_err!("invalid regex pattern: {:?}", err)),
-            }
-        }
-    }
-}
-
-fn init_regexp_utf8_data(expr: &mut Expr) -> Result<Option<Regex>> {
-    let children = expr.mut_children();
-    if children.len() <= 1 {
-        return Ok(None);
-    }
-
-    let tree_node = &mut children[1];
-    match tree_node.get_tp() {
-        ExprType::Bytes | ExprType::String => {
-            let val = match String::from_utf8(tree_node.take_val()) {
-                Ok(val) => val,
-                Err(_) => return Ok(None),
-            };
-            match Regex::new(val.as_ref()) {
-                Ok(regex) => Ok(Some(regex)),
-                Err(_) => Ok(None),
-            }
-        }
-        _ => Ok(None),
-    }
-}
-
-fn init_regexp_data(expr: &mut Expr) -> Result<Option<BytesRegex>> {
-    let children = expr.mut_children();
-    if children.len() <= 1 {
-        return Ok(None);
-    }
-
-    let tree_node = &mut children[1];
-    match tree_node.get_tp() {
-        ExprType::Bytes | ExprType::String => {
-            let val = match String::from_utf8(tree_node.take_val()) {
-                Ok(val) => val,
-                Err(_) => return Ok(None),
-            };
-            match BytesRegex::new(val.as_ref()) {
-                Ok(regex) => Ok(Some(regex)),
-                Err(_) => Ok(None),
-            }
-        }
-        _ => Ok(None),
-    }
 }
 
 #[cfg(test)]

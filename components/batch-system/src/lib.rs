@@ -6,6 +6,7 @@ mod fsm;
 mod mailbox;
 mod metrics;
 mod router;
+mod scheduler;
 
 #[cfg(feature = "test-runner")]
 pub mod test_runner;
@@ -16,7 +17,7 @@ pub use self::{
         PollHandler, Poller, PoolState,
     },
     config::Config,
-    fsm::{Fsm, Priority},
+    fsm::{Fsm, FsmScheduler, Priority},
     mailbox::{BasicMailbox, Mailbox},
     router::Router,
 };

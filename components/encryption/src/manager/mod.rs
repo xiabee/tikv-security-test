@@ -2,7 +2,7 @@
 
 use std::{
     collections::hash_map::Entry,
-    io::{Error as IoError, ErrorKind, Result as IoResult},
+    io::{self, Error as IoError, ErrorKind, Result as IoResult},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -13,16 +13,19 @@ use std::{
 };
 
 use crossbeam::channel::{self, select, tick};
-use engine_traits::{EncryptionKeyManager, FileEncryptionInfo};
+use engine_traits::{
+    EncryptionKeyManager, EncryptionMethod as EtEncryptionMethod, FileEncryptionInfo,
+};
 use fail::fail_point;
 use file_system::File;
 use kvproto::encryptionpb::{DataKey, EncryptionMethod, FileDictionary, FileInfo, KeyDictionary};
 use protobuf::Message;
-use tikv_util::{box_err, debug, error, info, thd_name, warn};
+use tikv_util::{box_err, debug, error, info, sys::thread::StdThreadBuildWrapper, thd_name, warn};
+use tokio::sync::oneshot;
 
 use crate::{
     config::EncryptionConfig,
-    crypter::{self, compat, Iv},
+    crypter::{self, Iv},
     encrypted_file::EncryptedFile,
     file_dict_file::FileDictionaryFile,
     io::{DecrypterReader, EncrypterWriter},
@@ -34,6 +37,7 @@ use crate::{
 const KEY_DICT_NAME: &str = "key.dict";
 const FILE_DICT_NAME: &str = "file.dict";
 const ROTATE_CHECK_PERIOD: u64 = 600; // 10min
+const GENERATE_DATA_KEY_LIMIT: usize = 10;
 
 struct Dicts {
     // Maps data file paths to key id and metadata. This file is stored as plaintext.
@@ -191,13 +195,17 @@ impl Dicts {
         dict.files.get(fname).cloned()
     }
 
-    fn new_file(&self, fname: &str, method: EncryptionMethod) -> Result<FileInfo> {
+    fn new_file(&self, fname: &str, method: EncryptionMethod, sync: bool) -> Result<FileInfo> {
         let mut file_dict_file = self.file_dict_file.lock().unwrap();
-        let iv = Iv::new_ctr();
+        let iv = if method != EncryptionMethod::Plaintext {
+            Iv::new_ctr()
+        } else {
+            Iv::Empty
+        };
         let file = FileInfo {
             iv: iv.as_slice().to_vec(),
             key_id: self.current_key_id.load(Ordering::SeqCst),
-            method: compat(method),
+            method,
             ..Default::default()
         };
         let file_num = {
@@ -206,7 +214,7 @@ impl Dicts {
             file_dict.files.len() as _
         };
 
-        file_dict_file.insert(fname, &file)?;
+        file_dict_file.insert(fname, &file, sync)?;
         ENCRYPTION_FILE_NUM_GAUGE.set(file_num);
 
         if method != EncryptionMethod::Plaintext {
@@ -222,7 +230,7 @@ impl Dicts {
 
     // If the file does not exist, return Ok(())
     // In either case the intent that the file not exist is achieved.
-    fn delete_file(&self, fname: &str) -> Result<()> {
+    fn delete_file(&self, fname: &str, sync: bool) -> Result<()> {
         let mut file_dict_file = self.file_dict_file.lock().unwrap();
         let (file, file_num) = {
             let mut file_dict = self.file_dict.lock().unwrap();
@@ -240,9 +248,9 @@ impl Dicts {
             }
         };
 
-        file_dict_file.remove(fname)?;
+        file_dict_file.remove(fname, sync)?;
         ENCRYPTION_FILE_NUM_GAUGE.set(file_num);
-        if file.method != compat(EncryptionMethod::Plaintext) {
+        if file.method != EncryptionMethod::Plaintext {
             debug!("delete encrypted file"; "fname" => fname);
         } else {
             debug!("delete plaintext file"; "fname" => fname);
@@ -250,7 +258,7 @@ impl Dicts {
         Ok(())
     }
 
-    fn link_file(&self, src_fname: &str, dst_fname: &str) -> Result<Option<()>> {
+    fn link_file(&self, src_fname: &str, dst_fname: &str, sync: bool) -> Result<Option<()>> {
         let mut file_dict_file = self.file_dict_file.lock().unwrap();
         let (method, file, file_num) = {
             let mut file_dict = self.file_dict.lock().unwrap();
@@ -262,19 +270,19 @@ impl Dicts {
                     return Ok(None);
                 }
             };
-            // When an encrypted file exists in the file system, the file_dict must have info about
-            // this file. But the opposite is not true, this is because the actual file operation
-            // and file_dict operation are not atomic.
+            // When an encrypted file exists in the file system, the file_dict must have
+            // info about this file. But the opposite is not true, this is because the
+            // actual file operation and file_dict operation are not atomic.
             check_stale_file_exist(dst_fname, &mut file_dict, &mut file_dict_file)?;
             let method = file.method;
             file_dict.files.insert(dst_fname.to_owned(), file.clone());
             let file_num = file_dict.files.len() as _;
             (method, file, file_num)
         };
-        file_dict_file.insert(dst_fname, &file)?;
+        file_dict_file.insert(dst_fname, &file, sync)?;
         ENCRYPTION_FILE_NUM_GAUGE.set(file_num);
 
-        if method != compat(EncryptionMethod::Plaintext) {
+        if method != EncryptionMethod::Plaintext {
             info!("link encrypted file"; "src" => src_fname, "dst" => dst_fname);
         } else {
             info!("link plaintext file"; "src" => src_fname, "dst" => dst_fname);
@@ -315,7 +323,7 @@ impl Dicts {
             // Generate a new data key if
             //   1. encryption method is not the same, or
             //   2. the current data key was exposed and the new master key is secure.
-            if compat(method) == key.method && !(key.was_exposed && master_key.is_secure()) {
+            if method == key.method && !(key.was_exposed && master_key.is_secure()) {
                 let creation_time = UNIX_EPOCH + Duration::from_secs(key.creation_time);
                 match now.duration_since(creation_time) {
                     Ok(duration) => {
@@ -337,8 +345,7 @@ impl Dicts {
         let creation_time = duration.as_secs();
 
         // Generate new data key.
-        let generate_limit = 10;
-        for _ in 0..generate_limit {
+        for _ in 0..GENERATE_DATA_KEY_LIMIT {
             let (key_id, key) = generate_data_key(method);
             if key_id == 0 {
                 // 0 is invalid
@@ -359,7 +366,10 @@ impl Dicts {
             }
             return Ok(());
         }
-        Err(box_err!("key id collides {} times!", generate_limit))
+        Err(box_err!(
+            "key id collides {} times!",
+            GENERATE_DATA_KEY_LIMIT
+        ))
     }
 }
 
@@ -379,17 +389,22 @@ fn check_stale_file_exist(
             "Clean stale file information in file dictionary: {:?}",
             fname
         );
-        file_dict_file.remove(fname)?;
+        file_dict_file.remove(fname, true)?;
         let _ = file_dict.files.remove(fname);
     }
     Ok(())
+}
+
+enum RotateTask {
+    Terminate,
+    Save(oneshot::Sender<()>),
 }
 
 fn run_background_rotate_work(
     dict: Arc<Dicts>,
     method: EncryptionMethod,
     master_key: &dyn Backend,
-    terminal_recv: channel::Receiver<()>,
+    rx: channel::Receiver<RotateTask>,
 ) {
     let check_period = std::cmp::min(
         Duration::from_secs(ROTATE_CHECK_PERIOD),
@@ -403,9 +418,17 @@ fn run_background_rotate_work(
                 dict.maybe_rotate_data_key(method, master_key)
                     .expect("Rotating key operation encountered error in the background worker");
             },
-            recv(terminal_recv) -> _ => {
-                info!("Key rotate worker has been cancelled.");
-                break
+            recv(rx) -> r => {
+                match r {
+                    Err(_) | Ok(RotateTask::Terminate) => {
+                        info!("Key rotate worker has been cancelled.");
+                        return;
+                    }
+                    Ok(RotateTask::Save(tx)) => {
+                        dict.save_key_dict(master_key).expect("Saving key dict encountered error in the background worker");
+                        tx.send(()).unwrap();
+                    }
+                }
             },
         }
     }
@@ -424,7 +447,7 @@ fn generate_data_key(method: EncryptionMethod) -> (u64, Vec<u8>) {
 pub struct DataKeyManager {
     dicts: Arc<Dicts>,
     method: EncryptionMethod,
-    rotate_terminal: channel::Sender<()>,
+    rotate_tx: channel::Sender<RotateTask>,
     background_worker: Option<JoinHandle<()>>,
 }
 
@@ -484,7 +507,8 @@ impl DataKeyManager {
         Ok(Some(Self::from_dicts(dicts, args.method, master_key)?))
     }
 
-    /// Will block file operation for a considerable amount of time. Only used for debugging purpose.
+    /// Will block file operation for a considerable amount of time. Only used
+    /// for debugging purpose.
     pub fn retain_encrypted_files(&self, f: impl Fn(&str) -> bool) {
         let mut dict = self.dicts.file_dict.lock().unwrap();
         let mut file_dict_file = self.dicts.file_dict_file.lock().unwrap();
@@ -492,7 +516,7 @@ impl DataKeyManager {
             if info.method != EncryptionMethod::Plaintext {
                 let retain = f(fname);
                 if !retain {
-                    file_dict_file.remove(fname).unwrap();
+                    file_dict_file.remove(fname, true).unwrap();
                 }
                 retain
             } else {
@@ -511,7 +535,7 @@ impl DataKeyManager {
             Dicts::open(
                 &args.dict_path,
                 args.rotation_period,
-                &*master_key,
+                master_key,
                 args.enable_file_dictionary_log,
                 args.file_dictionary_rewrite_threshold,
             ),
@@ -577,7 +601,7 @@ impl DataKeyManager {
             ))
         })?;
         // Rewrite key_dict after replace master key.
-        dicts.save_key_dict(&*master_key)?;
+        dicts.save_key_dict(master_key)?;
 
         info!("encryption: persisted result after replace master key.");
         Ok(dicts)
@@ -591,10 +615,10 @@ impl DataKeyManager {
         dicts.maybe_rotate_data_key(method, &*master_key)?;
         let dicts = Arc::new(dicts);
         let dict_clone = dicts.clone();
-        let (rotate_terminal, rx) = channel::bounded(1);
+        let (rotate_tx, rx) = channel::bounded(1);
         let background_worker = std::thread::Builder::new()
             .name(thd_name!("enc:key"))
-            .spawn(move || {
+            .spawn_wrapper(move || {
                 run_background_rotate_work(dict_clone, method, &*master_key, rx);
             })?;
 
@@ -603,14 +627,14 @@ impl DataKeyManager {
         Ok(DataKeyManager {
             dicts,
             method,
-            rotate_terminal,
+            rotate_tx,
             background_worker: Some(background_worker),
         })
     }
 
     pub fn create_file_for_write<P: AsRef<Path>>(&self, path: P) -> Result<EncrypterWriter<File>> {
         let file_writer = File::create(&path)?;
-        self.open_file_with_writer(path, file_writer, true /*create*/)
+        self.open_file_with_writer(path, file_writer, true /* create */)
     }
 
     pub fn open_file_with_writer<P: AsRef<Path>, W: std::io::Write>(
@@ -632,9 +656,14 @@ impl DataKeyManager {
         };
         EncrypterWriter::new(
             writer,
-            crypter::encryption_method_from_db_encryption_method(file.method),
+            crypter::from_engine_encryption_method(file.method),
             &file.key,
-            Iv::from_slice(&file.iv)?,
+            if file.method == EtEncryptionMethod::Plaintext {
+                debug_assert!(file.iv.is_empty());
+                Iv::Empty
+            } else {
+                Iv::from_slice(&file.iv)?
+            },
         )
     }
 
@@ -657,9 +686,14 @@ impl DataKeyManager {
         let file = self.get_file(fname)?;
         DecrypterReader::new(
             reader,
-            crypter::encryption_method_from_db_encryption_method(file.method),
+            crypter::from_engine_encryption_method(file.method),
             &file.key,
-            Iv::from_slice(&file.iv)?,
+            if file.method == EtEncryptionMethod::Plaintext {
+                debug_assert!(file.iv.is_empty());
+                Iv::Empty
+            } else {
+                Iv::from_slice(&file.iv)?
+            },
         )
     }
 
@@ -691,9 +725,9 @@ impl DataKeyManager {
         let (_, file_dict) = FileDictionaryFile::open(
             dict_path,
             FILE_DICT_NAME,
-            true, /*enable_file_dictionary_log*/
+            true, // enable_file_dictionary_log
             1,
-            true, /*skip_rewrite*/
+            true, // skip_rewrite
         )?;
         if let Some(file_path) = file_path {
             if let Some(info) = file_dict.files.get(file_path) {
@@ -730,16 +764,65 @@ impl DataKeyManager {
         };
         let encrypted_file = FileEncryptionInfo {
             key,
-            method: crypter::encryption_method_to_db_encryption_method(method),
+            method: crypter::to_engine_encryption_method(method),
             iv,
         };
         Ok(Some(encrypted_file))
+    }
+
+    /// Removes data keys under the directory `logical`. If `physical` is
+    /// present, if means the `logical` directory is already physically renamed
+    /// to `physical`.
+    /// There're two uses of this function:
+    ///
+    /// (1) without `physical`: `remove_dir` is called before
+    /// `fs::remove_dir_all`. User must guarantee that this directory won't be
+    /// read again even if the removal fails or panics.
+    ///
+    /// (2) with `physical`: Use `fs::rename` to rename the directory to trash.
+    /// Then `remove_dir` with `physical` set to the trash directory name.
+    /// Finally remove the trash directory. This is the safest way to delete a
+    /// directory.
+    pub fn remove_dir(&self, logical: &Path, physical: Option<&Path>) -> IoResult<()> {
+        let scan = physical.unwrap_or(logical);
+        debug_assert!(scan.is_dir());
+        if !scan.exists() {
+            return Ok(());
+        }
+        let mut iter = walkdir::WalkDir::new(scan).into_iter().peekable();
+        while let Some(e) = iter.next() {
+            let e = e?;
+            if e.path_is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("unexpected symbolic link: {}", e.path().display()),
+                ));
+            }
+            let fname = e.path().to_str().unwrap();
+            let sync = iter.peek().is_none();
+            if let Some(p) = physical {
+                let sub = fname
+                    .strip_prefix(p.to_str().unwrap())
+                    .unwrap()
+                    .trim_start_matches('/');
+                self.dicts
+                    .delete_file(logical.join(sub).to_str().unwrap(), sync)?;
+            } else {
+                self.dicts.delete_file(fname, sync)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return which method this manager is using.
+    pub fn encryption_method(&self) -> engine_traits::EncryptionMethod {
+        crypter::to_engine_encryption_method(self.method)
     }
 }
 
 impl Drop for DataKeyManager {
     fn drop(&mut self) {
-        if let Err(e) = self.rotate_terminal.send(()) {
+        if let Err(e) = self.rotate_tx.send(RotateTask::Terminate) {
             info!("failed to terminate background rotation, are we shutting down?"; "err" => %e);
         }
         if let Some(Err(e)) = self.background_worker.take().map(|w| w.join()) {
@@ -757,10 +840,10 @@ impl EncryptionKeyManager for DataKeyManager {
                 // Return Plaintext if file is not found
                 // RocksDB requires this
                 let file = FileInfo::default();
-                let method = compat(EncryptionMethod::Plaintext);
+                let method = EncryptionMethod::Plaintext;
                 Ok(FileEncryptionInfo {
                     key: vec![],
-                    method: crypter::encryption_method_to_db_encryption_method(method),
+                    method: crypter::to_engine_encryption_method(method),
                     iv: file.iv,
                 })
             }
@@ -771,10 +854,10 @@ impl EncryptionKeyManager for DataKeyManager {
     fn new_file(&self, fname: &str) -> IoResult<FileEncryptionInfo> {
         let (_, data_key) = self.dicts.current_data_key();
         let key = data_key.get_key().to_owned();
-        let file = self.dicts.new_file(fname, self.method)?;
+        let file = self.dicts.new_file(fname, self.method, true)?;
         let encrypted_file = FileEncryptionInfo {
             key,
-            method: crypter::encryption_method_to_db_encryption_method(file.method),
+            method: crypter::to_engine_encryption_method(file.method),
             iv: file.get_iv().to_owned(),
         };
         Ok(encrypted_file)
@@ -784,19 +867,169 @@ impl EncryptionKeyManager for DataKeyManager {
         fail_point!("key_manager_fails_before_delete_file", |_| IoResult::Err(
             std::io::ErrorKind::Other.into()
         ));
-        self.dicts.delete_file(fname)?;
+        // `RemoveDir` is not managed, but RocksDB may use `RenameFile` on a directory,
+        // which internally calls `LinkFile` and `DeleteFile`.
+        let path = Path::new(fname);
+        if path.is_dir() {
+            let mut iter = walkdir::WalkDir::new(path).into_iter().peekable();
+            while let Some(e) = iter.next() {
+                self.dicts
+                    .delete_file(e?.path().to_str().unwrap(), iter.peek().is_none())?;
+            }
+        } else {
+            self.dicts.delete_file(fname, true)?;
+        }
         Ok(())
     }
 
     fn link_file(&self, src_fname: &str, dst_fname: &str) -> IoResult<()> {
-        self.dicts.link_file(src_fname, dst_fname)?;
+        let src_path = Path::new(src_fname);
+        let dst_path = Path::new(dst_fname);
+        if src_path.is_dir() {
+            let mut iter = walkdir::WalkDir::new(src_path)
+                .into_iter()
+                .filter(|e| e.as_ref().map_or(true, |e| !e.path().is_dir()))
+                .peekable();
+            while let Some(e) = iter.next() {
+                let e = e?;
+                if e.path_is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unexpected symbolic link: {}", e.path().display()),
+                    ));
+                }
+                let sub_path = e.path().strip_prefix(src_path).unwrap();
+                let src = e.path().to_str().unwrap();
+                let dst_path = dst_path.join(sub_path);
+                let dst = dst_path.to_str().unwrap();
+                self.dicts.link_file(src, dst, iter.peek().is_none())?;
+            }
+        } else {
+            self.dicts.link_file(src_fname, dst_fname, true)?;
+        }
         Ok(())
+    }
+}
+
+/// An RAII-style importer of data keys. It automatically creates data key that
+/// doesn't exist locally. It synchronizes log file in batch. It automatically
+/// reverts changes if caller aborts.
+pub struct DataKeyImporter<'a> {
+    manager: &'a DataKeyManager,
+    // Added file names.
+    file_additions: Vec<String>,
+    // Added key ids.
+    key_additions: Vec<u64>,
+    committed: bool,
+}
+
+#[allow(dead_code)]
+impl<'a> DataKeyImporter<'a> {
+    pub fn new(manager: &'a DataKeyManager) -> Self {
+        Self {
+            manager,
+            file_additions: Vec::new(),
+            key_additions: Vec::new(),
+            committed: false,
+        }
+    }
+
+    pub fn add(&mut self, fname: &str, iv: Vec<u8>, new_key: DataKey) -> Result<()> {
+        let method = new_key.method;
+        let mut key_id = None;
+        {
+            let mut key_dict = self.manager.dicts.key_dict.lock().unwrap();
+            for (id, data_key) in &key_dict.keys {
+                if data_key.key == new_key.key {
+                    key_id = Some(*id);
+                }
+            }
+            if key_id.is_none() {
+                for _ in 0..GENERATE_DATA_KEY_LIMIT {
+                    // Match `generate_data_key`.
+                    use rand::{rngs::OsRng, RngCore};
+                    let id = OsRng.next_u64();
+                    if let Entry::Vacant(e) = key_dict.keys.entry(id) {
+                        key_id = Some(id);
+                        e.insert(new_key);
+                        self.key_additions.push(id);
+                        break;
+                    }
+                }
+                if key_id.is_none() {
+                    return Err(box_err!(
+                        "key id collides {} times!",
+                        GENERATE_DATA_KEY_LIMIT
+                    ));
+                }
+            }
+        }
+
+        let file = FileInfo {
+            iv,
+            key_id: key_id.unwrap(),
+            method,
+            ..Default::default()
+        };
+        let mut file_dict_file = self.manager.dicts.file_dict_file.lock().unwrap();
+        let file_num = {
+            let mut file_dict = self.manager.dicts.file_dict.lock().unwrap();
+            if let Entry::Vacant(e) = file_dict.files.entry(fname.to_owned()) {
+                e.insert(file.clone());
+            } else {
+                return Err(box_err!("file name collides with existing file: {}", fname));
+            }
+            file_dict.files.len() as _
+        };
+        file_dict_file.insert(fname, &file, false)?;
+        self.file_additions.push(fname.to_owned());
+        ENCRYPTION_FILE_NUM_GAUGE.set(file_num);
+        Ok(())
+    }
+
+    pub fn commit(mut self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        if !self.key_additions.is_empty() {
+            self.manager.rotate_tx.send(RotateTask::Save(tx)).unwrap();
+            rx.blocking_recv().unwrap();
+        }
+        if !self.file_additions.is_empty() {
+            self.manager.dicts.file_dict_file.lock().unwrap().sync()?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+
+    pub fn rollback(&mut self) -> Result<()> {
+        assert!(!self.committed);
+        let mut iter = self.file_additions.drain(..).peekable();
+        while let Some(f) = iter.next() {
+            self.manager.dicts.delete_file(&f, iter.peek().is_none())?;
+        }
+        for key_id in self.key_additions.drain(..) {
+            let mut key_dict = self.manager.dicts.key_dict.lock().unwrap();
+            key_dict.keys.remove(&key_id);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.manager.rotate_tx.send(RotateTask::Save(tx)).unwrap();
+        rx.blocking_recv().unwrap();
+        Ok(())
+    }
+}
+
+impl<'a> Drop for DataKeyImporter<'a> {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(e) = self.rollback() {
+                warn!("failed to rollback imported data keys"; "err" => ?e);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use engine_traits::EncryptionMethod as DBEncryptionMethod;
+    use engine_traits::EncryptionMethod as EtEncryptionMethod;
     use file_system::{remove_file, File};
     use matches::assert_matches;
     use tempfile::TempDir;
@@ -813,7 +1046,7 @@ mod tests {
     }
 
     fn new_mock_backend() -> Box<MockBackend> {
-        Box::new(MockBackend::default())
+        Box::<MockBackend>::default()
     }
 
     fn new_key_manager_def(
@@ -827,7 +1060,7 @@ mod tests {
         }
         match DataKeyManager::new_previous_loaded(
             master_backend,
-            Box::new(MockBackend::default()),
+            Box::<MockBackend>::default(),
             args,
         ) {
             Ok(None) => panic!("expected encryption"),
@@ -842,7 +1075,7 @@ mod tests {
             rotation_period: Duration::from_secs(60),
             enable_file_dictionary_log: true,
             file_dictionary_rewrite_threshold: 2,
-            dict_path: tmp_dir.path().as_os_str().to_str().unwrap().to_string(),
+            dict_path: tmp_dir.path().to_str().unwrap().to_string(),
         }
     }
 
@@ -919,7 +1152,7 @@ mod tests {
         let foo3 = manager.get_file("foo").unwrap();
         assert_eq!(foo1, foo3);
         let bar = manager.new_file("bar").unwrap();
-        assert_eq!(bar.method, DBEncryptionMethod::Plaintext);
+        assert_eq!(bar.method, EtEncryptionMethod::Plaintext);
     }
 
     // When enabling encryption, using insecure master key is not allowed.
@@ -930,7 +1163,7 @@ mod tests {
         let manager = new_key_manager(
             &tmp_dir,
             Some(EncryptionMethod::Aes256Ctr),
-            Box::new(PlaintextBackend::default()),
+            Box::<PlaintextBackend>::default(),
             new_mock_backend() as Box<dyn Backend>,
         );
         manager.err().unwrap();
@@ -1299,13 +1532,283 @@ mod tests {
             encrypt_fail: false,
             ..MockBackend::default()
         });
-        let previous = Box::new(PlaintextBackend::default()) as Box<dyn Backend>;
+        let previous = Box::<PlaintextBackend>::default() as Box<dyn Backend>;
 
         let result = new_key_manager(&tmp_dir, None, wrong_key, previous);
-        // When the master key is invalid, the key manager left a empty file dict and return errors.
+        // When the master key is invalid, the key manager left a empty file dict and
+        // return errors.
         assert!(result.is_err());
-        let previous = Box::new(PlaintextBackend::default()) as Box<dyn Backend>;
-        let result = new_key_manager(&tmp_dir, None, right_key, previous);
-        assert!(result.is_ok());
+        let previous = Box::<PlaintextBackend>::default() as Box<dyn Backend>;
+        new_key_manager(&tmp_dir, None, right_key, previous).unwrap();
+    }
+
+    #[test]
+    fn test_plaintext_encrypter_writer() {
+        use std::io::{Read, Write};
+
+        let _guard = LOCK_FOR_GAUGE.lock().unwrap();
+        let (key_path, _tmp_key_dir) = create_key_file("key");
+        let master_key_backend =
+            Box::new(FileBackend::new(key_path.as_path()).unwrap()) as Box<dyn Backend>;
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let previous = new_mock_backend() as Box<dyn Backend>;
+        let manager = new_key_manager(&tmp_dir, None, master_key_backend, previous).unwrap();
+        let path = tmp_dir.path().join("nonencyrpted");
+        let content = "I'm exposed.".to_string();
+        {
+            let raw = File::create(&path).unwrap();
+            let mut f = manager
+                .open_file_with_writer(&path, raw, false /* create */)
+                .unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        {
+            let mut buffer = String::new();
+            let mut f = File::open(&path).unwrap();
+            assert_eq!(f.read_to_string(&mut buffer).unwrap(), content.len());
+            assert_eq!(buffer, content);
+        }
+        {
+            let mut buffer = String::new();
+            let mut f = manager.open_file_for_read(&path).unwrap();
+            assert_eq!(f.read_to_string(&mut buffer).unwrap(), content.len());
+            assert_eq!(buffer, content);
+        }
+    }
+
+    fn generate_mock_file<P: AsRef<Path>>(dkm: Option<&DataKeyManager>, path: P, content: &String) {
+        use std::io::Write;
+        match dkm {
+            Some(manager) => {
+                // Encryption enabled. Use DataKeyManager to manage file.
+                let mut f = manager.create_file_for_write(&path).unwrap();
+                f.write_all(content.as_bytes()).unwrap();
+                f.sync_all().unwrap();
+            }
+            None => {
+                // Encryption disabled. Write content in plaintext.
+                let mut f = File::create(&path).unwrap();
+                f.write_all(content.as_bytes()).unwrap();
+                f.sync_all().unwrap();
+            }
+        }
+    }
+
+    fn check_mock_file_content<P: AsRef<Path>>(
+        dkm: Option<&DataKeyManager>,
+        path: P,
+        expected: &String,
+    ) {
+        use std::io::Read;
+
+        match dkm {
+            Some(manager) => {
+                let mut buffer = String::new();
+                let mut f = manager.open_file_for_read(&path).unwrap();
+                assert_eq!(f.read_to_string(&mut buffer).unwrap(), expected.len());
+                assert_eq!(buffer, expected.to_string());
+            }
+            None => {
+                let mut buffer = String::new();
+                let mut f = File::open(&path).unwrap();
+                assert_eq!(f.read_to_string(&mut buffer).unwrap(), expected.len());
+                assert_eq!(buffer, expected.to_string());
+            }
+        }
+    }
+
+    fn test_change_method(from: EncryptionMethod, to: EncryptionMethod) {
+        if from == to {
+            return;
+        }
+
+        let generate_file_name = |method| format!("{:?}", method);
+        let generate_file_content = |method| format!("Encrypted with {:?}", method);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let (key_path, _tmp_key_dir) = create_key_file("key");
+        let master_key_backend =
+            Box::new(FileBackend::new(key_path.as_path()).unwrap()) as Box<dyn Backend>;
+        let previous = new_mock_backend() as Box<dyn Backend>;
+        let path_to_file1 = tmp_dir.path().join(generate_file_name(from));
+        let content1 = generate_file_content(from);
+
+        if from == EncryptionMethod::Plaintext {
+            // encryption not enabled.
+            let mut args = def_data_key_args(&tmp_dir);
+            args.method = EncryptionMethod::Plaintext;
+            let manager =
+                DataKeyManager::new(master_key_backend, Box::new(move || Ok(previous)), args)
+                    .unwrap();
+            assert!(manager.is_none());
+            generate_mock_file(None, &path_to_file1, &content1);
+            check_mock_file_content(None, &path_to_file1, &content1);
+        } else {
+            let manager =
+                new_key_manager(&tmp_dir, Some(from), master_key_backend, previous).unwrap();
+
+            generate_mock_file(Some(&manager), &path_to_file1, &content1);
+            check_mock_file_content(Some(&manager), &path_to_file1, &content1);
+            // Close old manager
+            drop(manager);
+        }
+
+        // re-open with new encryption/plaintext algorithm.
+        let master_key_backend =
+            Box::new(FileBackend::new(key_path.as_path()).unwrap()) as Box<dyn Backend>;
+        let previous = new_mock_backend() as Box<dyn Backend>;
+        let manager = new_key_manager(&tmp_dir, Some(to), master_key_backend, previous).unwrap();
+        let path_to_file2 = tmp_dir.path().join(generate_file_name(to));
+
+        let content2 = generate_file_content(to);
+        generate_mock_file(Some(&manager), &path_to_file2, &content2);
+        check_mock_file_content(Some(&manager), &path_to_file2, &content2);
+        // check old file content
+        check_mock_file_content(Some(&manager), &path_to_file1, &content1);
+    }
+
+    #[test]
+    fn test_encryption_algorithm_switch() {
+        let _guard = LOCK_FOR_GAUGE.lock().unwrap();
+
+        let method_list = [
+            EncryptionMethod::Plaintext,
+            EncryptionMethod::Aes128Ctr,
+            EncryptionMethod::Aes192Ctr,
+            EncryptionMethod::Aes256Ctr,
+            EncryptionMethod::Sm4Ctr,
+        ];
+        for from in method_list {
+            for to in method_list {
+                test_change_method(from, to)
+            }
+        }
+    }
+
+    #[test]
+    fn test_rename_dir() {
+        let _guard = LOCK_FOR_GAUGE.lock().unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let manager = new_key_manager_def(&tmp_dir, Some(EncryptionMethod::Aes192Ctr)).unwrap();
+        let subdir = tmp_dir.path().join("foo");
+        std::fs::create_dir(&subdir).unwrap();
+        let file_a = manager
+            .new_file(subdir.join("a").to_str().unwrap())
+            .unwrap();
+        File::create(subdir.join("a")).unwrap();
+        let file_b = manager
+            .new_file(subdir.join("b").to_str().unwrap())
+            .unwrap();
+        File::create(subdir.join("b")).unwrap();
+
+        let dstdir = tmp_dir.path().join("bar");
+        manager
+            .link_file(subdir.to_str().unwrap(), dstdir.to_str().unwrap())
+            .unwrap();
+        manager.delete_file(subdir.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            manager
+                .get_file(dstdir.join("a").to_str().unwrap())
+                .unwrap(),
+            file_a
+        );
+        assert_eq!(
+            manager
+                .get_file_exists(subdir.join("a").to_str().unwrap())
+                .unwrap(),
+            None
+        );
+
+        assert_eq!(
+            manager
+                .get_file(dstdir.join("b").to_str().unwrap())
+                .unwrap(),
+            file_b
+        );
+        assert_eq!(
+            manager
+                .get_file_exists(subdir.join("b").to_str().unwrap())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_import_keys() {
+        let _guard = LOCK_FOR_GAUGE.lock().unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let manager = new_key_manager_def(&tmp_dir, Some(EncryptionMethod::Aes192Ctr)).unwrap();
+
+        let mut importer = DataKeyImporter::new(&manager);
+        let file0 = manager.new_file("0").unwrap();
+
+        // conflict
+        importer
+            .add("0", file0.iv.clone(), DataKey::default())
+            .unwrap_err();
+        // same key
+        importer
+            .add(
+                "1",
+                file0.iv.clone(),
+                DataKey {
+                    key: file0.key.clone(),
+                    method: EncryptionMethod::Aes192Ctr,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // different key
+        let (_, key2) = generate_data_key(EncryptionMethod::Aes192Ctr);
+        importer
+            .add(
+                "2",
+                Iv::new_ctr().as_slice().to_owned(),
+                DataKey {
+                    key: key2.clone(),
+                    method: EncryptionMethod::Aes192Ctr,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(manager.get_file("0").unwrap(), file0);
+        assert_eq!(manager.get_file("1").unwrap(), file0);
+        assert_eq!(manager.get_file("2").unwrap().key, key2);
+
+        drop(importer);
+        assert_eq!(manager.get_file_exists("1").unwrap(), None);
+        assert_eq!(manager.get_file_exists("2").unwrap(), None);
+
+        let mut importer = DataKeyImporter::new(&manager);
+        // same key
+        importer
+            .add(
+                "1",
+                file0.iv.clone(),
+                DataKey {
+                    key: file0.key.clone(),
+                    method: EncryptionMethod::Aes192Ctr,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // different key
+        importer
+            .add(
+                "2",
+                Iv::new_ctr().as_slice().to_owned(),
+                DataKey {
+                    key: key2.clone(),
+                    method: EncryptionMethod::Aes192Ctr,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // importer is dropped here.
+        importer.commit().unwrap();
+        assert_eq!(manager.get_file("1").unwrap(), file0);
+        assert_eq!(manager.get_file("2").unwrap().key, key2);
     }
 }

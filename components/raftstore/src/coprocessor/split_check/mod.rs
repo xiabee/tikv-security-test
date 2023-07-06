@@ -92,8 +92,8 @@ impl<'a, E> Host<'a, E> {
         const MIN_BUCKET_COUNT_PER_REGION: u64 = 2;
         if region_size >= self.cfg.region_bucket_size.0 * MIN_BUCKET_COUNT_PER_REGION {
             let mut bucket_checker = size::Checker::new(
-                self.cfg.region_bucket_size.0, /* not used */
-                self.cfg.region_bucket_size.0, /* not used */
+                self.cfg.region_bucket_size.0, // not used
+                self.cfg.region_bucket_size.0, // not used
                 region_size / self.cfg.region_bucket_size.0,
                 CheckPolicy::Approximate,
             );
@@ -120,7 +120,7 @@ impl<'a, E> Host<'a, E> {
 
     #[inline]
     pub fn enable_region_bucket(&self) -> bool {
-        self.cfg.enable_region_bucket
+        self.cfg.enable_region_bucket()
     }
 
     #[inline]

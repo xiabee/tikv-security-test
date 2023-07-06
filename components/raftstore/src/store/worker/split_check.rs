@@ -7,25 +7,27 @@ use std::{
     mem,
 };
 
-use engine_traits::{CfName, IterOptions, Iterable, Iterator, KvEngine, CF_WRITE, LARGE_CFS};
-use file_system::{IOType, WithIOType};
-use itertools::Itertools;
-use kvproto::{
-    metapb::{Region, RegionEpoch},
-    pdpb::CheckPolicy,
+use engine_traits::{
+    CfName, IterOptions, Iterable, Iterator, KvEngine, TabletRegistry, CF_WRITE, LARGE_CFS,
 };
+use file_system::{IoType, WithIoType};
+use itertools::Itertools;
+use kvproto::{metapb::Region, pdpb::CheckPolicy};
 use online_config::{ConfigChange, OnlineConfig};
-use tikv_util::{box_err, debug, error, info, keybuilder::KeyBuilder, warn, worker::Runnable};
+use tikv_util::{
+    box_err, debug, error, info, keybuilder::KeyBuilder, warn, worker::Runnable, Either,
+};
+use txn_types::Key;
 
 use super::metrics::*;
 #[cfg(any(test, feature = "testexport"))]
 use crate::coprocessor::Config;
 use crate::{
     coprocessor::{
+        dispatcher::StoreHandle,
         split_observer::{is_valid_split_key, strip_timestamp_if_exists},
         CoprocessorHost, SplitCheckerHost,
     },
-    store::{Callback, CasualMessage, CasualRouter},
     Result,
 };
 
@@ -97,14 +99,14 @@ where
                 Some(KeyBuilder::from_slice(end_key, 0, 0)),
                 fill_cache,
             );
-            let mut iter = db.iterator_cf_opt(cf, iter_opt)?;
-            let found: Result<bool> = iter.seek(start_key.into()).map_err(|e| box_err!(e));
+            let mut iter = db.iterator_opt(cf, iter_opt)?;
+            let found: Result<bool> = iter.seek(start_key).map_err(|e| box_err!(e));
             if found? {
                 heap.push(KeyEntry::new(
                     iter.key().to_vec(),
                     pos,
                     iter.value().len(),
-                    *cf,
+                    cf,
                 ));
             }
             iters.push((*cf, iter));
@@ -130,10 +132,10 @@ where
     }
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct BucketRange(pub Vec<u8>, pub Vec<u8>);
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct Bucket {
     // new proposed split keys under the bucket for split
     // if it does not need split, it's empty
@@ -145,6 +147,8 @@ pub struct Bucket {
 pub enum Task {
     SplitCheckTask {
         region: Region,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
         auto_split: bool,
         policy: CheckPolicy,
         bucket_ranges: Option<Vec<BucketRange>>,
@@ -164,6 +168,26 @@ impl Task {
     ) -> Task {
         Task::SplitCheckTask {
             region,
+            start_key: None,
+            end_key: None,
+            auto_split,
+            policy,
+            bucket_ranges,
+        }
+    }
+
+    pub fn split_check_key_range(
+        region: Region,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
+        auto_split: bool,
+        policy: CheckPolicy,
+        bucket_ranges: Option<Vec<BucketRange>>,
+    ) -> Task {
+        Task::SplitCheckTask {
+            region,
+            start_key,
+            end_key,
             auto_split,
             policy,
             bucket_ranges,
@@ -175,11 +199,17 @@ impl Display for Task {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Task::SplitCheckTask {
-                region, auto_split, ..
+                region,
+                start_key,
+                end_key,
+                auto_split,
+                ..
             } => write!(
                 f,
-                "[split check worker] Split Check Task for {}, auto_split: {:?}",
+                "[split check worker] Split Check Task for {}, start_key: {:?}, end_key: {:?}, auto_split: {:?}",
                 region.get_id(),
+                start_key,
+                end_key,
                 auto_split
             ),
             Task::ChangeConfig(_) => write!(f, "[split check worker] Change Config Task"),
@@ -190,23 +220,30 @@ impl Display for Task {
     }
 }
 
-pub struct Runner<E, S>
-where
-    E: KvEngine,
-{
-    engine: E,
+pub struct Runner<EK: KvEngine, S> {
+    // We can't just use `TabletRegistry` here, otherwise v1 may create many
+    // invalid records and cause other problems.
+    engine: Either<EK, TabletRegistry<EK>>,
     router: S,
-    coprocessor: CoprocessorHost<E>,
+    coprocessor: CoprocessorHost<EK>,
 }
 
-impl<E, S> Runner<E, S>
-where
-    E: KvEngine,
-    S: CasualRouter<E>,
-{
-    pub fn new(engine: E, router: S, coprocessor: CoprocessorHost<E>) -> Runner<E, S> {
+impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
+    pub fn new(engine: EK, router: S, coprocessor: CoprocessorHost<EK>) -> Runner<EK, S> {
         Runner {
-            engine,
+            engine: Either::Left(engine),
+            router,
+            coprocessor,
+        }
+    }
+
+    pub fn with_registry(
+        registry: TabletRegistry<EK>,
+        router: S,
+        coprocessor: CoprocessorHost<EK>,
+    ) -> Runner<EK, S> {
+        Runner {
+            engine: Either::Right(registry),
             router,
             coprocessor,
         }
@@ -214,8 +251,9 @@ where
 
     fn approximate_check_bucket(
         &self,
+        tablet: &EK,
         region: &Region,
-        host: &mut SplitCheckerHost<'_, E>,
+        host: &mut SplitCheckerHost<'_, EK>,
         bucket_ranges: Option<Vec<BucketRange>>,
     ) -> Result<()> {
         let ranges = bucket_ranges.clone().unwrap_or_else(|| {
@@ -229,7 +267,7 @@ where
             let mut bucket = region.clone();
             bucket.set_start_key(range.0.clone());
             bucket.set_end_key(range.1.clone());
-            let bucket_entry = host.approximate_bucket_keys(&bucket, &self.engine)?;
+            let bucket_entry = host.approximate_bucket_keys(&bucket, tablet)?;
             debug!(
                 "bucket_entry size {} keys count {}",
                 bucket_entry.size,
@@ -299,64 +337,110 @@ where
         region: &Region,
         bucket_ranges: Option<Vec<BucketRange>>,
     ) {
-        let _ = self.router.send(
+        self.router.refresh_region_buckets(
             region.get_id(),
-            CasualMessage::RefreshRegionBuckets {
-                region_epoch: region.get_region_epoch().clone(),
-                buckets,
-                bucket_ranges,
-                cb: Callback::None,
-            },
+            region.get_region_epoch().clone(),
+            buckets,
+            bucket_ranges,
         );
     }
 
-    /// Checks a Region with split and bucket checkers to produce split keys and buckets keys and generates split admin command.
+    /// Checks a Region with split and bucket checkers to produce split keys and
+    /// buckets keys and generates split admin command.
     fn check_split_and_bucket(
         &mut self,
         region: &Region,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
         auto_split: bool,
         policy: CheckPolicy,
         bucket_ranges: Option<Vec<BucketRange>>,
     ) {
+        let mut cached;
+        let tablet = match &self.engine {
+            Either::Left(e) => e,
+            Either::Right(r) => match r.get(region.get_id()) {
+                Some(c) => {
+                    cached = Some(c);
+                    match cached.as_mut().unwrap().latest() {
+                        Some(t) => t,
+                        None => return,
+                    }
+                }
+                None => return,
+            },
+        };
         let region_id = region.get_id();
-        let start_key = keys::enc_start_key(region);
-        let end_key = keys::enc_end_key(region);
+        let is_key_range = start_key.is_some() && end_key.is_some();
+        let start_key = if is_key_range {
+            // This key is usually from a request, which should be encoded first.
+            keys::data_key(Key::from_raw(&start_key.unwrap()).as_encoded().as_slice())
+        } else {
+            keys::enc_start_key(region)
+        };
+        let end_key = if is_key_range {
+            keys::data_end_key(Key::from_raw(&end_key.unwrap()).as_encoded().as_slice())
+        } else {
+            keys::enc_end_key(region)
+        };
         debug!(
             "executing task";
             "region_id" => region_id,
+            "is_key_range" => is_key_range,
             "start_key" => log_wrappers::Value::key(&start_key),
             "end_key" => log_wrappers::Value::key(&end_key),
             "policy" => ?policy,
         );
         CHECK_SPILT_COUNTER.all.inc();
-        let mut host =
-            self.coprocessor
-                .new_split_checker_host(region, &self.engine, auto_split, policy);
+        let mut host = self
+            .coprocessor
+            .new_split_checker_host(region, tablet, auto_split, policy);
 
         if host.skip() {
-            debug!("skip split check"; "region_id" => region.get_id());
+            debug!("skip split check";
+                "region_id" => region.get_id(),
+                "is_key_range" => is_key_range,
+                "start_key" => log_wrappers::Value::key(&start_key),
+                "end_key" => log_wrappers::Value::key(&end_key),
+            );
             return;
         }
 
         let split_keys = match host.policy() {
             CheckPolicy::Scan => {
-                match self.scan_split_keys(&mut host, region, &start_key, &end_key, bucket_ranges) {
+                match self.scan_split_keys(
+                    &mut host,
+                    tablet,
+                    region,
+                    is_key_range,
+                    &start_key,
+                    &end_key,
+                    bucket_ranges,
+                ) {
                     Ok(keys) => keys,
                     Err(e) => {
-                        error!(%e; "failed to scan split key"; "region_id" => region_id,);
+                        error!(%e; "failed to scan split key";
+                            "region_id" => region_id,
+                            "is_key_range" => is_key_range,
+                            "start_key" => log_wrappers::Value::key(&start_key),
+                            "end_key" => log_wrappers::Value::key(&end_key),
+                        );
                         return;
                     }
                 }
             }
-            CheckPolicy::Approximate => match host.approximate_split_keys(region, &self.engine) {
+            CheckPolicy::Approximate => match host.approximate_split_keys(region, tablet) {
                 Ok(keys) => {
                     if host.enable_region_bucket() {
                         if let Err(e) =
-                            self.approximate_check_bucket(region, &mut host, bucket_ranges)
+                            self.approximate_check_bucket(tablet, region, &mut host, bucket_ranges)
                         {
                             error!(%e;
                                 "approximate_check_bucket failed";
                                 "region_id" => region_id,
+                                "is_key_range" => is_key_range,
+                                "start_key" => log_wrappers::Value::key(&start_key),
+                                "end_key" => log_wrappers::Value::key(&end_key),
                             );
                         }
                     }
@@ -368,17 +452,27 @@ where
                     error!(%e;
                         "failed to get approximate split key, try scan way";
                         "region_id" => region_id,
+                        "is_key_range" => is_key_range,
+                        "start_key" => log_wrappers::Value::key(&start_key),
+                        "end_key" => log_wrappers::Value::key(&end_key),
                     );
                     match self.scan_split_keys(
                         &mut host,
+                        tablet,
                         region,
+                        is_key_range,
                         &start_key,
                         &end_key,
                         bucket_ranges,
                     ) {
                         Ok(keys) => keys,
                         Err(e) => {
-                            error!(%e; "failed to scan split key"; "region_id" => region_id,);
+                            error!(%e; "failed to scan split key";
+                                "region_id" => region_id,
+                                "is_key_range" => is_key_range,
+                                "start_key" => log_wrappers::Value::key(&start_key),
+                                "end_key" => log_wrappers::Value::key(&end_key),
+                            );
                             return;
                         }
                     }
@@ -389,12 +483,8 @@ where
 
         if !split_keys.is_empty() {
             let region_epoch = region.get_region_epoch().clone();
-            let msg = new_split_region(region_epoch, split_keys, "split checker");
-            let res = self.router.send(region_id, msg);
-            if let Err(e) = res {
-                warn!("failed to send check result"; "region_id" => region_id, "err" => %e);
-            }
-
+            self.router
+                .ask_split(region_id, region_epoch, split_keys, "split checker".into());
             CHECK_SPILT_COUNTER.success.inc();
         } else {
             debug!(
@@ -408,12 +498,14 @@ where
 
     /// Gets the split keys by scanning the range.
     /// bucket_ranges: specify the ranges to generate buckets.
-    ///                If none, gengerate buckets for the whole region.
+    ///                If none, generate buckets for the whole region.
     ///                If it's Some(vec![]), skip generating buckets.
     fn scan_split_keys(
         &self,
-        host: &mut SplitCheckerHost<'_, E>,
+        host: &mut SplitCheckerHost<'_, EK>,
+        tablet: &EK,
         region: &Region,
+        is_key_range: bool,
         start_key: &[u8],
         end_key: &[u8],
         bucket_ranges: Option<Vec<BucketRange>>,
@@ -432,12 +524,8 @@ where
                 (!host.enable_region_bucket(), &empty_bucket)
             };
 
-        MergedIterator::<<E as Iterable>::Iterator>::new(
-            &self.engine,
-            LARGE_CFS,
-            start_key,
-            end_key,
-            false,
+        MergedIterator::<<EK as Iterable>::Iterator>::new(
+            tablet, LARGE_CFS, start_key, end_key, false,
         )
         .map(|mut iter| {
             let mut size = 0;
@@ -481,7 +569,8 @@ where
                         if bucket_range_idx == bucket_range_list.len() {
                             skip_check_bucket = true;
                         } else if origin_key >= bucket_range_list[bucket_range_idx].0.as_slice() {
-                            // e.key() is between bucket_range_list[bucket_range_idx].0, bucket_range_list[bucket_range_idx].1
+                            // e.key() is between bucket_range_list[bucket_range_idx].0,
+                            // bucket_range_list[bucket_range_idx].1
                             bucket_size += e.entry_size() as u64;
                             if bucket_size >= host.region_bucket_size() {
                                 bucket.keys.push(origin_key.to_vec());
@@ -508,7 +597,11 @@ where
                 }
             }
 
-            // if we scan the whole range, we can update approximate size and keys with accurate value.
+            // if we scan the whole range, we can update approximate size and keys with
+            // accurate value.
+            if is_key_range {
+                return;
+            }
             info!(
                 "update approximate size and keys with accurate value";
                 "region_id" => region.get_id(),
@@ -517,14 +610,8 @@ where
                 "bucket_count" => buckets.len(),
                 "bucket_size" => bucket_size,
             );
-            let _ = self.router.send(
-                region.get_id(),
-                CasualMessage::RegionApproximateSize { size },
-            );
-            let _ = self.router.send(
-                region.get_id(),
-                CasualMessage::RegionApproximateKeys { keys },
-            );
+            self.router.update_approximate_size(region.get_id(), size);
+            self.router.update_approximate_keys(region.get_id(), keys);
         })?;
 
         if host.enable_region_bucket() {
@@ -543,39 +630,66 @@ where
     }
 
     fn change_cfg(&mut self, change: ConfigChange) {
+        if let Err(e) = self.coprocessor.cfg.update(change.clone()) {
+            error!("update split check config failed"; "err" => ?e);
+            return;
+        };
         info!(
             "split check config updated";
             "change" => ?change
         );
-        self.coprocessor.cfg.update(change);
     }
 }
 
-impl<E, S> Runnable for Runner<E, S>
+impl<EK, S> Runnable for Runner<EK, S>
 where
-    E: KvEngine,
-    S: CasualRouter<E>,
+    EK: KvEngine,
+    S: StoreHandle,
 {
     type Task = Task;
     fn run(&mut self, task: Task) {
-        let _io_type_guard = WithIOType::new(IOType::LoadBalance);
+        let _io_type_guard = WithIoType::new(IoType::LoadBalance);
         match task {
             Task::SplitCheckTask {
                 region,
+                start_key,
+                end_key,
                 auto_split,
                 policy,
                 bucket_ranges,
-            } => self.check_split_and_bucket(&region, auto_split, policy, bucket_ranges),
+            } => self.check_split_and_bucket(
+                &region,
+                start_key,
+                end_key,
+                auto_split,
+                policy,
+                bucket_ranges,
+            ),
             Task::ChangeConfig(c) => self.change_cfg(c),
             Task::ApproximateBuckets(region) => {
-                if self.coprocessor.cfg.enable_region_bucket {
+                if self.coprocessor.cfg.enable_region_bucket() {
+                    let mut cached;
+                    let tablet = match &self.engine {
+                        Either::Left(e) => e,
+                        Either::Right(r) => match r.get(region.get_id()) {
+                            Some(c) => {
+                                cached = Some(c);
+                                match cached.as_mut().unwrap().latest() {
+                                    Some(t) => t,
+                                    None => return,
+                                }
+                            }
+                            None => return,
+                        },
+                    };
                     let mut host = self.coprocessor.new_split_checker_host(
                         &region,
-                        &self.engine,
+                        tablet,
                         false,
                         CheckPolicy::Approximate,
                     );
-                    if let Err(e) = self.approximate_check_bucket(&region, &mut host, None) {
+                    if let Err(e) = self.approximate_check_bucket(tablet, &region, &mut host, None)
+                    {
                         error!(%e;
                             "approximate_check_bucket failed";
                             "region_id" => region.get_id(),
@@ -586,21 +700,5 @@ where
             #[cfg(any(test, feature = "testexport"))]
             Task::Validate(f) => f(&self.coprocessor.cfg),
         }
-    }
-}
-
-fn new_split_region<E>(
-    region_epoch: RegionEpoch,
-    split_keys: Vec<Vec<u8>>,
-    source: &'static str,
-) -> CasualMessage<E>
-where
-    E: KvEngine,
-{
-    CasualMessage::SplitRegion {
-        region_epoch,
-        split_keys,
-        callback: Callback::None,
-        source: source.into(),
     }
 }

@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use engine_rocks::RocksEngine;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use grpcio::{
     ClientStreamingSink, Environment, RequestStream, RpcContext, RpcStatus, RpcStatusCode, Server,
@@ -20,16 +19,14 @@ use kvproto::{
     tikvpb::BatchRaftMessage,
 };
 use raft::eraftpb::Entry;
-use raftstore::{
-    errors::DiscardReason,
-    router::{RaftStoreBlackHole, RaftStoreRouter},
-};
+use raftstore::errors::DiscardReason;
 use tikv::server::{
-    self, load_statistics::ThreadLoadPool, resolve, resolve::Callback, Config, ConnectionBuilder,
-    RaftClient, StoreAddrResolver, TestRaftStoreRouter,
+    self, load_statistics::ThreadLoadPool, raftkv::RaftRouterWrap, resolve, resolve::Callback,
+    Config, ConnectionBuilder, RaftClient, StoreAddrResolver, TestRaftStoreRouter,
 };
+use tikv_kv::{FakeExtension, RaftExtension};
 use tikv_util::{
-    config::VersionTrack,
+    config::{ReadableDuration, VersionTrack},
     worker::{Builder as WorkerBuilder, LazyWorker},
 };
 
@@ -53,13 +50,16 @@ impl StoreAddrResolver for StaticResolver {
     }
 }
 
-fn get_raft_client<R, T>(router: R, resolver: T) -> RaftClient<T, R, RocksEngine>
+fn get_raft_client<R, T>(router: R, resolver: T) -> RaftClient<T, R>
 where
-    R: RaftStoreRouter<RocksEngine> + Unpin + 'static,
+    R: RaftExtension + Unpin + 'static,
     T: StoreAddrResolver + 'static,
 {
     let env = Arc::new(Environment::new(2));
-    let cfg = Arc::new(VersionTrack::new(Config::default()));
+    let mut config = Config::default();
+    config.raft_client_max_backoff = ReadableDuration::millis(100);
+    config.raft_client_initial_reconnect_backoff = ReadableDuration::millis(100);
+    let cfg = Arc::new(VersionTrack::new(config));
     let security_mgr = Arc::new(SecurityManager::new(&SecurityConfig::default()).unwrap());
     let worker = LazyWorker::new("test-raftclient");
     let loads = Arc::new(ThreadLoadPool::with_threshold(1000));
@@ -72,13 +72,11 @@ where
         worker.scheduler(),
         loads,
     );
-    RaftClient::new(builder)
+    RaftClient::new(0, builder)
 }
 
-fn get_raft_client_by_port(
-    port: u16,
-) -> RaftClient<StaticResolver, RaftStoreBlackHole, RocksEngine> {
-    get_raft_client(RaftStoreBlackHole, StaticResolver::new(port))
+fn get_raft_client_by_port(port: u16) -> RaftClient<StaticResolver, FakeExtension> {
+    get_raft_client(FakeExtension, StaticResolver::new(port))
 }
 
 #[derive(Clone)]
@@ -178,7 +176,8 @@ fn test_raft_client_reconnect() {
     let (tx, rx) = mpsc::channel();
     let (significant_msg_sender, _significant_msg_receiver) = mpsc::channel();
     let router = TestRaftStoreRouter::new(tx, significant_msg_sender);
-    let mut raft_client = get_raft_client(router, StaticResolver::new(port));
+    let wrap = RaftRouterWrap::new(router);
+    let mut raft_client = get_raft_client(wrap, StaticResolver::new(port));
     (0..50).for_each(|_| raft_client.send(RaftMessage::default()).unwrap());
     raft_client.flush();
 
@@ -194,7 +193,6 @@ fn test_raft_client_reconnect() {
         raft_client.send(RaftMessage::default()).unwrap();
     }
     raft_client.flush();
-    rx.recv_timeout(Duration::from_secs(3)).unwrap();
 
     // `send` should success after the mock server restarted.
     let service = MockKvForRaft::new(Arc::clone(&msg_count), batch_msg_count, true);
@@ -236,8 +234,8 @@ fn test_batch_size_limit() {
     assert_eq!(msg_count.load(Ordering::SeqCst), 10);
 }
 
-/// In edge case that the estimated size may be inaccurate, we need to ensure connection
-/// will not be broken in this case.
+/// In edge case that the estimated size may be inaccurate, we need to ensure
+/// connection will not be broken in this case.
 #[test]
 fn test_batch_size_edge_limit() {
     let msg_count = Arc::new(AtomicUsize::new(0));
@@ -247,13 +245,14 @@ fn test_batch_size_edge_limit() {
 
     let mut raft_client = get_raft_client_by_port(port);
 
-    // Put them in buffer so sibling messages will be likely be batched during sending.
+    // Put them in buffer so sibling messages will be likely be batched during
+    // sending.
     let mut msgs = Vec::with_capacity(5);
     for _ in 0..5 {
         let mut raft_m = RaftMessage::default();
-        // Magic number, this can make estimated size about 4940000, hence two messages will be
-        // batched together, but the total size will be way largher than 10MiB as there are many
-        // indexes and terms.
+        // Magic number, this can make estimated size about 4940000, hence two messages
+        // will be batched together, but the total size will be way larger than
+        // 10MiB as there are many indexes and terms.
         for _ in 0..38000 {
             let mut e = Entry::default();
             e.set_term(1);
@@ -275,8 +274,9 @@ fn test_batch_size_edge_limit() {
     assert_eq!(msg_count.load(Ordering::SeqCst), 5);
 }
 
-// Try to create a mock server with `service`. The server will be binded wiht a random
-// port chosen between [`min_port`, `max_port`]. Return `None` if no port is available.
+// Try to create a mock server with `service`. The server will be bounded with a
+// random port chosen between [`min_port`, `max_port`]. Return `None` if no port
+// is available.
 fn create_mock_server<T>(service: T, min_port: u16, max_port: u16) -> Option<(Server, u16)>
 where
     T: Tikv + Clone + Send + 'static,
@@ -328,15 +328,14 @@ fn test_tombstone_block_list() {
     let bg_worker = WorkerBuilder::new(thd_name!("background"))
         .thread_count(2)
         .create();
-    let resolver =
-        resolve::new_resolver::<_, _, RocksEngine>(pd_client, &bg_worker, RaftStoreBlackHole).0;
+    let resolver = resolve::new_resolver(pd_client, &bg_worker, FakeExtension).0;
 
     let msg_count = Arc::new(AtomicUsize::new(0));
     let batch_msg_count = Arc::new(AtomicUsize::new(0));
     let service = MockKvForRaft::new(Arc::clone(&msg_count), Arc::clone(&batch_msg_count), true);
     let (_mock_server, port) = create_mock_server(service, 60200, 60300).unwrap();
 
-    let mut raft_client = get_raft_client(RaftStoreBlackHole, resolver);
+    let mut raft_client = get_raft_client(FakeExtension, resolver);
 
     let mut store1 = metapb::Store::default();
     store1.set_id(1);
@@ -385,9 +384,8 @@ fn test_store_allowlist() {
     let bg_worker = WorkerBuilder::new(thd_name!("background"))
         .thread_count(2)
         .create();
-    let resolver =
-        resolve::new_resolver::<_, _, RocksEngine>(pd_client, &bg_worker, RaftStoreBlackHole).0;
-    let mut raft_client = get_raft_client(RaftStoreBlackHole, resolver);
+    let resolver = resolve::new_resolver(pd_client, &bg_worker, FakeExtension).0;
+    let mut raft_client = get_raft_client(FakeExtension, resolver);
 
     let msg_count1 = Arc::new(AtomicUsize::new(0));
     let batch_msg_count1 = Arc::new(AtomicUsize::new(0));
@@ -421,7 +419,7 @@ fn test_store_allowlist() {
     for _ in 0..3 {
         let mut raft_m = RaftMessage::default();
         raft_m.mut_to_peer().set_store_id(1);
-        assert!(raft_client.send(raft_m).is_err());
+        raft_client.send(raft_m).unwrap_err();
     }
     for _ in 0..5 {
         let mut raft_m = RaftMessage::default();

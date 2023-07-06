@@ -29,7 +29,7 @@ use crate::{
     yatp_pool::{DefaultTicker, YatpPoolBuilder},
 };
 
-#[derive(Eq, PartialEq)]
+#[derive(PartialEq)]
 pub enum ScheduleError<T> {
     Stopped(T),
     Full(T),
@@ -117,7 +117,8 @@ impl<T: Display + Send> Scheduler<T> {
 
     /// Schedules a task to run.
     ///
-    /// If the worker is stopped or number pending tasks exceeds capacity, an error will return.
+    /// If the worker is stopped or number pending tasks exceeds capacity, an
+    /// error will return.
     pub fn schedule(&self, task: T) -> Result<(), ScheduleError<T>> {
         debug!("scheduling task {}", task);
         if self.counter.load(Ordering::Acquire) >= self.pending_capacity {
@@ -375,8 +376,11 @@ impl Worker {
         let mut interval = GLOBAL_TIMER_HANDLE
             .interval(std::time::Instant::now(), interval)
             .compat();
+        let stop = self.stop.clone();
         self.remote.spawn(async move {
-            while let Some(Ok(_)) = interval.next().await {
+            while !stop.load(Ordering::Relaxed)
+                && let Some(Ok(_)) = interval.next().await
+            {
                 func();
             }
         });
@@ -390,12 +394,22 @@ impl Worker {
         let mut interval = GLOBAL_TIMER_HANDLE
             .interval(std::time::Instant::now(), interval)
             .compat();
+        let stop = self.stop.clone();
         self.remote.spawn(async move {
-            while let Some(Ok(_)) = interval.next().await {
+            while !stop.load(Ordering::Relaxed)
+                && let Some(Ok(_)) = interval.next().await
+            {
                 let fut = func();
                 fut.await;
             }
         });
+    }
+
+    pub fn spawn_async_task<F>(&self, f: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.remote.spawn(f);
     }
 
     fn delay_notify<T: Display + Send + 'static>(tx: UnboundedSender<Msg<T>>, timeout: Duration) {

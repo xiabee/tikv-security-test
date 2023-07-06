@@ -1,14 +1,16 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use bytes::BufMut;
+use kvproto::metapb::Region;
 
-const PREFIX: &str = "/tidb/br-stream";
+pub(super) const PREFIX: &str = "/tidb/br-stream";
 const PATH_INFO: &str = "/info";
 const PATH_NEXT_BACKUP_TS: &str = "/checkpoint";
+const PATH_STORAGE_CHECKPOINT: &str = "/storage-checkpoint";
 const PATH_RANGES: &str = "/ranges";
 const PATH_PAUSE: &str = "/pause";
 const PATH_LAST_ERROR: &str = "/last-error";
-// Note: maybe use something like `const_fmt` for concatenating constant strings?
+// Note: maybe use something like `const_fmt` for concatenating constant
+// strings?
 const TASKS_PREFIX: &str = "/tidb/br-stream/info/";
 
 /// A key that associates to some metadata.
@@ -23,18 +25,29 @@ const TASKS_PREFIX: &str = "/tidb/br-stream/info/";
 /// <PREFIX>/checkpoint/<task_name>/<store_id(u64,be)>/<region_id(u64,be)> -> <next_backup_ts(u64,be)>
 /// For the status of tasks:
 /// <PREFIX>/pause/<task_name> -> ""
+/// For the storage checkpoint ts of tasks:
+/// <PREFIX>/storage-checkpoint/<task_name>/<store_id(u64,be)> -> <ts(u64,be)>
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct MetaKey(pub Vec<u8>);
 
 /// A simple key value pair of metadata.
-#[derive(Clone, Debug)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct KeyValue(pub MetaKey, pub Vec<u8>);
+
+impl std::fmt::Debug for KeyValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("KV")
+            .field(&self.0)
+            .field(&format_args!("{}", self.1.escape_ascii()))
+            .finish()
+    }
+}
 
 impl std::fmt::Debug for MetaKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("MetaKey")
-            .field(&self.0.escape_ascii())
+        f.debug_tuple("K")
+            .field(&format_args!("{}", self.0.escape_ascii()))
             .finish()
     }
 }
@@ -57,7 +70,8 @@ impl KeyValue {
     }
 
     /// Take the start-key and end-key from a metadata key-value pair.
-    /// example: `KeyValue(<prefix>/ranges/<start-key>, <end-key>) -> (<start-key>, <end-key>)`
+    /// example: `KeyValue(<prefix>/ranges/<start-key>, <end-key>) ->
+    /// (<start-key>, <end-key>)`
     pub fn take_range(&mut self, task_name: &str) -> (Vec<u8>, Vec<u8>) {
         let prefix_len = MetaKey::ranges_prefix_len(task_name);
         (self.take_key()[prefix_len..].to_vec(), self.take_value())
@@ -99,17 +113,45 @@ impl MetaKey {
         ranges
     }
 
-    /// The key of next backup ts of some region in some store.
-    pub fn next_backup_ts_of(name: &str, store_id: u64) -> Self {
-        let base = Self::next_backup_ts(name);
-        let mut buf = bytes::BytesMut::from(base.0.as_slice());
-        buf.put_u64(store_id);
-        Self(buf.to_vec())
-    }
-
     // The prefix for next backup ts.
     pub fn next_backup_ts(name: &str) -> Self {
         Self(format!("{}{}/{}/", PREFIX, PATH_NEXT_BACKUP_TS, name).into_bytes())
+    }
+
+    /// The key of next backup ts of some region in some store.
+    pub fn next_backup_ts_of(name: &str, store_id: u64) -> Self {
+        Self(
+            format!(
+                "{}{}/{}/store/{}",
+                PREFIX, PATH_NEXT_BACKUP_TS, name, store_id
+            )
+            .into_bytes(),
+        )
+    }
+
+    pub fn next_bakcup_ts_of_region(name: &str, region: &Region) -> Self {
+        Self(
+            format!(
+                "{}{}/{}/region/{}/{}",
+                PREFIX,
+                PATH_NEXT_BACKUP_TS,
+                name,
+                region.id,
+                region.get_region_epoch().get_version()
+            )
+            .into_bytes(),
+        )
+    }
+
+    /// defines the key of storage checkpoint-ts of task in a store.
+    pub fn storage_checkpoint_of(name: &str, store_id: u64) -> Self {
+        Self(
+            format!(
+                "{}{}/{}/{}",
+                PREFIX, PATH_STORAGE_CHECKPOINT, name, store_id
+            )
+            .into_bytes(),
+        )
     }
 
     pub fn pause_prefix_len() -> usize {
@@ -125,8 +167,16 @@ impl MetaKey {
         Self(format!("{}{}/{}", PREFIX, PATH_PAUSE, name).into_bytes())
     }
 
+    pub fn last_errors_of(name: &str) -> Self {
+        Self(format!("{}{}/{}", PREFIX, PATH_LAST_ERROR, name).into_bytes())
+    }
+
     pub fn last_error_of(name: &str, store: u64) -> Self {
         Self(format!("{}{}/{}/{}", PREFIX, PATH_LAST_ERROR, name, store).into_bytes())
+    }
+
+    pub fn central_global_checkpoint_of(name: &str) -> Self {
+        Self(format!("{}/checkpoint/{}/central_global", PREFIX, name).into_bytes())
     }
 
     /// return the key that keeps the range [self, self.next()) contains only
@@ -140,16 +190,7 @@ impl MetaKey {
     /// return the key that keeps the range [self, self.next_prefix()) contains
     /// all keys with the prefix `self`.
     pub fn next_prefix(&self) -> Self {
-        let mut next_prefix = self.clone();
-        for i in (0..next_prefix.0.len()).rev() {
-            if next_prefix.0[i] == u8::MAX {
-                next_prefix.0.pop();
-            } else {
-                next_prefix.0[i] += 1;
-                break;
-            }
-        }
-        next_prefix
+        Self(tikv_util::codec::next_prefix_of(self.0.clone()))
     }
 }
 

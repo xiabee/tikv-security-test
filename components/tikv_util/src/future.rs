@@ -1,6 +1,7 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
+    borrow::BorrowMut,
     cell::UnsafeCell,
     sync::{
         atomic::{AtomicU8, Ordering},
@@ -15,10 +16,10 @@ use futures::{
     task::{self, ArcWake, Context, Poll},
 };
 
-use crate::callback::must_call;
+use crate::{callback::must_call, timer::GLOBAL_TIMER_HANDLE};
 
-/// Generates a paired future and callback so that when callback is being called, its result
-/// is automatically passed as a future result.
+/// Generates a paired future and callback so that when callback is being
+/// called, its result is automatically passed as a future result.
 pub fn paired_future_callback<T>() -> (Box<dyn FnOnce(T) + Send>, futures_oneshot::Receiver<T>)
 where
     T: Send + 'static,
@@ -52,8 +53,9 @@ where
     (callback, future)
 }
 
-/// Create a stream proxy with buffer representing the remote stream. The returned task
-/// will receive messages from the remote stream as much as possible.
+/// Create a stream proxy with buffer representing the remote stream. The
+/// returned task will receive messages from the remote stream as much as
+/// possible.
 pub fn create_stream_with_buffer<T, S>(
     s: S,
     size: usize,
@@ -146,7 +148,7 @@ impl PollAtWake {
         };
 
         let waker = task::waker_ref(arc_self);
-        let cx = &mut Context::from_waker(&*waker);
+        let cx = &mut Context::from_waker(&waker);
         loop {
             match fut.as_mut().poll(cx) {
                 // Likely pending
@@ -165,7 +167,8 @@ impl PollAtWake {
                 Ok(_) => return,
                 Err(s) => {
                     if s == NOTIFIED {
-                        // Only this thread can change the state from NOTIFIED, so it has to succeed.
+                        // Only this thread can change the state from NOTIFIED, so it has to
+                        // succeed.
                         match arc_self.state.compare_exchange(
                             NOTIFIED,
                             POLLING,
@@ -193,6 +196,40 @@ impl ArcWake for PollAtWake {
     fn wake_by_ref(arc_self: &Arc<Self>) {
         PollAtWake::poll(arc_self)
     }
+}
+
+/// Poll the future immediately. If the future is ready, returns the result.
+/// Otherwise just ignore the future.
+#[inline]
+pub fn try_poll<T>(f: impl Future<Output = T>) -> Option<T> {
+    futures::executor::block_on(async move {
+        futures::select_biased! {
+            res = f.fuse() => Some(res),
+            _ = futures::future::ready(()).fuse() => None,
+        }
+    })
+}
+
+// Run a future with a timeout on the current thread. Returns Err if times out.
+#[allow(clippy::result_unit_err)]
+pub fn block_on_timeout<B, F, I>(mut fut: B, dur: std::time::Duration) -> Result<I, ()>
+where
+    F: std::future::Future<Output = I> + Unpin,
+    B: BorrowMut<F>,
+{
+    use futures_util::compat::Future01CompatExt;
+
+    let mut timeout = GLOBAL_TIMER_HANDLE
+        .delay(std::time::Instant::now() + dur)
+        .compat()
+        .fuse();
+    let mut f = fut.borrow_mut().fuse();
+    futures::executor::block_on(async {
+        futures::select! {
+            _ = timeout => Err(()),
+            item = f => Ok(item),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -229,5 +266,13 @@ mod tests {
         //   2.2 future returns Poll::Ready
         // 3. future gets ready, ignore NOTIFIED
         assert_eq!(poll_times.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_try_poll() {
+        let f = futures::future::ready(1);
+        assert_eq!(try_poll(f), Some(1));
+        let f = futures::future::pending::<()>();
+        assert_eq!(try_poll(f), None);
     }
 }

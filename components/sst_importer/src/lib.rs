@@ -19,11 +19,12 @@ mod sst_writer;
 mod util;
 #[macro_use]
 pub mod import_mode;
+mod caching;
 pub mod metrics;
 pub mod sst_importer;
 
 pub use self::{
-    config::Config,
+    config::{Config, ConfigManager},
     errors::{error_inc, Error, Result},
     import_file::sst_meta_to_path,
     sst_importer::SstImporter,

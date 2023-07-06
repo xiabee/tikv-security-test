@@ -27,7 +27,7 @@ pub struct CdcObserver {
     sched: Scheduler<Task>,
     // A shared registry for managing observed regions.
     // TODO: it may become a bottleneck, find a better way to manage the registry.
-    observe_regions: Arc<RwLock<HashMap<u64, ObserveID>>>,
+    observe_regions: Arc<RwLock<HashMap<u64, ObserveId>>>,
 }
 
 impl CdcObserver {
@@ -43,8 +43,8 @@ impl CdcObserver {
     }
 
     pub fn register_to(&self, coprocessor_host: &mut CoprocessorHost<impl KvEngine>) {
-        // use 0 as the priority of the cmd observer. CDC should have a higher priority than
-        // the `resolved-ts`'s cmd observer
+        // use 0 as the priority of the cmd observer. CDC should have a higher priority
+        // than the `resolved-ts`'s cmd observer
         coprocessor_host
             .registry
             .register_cmd_observer(0, BoxCmdObserver::new(self.clone()));
@@ -59,8 +59,8 @@ impl CdcObserver {
     /// Subscribe an region, the observer will sink events of the region into
     /// its scheduler.
     ///
-    /// Return previous ObserveID if there is one.
-    pub fn subscribe_region(&self, region_id: u64, observe_id: ObserveID) -> Option<ObserveID> {
+    /// Return previous ObserveId if there is one.
+    pub fn subscribe_region(&self, region_id: u64, observe_id: ObserveId) -> Option<ObserveId> {
         self.observe_regions
             .write()
             .unwrap()
@@ -70,9 +70,9 @@ impl CdcObserver {
     /// Stops observe the region.
     ///
     /// Return ObserverID if unsubscribe successfully.
-    pub fn unsubscribe_region(&self, region_id: u64, observe_id: ObserveID) -> Option<ObserveID> {
+    pub fn unsubscribe_region(&self, region_id: u64, observe_id: ObserveId) -> Option<ObserveId> {
         let mut regions = self.observe_regions.write().unwrap();
-        // To avoid ABA problem, we must check the unique ObserveID.
+        // To avoid ABA problem, we must check the unique ObserveId.
         if let Some(oid) = regions.get(&region_id) {
             if *oid == observe_id {
                 return regions.remove(&region_id);
@@ -82,7 +82,7 @@ impl CdcObserver {
     }
 
     /// Check whether the region is subscribed or not.
-    pub fn is_subscribed(&self, region_id: u64) -> Option<ObserveID> {
+    pub fn is_subscribed(&self, region_id: u64) -> Option<ObserveId> {
         self.observe_regions
             .read()
             .unwrap()
@@ -94,7 +94,8 @@ impl CdcObserver {
 impl Coprocessor for CdcObserver {}
 
 impl<E: KvEngine> CmdObserver<E> for CdcObserver {
-    // `CdcObserver::on_flush_applied_cmd_batch` should only invoke if `cmd_batches` is not empty
+    // `CdcObserver::on_flush_applied_cmd_batch` should only invoke if `cmd_batches`
+    // is not empty
     fn on_flush_applied_cmd_batch(
         &self,
         max_level: ObserveLevel,
@@ -103,6 +104,7 @@ impl<E: KvEngine> CmdObserver<E> for CdcObserver {
     ) {
         assert!(!cmd_batches.is_empty());
         fail_point!("before_cdc_flush_apply");
+
         if max_level < ObserveLevel::All {
             return;
         }
@@ -117,7 +119,8 @@ impl<E: KvEngine> CmdObserver<E> for CdcObserver {
         let mut region = Region::default();
         region.mut_peers().push(Peer::default());
         // Create a snapshot here for preventing the old value was GC-ed.
-        // TODO: only need it after enabling old value, may add a flag to indicate whether to get it.
+        // TODO: only need it after enabling old value, may add a flag to indicate
+        // whether to get it.
         let snapshot = RegionSnapshot::from_snapshot(Arc::new(engine.snapshot()), Arc::new(region));
         let get_old_value = move |key,
                                   query_ts,
@@ -198,8 +201,9 @@ mod tests {
 
     use engine_rocks::RocksEngine;
     use kvproto::metapb::Region;
-    use raftstore::{coprocessor::RoleChange, store::util::new_peer};
+    use raftstore::coprocessor::RoleChange;
     use tikv::storage::kv::TestEngineBuilder;
+    use tikv_util::store::new_peer;
 
     use super::*;
 
@@ -256,7 +260,7 @@ mod tests {
         observer.on_role_change(&mut ctx, &RoleChange::new(StateRole::Follower));
         rx.recv_timeout(Duration::from_millis(10)).unwrap_err();
 
-        let oid = ObserveID::new();
+        let oid = ObserveId::new();
         observer.subscribe_region(1, oid);
         let mut ctx = ObserverContext::new(&region);
 
@@ -268,6 +272,8 @@ mod tests {
                 leader_id: 2,
                 prev_lead_transferee: raft::INVALID_ID,
                 vote: raft::INVALID_ID,
+                initialized: true,
+                peer_id: raft::INVALID_ID,
             },
         );
         match rx.recv_timeout(Duration::from_millis(10)).unwrap().unwrap() {
@@ -295,6 +301,8 @@ mod tests {
                 leader_id: raft::INVALID_ID,
                 prev_lead_transferee: 3,
                 vote: 3,
+                initialized: true,
+                peer_id: raft::INVALID_ID,
             },
         );
         match rx.recv_timeout(Duration::from_millis(10)).unwrap().unwrap() {
@@ -319,7 +327,7 @@ mod tests {
         rx.recv_timeout(Duration::from_millis(10)).unwrap_err();
 
         // unsubscribed fail if observer id is different.
-        assert_eq!(observer.unsubscribe_region(1, ObserveID::new()), None);
+        assert_eq!(observer.unsubscribe_region(1, ObserveId::new()), None);
 
         // No event if it is unsubscribed.
         let oid_ = observer.unsubscribe_region(1, oid).unwrap();

@@ -2,22 +2,28 @@
 
 use std::{
     fmt::{self, Debug, Display, Formatter},
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    task::Poll,
     time::Duration,
 };
 
+use collections::HashMap;
 pub use engine_rocks::RocksSnapshot;
 use engine_rocks::{
-    get_env, raw::DBOptions, raw_util::CFOptions, RocksEngine as BaseRocksEngine,
-    RocksEngineIterator,
+    get_env, RocksCfOptions, RocksDbOptions, RocksEngine as BaseRocksEngine, RocksEngineIterator,
 };
 use engine_traits::{
-    CfName, Engines, IterOptions, Iterable, Iterator, KvEngine, Peekable, ReadOptions, SeekKey,
+    CfName, Engines, IterOptions, Iterable, Iterator, KvEngine, Peekable, ReadOptions,
 };
-use file_system::IORateLimiter;
+use file_system::IoRateLimiter;
+use futures::{
+    channel::{mpsc, oneshot},
+    stream, Future, Stream,
+};
 use kvproto::{kvrpcpb::Context, metapb, raft_cmdpb};
 use raftstore::coprocessor::CoprocessorHost;
 use tempfile::{Builder, TempDir};
@@ -25,16 +31,17 @@ use tikv_util::worker::{Runnable, Scheduler, Worker};
 use txn_types::{Key, Value};
 
 use super::{
-    write_modifies, Callback, DummySnapshotExt, Engine, Error, ErrorInner, ExtCallback,
+    write_modifies, Callback, DummySnapshotExt, Engine, Error, ErrorInner,
     Iterator as EngineIterator, Modify, Result, SnapContext, Snapshot, WriteData,
 };
+use crate::{FakeExtension, OnAppliedCb, RaftExtension, WriteEvent};
 
 // Duplicated in test_engine_builder
 const TEMP_DIR: &str = "";
 
 enum Task {
     Write(Vec<Modify>, Callback<()>),
-    Snapshot(Callback<Arc<RocksSnapshot>>),
+    Snapshot(oneshot::Sender<Arc<RocksSnapshot>>),
     Pause(Duration),
 }
 
@@ -56,7 +63,9 @@ impl Runnable for Runner {
     fn run(&mut self, t: Task) {
         match t {
             Task::Write(modifies, cb) => cb(write_modifies(&self.0.kv, modifies)),
-            Task::Snapshot(cb) => cb(Ok(Arc::new(self.0.kv.snapshot()))),
+            Task::Snapshot(sender) => {
+                let _ = sender.send(Arc::new(self.0.kv.snapshot()));
+            }
             Task::Pause(dur) => std::thread::sleep(dur),
         }
     }
@@ -78,22 +87,34 @@ impl Drop for RocksEngineCore {
 ///
 /// This is intended for **testing use only**.
 #[derive(Clone)]
-pub struct RocksEngine {
+pub struct RocksEngine<RE = FakeExtension> {
     core: Arc<Mutex<RocksEngineCore>>,
     sched: Scheduler<Task>,
     engines: Engines<BaseRocksEngine, BaseRocksEngine>,
     not_leader: Arc<AtomicBool>,
     coprocessor: CoprocessorHost<BaseRocksEngine>,
+    ext: RE,
+}
+
+impl<RE> RocksEngine<RE> {
+    pub fn with_raft_extension<NRE>(self, ext: NRE) -> RocksEngine<NRE> {
+        RocksEngine {
+            core: self.core,
+            sched: self.sched,
+            engines: self.engines,
+            not_leader: self.not_leader,
+            coprocessor: self.coprocessor,
+            ext,
+        }
+    }
 }
 
 impl RocksEngine {
     pub fn new(
         path: &str,
-        cfs: &[CfName],
-        cfs_opts: Option<Vec<CFOptions<'_>>>,
-        shared_block_cache: bool,
-        io_rate_limiter: Option<Arc<IORateLimiter>>,
-        db_opts: Option<DBOptions>,
+        db_opts: Option<RocksDbOptions>,
+        cfs_opts: Vec<(CfName, RocksCfOptions)>,
+        io_rate_limiter: Option<Arc<IoRateLimiter>>,
     ) -> Result<RocksEngine> {
         info!("RocksEngine: creating for path"; "path" => path);
         let (path, temp_dir) = match path {
@@ -104,24 +125,15 @@ impl RocksEngine {
             _ => (path.to_owned(), None),
         };
         let worker = Worker::new("engine-rocksdb");
-        let mut db_opts = db_opts.unwrap_or_else(|| DBOptions::new());
+        let mut db_opts = db_opts.unwrap_or_default();
         if io_rate_limiter.is_some() {
-            db_opts.set_env(get_env(None /*key_manager*/, io_rate_limiter).unwrap());
+            db_opts.set_env(get_env(None /* key_manager */, io_rate_limiter).unwrap());
         }
 
-        let db = Arc::new(engine_rocks::raw_util::new_engine(
-            &path,
-            Some(db_opts),
-            cfs,
-            cfs_opts,
-        )?);
+        let db = engine_rocks::util::new_engine_opt(&path, db_opts, cfs_opts)?;
         // It does not use the raft_engine, so it is ok to fill with the same
         // rocksdb.
-        let mut kv_engine = BaseRocksEngine::from_db(db.clone());
-        let mut raft_engine = BaseRocksEngine::from_db(db);
-        kv_engine.set_shared_block_cache(shared_block_cache);
-        raft_engine.set_shared_block_cache(shared_block_cache);
-        let engines = Engines::new(kv_engine, raft_engine);
+        let engines = Engines::new(db.clone(), db);
         let sched = worker.start("engine-rocksdb", Runner(engines.clone()));
         Ok(RocksEngine {
             sched,
@@ -129,9 +141,12 @@ impl RocksEngine {
             not_leader: Arc::new(AtomicBool::new(false)),
             engines,
             coprocessor: CoprocessorHost::default(),
+            ext: FakeExtension,
         })
     }
+}
 
+impl<RE> RocksEngine<RE> {
     pub fn trigger_not_leader(&self) {
         self.not_leader.store(true, Ordering::SeqCst);
     }
@@ -167,7 +182,8 @@ impl RocksEngine {
     }
 
     /// `pre_propose` is called before propose.
-    /// It's used to trigger "pre_propose_query" observers for RawKV API V2 by now.
+    /// It's used to trigger "pre_propose_query" observers for RawKV API V2 by
+    /// now.
     fn pre_propose(&self, mut batch: WriteData) -> Result<WriteData> {
         let requests = batch
             .modifies
@@ -192,13 +208,13 @@ impl RocksEngine {
     }
 }
 
-impl Display for RocksEngine {
+impl<RE> Display for RocksEngine<RE> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "RocksDB")
     }
 }
 
-impl Debug for RocksEngine {
+impl<RE> Debug for RocksEngine<RE> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -208,19 +224,21 @@ impl Debug for RocksEngine {
     }
 }
 
-impl Engine for RocksEngine {
+impl<RE: RaftExtension + 'static> Engine for RocksEngine<RE> {
     type Snap = Arc<RocksSnapshot>;
     type Local = BaseRocksEngine;
 
-    fn kv_engine(&self) -> BaseRocksEngine {
-        self.engines.kv.clone()
+    fn kv_engine(&self) -> Option<BaseRocksEngine> {
+        Some(self.engines.kv.clone())
     }
 
-    fn snapshot_on_kv_engine(&self, _: &[u8], _: &[u8]) -> Result<Self::Snap> {
-        self.snapshot(Default::default())
+    type RaftExtension = RE;
+    fn raft_extension(&self) -> Self::RaftExtension {
+        self.ext.clone()
     }
 
-    fn modify_on_kv_engine(&self, modifies: Vec<Modify>) -> Result<()> {
+    fn modify_on_kv_engine(&self, region_modifies: HashMap<u64, Vec<Modify>>) -> Result<()> {
+        let modifies = region_modifies.into_values().flatten().collect();
         write_modifies(&self.engines.kv, modifies)
     }
 
@@ -231,48 +249,67 @@ impl Engine for RocksEngine {
         Ok(())
     }
 
-    fn async_write(&self, ctx: &Context, batch: WriteData, cb: Callback<()>) -> Result<()> {
-        self.async_write_ext(ctx, batch, cb, None, None)
-    }
-
-    fn async_write_ext(
+    type WriteRes = impl Stream<Item = crate::WriteEvent> + Send + 'static;
+    fn async_write(
         &self,
-        _: &Context,
+        _ctx: &Context,
         batch: WriteData,
-        cb: Callback<()>,
-        proposed_cb: Option<ExtCallback>,
-        committed_cb: Option<ExtCallback>,
-    ) -> Result<()> {
-        fail_point!("rockskv_async_write", |_| Err(box_err!("write failed")));
+        subscribed: u8,
+        on_applied: Option<OnAppliedCb>,
+    ) -> Self::WriteRes {
+        let (mut tx, mut rx) = mpsc::channel::<WriteEvent>(WriteEvent::event_capacity(subscribed));
+        let res = (move || {
+            fail_point!("rockskv_async_write", |_| Err(box_err!("write failed")));
 
-        if batch.modifies.is_empty() {
-            return Err(Error::from(ErrorInner::EmptyRequest));
-        }
+            if batch.modifies.is_empty() {
+                return Err(Error::from(ErrorInner::EmptyRequest));
+            }
 
-        let batch = self.pre_propose(batch)?;
+            let batch = self.pre_propose(batch)?;
 
-        if let Some(cb) = proposed_cb {
-            cb();
-        }
-        if let Some(cb) = committed_cb {
-            cb();
-        }
-        box_try!(self.sched.schedule(Task::Write(batch.modifies, cb)));
-        Ok(())
+            if WriteEvent::subscribed_proposed(subscribed) {
+                let _ = tx.try_send(WriteEvent::Proposed);
+            }
+            if WriteEvent::subscribed_committed(subscribed) {
+                let _ = tx.try_send(WriteEvent::Committed);
+            }
+            let cb = Box::new(move |mut res| {
+                if let Some(cb) = on_applied {
+                    cb(&mut res);
+                }
+                let _ = tx.try_send(WriteEvent::Finished(res));
+            });
+            box_try!(self.sched.schedule(Task::Write(batch.modifies, cb)));
+            Ok(())
+        })();
+        let mut res = Some(res);
+        stream::poll_fn(move |cx| {
+            if res.as_ref().map_or(false, |r| r.is_err()) {
+                return Poll::Ready(res.take().map(WriteEvent::Finished));
+            }
+            // If it's none, it means an error is returned, it should not be polled again.
+            assert!(res.is_some());
+            Pin::new(&mut rx).poll_next(cx)
+        })
     }
 
-    fn async_snapshot(&self, _: SnapContext<'_>, cb: Callback<Self::Snap>) -> Result<()> {
-        fail_point!("rockskv_async_snapshot", |_| Err(box_err!(
-            "snapshot failed"
-        )));
-        fail_point!("rockskv_async_snapshot_not_leader", |_| {
-            Err(self.not_leader_error())
-        });
-        if self.not_leader.load(Ordering::SeqCst) {
-            return Err(self.not_leader_error());
-        }
-        box_try!(self.sched.schedule(Task::Snapshot(cb)));
-        Ok(())
+    type SnapshotRes = impl Future<Output = Result<Self::Snap>> + Send;
+    fn async_snapshot(&mut self, _: SnapContext<'_>) -> Self::SnapshotRes {
+        let res = (|| {
+            fail_point!("rockskv_async_snapshot", |_| Err(box_err!(
+                "snapshot failed"
+            )));
+            if self.not_leader.load(Ordering::SeqCst) {
+                return Err(self.not_leader_error());
+            }
+            let (tx, rx) = oneshot::channel();
+            if self.sched.schedule(Task::Snapshot(tx)).is_err() {
+                return Err(box_err!("failed to schedule snapshot"));
+            }
+            Ok(rx)
+        })();
+
+        async move { Ok(res?.await.unwrap()) }
     }
 }
 
@@ -298,14 +335,9 @@ impl Snapshot for Arc<RocksSnapshot> {
         Ok(v.map(|v| v.to_vec()))
     }
 
-    fn iter(&self, iter_opt: IterOptions) -> Result<Self::Iter> {
-        trace!("RocksSnapshot: create iterator");
-        Ok(self.iterator_opt(iter_opt)?)
-    }
-
-    fn iter_cf(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter> {
+    fn iter(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter> {
         trace!("RocksSnapshot: create cf iterator");
-        Ok(self.iterator_cf_opt(cf, iter_opt)?)
+        Ok(self.iterator_opt(cf, iter_opt)?)
     }
 
     fn ext(&self) -> DummySnapshotExt {
@@ -323,19 +355,19 @@ impl EngineIterator for RocksEngineIterator {
     }
 
     fn seek(&mut self, key: &Key) -> Result<bool> {
-        Iterator::seek(self, key.as_encoded().as_slice().into()).map_err(Error::from)
+        Iterator::seek(self, key.as_encoded()).map_err(Error::from)
     }
 
     fn seek_for_prev(&mut self, key: &Key) -> Result<bool> {
-        Iterator::seek_for_prev(self, key.as_encoded().as_slice().into()).map_err(Error::from)
+        Iterator::seek_for_prev(self, key.as_encoded()).map_err(Error::from)
     }
 
     fn seek_to_first(&mut self) -> Result<bool> {
-        Iterator::seek(self, SeekKey::Start).map_err(Error::from)
+        Iterator::seek_to_first(self).map_err(Error::from)
     }
 
     fn seek_to_last(&mut self) -> Result<bool> {
-        Iterator::seek(self, SeekKey::End).map_err(Error::from)
+        Iterator::seek_to_last(self).map_err(Error::from)
     }
 
     fn valid(&self) -> Result<bool> {

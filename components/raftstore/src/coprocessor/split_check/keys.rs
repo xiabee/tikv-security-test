@@ -1,10 +1,5 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    marker::PhantomData,
-    sync::{Arc, Mutex},
-};
-
 use engine_traits::{KvEngine, Range};
 use error_code::ErrorCodeExt;
 use kvproto::{metapb::Region, pdpb::CheckPolicy};
@@ -19,7 +14,7 @@ use super::{
     size::get_approximate_split_keys,
     Host,
 };
-use crate::store::{CasualMessage, CasualRouter};
+use crate::coprocessor::dispatcher::StoreHandle;
 
 pub struct Checker {
     max_keys_count: u64,
@@ -62,7 +57,8 @@ where
         if self.current_count > self.split_threshold && !over_limit {
             self.split_keys.push(keys::origin_key(key.key()).to_vec());
             // if for previous on_kv() self.current_count == self.split_threshold,
-            // the split key would be pushed this time, but the entry for this time should not be ignored.
+            // the split key would be pushed this time, but the entry for this time should
+            // not be ignored.
             self.current_count = 1;
             over_limit = self.split_keys.len() as u64 >= self.batch_split_limit;
         }
@@ -115,29 +111,19 @@ where
 }
 
 #[derive(Clone)]
-pub struct KeysCheckObserver<C, E> {
-    router: Arc<Mutex<C>>,
-    _phantom: PhantomData<E>,
+pub struct KeysCheckObserver<C> {
+    router: C,
 }
 
-impl<C: CasualRouter<E>, E> KeysCheckObserver<C, E>
-where
-    E: KvEngine,
-{
-    pub fn new(router: C) -> KeysCheckObserver<C, E> {
-        KeysCheckObserver {
-            router: Arc::new(Mutex::new(router)),
-            _phantom: PhantomData,
-        }
+impl<C: StoreHandle> KeysCheckObserver<C> {
+    pub fn new(router: C) -> KeysCheckObserver<C> {
+        KeysCheckObserver { router }
     }
 }
 
-impl<C: Send, E: Send> Coprocessor for KeysCheckObserver<C, E> {}
+impl<C: Send> Coprocessor for KeysCheckObserver<C> {}
 
-impl<C: CasualRouter<E> + Send, E> SplitCheckObserver<E> for KeysCheckObserver<C, E>
-where
-    E: KvEngine,
-{
+impl<C: StoreHandle, E: KvEngine> SplitCheckObserver<E> for KeysCheckObserver<C> {
     fn add_checker(
         &self,
         ctx: &mut ObserverContext<'_>,
@@ -171,20 +157,13 @@ where
             }
         };
 
-        let res = CasualMessage::RegionApproximateKeys { keys: region_keys };
-        if let Err(e) = self.router.lock().unwrap().send(region_id, res) {
-            warn!(
-                "failed to send approximate region keys";
-                "region_id" => region_id,
-                "err" => %e,
-                "error_code" => %e.error_code(),
-            );
-        }
+        self.router.update_approximate_keys(region_id, region_keys);
 
         REGION_KEYS_HISTOGRAM.observe(region_keys as f64);
         // if bucket checker using scan is added, to utilize the scan,
         // add keys checker as well for free
-        // It has the assumption that the size's checker is before the keys's check in the host
+        // It has the assumption that the size's checker is before the keys's check in
+        // the host
         let need_split_region = region_keys >= host.cfg.region_max_keys();
         if need_split_region {
             info!(
@@ -230,7 +209,7 @@ pub fn get_region_approximate_keys(
 mod tests {
     use std::{cmp, sync::mpsc, u64};
 
-    use engine_test::ctor::{CFOptions, ColumnFamilyOptions, DBOptions};
+    use engine_test::ctor::{CfOptions, DbOptions};
     use engine_traits::{KvEngine, MiscExt, SyncMutable, ALL_CFS, CF_DEFAULT, CF_WRITE, LARGE_CFS};
     use kvproto::{
         metapb::{Peer, Region},
@@ -251,8 +230,8 @@ mod tests {
         *,
     };
     use crate::{
-        coprocessor::{Config, CoprocessorHost},
-        store::{CasualMessage, SplitCheckRunner, SplitCheckTask},
+        coprocessor::{dispatcher::SchedTask, Config, CoprocessorHost},
+        store::{SplitCheckRunner, SplitCheckTask},
     };
 
     fn put_data(engine: &impl KvEngine, mut start_idx: u64, end_idx: u64, fill_short_value: bool) {
@@ -290,13 +269,7 @@ mod tests {
     fn test_split_check() {
         let path = Builder::new().prefix("test-raftstore").tempdir().unwrap();
         let path_str = path.path().to_str().unwrap();
-        let db_opts = DBOptions::default();
-        let cf_opts = ColumnFamilyOptions::new();
-        let cfs_opts = ALL_CFS
-            .iter()
-            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
-            .collect();
-        let engine = engine_test::kv::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
+        let engine = engine_test::kv::new_engine(path_str, ALL_CFS).unwrap();
 
         let mut region = Region::default();
         region.set_id(1);
@@ -327,8 +300,8 @@ mod tests {
         ));
         // keys has not reached the max_keys 100 yet.
         match rx.try_recv() {
-            Ok((region_id, CasualMessage::RegionApproximateSize { .. }))
-            | Ok((region_id, CasualMessage::RegionApproximateKeys { .. })) => {
+            Ok(SchedTask::UpdateApproximateSize { region_id, .. })
+            | Ok(SchedTask::UpdateApproximateKeys { region_id, .. }) => {
                 assert_eq!(region_id, region.get_id());
             }
             others => panic!("expect recv empty, but got {:?}", others),
@@ -400,13 +373,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let path_str = path.path().to_str().unwrap();
-        let db_opts = DBOptions::default();
-        let cf_opts = ColumnFamilyOptions::new();
-        let cfs_opts = ALL_CFS
-            .iter()
-            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
-            .collect();
-        let engine = engine_test::kv::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
+        let engine = engine_test::kv::new_engine(path_str, ALL_CFS).unwrap();
 
         let mut region = Region::default();
         region.set_id(1);
@@ -437,8 +404,8 @@ mod tests {
         ));
         // keys has not reached the max_keys 100 yet.
         match rx.try_recv() {
-            Ok((region_id, CasualMessage::RegionApproximateSize { .. }))
-            | Ok((region_id, CasualMessage::RegionApproximateKeys { .. })) => {
+            Ok(SchedTask::UpdateApproximateSize { region_id, .. })
+            | Ok(SchedTask::UpdateApproximateKeys { region_id, .. }) => {
                 assert_eq!(region_id, region.get_id());
             }
             others => panic!("expect recv empty, but got {:?}", others),
@@ -463,13 +430,10 @@ mod tests {
             .tempdir()
             .unwrap();
         let path_str = path.path().to_str().unwrap();
-        let db_opts = DBOptions::default();
-        let mut cf_opts = ColumnFamilyOptions::new();
+        let db_opts = DbOptions::default();
+        let mut cf_opts = CfOptions::new();
         cf_opts.set_level_zero_file_num_compaction_trigger(10);
-        let cfs_opts = LARGE_CFS
-            .iter()
-            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
-            .collect();
+        let cfs_opts = LARGE_CFS.iter().map(|cf| (*cf, cf_opts.clone())).collect();
         let db = engine_test::kv::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
 
         let cases = [("a", 1024), ("b", 2048), ("c", 4096)];
@@ -575,13 +539,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let path_str = path.path().to_str().unwrap();
-        let db_opts = DBOptions::default();
-        let cf_opts = ColumnFamilyOptions::new();
-        let cfs_opts = ALL_CFS
-            .iter()
-            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
-            .collect();
-        let engine = engine_test::kv::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
+        let engine = engine_test::kv::new_engine(path_str, ALL_CFS).unwrap();
 
         let mut region = Region::default();
         region.set_id(1);
@@ -597,7 +555,7 @@ mod tests {
             region_max_keys: Some(159),
             region_split_keys: Some(80),
             batch_split_limit: 5,
-            enable_region_bucket: true,
+            enable_region_bucket: Some(true),
             // need check split region buckets, but region size does not exceed the split threshold
             region_bucket_size: ReadableSize(100),
             ..Default::default()
@@ -618,8 +576,8 @@ mod tests {
         ));
         // keys has not reached the max_keys 100 yet.
         match rx.try_recv() {
-            Ok((region_id, CasualMessage::RegionApproximateSize { .. }))
-            | Ok((region_id, CasualMessage::RegionApproximateKeys { .. })) => {
+            Ok(SchedTask::UpdateApproximateSize { region_id, .. })
+            | Ok(SchedTask::UpdateApproximateKeys { region_id, .. }) => {
                 assert_eq!(region_id, region.get_id());
             }
             others => panic!("expect recv empty, but got {:?}", others),
@@ -629,10 +587,10 @@ mod tests {
         let region_size =
             get_region_approximate_size(&engine, &region, ReadableSize::mb(1000).0).unwrap();
         // to make the region_max_size < region_split_size + region_size
-        // The split by keys should still work. But if the bug in on_kv() in size.rs exists,
-        // it will result in split by keys failed.
+        // The split by keys should still work. But if the bug in on_kv() in size.rs
+        // exists, it will result in split by keys failed.
         cfg.region_max_size = Some(ReadableSize(region_size * 6 / 5));
-        cfg.region_split_size = ReadableSize(region_size * 4 / 5);
+        cfg.region_split_size = Some(ReadableSize(region_size * 4 / 5));
         runnable = SplitCheckRunner::new(engine, tx.clone(), CoprocessorHost::new(tx, cfg));
         runnable.run(SplitCheckTask::split_check(
             region.clone(),
@@ -652,13 +610,10 @@ mod tests {
             .tempdir()
             .unwrap();
         let path_str = path.path().to_str().unwrap();
-        let db_opts = DBOptions::default();
-        let mut cf_opts = ColumnFamilyOptions::new();
+        let db_opts = DbOptions::default();
+        let mut cf_opts = CfOptions::new();
         cf_opts.set_level_zero_file_num_compaction_trigger(10);
-        let cfs_opts = LARGE_CFS
-            .iter()
-            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
-            .collect();
+        let cfs_opts = LARGE_CFS.iter().map(|cf| (*cf, cf_opts.clone())).collect();
         let db = engine_test::kv::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
 
         // size >= 4194304 will insert a new point in range properties

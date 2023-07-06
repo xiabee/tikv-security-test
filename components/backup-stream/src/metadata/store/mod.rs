@@ -1,13 +1,25 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
+cfg_if::cfg_if! {
+    if #[cfg(feature = "metastore-etcd")] {
+        pub mod etcd;
+        pub mod lazy_etcd;
+        pub use etcd::EtcdStore;
+    }
+}
+
+// Note: these mods also used for integration tests,
+//       so we cannot compile them only when `#[cfg(test)]`.
+//       (See https://github.com/rust-lang/rust/issues/84629)
+//       Maybe we'd better make a feature like `integration-test`?
 pub mod slash_etc;
 pub use slash_etc::SlashEtcStore;
 
-pub mod etcd;
-use std::{future::Future, pin::Pin};
+pub mod pd;
+
+use std::{cmp::Ordering, future::Future, pin::Pin, time::Duration};
 
 use async_trait::async_trait;
-pub use etcd::EtcdStore;
 use tokio_stream::Stream;
 
 // ==== Generic interface definition ====
@@ -16,10 +28,50 @@ use crate::errors::Result;
 
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+pub use pd::PdStore;
 
 #[derive(Debug, Default)]
 pub struct Transaction {
     ops: Vec<TransactionOp>,
+}
+
+/// A condition for executing a transcation.
+/// Compare value a key with arg.
+#[derive(Debug)]
+pub struct Condition {
+    over_key: Vec<u8>,
+    result: Ordering,
+    arg: Vec<u8>,
+}
+
+impl Condition {
+    pub fn new(over_key: MetaKey, result: Ordering, arg: Vec<u8>) -> Self {
+        Self {
+            over_key: over_key.0,
+            result,
+            arg,
+        }
+    }
+}
+
+/// A conditional transaction.
+/// This would atomically evaluate the condition, and execute corresponding
+/// transaction.
+#[derive(Debug)]
+pub struct CondTransaction {
+    cond: Condition,
+    success: Transaction,
+    failure: Transaction,
+}
+
+impl CondTransaction {
+    pub fn new(cond: Condition, success: Transaction, failure: Transaction) -> Self {
+        Self {
+            cond,
+            success,
+            failure,
+        }
+    }
 }
 
 impl Transaction {
@@ -27,20 +79,30 @@ impl Transaction {
         self.ops
     }
 
-    fn put(mut self, kv: KeyValue) -> Self {
-        self.ops.push(TransactionOp::Put(kv));
+    pub fn put(mut self, kv: KeyValue) -> Self {
+        self.ops.push(TransactionOp::Put(kv, PutOption::default()));
         self
     }
 
-    fn delete(mut self, keys: Keys) -> Self {
+    pub fn put_opt(mut self, kv: KeyValue, opt: PutOption) -> Self {
+        self.ops.push(TransactionOp::Put(kv, opt));
+        self
+    }
+
+    pub fn delete(mut self, keys: Keys) -> Self {
         self.ops.push(TransactionOp::Delete(keys));
         self
     }
 }
 
+#[derive(Default, Debug)]
+pub struct PutOption {
+    pub ttl: Duration,
+}
+
 #[derive(Debug)]
 pub enum TransactionOp {
-    Put(KeyValue),
+    Put(KeyValue, PutOption),
     Delete(Keys),
 }
 
@@ -53,10 +115,19 @@ pub struct WithRevision<T> {
     pub inner: T,
 }
 
+impl<T> WithRevision<T> {
+    pub fn map<R>(self, f: impl FnOnce(T) -> R) -> WithRevision<R> {
+        WithRevision {
+            revision: self.revision,
+            inner: f(self.inner),
+        }
+    }
+}
+
 /// The key set for getting.
 /// I guess there should be a `&[u8]` in meta key,
 /// but the etcd client requires Into<Vec<u8>> :(
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Keys {
     Prefix(MetaKey),
     Range(MetaKey, MetaKey),
@@ -105,7 +176,7 @@ pub trait Snapshot: Send + Sync + 'static {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum KvEventType {
     Put,
     Delete,
@@ -139,8 +210,9 @@ pub trait MetaStore: Clone + Send + Sync {
     /// Can be canceled then by polling the `cancel` future in the Subscription.
     async fn watch(&self, keys: Keys, start_rev: i64) -> Result<KvChangeSubscription>;
     /// Execute an atomic write (write batch) over the store.
-    /// Maybe support etcd-like compare operations?
     async fn txn(&self, txn: Transaction) -> Result<()>;
+    /// Execute an conditional transaction over the store.
+    async fn txn_cond(&self, txn: CondTransaction) -> Result<()>;
 
     /// Set a key in the store.
     /// Maybe rename it to `put` to keeping consistency with etcd?
@@ -150,5 +222,14 @@ pub trait MetaStore: Clone + Send + Sync {
     /// Delete some keys.
     async fn delete(&self, keys: Keys) -> Result<()> {
         self.txn(Transaction::default().delete(keys)).await
+    }
+    /// Get the latest version of some keys.
+    async fn get_latest(&self, keys: Keys) -> Result<WithRevision<Vec<KeyValue>>> {
+        let s = self.snapshot().await?;
+        let keys = s.get(keys).await?;
+        Ok(WithRevision {
+            revision: s.revision(),
+            inner: keys,
+        })
     }
 }

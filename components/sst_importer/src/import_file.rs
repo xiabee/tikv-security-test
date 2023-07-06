@@ -12,9 +12,11 @@ use api_version::api_v2::TIDB_RANGES_COMPLEMENT;
 use encryption::{DataKeyManager, EncrypterWriter};
 use engine_rocks::{get_env, RocksSstReader};
 use engine_traits::{
-    EncryptionKeyManager, Iterable, Iterator, KvEngine, SstExt, SstMetaInfo, SstReader,
+    iter_option, EncryptionKeyManager, IterOptions, Iterator, KvEngine, RefIterable, SstExt,
+    SstMetaInfo, SstReader,
 };
 use file_system::{get_io_rate_limiter, sync_dir, File, OpenOptions};
+use keys::data_key;
 use kvproto::{import_sstpb::*, kvrpcpb::ApiVersion};
 use tikv_util::time::Instant;
 use uuid::{Builder as UuidBuilder, Uuid};
@@ -52,7 +54,6 @@ pub struct ImportPath {
 impl ImportPath {
     // move file from temp to save.
     pub fn save(mut self, key_manager: Option<&DataKeyManager>) -> Result<()> {
-        file_system::rename(&self.temp, &self.save)?;
         if let Some(key_manager) = key_manager {
             let temp_str = self
                 .temp
@@ -63,7 +64,15 @@ impl ImportPath {
                 .to_str()
                 .ok_or_else(|| Error::InvalidSstPath(self.save.clone()))?;
             key_manager.link_file(temp_str, save_str)?;
-            key_manager.delete_file(temp_str)?;
+            let r = file_system::rename(&self.temp, &self.save);
+            let del_file = if r.is_ok() { temp_str } else { save_str };
+            if let Err(e) = key_manager.delete_file(del_file) {
+                warn!("fail to remove encryption metadata during 'save'";
+                      "file" => ?self, "err" => ?e);
+            }
+            r?;
+        } else {
+            file_system::rename(&self.temp, &self.save)?;
         }
         // sync the directory after rename
         self.save.pop();
@@ -139,12 +148,19 @@ impl ImportFile {
                 "finalize SST write cache",
             ));
         }
-        file_system::rename(&self.path.temp, &self.path.save)?;
         if let Some(ref manager) = self.key_manager {
             let tmp_str = self.path.temp.to_str().unwrap();
             let save_str = self.path.save.to_str().unwrap();
             manager.link_file(tmp_str, save_str)?;
-            manager.delete_file(self.path.temp.to_str().unwrap())?;
+            let r = file_system::rename(&self.path.temp, &self.path.save);
+            let del_file = if r.is_ok() { tmp_str } else { save_str };
+            if let Err(e) = manager.delete_file(del_file) {
+                warn!("fail to remove encryption metadata during finishing importing files.";
+                      "err" => ?e);
+            }
+            r?;
+        } else {
+            file_system::rename(&self.path.temp, &self.path.save)?;
         }
         Ok(())
     }
@@ -169,6 +185,10 @@ impl ImportFile {
             return Err(Error::FileCorrupted(self.path.temp.clone(), reason));
         }
         Ok(())
+    }
+
+    pub fn get_import_path(&self) -> &ImportPath {
+        &self.path
     }
 }
 
@@ -230,9 +250,9 @@ impl ImportDir {
 
     /// Make an import path base on the basic path and the file name.
     pub fn get_import_path(&self, file_name: &str) -> Result<ImportPath> {
-        let save_path = self.root_dir.join(&file_name);
-        let temp_path = self.temp_dir.join(&file_name);
-        let clone_path = self.clone_dir.join(&file_name);
+        let save_path = self.root_dir.join(file_name);
+        let temp_path = self.temp_dir.join(file_name);
+        let clone_path = self.clone_dir.join(file_name);
         Ok(ImportPath {
             save: save_path,
             temp: temp_path,
@@ -259,7 +279,7 @@ impl ImportDir {
 
     pub fn delete_file(&self, path: &Path, key_manager: Option<&DataKeyManager>) -> Result<()> {
         if path.exists() {
-            file_system::remove_file(&path)?;
+            file_system::remove_file(path)?;
             if let Some(manager) = key_manager {
                 manager.delete_file(path.to_str().unwrap())?;
             }
@@ -305,7 +325,8 @@ impl ImportDir {
         for meta in metas {
             match (api_version, meta.api_version) {
                 (cur_version, meta_version) if cur_version == meta_version => continue,
-                // sometimes client do not know whether ttl is enabled, so a general V1 is accepted as V1ttl
+                // sometimes client do not know whether ttl is enabled, so a general V1 is accepted
+                // as V1ttl
                 (ApiVersion::V1ttl, ApiVersion::V1) => continue,
                 // import V1ttl as V1 will immediatly be rejected because it is never correct.
                 (ApiVersion::V1, ApiVersion::V1ttl) => return Ok(false),
@@ -318,18 +339,14 @@ impl ImportDir {
                     let sst_reader = RocksSstReader::open_with_env(path_str, Some(env))?;
 
                     for &(start, end) in TIDB_RANGES_COMPLEMENT {
-                        let mut unexpected_data_key = None;
-                        sst_reader.scan(start, end, false, |key, _| {
-                            unexpected_data_key = Some(key.to_vec());
-                            Ok(false)
-                        })?;
-
-                        if let Some(unexpected_data_key) = unexpected_data_key {
+                        let opt = iter_option(&data_key(start), &data_key(end), false);
+                        let mut iter = sst_reader.iter(opt)?;
+                        if iter.seek(start)? {
                             error!(
                                 "unable to import: switch api version with non-tidb key";
                                 "sst" => ?meta.api_version,
                                 "current" => ?api_version,
-                                "key" => ?log_wrappers::hex_encode_upper(&unexpected_data_key)
+                                "key" => ?log_wrappers::hex_encode_upper(iter.key())
                             );
                             return Ok(false);
                         }
@@ -408,7 +425,8 @@ impl ImportDir {
             Some(km) => E::SstReader::open_encrypted(&path.save.to_string_lossy(), km)?,
             None => E::SstReader::open(&path.save.to_string_lossy())?,
         };
-        let mut i = r.iter();
+        let opts = IterOptions::new(None, None, false);
+        let mut i = r.iter(opts)?;
         if !i.seek_to_first()? || !i.valid()? {
             return Ok(None);
         }
@@ -477,8 +495,9 @@ pub fn parse_meta_from_path<P: AsRef<Path>>(path: P) -> Result<SstMeta> {
     meta.mut_region_epoch().set_conf_ver(elems[2].parse()?);
     meta.mut_region_epoch().set_version(elems[3].parse()?);
     if elems.len() > 4 {
-        // If we upgrade TiKV from 3.0.x to 4.0.x and higher version, we can not read cf_name from
-        // the file path, because TiKV 3.0.x does not encode cf_name to path.
+        // If we upgrade TiKV from 3.0.x to 4.0.x and higher version, we can not read
+        // cf_name from the file path, because TiKV 3.0.x does not encode
+        // cf_name to path.
         meta.set_cf_name(elems[4].to_owned());
     }
     Ok(meta)

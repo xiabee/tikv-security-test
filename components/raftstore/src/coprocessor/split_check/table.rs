@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use engine_traits::{IterOptions, Iterator, KvEngine, SeekKey, CF_WRITE};
+use engine_traits::{IterOptions, Iterator, KvEngine, CF_WRITE};
 use error_code::ErrorCodeExt;
 use kvproto::{metapb::Region, pdpb::CheckPolicy};
 use tidb_query_datatype::codec::table as table_codec;
@@ -26,8 +26,9 @@ where
     E: KvEngine,
 {
     /// Feed keys in order to find the split key.
-    /// If `current_data_key` does not belong to `status.first_encoded_table_prefix`.
-    /// it returns the encoded table prefix of `current_data_key`.
+    /// If `current_data_key` does not belong to
+    /// `status.first_encoded_table_prefix`. it returns the encoded table
+    /// prefix of `current_data_key`.
     fn on_kv(&mut self, _: &mut ObserverContext<'_>, entry: &KeyEntry) -> bool {
         if self.split_key.is_some() {
             return true;
@@ -183,10 +184,10 @@ fn last_key_of_region(db: &impl KvEngine, region: &Region) -> Result<Option<Vec<
         Some(KeyBuilder::from_vec(end_key, 0, 0)),
         false,
     );
-    let mut iter = box_try!(db.iterator_cf_opt(CF_WRITE, iter_opt));
+    let mut iter = box_try!(db.iterator_opt(CF_WRITE, iter_opt));
 
     // the last key
-    let found: Result<bool> = iter.seek(SeekKey::End).map_err(|e| box_err!(e));
+    let found: Result<bool> = iter.seek_to_last().map_err(|e| box_err!(e));
     if found? {
         let key = iter.key().to_vec();
         last_key = Some(key);
@@ -237,8 +238,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        coprocessor::{Config, CoprocessorHost},
-        store::{CasualMessage, SplitCheckRunner, SplitCheckTask},
+        coprocessor::{dispatcher::SchedTask, Config, CoprocessorHost},
+        store::{SplitCheckRunner, SplitCheckTask},
     };
 
     /// Composes table record and index prefix: `t[table_id]`.
@@ -256,7 +257,7 @@ mod tests {
             .prefix("test_last_key_of_region")
             .tempdir()
             .unwrap();
-        let engine = new_engine(path.path().to_str().unwrap(), None, ALL_CFS, None).unwrap();
+        let engine = new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap();
 
         let mut region = Region::default();
         region.set_id(1);
@@ -309,7 +310,7 @@ mod tests {
             .prefix("test_table_check_observer")
             .tempdir()
             .unwrap();
-        let engine = new_engine(path.path().to_str().unwrap(), None, ALL_CFS, None).unwrap();
+        let engine = new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap();
 
         let mut region = Region::default();
         region.set_id(1);
@@ -325,7 +326,7 @@ mod tests {
             split_region_on_table: true,
             // Try to "disable" size split.
             region_max_size: Some(ReadableSize::gb(2)),
-            region_split_size: ReadableSize::gb(1),
+            region_split_size: Some(ReadableSize::gb(1)),
             // Try to "disable" keys split
             region_max_keys: Some(2000000000),
             region_split_keys: Some(1000000000),
@@ -352,9 +353,9 @@ mod tests {
                     let key = Key::from_raw(&gen_table_prefix(id));
                     loop {
                         match rx.try_recv() {
-                            Ok((_, CasualMessage::RegionApproximateSize { .. }))
-                            | Ok((_, CasualMessage::RegionApproximateKeys { .. })) => (),
-                            Ok((_, CasualMessage::SplitRegion { split_keys, .. })) => {
+                            Ok(SchedTask::UpdateApproximateSize { .. })
+                            | Ok(SchedTask::UpdateApproximateKeys { .. }) => (),
+                            Ok(SchedTask::AskSplit { split_keys, .. }) => {
                                 assert_eq!(split_keys, vec![key.into_encoded()]);
                                 break;
                             }
@@ -364,8 +365,8 @@ mod tests {
                 } else {
                     loop {
                         match rx.try_recv() {
-                            Ok((_, CasualMessage::RegionApproximateSize { .. }))
-                            | Ok((_, CasualMessage::RegionApproximateKeys { .. })) => (),
+                            Ok(SchedTask::UpdateApproximateSize { .. })
+                            | Ok(SchedTask::UpdateApproximateKeys { .. }) => (),
                             Err(mpsc::TryRecvError::Empty) => {
                                 break;
                             }

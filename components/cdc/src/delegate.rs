@@ -38,23 +38,24 @@ use crate::{
     initializer::KvEntry,
     metrics::*,
     old_value::{OldValueCache, OldValueCallback},
-    service::ConnID,
+    service::ConnId,
+    txn_source::TxnSource,
     Error, Result,
 };
 
 static DOWNSTREAM_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique identifier of a Downstream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct DownstreamID(usize);
+#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+pub struct DownstreamId(usize);
 
-impl DownstreamID {
-    pub fn new() -> DownstreamID {
-        DownstreamID(DOWNSTREAM_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
+impl DownstreamId {
+    pub fn new() -> DownstreamId {
+        DownstreamId(DOWNSTREAM_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
     }
 }
 
-impl Default for DownstreamID {
+impl Default for DownstreamId {
     fn default() -> Self {
         Self::new()
     }
@@ -64,10 +65,11 @@ impl Default for DownstreamID {
 pub enum DownstreamState {
     /// It's just created and rejects change events and resolved timestamps.
     Uninitialized,
-    /// It has got a snapshot for incremental scan, and change events will be accepted.
-    /// However it still rejects resolved timestamps.
+    /// It has got a snapshot for incremental scan, and change events will be
+    /// accepted. However it still rejects resolved timestamps.
     Initializing,
-    /// Incremental scan is finished so that resolved timestamps are acceptable now.
+    /// Incremental scan is finished so that resolved timestamps are acceptable
+    /// now.
     Normal,
     Stopped,
 }
@@ -78,7 +80,8 @@ impl Default for DownstreamState {
     }
 }
 
-/// Shold only be called when it's uninitialized or stopped. Return false if it's stopped.
+/// Should only be called when it's uninitialized or stopped. Return false if
+/// it's stopped.
 pub(crate) fn on_init_downstream(s: &AtomicCell<DownstreamState>) -> bool {
     s.compare_exchange(
         DownstreamState::Uninitialized,
@@ -87,7 +90,8 @@ pub(crate) fn on_init_downstream(s: &AtomicCell<DownstreamState>) -> bool {
     .is_ok()
 }
 
-/// Shold only be called when it's initializing or stopped. Return false if it's stopped.
+/// Should only be called when it's initializing or stopped. Return false if
+/// it's stopped.
 pub(crate) fn post_init_downstream(s: &AtomicCell<DownstreamState>) -> bool {
     s.compare_exchange(DownstreamState::Initializing, DownstreamState::Normal)
         .is_ok()
@@ -116,16 +120,18 @@ impl DownstreamState {
 pub struct Downstream {
     // TODO: include cdc request.
     /// A unique identifier of the Downstream.
-    id: DownstreamID,
+    id: DownstreamId,
     // The request ID set by CDC to identify events corresponding different requests.
     req_id: u64,
-    conn_id: ConnID,
+    conn_id: ConnId,
     // The IP address of downstream.
     peer: String,
     region_epoch: RegionEpoch,
     sink: Option<Sink>,
     state: Arc<AtomicCell<DownstreamState>>,
     kv_api: ChangeDataRequestKvApi,
+    filter_loop: bool,
+    pub(crate) observed_range: ObservedRange,
 }
 
 impl Downstream {
@@ -137,11 +143,13 @@ impl Downstream {
         peer: String,
         region_epoch: RegionEpoch,
         req_id: u64,
-        conn_id: ConnID,
+        conn_id: ConnId,
         kv_api: ChangeDataRequestKvApi,
+        filter_loop: bool,
+        observed_range: ObservedRange,
     ) -> Downstream {
         Downstream {
-            id: DownstreamID::new(),
+            id: DownstreamId::new(),
             req_id,
             conn_id,
             peer,
@@ -149,6 +157,8 @@ impl Downstream {
             sink: None,
             state: Arc::new(AtomicCell::new(DownstreamState::default())),
             kv_api,
+            filter_loop,
+            observed_range,
         }
     }
 
@@ -196,15 +206,19 @@ impl Downstream {
         self.sink = Some(sink);
     }
 
-    pub fn get_id(&self) -> DownstreamID {
+    pub fn get_id(&self) -> DownstreamId {
         self.id
+    }
+
+    pub fn get_filter_loop(&self) -> bool {
+        self.filter_loop
     }
 
     pub fn get_state(&self) -> Arc<AtomicCell<DownstreamState>> {
         self.state.clone()
     }
 
-    pub fn get_conn_id(&self) -> ConnID {
+    pub fn get_conn_id(&self) -> ConnId {
         self.conn_id
     }
 }
@@ -244,7 +258,6 @@ pub struct Delegate {
     pending: Option<Pending>,
     txn_extra_op: Arc<AtomicCell<TxnExtraOp>>,
     failed: bool,
-    has_resolver: bool,
 }
 
 impl Delegate {
@@ -259,12 +272,7 @@ impl Delegate {
             pending: Some(Pending::default()),
             txn_extra_op,
             failed: false,
-            has_resolver: false,
         }
-    }
-
-    pub fn has_resolver(&self) -> bool {
-        self.has_resolver
     }
 
     /// Let downstream subscribe the delegate.
@@ -274,14 +282,11 @@ impl Delegate {
             // Check if the downstream is out dated.
             self.check_epoch_on_ready(&downstream)?;
         }
-        if downstream.kv_api == ChangeDataRequestKvApi::TiDb {
-            self.has_resolver = true;
-        }
         self.add_downstream(downstream);
         Ok(())
     }
 
-    pub fn downstream(&self, downstream_id: DownstreamID) -> Option<&Downstream> {
+    pub fn downstream(&self, downstream_id: DownstreamId) -> Option<&Downstream> {
         self.downstreams().iter().find(|d| d.id == downstream_id)
     }
 
@@ -301,7 +306,7 @@ impl Delegate {
 
     /// Let downstream unsubscribe the delegate.
     /// Return whether the delegate is empty or not.
-    pub fn unsubscribe(&mut self, id: DownstreamID, err: Option<Error>) -> bool {
+    pub fn unsubscribe(&mut self, id: DownstreamId, err: Option<Error>) -> bool {
         let error_event = err.map(|err| err.into_error_event(self.region_id));
         let region_id = self.region_id;
         if let Some(d) = self.remove_downstream(id) {
@@ -355,9 +360,10 @@ impl Delegate {
         let _ = self.broadcast(send);
     }
 
-    /// `txn_extra_op` returns a shared flag which is accessed in TiKV's transaction layer to
-    /// determine whether to capture modifications' old value or not. Unsubsribing all downstreams
-    /// or calling `Delegate::stop` will store it with `TxnExtraOp::Noop`.
+    /// `txn_extra_op` returns a shared flag which is accessed in TiKV's
+    /// transaction layer to determine whether to capture modifications' old
+    /// value or not. Unsubscribing all downstreams or calling
+    /// `Delegate::stop` will store it with `TxnExtraOp::Noop`.
     ///
     /// NOTE: Dropping a `Delegate` won't update this flag.
     pub fn txn_extra_op(&self) -> &AtomicCell<TxnExtraOp> {
@@ -380,7 +386,8 @@ impl Delegate {
         Ok(())
     }
 
-    /// Install a resolver. Return downstreams which fail because of the region's internal changes.
+    /// Install a resolver. Return downstreams which fail because of the
+    /// region's internal changes.
     pub fn on_region_ready(
         &mut self,
         mut resolver: Resolver,
@@ -391,6 +398,11 @@ impl Delegate {
             "region {} resolver should not be ready",
             self.region_id,
         );
+
+        // Check observed key range in region.
+        for downstream in self.downstreams_mut() {
+            downstream.observed_range.update_region_key_range(&region);
+        }
 
         // Mark the delegate as initialized.
         let mut pending = self.pending.take().unwrap();
@@ -427,8 +439,6 @@ impl Delegate {
         let resolved_ts = resolver.resolve(min_ts);
         debug!("cdc resolved ts updated";
             "region_id" => self.region_id, "resolved_ts" => resolved_ts);
-        CDC_RESOLVED_TS_GAP_HISTOGRAM
-            .observe((min_ts.physical() - resolved_ts.physical()) as f64 / 1000f64);
         Some(resolved_ts)
     }
 
@@ -446,6 +456,7 @@ impl Delegate {
         for cmd in batch.into_iter(self.region_id) {
             let Cmd {
                 index,
+                term: _,
                 mut request,
                 mut response,
             } = cmd;
@@ -476,6 +487,8 @@ impl Delegate {
         region_id: u64,
         request_id: u64,
         entries: Vec<Option<KvEntry>>,
+        filter_loop: bool,
+        observed_range: &ObservedRange,
     ) -> Result<Vec<CdcEvent>> {
         let entries_len = entries.len();
         let mut rows = vec![Vec::with_capacity(entries_len)];
@@ -493,6 +506,9 @@ impl Delegate {
                     lock,
                     old_value,
                 })) => {
+                    if !observed_range.contains_encoded_key(&lock.0) {
+                        continue;
+                    }
                     let l = Lock::parse(&lock.1).unwrap();
                     if decode_lock(lock.0, l, &mut row, &mut _has_value) {
                         continue;
@@ -506,6 +522,9 @@ impl Delegate {
                     write,
                     old_value,
                 })) => {
+                    if !observed_range.contains_encoded_key(&write.0) {
+                        continue;
+                    }
                     if decode_write(write.0, &write.1, &mut row, &mut _has_value, false) {
                         continue;
                     }
@@ -531,6 +550,12 @@ impl Delegate {
                     set_event_row_type(&mut row, EventLogType::Initialized);
                     row_size = 0;
                 }
+            }
+            let lossy_ddl_filter = TxnSource::is_lossy_ddl_reorg_source_set(row.txn_source);
+            let cdc_write_filter =
+                TxnSource::is_cdc_write_source_set(row.txn_source) && filter_loop;
+            if lossy_ddl_filter || cdc_write_filter {
+                continue;
             }
             if current_rows_size + row_size >= CDC_EVENT_MAX_BYTES {
                 rows.push(Vec::with_capacity(entries_len));
@@ -613,10 +638,7 @@ impl Delegate {
             rows.push(v);
         }
         self.sink_downstream(rows, index, ChangeDataRequestKvApi::TiDb)?;
-
-        self.sink_downstream(raw_rows, index, ChangeDataRequestKvApi::RawKv)?;
-
-        Ok(())
+        self.sink_downstream(raw_rows, index, ChangeDataRequestKvApi::RawKv)
     }
 
     fn sink_downstream(
@@ -628,24 +650,74 @@ impl Delegate {
         if entries.is_empty() {
             return Ok(());
         }
-        let event_entries = EventEntries {
-            entries: entries.into(),
-            ..Default::default()
-        };
-        let change_data_event = Event {
-            region_id: self.region_id,
-            index,
-            event: Some(Event_oneof_event::Entries(event_entries)),
-            ..Default::default()
-        };
+
+        // Filter the entries which are lossy DDL events.
+        // We don't need to send them to downstream.
+        let entries = entries
+            .iter()
+            .filter(|x| !TxnSource::is_lossy_ddl_reorg_source_set(x.txn_source))
+            .cloned()
+            .collect::<Vec<EventRow>>();
+
+        let downstreams = self.downstreams();
+        assert!(
+            !downstreams.is_empty(),
+            "region {} miss downstream",
+            self.region_id
+        );
+
+        // Collect the change event cause by user write, which cdc write source is not
+        // set. For changefeed which only need the user write,
+        // send the `filtered_entries`, or else, send them all.
+        let mut filtered_entries = None;
+        for downstream in downstreams {
+            if downstream.filter_loop {
+                let filtered = entries
+                    .iter()
+                    .filter(|x| !TxnSource::is_cdc_write_source_set(x.txn_source))
+                    .cloned()
+                    .collect::<Vec<EventRow>>();
+                if !filtered.is_empty() {
+                    filtered_entries = Some(filtered);
+                }
+                break;
+            }
+        }
+
+        let region_id = self.region_id;
         let send = move |downstream: &Downstream| {
-            // No ready downstream or a downstream that does not match the kv_api type, will be ignored.
-            // There will be one region that contains both Txn & Raw entries.
+            // No ready downstream or a downstream that does not match the kv_api type, will
+            // be ignored. There will be one region that contains both Txn & Raw entries.
             // The judgement here is for sending entries to downstreams with correct kv_api.
             if !downstream.state.load().ready_for_change_events() || downstream.kv_api != kv_api {
                 return Ok(());
             }
-            let event = change_data_event.clone();
+            if downstream.filter_loop && filtered_entries.is_none() {
+                return Ok(());
+            }
+
+            let entries_clone = if downstream.filter_loop {
+                downstream
+                    .observed_range
+                    .filter_entries(filtered_entries.clone().unwrap())
+            } else {
+                downstream.observed_range.filter_entries(entries.clone())
+            };
+
+            if entries_clone.is_empty() {
+                return Ok(());
+            }
+
+            let event = Event {
+                region_id,
+                index,
+                event: Some(Event_oneof_event::Entries(EventEntries {
+                    entries: entries_clone.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+
             // Do not force send for real time change data events.
             let force_send = false;
             downstream.sink_event(event, force_send)
@@ -830,7 +902,7 @@ impl Delegate {
         self.txn_extra_op.store(TxnExtraOp::ReadOldValue);
     }
 
-    fn remove_downstream(&mut self, id: DownstreamID) -> Option<Downstream> {
+    fn remove_downstream(&mut self, id: DownstreamId) -> Option<Downstream> {
         let downstreams = self.downstreams_mut();
         if let Some(index) = downstreams.iter().position(|x| x.id == id) {
             let downstream = downstreams.swap_remove(index);
@@ -849,9 +921,9 @@ impl Delegate {
         if let Err(e) = compare_region_epoch(
             &downstream.region_epoch,
             region,
-            false, /* check_conf_ver */
-            true,  /* check_ver */
-            true,  /* include_region */
+            false, // check_conf_ver
+            true,  // check_ver
+            true,  // include_region
         ) {
             info!(
                 "cdc fail to subscribe downstream";
@@ -890,9 +962,10 @@ fn make_overlapped_rollback(key: Key, row: &mut EventRow) {
     set_event_row_type(row, EventLogType::Rollback);
 }
 
-/// Decodes the write record and store its information in `row`. This may be called both when
-/// doing incremental scan of observing apply events. There's different behavior for the two
-/// case, distinguished by the `is_apply` parameter.
+/// Decodes the write record and store its information in `row`. This may be
+/// called both when doing incremental scan of observing apply events. There's
+/// different behavior for the two case, distinguished by the `is_apply`
+/// parameter.
 fn decode_write(
     key: Vec<u8>,
     value: &[u8],
@@ -904,8 +977,8 @@ fn decode_write(
     let write = WriteRef::parse(value).unwrap().to_owned();
 
     // For scanning, ignore the GC fence and read the old data;
-    // For observed apply, drop the record it self but keep only the overlapped rollback information
-    // if gc_fence exists.
+    // For observed apply, drop the record it self but keep only the overlapped
+    // rollback information if gc_fence exists.
     if is_apply && write.gc_fence.is_some() {
         // `gc_fence` is set means the write record has been rewritten.
         // Currently the only case is writing overlapped_rollback. And in this case
@@ -925,6 +998,7 @@ fn decode_write(
         }
     };
     let commit_ts = if write.write_type == WriteType::Rollback {
+        assert_eq!(write.txn_source, 0);
         0
     } else {
         key.decode_ts().unwrap().into_inner()
@@ -933,6 +1007,8 @@ fn decode_write(
     row.commit_ts = commit_ts;
     row.key = key.truncate_ts().unwrap().into_raw().unwrap();
     row.op_type = op_type as _;
+    // used for filter out the event. see `txn_source` field for more detail.
+    row.txn_source = write.txn_source;
     set_event_row_type(row, r_type);
     if let Some(value) = write.short_value {
         row.value = value;
@@ -959,6 +1035,8 @@ fn decode_lock(key: Vec<u8>, lock: Lock, row: &mut EventRow, has_value: &mut boo
     row.start_ts = lock.ts.into_inner();
     row.key = key.into_raw().unwrap();
     row.op_type = op_type as _;
+    // used for filter out the event. see `txn_source` field for more detail.
+    row.txn_source = lock.txn_source;
     set_event_row_type(row, EventLogType::Prewrite);
     if let Some(value) = lock.short_value {
         row.value = value;
@@ -998,6 +1076,70 @@ fn decode_default(value: Vec<u8>, row: &mut EventRow, has_value: &mut bool) {
     *has_value = true;
 }
 
+/// Observed key range.
+#[derive(Clone, Default)]
+pub struct ObservedRange {
+    start_key_encoded: Vec<u8>,
+    end_key_encoded: Vec<u8>,
+    start_key_raw: Vec<u8>,
+    end_key_raw: Vec<u8>,
+    pub(crate) all_key_covered: bool,
+}
+
+impl ObservedRange {
+    pub fn new(start_key_encoded: Vec<u8>, end_key_encoded: Vec<u8>) -> Result<ObservedRange> {
+        let start_key_raw = Key::from_encoded(start_key_encoded.clone())
+            .into_raw()
+            .map_err(|e| Error::Other(e.into()))?;
+        let end_key_raw = Key::from_encoded(end_key_encoded.clone())
+            .into_raw()
+            .map_err(|e| Error::Other(e.into()))?;
+        Ok(ObservedRange {
+            start_key_encoded,
+            end_key_encoded,
+            start_key_raw,
+            end_key_raw,
+            all_key_covered: false,
+        })
+    }
+
+    #[allow(clippy::collapsible_if)]
+    pub fn update_region_key_range(&mut self, region: &Region) {
+        // Check observed key range in region.
+        if self.start_key_encoded <= region.start_key {
+            if self.end_key_encoded.is_empty()
+                || (region.end_key <= self.end_key_encoded && !region.end_key.is_empty())
+            {
+                // Observed range covers the region.
+                self.all_key_covered = true;
+            }
+        }
+    }
+
+    fn is_key_in_range(&self, start_key: &[u8], end_key: &[u8], key: &[u8]) -> bool {
+        if self.all_key_covered {
+            return true;
+        }
+        if start_key <= key && (key < end_key || end_key.is_empty()) {
+            return true;
+        }
+        false
+    }
+
+    pub fn contains_encoded_key(&self, key: &[u8]) -> bool {
+        self.is_key_in_range(&self.start_key_encoded, &self.end_key_encoded, key)
+    }
+
+    pub fn filter_entries(&self, mut entries: Vec<EventRow>) -> Vec<EventRow> {
+        if self.all_key_covered {
+            return entries;
+        }
+        // Entry's key is in raw key format.
+        entries.retain(|e| self.is_key_in_range(&self.start_key_raw, &self.end_key_raw, &e.key));
+        entries
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1007,6 +1149,7 @@ mod tests {
     use kvproto::{errorpb::Error as ErrorHeader, metapb::Region};
 
     use super::*;
+    use crate::channel::{channel, recv_timeout, MemoryQuota};
 
     #[test]
     fn test_error() {
@@ -1026,8 +1169,10 @@ mod tests {
             String::new(),
             region_epoch,
             request_id,
-            ConnID::new(),
+            ConnId::new(),
             ChangeDataRequestKvApi::TiDb,
+            false,
+            ObservedRange::default(),
         );
         downstream.set_sink(sink);
         let mut delegate = Delegate::new(region_id, Default::default());
@@ -1035,6 +1180,7 @@ mod tests {
         assert!(delegate.handle.is_observing());
         let resolver = Resolver::new(region_id);
         assert!(delegate.on_region_ready(resolver, region).is_empty());
+        assert!(delegate.downstreams()[0].observed_range.all_key_covered);
 
         let rx_wrap = Cell::new(Some(rx));
         let receive_error = || {
@@ -1145,7 +1291,15 @@ mod tests {
             let mut epoch = RegionEpoch::default();
             epoch.set_conf_ver(region_version);
             epoch.set_version(region_version);
-            Downstream::new(peer, epoch, id, ConnID::new(), ChangeDataRequestKvApi::TiDb)
+            Downstream::new(
+                peer,
+                epoch,
+                id,
+                ConnId::new(),
+                ChangeDataRequestKvApi::TiDb,
+                false,
+                ObservedRange::default(),
+            )
         };
 
         // Create a new delegate.
@@ -1185,7 +1339,7 @@ mod tests {
         assert!(delegate.handle.is_observing());
 
         // Subscribe with an invalid epoch.
-        assert!(delegate.subscribe(new_downstream(1, 2)).is_err());
+        delegate.subscribe(new_downstream(1, 2)).unwrap_err();
         assert_eq!(delegate.downstreams().len(), 1);
 
         // Unsubscribe all downstreams.
@@ -1193,6 +1347,239 @@ mod tests {
         assert!(delegate.downstreams().is_empty());
         assert_eq!(txn_extra_op.load(), TxnExtraOp::Noop);
         assert!(!delegate.handle.is_observing());
+    }
+
+    #[test]
+    fn test_observed_range() {
+        for case in vec![
+            (b"".as_slice(), b"".as_slice(), false),
+            (b"a", b"", false),
+            (b"", b"b", false),
+            (b"a", b"b", true),
+            (b"a", b"bb", false),
+            (b"a", b"aa", true),
+            (b"aa", b"aaa", true),
+        ] {
+            let start_key = if !case.0.is_empty() {
+                Key::from_raw(case.0).into_encoded()
+            } else {
+                case.0.to_owned()
+            };
+            let end_key = if !case.1.is_empty() {
+                Key::from_raw(case.1).into_encoded()
+            } else {
+                case.1.to_owned()
+            };
+            let mut region = Region::default();
+            region.start_key = start_key.to_owned();
+            region.end_key = end_key.to_owned();
+
+            for k in 0..=0xff {
+                let mut observed_range = ObservedRange::default();
+                observed_range.update_region_key_range(&region);
+                assert!(observed_range.contains_encoded_key(&Key::from_raw(&[k]).into_encoded()));
+            }
+            let mut observed_range = ObservedRange::new(
+                Key::from_raw(b"a").into_encoded(),
+                Key::from_raw(b"b").into_encoded(),
+            )
+            .unwrap();
+            observed_range.update_region_key_range(&region);
+            assert_eq!(observed_range.all_key_covered, case.2, "{:?}", case);
+            assert!(
+                observed_range.contains_encoded_key(&Key::from_raw(b"a").into_encoded()),
+                "{:?}",
+                case
+            );
+            assert!(
+                observed_range.contains_encoded_key(&Key::from_raw(b"ab").into_encoded()),
+                "{:?}",
+                case
+            );
+            if observed_range.all_key_covered {
+                assert!(
+                    observed_range.contains_encoded_key(&Key::from_raw(b"b").into_encoded()),
+                    "{:?}",
+                    case
+                );
+            } else {
+                assert!(
+                    !observed_range.contains_encoded_key(&Key::from_raw(b"b").into_encoded()),
+                    "{:?}",
+                    case
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_downstream_filter_entires() {
+        // Create a new delegate that observes [b, d).
+        let observed_range = ObservedRange::new(
+            Key::from_raw(b"b").into_encoded(),
+            Key::from_raw(b"d").into_encoded(),
+        )
+        .unwrap();
+        let txn_extra_op = Arc::new(AtomicCell::new(TxnExtraOp::Noop));
+        let mut delegate = Delegate::new(1, txn_extra_op);
+        assert!(delegate.handle.is_observing());
+
+        let mut map = HashMap::default();
+        for k in b'a'..=b'e' {
+            let mut put = PutRequest::default();
+            put.key = Key::from_raw(&[k]).into_encoded();
+            put.cf = "lock".to_owned();
+            put.value = Lock::new(
+                LockType::Put,
+                put.key.clone(),
+                1.into(),
+                10,
+                None,
+                TimeStamp::zero(),
+                0,
+                TimeStamp::zero(),
+            )
+            .to_bytes();
+            delegate
+                .sink_txn_put(
+                    put,
+                    false,
+                    &mut map,
+                    |_: &mut EventRow, _: TimeStamp| Ok(()),
+                )
+                .unwrap();
+        }
+        assert_eq!(map.len(), 5);
+
+        let (sink, mut drain) = channel(1, MemoryQuota::new(1024));
+        let downstream = Downstream {
+            id: DownstreamId::new(),
+            req_id: 1,
+            conn_id: ConnId::new(),
+            peer: String::new(),
+            region_epoch: RegionEpoch::default(),
+            sink: Some(sink),
+            state: Arc::new(AtomicCell::new(DownstreamState::Normal)),
+            kv_api: ChangeDataRequestKvApi::TiDb,
+            filter_loop: false,
+            observed_range,
+        };
+        delegate.add_downstream(downstream);
+        let entries = map.values().map(|(r, _)| r).cloned().collect();
+        delegate
+            .sink_downstream(entries, 1, ChangeDataRequestKvApi::TiDb)
+            .unwrap();
+
+        let (mut tx, mut rx) = futures::channel::mpsc::unbounded();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn(async move {
+            drain.forward(&mut tx).await.unwrap();
+        });
+        let (e, _) = recv_timeout(&mut rx, std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.events[0].get_entries().get_entries().len(), 2, "{:?}", e);
+    }
+
+    fn test_downstream_txn_source_filter(txn_source: TxnSource, filter_loop: bool) {
+        // Create a new delegate that observes [a, f).
+        let observed_range = ObservedRange::new(
+            Key::from_raw(b"a").into_encoded(),
+            Key::from_raw(b"f").into_encoded(),
+        )
+        .unwrap();
+        let txn_extra_op = Arc::new(AtomicCell::new(TxnExtraOp::Noop));
+        let mut delegate = Delegate::new(1, txn_extra_op);
+        assert!(delegate.handle.is_observing());
+
+        let mut map = HashMap::default();
+        for k in b'a'..=b'e' {
+            let mut put = PutRequest::default();
+            put.key = Key::from_raw(&[k]).into_encoded();
+            put.cf = "lock".to_owned();
+            let mut lock = Lock::new(
+                LockType::Put,
+                put.key.clone(),
+                1.into(),
+                10,
+                None,
+                TimeStamp::zero(),
+                0,
+                TimeStamp::zero(),
+            );
+            // Only the key `a` is a normal write.
+            if k != b'a' {
+                lock = lock.set_txn_source(txn_source.into());
+            }
+            put.value = lock.to_bytes();
+            delegate
+                .sink_txn_put(
+                    put,
+                    false,
+                    &mut map,
+                    |_: &mut EventRow, _: TimeStamp| Ok(()),
+                )
+                .unwrap();
+        }
+        assert_eq!(map.len(), 5);
+
+        let (sink, mut drain) = channel(1, MemoryQuota::new(1024));
+        let downstream = Downstream {
+            id: DownstreamId::new(),
+            req_id: 1,
+            conn_id: ConnId::new(),
+            peer: String::new(),
+            region_epoch: RegionEpoch::default(),
+            sink: Some(sink),
+            state: Arc::new(AtomicCell::new(DownstreamState::Normal)),
+            kv_api: ChangeDataRequestKvApi::TiDb,
+            filter_loop,
+            observed_range,
+        };
+        delegate.add_downstream(downstream);
+        let entries = map.values().map(|(r, _)| r).cloned().collect();
+        delegate
+            .sink_downstream(entries, 1, ChangeDataRequestKvApi::TiDb)
+            .unwrap();
+
+        let (mut tx, mut rx) = futures::channel::mpsc::unbounded();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn(async move {
+            drain.forward(&mut tx).await.unwrap();
+        });
+        let (e, _) = recv_timeout(&mut rx, std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.events[0].get_entries().get_entries().len(), 1, "{:?}", e);
+    }
+
+    #[test]
+    fn test_downstream_filter_cdc_write_entires() {
+        let mut txn_source = TxnSource::default();
+        txn_source.set_cdc_write_source(1);
+
+        test_downstream_txn_source_filter(txn_source, true);
+    }
+
+    #[test]
+    fn test_downstream_filter_lossy_ddl_entires() {
+        let mut txn_source = TxnSource::default();
+        txn_source.set_lossy_ddl_reorg_source(1);
+        test_downstream_txn_source_filter(txn_source, false);
+
+        // With cdr write source and filter loop is false, we should still ignore lossy
+        // ddl changes.
+        let mut txn_source = TxnSource::default();
+        txn_source.set_cdc_write_source(1);
+        txn_source.set_lossy_ddl_reorg_source(1);
+        test_downstream_txn_source_filter(txn_source, false);
+
+        // With cdr write source and filter loop is true, we should still ignore some
+        // events.
+        let mut txn_source = TxnSource::default();
+        txn_source.set_cdc_write_source(1);
+        txn_source.set_lossy_ddl_reorg_source(1);
+        test_downstream_txn_source_filter(txn_source, true);
     }
 
     #[test]

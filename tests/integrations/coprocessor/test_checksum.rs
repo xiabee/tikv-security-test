@@ -2,6 +2,8 @@
 
 use std::u64;
 
+use api_version::{keyspace::KvPair, ApiV1};
+use futures::executor::block_on;
 use kvproto::{
     coprocessor::{KeyRange, Request},
     kvrpcpb::{Context, IsolationLevel},
@@ -13,7 +15,7 @@ use tidb_query_common::storage::{
     Range,
 };
 use tikv::{
-    coprocessor::{dag::TiKvStorage, *},
+    coprocessor::{dag::TikvStorage, *},
     storage::{Engine, SnapshotStore},
 };
 use tipb::{ChecksumAlgorithm, ChecksumRequest, ChecksumResponse, ChecksumScanOn};
@@ -78,8 +80,8 @@ fn reversed_checksum_crc64_xor<E: Engine>(store: &Store<E>, range: KeyRange) -> 
         Default::default(),
         false,
     );
-    let mut scanner = RangesScanner::new(RangesScannerOptions {
-        storage: TiKvStorage::new(store, false),
+    let mut scanner = RangesScanner::<_, ApiV1>::new(RangesScannerOptions {
+        storage: TikvStorage::new(store, false),
         ranges: vec![Range::from_pb_range(range, false)],
         scan_backward_in_range: true,
         is_key_only: false,
@@ -88,10 +90,11 @@ fn reversed_checksum_crc64_xor<E: Engine>(store: &Store<E>, range: KeyRange) -> 
 
     let mut checksum = 0;
     let digest = crc64fast::Digest::new();
-    while let Some((k, v)) = scanner.next().unwrap() {
+    while let Some(row) = block_on(scanner.next()).unwrap() {
+        let (k, v) = row.kv();
         let mut digest = digest.clone();
-        digest.write(&k);
-        digest.write(&v);
+        digest.write(k);
+        digest.write(v);
         checksum ^= digest.sum64();
     }
     checksum

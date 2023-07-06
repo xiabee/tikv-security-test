@@ -1,9 +1,6 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, RwLock,
-};
+use std::sync::{Arc, RwLock};
 
 use engine_traits::KvEngine;
 use kvproto::metapb::Region;
@@ -17,18 +14,6 @@ use crate::{
     try_send,
     utils::SegmentSet,
 };
-
-/// The inflight `StartObserve` message count.
-/// Currently, we handle the `StartObserve` message in the main loop(endpoint thread), which may
-/// take longer time than expected. So when we are starting to observe many region (e.g. failover),
-/// there may be many pending messages, those messages won't block the advancing of checkpoint ts.
-/// So the checkpoint ts may be too late and losing some data.
-///
-/// This is a temporary solution for this problem: If this greater than (1), then it implies that there are some
-/// inflight wait-for-initialized regions, we should block the resolved ts from advancing in that condition.
-///
-/// FIXME: Move handler of `ModifyObserve` to another thread, and remove this :(
-pub static IN_FLIGHT_START_OBSERVE_MESSAGE: AtomicUsize = AtomicUsize::new(0);
 
 /// An Observer for Backup Stream.
 ///
@@ -71,7 +56,6 @@ impl BackupStreamObserver {
             .scheduler
             .schedule(Task::ModifyObserve(ObserveOp::Start {
                 region: region.clone(),
-                needs_initial_scanning: true,
             }))
         {
             use crate::errors::Error;
@@ -95,13 +79,20 @@ impl BackupStreamObserver {
             .rl()
             .is_overlapping((region.get_start_key(), end_key))
     }
+
+    /// Check whether there are any task range registered to the observer.
+    /// when there isn't any task, we can ignore the events, so we don't need to
+    /// handle useless events. (Also won't yield verbose logs.)
+    pub fn is_hibernating(&self) -> bool {
+        self.ranges.rl().is_empty()
+    }
 }
 
 impl Coprocessor for BackupStreamObserver {}
 
 impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
-    // `BackupStreamObserver::on_flush_applied_cmd_batch` should only invoke if `cmd_batches` is not empty
-    // and only leader will trigger this.
+    // `BackupStreamObserver::on_flush_applied_cmd_batch` should only invoke if
+    // `cmd_batches` is not empty and only leader will trigger this.
     fn on_flush_applied_cmd_batch(
         &self,
         max_level: ObserveLevel,
@@ -133,23 +124,19 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
 
     fn on_applied_current_term(&self, role: StateRole, region: &Region) {
         if role == StateRole::Leader && self.should_register_region(region) {
-            let success = try_send!(
+            try_send!(
                 self.scheduler,
                 Task::ModifyObserve(ObserveOp::Start {
                     region: region.clone(),
-                    needs_initial_scanning: true,
                 })
             );
-            if success {
-                IN_FLIGHT_START_OBSERVE_MESSAGE.fetch_add(1, Ordering::SeqCst);
-            }
         }
     }
 }
 
 impl RoleObserver for BackupStreamObserver {
     fn on_role_change(&self, ctx: &mut ObserverContext<'_>, r: &RoleChange) {
-        if r.state != StateRole::Leader {
+        if r.state != StateRole::Leader && !self.is_hibernating() {
             try_send!(
                 self.scheduler,
                 Task::ModifyObserve(ObserveOp::Stop {
@@ -167,14 +154,14 @@ impl RegionChangeObserver for BackupStreamObserver {
         event: RegionChangeEvent,
         role: StateRole,
     ) {
-        if role != StateRole::Leader {
+        if role != StateRole::Leader || self.is_hibernating() {
             return;
         }
         match event {
             RegionChangeEvent::Destroy => {
                 try_send!(
                     self.scheduler,
-                    Task::ModifyObserve(ObserveOp::CheckEpochAndStop {
+                    Task::ModifyObserve(ObserveOp::Destroy {
                         region: ctx.region().clone(),
                     })
                 );
@@ -207,7 +194,7 @@ mod tests {
     use raft::StateRole;
     use raftstore::coprocessor::{
         Cmd, CmdBatch, CmdObserveInfo, CmdObserver, ObserveHandle, ObserveLevel, ObserverContext,
-        RegionChangeEvent, RegionChangeObserver, RoleChange, RoleObserver,
+        RegionChangeEvent, RegionChangeObserver, RegionChangeReason, RoleChange, RoleObserver,
     };
     use tikv_util::{worker::dummy_scheduler, HandyRwLock};
 
@@ -320,5 +307,24 @@ mod tests {
             task,
             Ok(Some(Task::ModifyObserve(ObserveOp::Stop { region, .. }))) if region.id == 42
         );
+    }
+
+    #[test]
+    fn test_hibernate() {
+        let (sched, mut rx) = dummy_scheduler();
+
+        // Prepare: assuming a task wants the range of [0001, 0010].
+        let o = BackupStreamObserver::new(sched);
+        let r = fake_region(43, b"0010", b"0042");
+        let mut ctx = ObserverContext::new(&r);
+        o.on_region_changed(&mut ctx, RegionChangeEvent::Create, StateRole::Leader);
+        o.on_region_changed(
+            &mut ctx,
+            RegionChangeEvent::Update(RegionChangeReason::Split),
+            StateRole::Leader,
+        );
+        o.on_role_change(&mut ctx, &RoleChange::new(StateRole::Leader));
+        let task = rx.recv_timeout(Duration::from_millis(20));
+        assert!(task.is_err(), "it is {:?}", task);
     }
 }

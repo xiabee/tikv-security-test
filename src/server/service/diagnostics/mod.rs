@@ -19,14 +19,17 @@ use kvproto::diagnosticspb::{
     Diagnostics, SearchLogRequest, SearchLogRequestTarget, SearchLogResponse, ServerInfoRequest,
     ServerInfoResponse, ServerInfoType,
 };
-use tikv_util::{sys::SystemExt, timer::GLOBAL_TIMER_HANDLE};
+use tikv_util::{
+    sys::{ioload, SystemExt},
+    timer::GLOBAL_TIMER_HANDLE,
+};
 use tokio::runtime::Handle;
 
 use crate::server::Error;
 
-mod ioload;
 mod log;
-mod sys;
+/// Information about the current hardware and operating system.
+pub mod sys;
 
 lazy_static! {
     pub static ref SYS_INFO: Mutex<sysinfo::System> = Mutex::new(sysinfo::System::new());
@@ -116,7 +119,7 @@ impl Diagnostics for Service {
                     let load = (
                         sys::cpu_time_snapshot(),
                         system
-                            .get_networks()
+                            .networks()
                             .into_iter()
                             .map(|(n, d)| (n.to_owned(), sys::NicSnapshot::from_network_data(d)))
                             .collect(),
