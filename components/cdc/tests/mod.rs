@@ -20,9 +20,9 @@ use kvproto::{
     tikvpb::TikvClient,
 };
 use online_config::OnlineConfig;
-use raftstore::{coprocessor::CoprocessorHost, router::CdcRaftRouter};
+use raftstore::coprocessor::CoprocessorHost;
 use test_raftstore::*;
-use tikv::{config::CdcConfig, server::DEFAULT_CLUSTER_ID, storage::kv::LocalTablets};
+use tikv::{config::CdcConfig, server::DEFAULT_CLUSTER_ID};
 use tikv_util::{
     config::ReadableDuration,
     worker::{LazyWorker, Runnable},
@@ -182,12 +182,11 @@ impl TestSuiteBuilder {
             let mut cdc_endpoint = cdc::Endpoint::new(
                 DEFAULT_CLUSTER_ID,
                 &cfg,
-                false,
                 cluster.cfg.storage.api_version(),
                 pd_cli.clone(),
                 worker.scheduler(),
-                CdcRaftRouter(raft_router),
-                LocalTablets::Singleton(cluster.engines[id].kv.clone()),
+                raft_router,
+                cluster.engines[id].kv.clone(),
                 cdc_ob,
                 cluster.store_metas[id].clone(),
                 cm.clone(),
@@ -237,7 +236,7 @@ impl TestSuite {
     pub fn new(count: usize, api_version: ApiVersion) -> TestSuite {
         let mut cluster = new_server_cluster_with_api_ver(1, count, api_version);
         // Increase the Raft tick interval to make this test case running reliably.
-        configure_for_lease_read(&mut cluster.cfg, Some(100), None);
+        configure_for_lease_read(&mut cluster, Some(100), None);
         // Disable background renew to make timestamp predictable.
         configure_for_causal_ts(&mut cluster, "0s", 1);
 

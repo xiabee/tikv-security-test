@@ -44,13 +44,14 @@ use raftstore::{
     errors::Error as RaftServerError,
     router::{LocalReadRouter, RaftStoreRouter},
     store::{
-        self, util::encode_start_ts_into_flag_data, Callback as StoreCallback, RaftCmdExtraOpts,
-        ReadIndexContext, ReadResponse, RegionSnapshot, StoreMsg, WriteResponse,
+        self, Callback as StoreCallback, RaftCmdExtraOpts, ReadIndexContext, ReadResponse,
+        RegionSnapshot, StoreMsg, WriteResponse,
     },
 };
 use thiserror::Error;
 use tikv_kv::{write_modifies, OnAppliedCb, WriteEvent};
 use tikv_util::{
+    codec::number::NumberEncoder,
     future::{paired_future_callback, paired_must_called_future_callback},
     time::Instant,
 };
@@ -83,7 +84,7 @@ pub enum Error {
     Timeout(Duration),
 }
 
-pub fn get_status_kind_from_engine_error(e: &kv::Error) -> RequestStatusKind {
+fn get_status_kind_from_engine_error(e: &kv::Error) -> RequestStatusKind {
     match *e {
         KvError(box KvErrorInner::Request(ref header)) => {
             RequestStatusKind::from(storage::get_error_kind_from_header(header))
@@ -117,7 +118,7 @@ where
     Snap(RegionSnapshot<S>),
 }
 
-pub fn check_raft_cmd_response(resp: &mut RaftCmdResponse) -> Result<()> {
+fn check_raft_cmd_response(resp: &mut RaftCmdResponse) -> Result<()> {
     if resp.get_header().has_error() {
         return Err(Error::RequestFailed(resp.take_header().take_error()));
     }
@@ -160,11 +161,6 @@ pub fn new_request_header(ctx: &Context) -> RaftRequestHeader {
     }
     header.set_sync_log(ctx.get_sync_log());
     header.set_replica_read(ctx.get_replica_read());
-    header.set_resource_group_name(
-        ctx.get_resource_control_context()
-            .get_resource_group_name()
-            .to_owned(),
-    );
     header
 }
 
@@ -368,8 +364,8 @@ where
 
     type RaftExtension = RaftRouterWrap<S, E>;
     #[inline]
-    fn raft_extension(&self) -> Self::RaftExtension {
-        self.router.clone()
+    fn raft_extension(&self) -> &Self::RaftExtension {
+        &self.router
     }
 
     fn modify_on_kv_engine(
@@ -396,9 +392,6 @@ where
                         *key1 = Key::from_encoded(bytes);
                         let bytes = keys::data_end_key(key2.as_encoded());
                         *key2 = Key::from_encoded(bytes);
-                    }
-                    Modify::Ingest(_) => {
-                        return Err(box_err!("ingest sst is not supported in local engine"));
                     }
                 }
             }
@@ -456,9 +449,6 @@ where
         let reqs: Vec<Request> = batch.modifies.into_iter().map(Into::into).collect();
         let txn_extra = batch.extra;
         let mut header = new_request_header(ctx);
-        if batch.avoid_batch {
-            header.set_uuid(uuid::Uuid::new_v4().as_bytes().to_vec());
-        }
         let mut flags = 0;
         if txn_extra.one_pc {
             flags |= WriteBatchFlags::ONE_PC.bits();
@@ -557,21 +547,18 @@ where
 
         let mut header = new_request_header(ctx.pb_ctx);
         let mut flags = 0;
-        let need_encoded_start_ts = ctx.start_ts.map_or(true, |ts| !ts.is_zero());
-        if ctx.pb_ctx.get_stale_read() && need_encoded_start_ts {
+        if ctx.pb_ctx.get_stale_read() && ctx.start_ts.map_or(true, |ts| !ts.is_zero()) {
+            let mut data = [0u8; 8];
+            (&mut data[..])
+                .encode_u64(ctx.start_ts.unwrap_or_default().into_inner())
+                .unwrap();
             flags |= WriteBatchFlags::STALE_READ.bits();
+            header.set_flag_data(data.into());
         }
         if ctx.allowed_in_flashback {
             flags |= WriteBatchFlags::FLASHBACK.bits();
         }
         header.set_flags(flags);
-        // Encode `start_ts` in `flag_data` for the check of stale read and flashback.
-        if need_encoded_start_ts {
-            encode_start_ts_into_flag_data(
-                &mut header,
-                ctx.start_ts.unwrap_or_default().into_inner(),
-            );
-        }
 
         let mut cmd = RaftCmdRequest::default();
         cmd.set_header(header);
@@ -652,16 +639,13 @@ where
         }
     }
 
-    fn start_flashback(&self, ctx: &Context, start_ts: u64) -> BoxFuture<'static, kv::Result<()>> {
+    fn start_flashback(&self, ctx: &Context) -> BoxFuture<'static, kv::Result<()>> {
         // Send an `AdminCmdType::PrepareFlashback` to prepare the raftstore for the
         // later flashback. Once invoked, we will update the persistent region meta and
         // the memory state of the flashback in Peer FSM to reject all read, write
         // and scheduling operations for this region when propose/apply before we
         // start the actual data flashback transaction command in the next phase.
-        let mut req = new_flashback_req(ctx, AdminCmdType::PrepareFlashback);
-        req.mut_admin_request()
-            .mut_prepare_flashback()
-            .set_start_ts(start_ts);
+        let req = new_flashback_req(ctx, AdminCmdType::PrepareFlashback);
         exec_admin(&*self.router, req)
     }
 

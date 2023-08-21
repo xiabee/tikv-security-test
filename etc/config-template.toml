@@ -205,11 +205,9 @@
 ## Max time to handle Coprocessor requests before timeout.
 # end-point-request-max-handle-duration = "60s"
 
-## Max bytes that snapshot can interact with disk in one second. It should be
-## set based on your disk performance. Only write flow is considered, if
-## partiioned-raft-kv is used, read flow is also considered and it will be estimated
-## as read_size * 0.5 to get around errors from page cache.
-# snap-io-max-bytes-per-sec = "100MB"
+## Max bytes that snapshot can be written to disk in one second.
+## It should be set based on your disk performance.
+# snap-max-write-bytes-per-sec = "100MB"
 
 ## Whether to enable request batch.
 # enable-request-batch = true
@@ -273,11 +271,17 @@
 ## Set to 0 to disable this feature if you want to panic immediately when encountering such an error.
 # background-error-recovery-window = "1h"
 
+[storage.block-cache]
+## Whether to create a shared block cache for all RocksDB column families.
+##
 ## Block cache is used by RocksDB to cache uncompressed blocks. Big block cache can speed up read.
 ## It is recommended to turn on shared block cache. Since only the total cache size need to be
 ## set, it is easier to config. In most cases it should be able to auto-balance cache usage
 ## between column families with standard LRU algorithm.
-[storage.block-cache]
+##
+## The rest of config in the storage.block-cache session is effective only when shared block cache
+## is on.
+# shared = true
 
 ## Size of the shared block cache. Normally it should be tuned to 30%-50% of system's total memory.
 ## When the config is not set, it is decided by the sum of the following fields or their default
@@ -517,8 +521,8 @@
 ## Value -1 means files opened are always kept open and RocksDB will prefetch index and filter
 ## blocks into block cache at startup. So if your database has a large working set, it will take
 ## several minutes to open the DB. You may need to increase this if your database has a large
-## working set. You can estimate the number of files based on `target-file-size-base` for
-## level-based compaction.
+## working set. You can estimate the number of files based on `target-file-size-base` and
+## `target_file_size_multiplier` for level-based compaction.
 # max-open-files = 40960
 
 ## Max size of RocksDB's MANIFEST file.
@@ -560,6 +564,11 @@
 
 ## Max RocksDB WAL size in total
 # max-total-wal-size = "4GB"
+
+## RocksDB Statistics provides cumulative stats over time.
+## Turning statistics on will introduce about 5%-10% overhead for RocksDB, but it can help you to
+## know the internal status of RocksDB.
+# enable-statistics = true
 
 ## Dump statistics periodically in information logs.
 ## Same as RocksDB's default value (10 min).
@@ -628,11 +637,6 @@
 ## RocksDB log levels
 # info-log-level = "info"
 
-## Memory usage limit for Raft Engine. Undersized write buffers will be flushed to satisfy the
-## requirement.
-## No limit when not specified.
-# write-buffer-limit = "1GB"
-
 ## Options for `Titan`.
 [rocksdb.titan]
 ## Enables or disables `Titan`. Note that Titan is still an experimental feature. Once
@@ -681,7 +685,7 @@
 ## The data block size. RocksDB compresses data based on the unit of block.
 ## Similar to page in other databases, block is the smallest unit cached in block-cache. Note that
 ## the block size specified here corresponds to uncompressed data.
-# block-size = "32KB"
+# block-size = "64KB"
 
 ## If you're doing point lookups you definitely want to turn bloom filters on. We use bloom filters
 ## to avoid unnecessary disk reads. Default bits_per_key is 10, which yields ~1% false positive
@@ -798,7 +802,7 @@
 
 ## The lower bound of SST file size when compaction guard is enabled. The config prevent SST files
 ## being too small when compaction guard is enabled.
-# compaction-guard-min-output-file-size = "1M"
+# compaction-guard-min-output-file-size = "8M"
 
 ## The upper bound of SST file size when compaction guard is enabled. The config prevent SST files
 ## being too large when compaction guard is enabled. This config overrides target-file-size-base
@@ -855,8 +859,18 @@
 ##
 # checksum = "crc32c"
 
-## The maximum number of concurrent compaction tasks. 0 stands for no limit.
-# max-compactions = 0
+## SST files containing updates older than TTL will go through the compaction
+## process. This usually happens in a cascading way so that those entries
+## will be compacted to bottommost level/file.
+##
+## Default: 30 days.
+# ttl = "30d"
+
+## SST files older than this value will be picked up for compaction, and
+## re-written to the same level as they were before.
+##
+## Default: 30 days.
+# periodic-compaction-seconds = "30d"
 
 ## Options for "Default" Column Family for `Titan`.
 [rocksdb.defaultcf.titan]
@@ -917,7 +931,7 @@
 [rocksdb.writecf]
 ## Recommend to set it the same as `rocksdb.defaultcf.compression-per-level`.
 # compression-per-level = ["no", "no", "lz4", "lz4", "lz4", "zstd", "zstd"]
-# block-size = "32KB"
+# block-size = "64KB"
 
 ## Recommend to set it the same as `rocksdb.defaultcf.write-buffer-size`.
 # write-buffer-size = "128MB"
@@ -940,12 +954,11 @@
 # dynamic-level-bytes = true
 # optimize-filters-for-hits = false
 # enable-compaction-guard = true
-# compaction-guard-min-output-file-size = "1M"
+# compaction-guard-min-output-file-size = "8M"
 # compaction-guard-max-output-file-size = "128M"
 # format-version = 2
 # prepopulate-block-cache = "disabled"
 # checksum = "crc32c"
-# max-compactions = 0
 
 [rocksdb.lockcf]
 # compression-per-level = ["no", "no", "no", "no", "no", "no", "no"]
@@ -970,7 +983,6 @@
 # format-version = 2
 # prepopulate-block-cache = "disabled"
 # checksum = "crc32c"
-# max-compactions = 0
 
 [raftdb]
 # max-background-jobs = 4
@@ -979,6 +991,7 @@
 # max-manifest-file-size = "20MB"
 # create-if-missing = true
 
+# enable-statistics = true
 # stats-dump-period = "10m"
 
 ## Raft RocksDB WAL directory.
@@ -1032,7 +1045,6 @@
 # format-version = 2
 # prepopulate-block-cache = "disabled"
 # checksum = "crc32c"
-# max-compactions = 0
 
 [raft-engine]
 ## Determines whether to use Raft Engine to store raft logs. When it is
@@ -1101,16 +1113,8 @@
 ## Only available for `format-version` >= 2. This option is only
 ## available when TiKV >= 6.3.x.
 ##
-## Default: true.
-# enable-log-recycle = true
-
-## Whether to prepare log files for recycling when start.
-## If `true`, batch empty log files will be prepared for recycling when
-## starting engine.
-## Only available for `enable-log-reycle` is true.
-##
-## Default: false
-# prefill-for-recycle = false
+## Default: false.
+# enable-log-recycle = false
 
 [security]
 ## The path for TLS certificates. Empty string means disabling secure connections.

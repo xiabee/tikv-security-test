@@ -18,9 +18,10 @@ use pd_client::PdClient;
 use raft::StateRole;
 use raftstore::{
     coprocessor::{ObserveHandle, RegionInfoProvider},
-    router::CdcHandle,
+    router::RaftStoreRouter,
     store::fsm::ChangeObserver,
 };
+use resolved_ts::LeadershipResolver;
 use tikv::storage::Statistics;
 use tikv_util::{box_err, debug, info, time::Instant, warn, worker::Scheduler};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -29,7 +30,7 @@ use yatp::task::callback::Handle as YatpHandle;
 
 use crate::{
     annotate,
-    endpoint::{BackupStreamResolver, ObserveOp},
+    endpoint::ObserveOp,
     errors::{Error, Result},
     event_loader::InitialDataLoader,
     future,
@@ -37,7 +38,7 @@ use crate::{
     metrics,
     observer::BackupStreamObserver,
     router::{Router, TaskSelector},
-    subscription_track::{CheckpointType, ResolveResult, SubscriptionTracer},
+    subscription_track::{ResolveResult, SubscriptionTracer},
     try_send,
     utils::{self, CallbackWaitGroup, Work},
     Task,
@@ -143,7 +144,7 @@ impl<E, R, RT> InitialScan for InitialDataLoader<E, R, RT>
 where
     E: KvEngine,
     R: RegionInfoProvider + Clone + 'static,
-    RT: CdcHandle<E>,
+    RT: RaftStoreRouter<E>,
 {
     fn do_initial_scan(
         &self,
@@ -375,11 +376,11 @@ where
         meta_cli: MetadataClient<S>,
         pd_client: Arc<PDC>,
         scan_pool_size: usize,
-        resolver: BackupStreamResolver<RT, E>,
+        leader_checker: LeadershipResolver,
     ) -> (Self, future![()])
     where
         E: KvEngine,
-        RT: CdcHandle<E> + 'static,
+        RT: RaftStoreRouter<E> + 'static,
     {
         let (tx, rx) = channel(MESSAGE_BUFFER_SIZE);
         let scan_pool_handle = spawn_executors(initial_loader.clone(), scan_pool_size);
@@ -395,7 +396,7 @@ where
             scan_pool_handle: Arc::new(scan_pool_handle),
             scans: CallbackWaitGroup::new(),
         };
-        let fut = op.clone().region_operator_loop(rx, resolver);
+        let fut = op.clone().region_operator_loop(rx, leader_checker);
         (op, fut)
     }
 
@@ -415,19 +416,13 @@ where
     }
 
     /// the handler loop.
-    async fn region_operator_loop<E, RT>(
+    async fn region_operator_loop(
         self,
         mut message_box: Receiver<ObserveOp>,
-        mut resolver: BackupStreamResolver<RT, E>,
-    ) where
-        E: KvEngine,
-        RT: CdcHandle<E> + 'static,
-    {
+        mut leader_checker: LeadershipResolver,
+    ) {
         while let Some(op) = message_box.recv().await {
-            // Skip some trivial resolve commands.
-            if !matches!(op, ObserveOp::ResolveRegions { .. }) {
-                info!("backup stream: on_modify_observe"; "op" => ?op);
-            }
+            info!("backup stream: on_modify_observe"; "op" => ?op);
             match op {
                 ObserveOp::Start { region } => {
                     fail::fail_point!("delay_on_start_observe");
@@ -489,18 +484,15 @@ where
                         warn!("waiting for initial scanning done timed out, forcing progress!"; 
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
-                    let regions = resolver.resolve(self.subs.current_regions(), min_ts).await;
+                    let regions = leader_checker
+                        .resolve(self.subs.current_regions(), min_ts)
+                        .await;
                     let cps = self.subs.resolve_with(min_ts, regions);
                     let min_region = cps.iter().min_by_key(|rs| rs.checkpoint);
                     // If there isn't any region observed, the `min_ts` can be used as resolved ts
                     // safely.
                     let rts = min_region.map(|rs| rs.checkpoint).unwrap_or(min_ts);
-                    if min_region
-                        .map(|mr| mr.checkpoint_type != CheckpointType::MinTs)
-                        .unwrap_or(false)
-                    {
-                        info!("getting non-trivial checkpoint"; "defined_by_region" => ?min_region);
-                    }
+                    info!("getting checkpoint"; "defined_by_region" => ?min_region);
                     callback(ResolvedRegions::new(rts, cps));
                 }
             }

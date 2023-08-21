@@ -7,11 +7,10 @@ use std::{
 use ::tracker::{
     set_tls_tracker_token, with_tls_tracker, RequestInfo, RequestType, GLOBAL_TRACKERS,
 };
-use api_version::{dispatch_api_version, KvFormat};
 use async_stream::try_stream;
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::PerfLevel;
-use futures::{channel::mpsc, future::Either, prelude::*};
+use futures::{channel::mpsc, prelude::*};
 use kvproto::{coprocessor as coppb, errorpb, kvrpcpb};
 use protobuf::{CodedInputStream, Message};
 use resource_metering::{FutureExt, ResourceTagFactory, StreamExt};
@@ -68,9 +67,9 @@ pub struct Endpoint<E: Engine> {
 
     slow_log_threshold: Duration,
 
-    quota_limiter: Arc<QuotaLimiter>,
-
     _phantom: PhantomData<E>,
+
+    quota_limiter: Arc<QuotaLimiter>,
 }
 
 impl<E: Engine> tikv_util::AssertSend for Endpoint<E> {}
@@ -104,8 +103,8 @@ impl<E: Engine> Endpoint<E> {
             stream_channel_size: cfg.end_point_stream_channel_size,
             max_handle_duration: cfg.end_point_request_max_handle_duration.0,
             slow_log_threshold: cfg.end_point_slow_log_threshold.0,
-            quota_limiter,
             _phantom: Default::default(),
+            quota_limiter,
         }
     }
 
@@ -148,21 +147,6 @@ impl<E: Engine> Endpoint<E> {
     ///
     /// It also checks if there are locks in memory blocking this read request.
     fn parse_request_and_check_memory_locks(
-        &self,
-        req: coppb::Request,
-        peer: Option<String>,
-        is_streaming: bool,
-    ) -> Result<(RequestHandlerBuilder<E::Snap>, ReqContext)> {
-        dispatch_api_version!(req.get_context().get_api_version(), {
-            self.parse_request_and_check_memory_locks_impl::<API>(req, peer, is_streaming)
-        })
-    }
-
-    /// Parse the raw `Request` to create `RequestHandlerBuilder` and
-    /// `ReqContext`. Returns `Err` if fails.
-    ///
-    /// It also checks if there are locks in memory blocking this read request.
-    fn parse_request_and_check_memory_locks_impl<F: KvFormat>(
         &self,
         mut req: coppb::Request,
         peer: Option<String>,
@@ -248,7 +232,7 @@ impl<E: Engine> Endpoint<E> {
                         0 => None,
                         i => Some(i),
                     };
-                    dag::DagHandlerBuilder::<_, F>::new(
+                    dag::DagHandlerBuilder::new(
                         dag,
                         req_ctx.ranges.clone(),
                         store,
@@ -297,7 +281,7 @@ impl<E: Engine> Endpoint<E> {
                 let quota_limiter = self.quota_limiter.clone();
 
                 builder = Box::new(move |snap, req_ctx| {
-                    statistics::analyze::AnalyzeContext::<_, F>::new(
+                    statistics::analyze::AnalyzeContext::new(
                         analyze,
                         req_ctx.ranges.clone(),
                         start_ts,
@@ -486,12 +470,6 @@ impl<E: Engine> Endpoint<E> {
         let resource_tag = self
             .resource_tag_factory
             .new_tag_with_key_ranges(&req_ctx.context, key_ranges);
-        let group_name = req_ctx
-            .context
-            .get_resource_control_context()
-            .get_resource_group_name()
-            .as_bytes()
-            .to_owned();
         // box the tracker so that moving it is cheap.
         let tracker = Box::new(Tracker::new(req_ctx, self.slow_log_threshold));
 
@@ -502,7 +480,6 @@ impl<E: Engine> Endpoint<E> {
                     .in_resource_metering_tag(resource_tag),
                 priority,
                 task_id,
-                group_name,
             )
             .map_err(|_| Error::MaxPendingTasksExceeded);
         async move { res.await? }
@@ -517,16 +494,6 @@ impl<E: Engine> Endpoint<E> {
         mut req: coppb::Request,
         peer: Option<String>,
     ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
-        // Check the load of the read pool. If it's too busy, generate and return
-        // error in the gRPC thread to avoid waiting in the queue of the read pool.
-        if let Err(busy_err) = self.read_pool.check_busy_threshold(Duration::from_millis(
-            req.get_context().get_busy_threshold_ms() as u64,
-        )) {
-            let mut resp = coppb::Response::default();
-            resp.mut_region_error().set_server_is_busy(busy_err);
-            return Either::Left(async move { resp.into() });
-        }
-
         let tracker = GLOBAL_TRACKERS.insert(::tracker::Tracker::new(RequestInfo::new(
             req.get_context(),
             RequestType::Unknown,
@@ -537,7 +504,7 @@ impl<E: Engine> Endpoint<E> {
         let result_of_future = self
             .parse_request_and_check_memory_locks(req, peer, false)
             .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
-        let fut = async move {
+        async move {
             let res = match result_of_future {
                 Err(e) => {
                     let mut res = make_error_response(e);
@@ -557,8 +524,7 @@ impl<E: Engine> Endpoint<E> {
             };
             GLOBAL_TRACKERS.remove(tracker);
             res
-        };
-        Either::Right(fut)
+        }
     }
 
     // process_batch_tasks process the input batched coprocessor tasks if any,
@@ -726,12 +692,6 @@ impl<E: Engine> Endpoint<E> {
     ) -> Result<impl futures::stream::Stream<Item = Result<coppb::Response>>> {
         let (tx, rx) = mpsc::channel::<Result<coppb::Response>>(self.stream_channel_size);
         let priority = req_ctx.context.get_priority();
-        let group_name = req_ctx
-            .context
-            .get_resource_control_context()
-            .get_resource_group_name()
-            .as_bytes()
-            .to_owned();
         let key_ranges = req_ctx
             .ranges
             .iter()
@@ -754,7 +714,6 @@ impl<E: Engine> Endpoint<E> {
                     }),
                 priority,
                 task_id,
-                group_name,
             )
             .map_err(|_| Error::MaxPendingTasksExceeded)?;
         Ok(rx)
@@ -880,7 +839,7 @@ mod tests {
 
     /// A unary `RequestHandler` that always produces a fixture.
     struct UnaryFixture {
-        handle_duration: Duration,
+        handle_duration_millis: u64,
         yieldable: bool,
         result: Option<Result<coppb::Response>>,
     }
@@ -888,7 +847,7 @@ mod tests {
     impl UnaryFixture {
         pub fn new(result: Result<coppb::Response>) -> UnaryFixture {
             UnaryFixture {
-                handle_duration: Default::default(),
+                handle_duration_millis: 0,
                 yieldable: false,
                 result: Some(result),
             }
@@ -896,10 +855,10 @@ mod tests {
 
         pub fn new_with_duration(
             result: Result<coppb::Response>,
-            handle_duration: Duration,
+            handle_duration_millis: u64,
         ) -> UnaryFixture {
             UnaryFixture {
-                handle_duration,
+                handle_duration_millis,
                 yieldable: false,
                 result: Some(result),
             }
@@ -907,10 +866,10 @@ mod tests {
 
         pub fn new_with_duration_yieldable(
             result: Result<coppb::Response>,
-            handle_duration: Duration,
+            handle_duration_millis: u64,
         ) -> UnaryFixture {
             UnaryFixture {
-                handle_duration,
+                handle_duration_millis,
                 yieldable: true,
                 result: Some(result),
             }
@@ -922,15 +881,13 @@ mod tests {
         async fn handle_request(&mut self) -> Result<MemoryTraceGuard<coppb::Response>> {
             if self.yieldable {
                 // We split the task into small executions of 100 milliseconds.
-                for _ in 0..self.handle_duration.as_millis() as u64 / 100 {
+                for _ in 0..self.handle_duration_millis / 100 {
                     thread::sleep(Duration::from_millis(100));
                     yatp::task::future::reschedule().await;
                 }
-                thread::sleep(Duration::from_millis(
-                    self.handle_duration.as_millis() as u64 % 100,
-                ));
+                thread::sleep(Duration::from_millis(self.handle_duration_millis % 100));
             } else {
-                thread::sleep(self.handle_duration);
+                thread::sleep(Duration::from_millis(self.handle_duration_millis));
             }
 
             self.result.take().unwrap().map(|x| x.into())
@@ -941,7 +898,7 @@ mod tests {
     struct StreamFixture {
         result_len: usize,
         result_iter: vec::IntoIter<Result<coppb::Response>>,
-        handle_durations: vec::IntoIter<Duration>,
+        handle_durations_millis: vec::IntoIter<u64>,
         nth: usize,
     }
 
@@ -951,20 +908,20 @@ mod tests {
             StreamFixture {
                 result_len: len,
                 result_iter: result.into_iter(),
-                handle_durations: vec![Duration::default(); len].into_iter(),
+                handle_durations_millis: vec![0; len].into_iter(),
                 nth: 0,
             }
         }
 
         pub fn new_with_duration(
             result: Vec<Result<coppb::Response>>,
-            handle_durations: Vec<Duration>,
+            handle_durations_millis: Vec<u64>,
         ) -> StreamFixture {
-            assert_eq!(result.len(), handle_durations.len());
+            assert_eq!(result.len(), handle_durations_millis.len());
             StreamFixture {
                 result_len: result.len(),
                 result_iter: result.into_iter(),
-                handle_durations: handle_durations.into_iter(),
+                handle_durations_millis: handle_durations_millis.into_iter(),
                 nth: 0,
             }
         }
@@ -984,8 +941,8 @@ mod tests {
                     Ok((None, is_finished))
                 }
                 Some(val) => {
-                    let handle_duration = self.handle_durations.next().unwrap();
-                    thread::sleep(handle_duration);
+                    let handle_duration_ms = self.handle_durations_millis.next().unwrap();
+                    thread::sleep(Duration::from_millis(handle_duration_ms));
                     match val {
                         Ok(resp) => Ok((Some(resp), is_finished)),
                         Err(e) => Err(e),
@@ -1202,10 +1159,7 @@ mod tests {
             context.set_priority(kvrpcpb::CommandPri::Normal);
 
             let handler_builder = Box::new(|_, _: &_| {
-                Ok(
-                    UnaryFixture::new_with_duration(Ok(response), Duration::from_millis(1000))
-                        .into_boxed(),
-                )
+                Ok(UnaryFixture::new_with_duration(Ok(response), 1000).into_boxed())
             });
             let future = copr.handle_unary_request(ReqContext::default_for_test(), handler_builder);
             let tx = tx.clone();
@@ -1473,20 +1427,20 @@ mod tests {
         use tikv_util::config::ReadableDuration;
 
         /// Asserted that the snapshot can be retrieved in 500ms.
-        const SNAPSHOT_DURATION: Duration = Duration::from_millis(500);
+        const SNAPSHOT_DURATION_MS: u64 = 500;
 
         /// Asserted that the delay caused by OS scheduling other tasks is
         /// smaller than 200ms. This is mostly for CI.
-        const HANDLE_ERROR: Duration = Duration::from_millis(200);
+        const HANDLE_ERROR_MS: u64 = 200;
 
         /// The acceptable error range for a coarse timer. Note that we use
         /// CLOCK_MONOTONIC_COARSE which can be slewed by time
         /// adjustment code (e.g., NTP, PTP).
-        const COARSE_ERROR: Duration = Duration::from_millis(50);
+        const COARSE_ERROR_MS: u64 = 50;
 
         /// The duration that payload executes.
-        const PAYLOAD_SMALL: Duration = Duration::from_millis(3000);
-        const PAYLOAD_LARGE: Duration = Duration::from_millis(6000);
+        const PAYLOAD_SMALL: u64 = 3000;
+        const PAYLOAD_LARGE: u64 = 6000;
 
         let engine = TestEngineBuilder::new().build().unwrap();
 
@@ -1501,7 +1455,7 @@ mod tests {
         ));
 
         let config = Config {
-            end_point_request_max_handle_duration: ReadableDuration(
+            end_point_request_max_handle_duration: ReadableDuration::millis(
                 (PAYLOAD_SMALL + PAYLOAD_LARGE) * 2,
             ),
             ..Default::default()
@@ -1523,7 +1477,7 @@ mod tests {
         req_with_exec_detail.context.set_record_time_stat(true);
 
         {
-            let mut wait_time: Duration = Duration::default();
+            let mut wait_time: u64 = 0;
 
             // Request 1: Unary, success response.
             let handler_builder = Box::new(|_, _: &_| {
@@ -1537,7 +1491,7 @@ mod tests {
             let sender = tx.clone();
             thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
             // Sleep a while to make sure that thread is spawn and snapshot is taken.
-            thread::sleep(SNAPSHOT_DURATION);
+            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS));
 
             // Request 2: Unary, error response.
             let handler_builder = Box::new(|_, _: &_| {
@@ -1550,95 +1504,63 @@ mod tests {
                 copr.handle_unary_request(req_with_exec_detail.clone(), handler_builder);
             let sender = tx.clone();
             thread::spawn(move || sender.send(vec![block_on(resp_future_2).unwrap()]).unwrap());
-            thread::sleep(SNAPSHOT_DURATION);
+            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS));
 
             // Response 1
             let resp = &rx.recv().unwrap()[0];
             assert!(resp.get_other_error().is_empty());
             assert_ge!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR)
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_SMALL + HANDLE_ERROR + COARSE_ERROR
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time.saturating_sub(HANDLE_ERROR + COARSE_ERROR)
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time + HANDLE_ERROR + COARSE_ERROR
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
-            wait_time += PAYLOAD_SMALL - SNAPSHOT_DURATION;
+            wait_time += PAYLOAD_SMALL - SNAPSHOT_DURATION_MS;
 
             // Response 2
             let resp = &rx.recv().unwrap()[0];
             assert!(!resp.get_other_error().is_empty());
             assert_ge!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR)
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_LARGE + HANDLE_ERROR + COARSE_ERROR
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time.saturating_sub(HANDLE_ERROR + COARSE_ERROR)
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time + HANDLE_ERROR + COARSE_ERROR
-            );
-
-            // check TimeDetail and TimeDetailV2 has the same value.
-            let time_detail = resp.get_exec_details_v2().get_time_detail();
-            let time_detail_v2 = resp.get_exec_details_v2().get_time_detail_v2();
-            assert_eq!(
-                time_detail.get_process_wall_time_ms(),
-                time_detail_v2.get_process_wall_time_ns() / 1_000_000,
-            );
-            assert_eq!(
-                time_detail.get_wait_wall_time_ms(),
-                time_detail_v2.get_wait_wall_time_ns() / 1_000_000,
-            );
-            assert_eq!(
-                time_detail.get_kv_read_wall_time_ms(),
-                time_detail_v2.get_kv_read_wall_time_ns() / 1_000_000,
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
         }
 
@@ -1657,7 +1579,7 @@ mod tests {
             let sender = tx.clone();
             thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
             // Sleep a while to make sure that thread is spawn and snapshot is taken.
-            thread::sleep(SNAPSHOT_DURATION);
+            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS));
 
             // Request 2: Unary, error response.
             let handler_builder = Box::new(|_, _: &_| {
@@ -1670,7 +1592,7 @@ mod tests {
                 copr.handle_unary_request(req_with_exec_detail.clone(), handler_builder);
             let sender = tx.clone();
             thread::spawn(move || sender.send(vec![block_on(resp_future_2).unwrap()]).unwrap());
-            thread::sleep(SNAPSHOT_DURATION);
+            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS));
 
             // Response 1
             //
@@ -1683,20 +1605,16 @@ mod tests {
             let resp = &rx.recv().unwrap()[0];
             assert!(resp.get_other_error().is_empty());
             assert_ge!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR)
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_SMALL + PAYLOAD_LARGE + HANDLE_ERROR + COARSE_ERROR
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_SMALL + PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
 
             // Response 2
@@ -1710,25 +1628,21 @@ mod tests {
             let resp = &rx.recv().unwrap()[0];
             assert!(!resp.get_other_error().is_empty());
             assert_ge!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR)
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_SMALL + PAYLOAD_LARGE + HANDLE_ERROR + COARSE_ERROR
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_SMALL + PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
         }
 
         {
-            let mut wait_time = Duration::default();
+            let mut wait_time: u64 = 0;
 
             // Request 1: Unary, success response.
             let handler_builder = Box::new(|_, _: &_| {
@@ -1742,7 +1656,7 @@ mod tests {
             let sender = tx.clone();
             thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
             // Sleep a while to make sure that thread is spawn and snapshot is taken.
-            thread::sleep(SNAPSHOT_DURATION);
+            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS));
 
             // Request 2: Stream.
             let handler_builder = Box::new(|_, _: &_| {
@@ -1773,116 +1687,92 @@ mod tests {
             let resp = &rx.recv().unwrap()[0];
             assert!(resp.get_other_error().is_empty());
             assert_ge!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR)
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_LARGE + HANDLE_ERROR + COARSE_ERROR
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time.saturating_sub(HANDLE_ERROR + COARSE_ERROR)
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp.get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time + HANDLE_ERROR + COARSE_ERROR
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
-            wait_time += PAYLOAD_LARGE - SNAPSHOT_DURATION;
+            wait_time += PAYLOAD_LARGE - SNAPSHOT_DURATION_MS;
 
             // Response 2
             let resp = &rx.recv().unwrap();
             assert_eq!(resp.len(), 2);
             assert!(resp[0].get_other_error().is_empty());
             assert_ge!(
-                Duration::from_nanos(
-                    resp[0]
-                        .get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR)
+                resp[0]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp[0]
-                        .get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_SMALL + HANDLE_ERROR + COARSE_ERROR
+                resp[0]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                Duration::from_nanos(
-                    resp[0]
-                        .get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time.saturating_sub(HANDLE_ERROR + COARSE_ERROR)
+                resp[0]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp[0]
-                        .get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time + HANDLE_ERROR + COARSE_ERROR
+                resp[0]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
 
             assert!(!resp[1].get_other_error().is_empty());
             assert_ge!(
-                Duration::from_nanos(
-                    resp[1]
-                        .get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR)
+                resp[1]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp[1]
-                        .get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_process_wall_time_ns()
-                ),
-                PAYLOAD_LARGE + HANDLE_ERROR + COARSE_ERROR
+                resp[1]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
+                PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                Duration::from_nanos(
-                    resp[1]
-                        .get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time.saturating_sub(HANDLE_ERROR + COARSE_ERROR)
+                resp[1]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
             );
             assert_lt!(
-                Duration::from_nanos(
-                    resp[1]
-                        .get_exec_details_v2()
-                        .get_time_detail_v2()
-                        .get_wait_wall_time_ns()
-                ),
-                wait_time + HANDLE_ERROR + COARSE_ERROR
+                resp[1]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
+                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
         }
     }
@@ -1919,11 +1809,10 @@ mod tests {
 
         {
             let handler_builder = Box::new(|_, _: &_| {
-                Ok(UnaryFixture::new_with_duration_yieldable(
-                    Ok(coppb::Response::default()),
-                    Duration::from_millis(1500),
+                Ok(
+                    UnaryFixture::new_with_duration_yieldable(Ok(coppb::Response::default()), 1500)
+                        .into_boxed(),
                 )
-                .into_boxed())
             });
 
             let mut config = ReqContext::default_for_test();

@@ -68,9 +68,6 @@ pub struct Config {
     pub raft_log_compact_sync_interval: ReadableDuration,
     // Interval to gc unnecessary raft log.
     pub raft_log_gc_tick_interval: ReadableDuration,
-    // Interval to request voter_replicated_index for gc unnecessary raft log,
-    // if the leader has not initiated gc for a long time.
-    pub request_voter_replicated_index_interval: ReadableDuration,
     // A threshold to gc stale raft log, must >= 1.
     pub raft_log_gc_threshold: u64,
     // When entry count exceed this value, gc will be forced trigger.
@@ -95,6 +92,16 @@ pub struct Config {
     #[online_config(skip)]
     pub raft_reject_transfer_leader_duration: ReadableDuration,
 
+    /// Whether to disable checking quorum for the raft group. This will make
+    /// leader lease unavailable.
+    /// It cannot be changed in the config file, the only way to change it is
+    /// programmatically change the config structure during bootstrapping
+    /// the cluster.
+    #[doc(hidden)]
+    #[serde(skip)]
+    #[online_config(skip)]
+    pub unsafe_disable_check_quorum: bool,
+
     // Interval (ms) to check region whether need to be split or not.
     pub split_region_check_tick_interval: ReadableDuration,
     /// When size change of region exceed the diff since last check, it
@@ -103,17 +110,12 @@ pub struct Config {
     /// Interval (ms) to check whether start compaction for a region.
     pub region_compact_check_interval: ReadableDuration,
     /// Number of regions for each time checking.
-    pub region_compact_check_step: Option<u64>,
+    pub region_compact_check_step: u64,
     /// Minimum number of tombstones to trigger manual compaction.
     pub region_compact_min_tombstones: u64,
     /// Minimum percentage of tombstones to trigger manual compaction.
     /// Should between 1 and 100.
     pub region_compact_tombstones_percent: u64,
-    /// Minimum number of redundant rows to trigger manual compaction.
-    pub region_compact_min_redundant_rows: u64,
-    /// Minimum percentage of redundant rows to trigger manual compaction.
-    /// Should between 1 and 100.
-    pub region_compact_redundant_rows_percent: u64,
     pub pd_heartbeat_tick_interval: ReadableDuration,
     pub pd_store_heartbeat_tick_interval: ReadableDuration,
     pub snap_mgr_gc_tick_interval: ReadableDuration,
@@ -145,6 +147,14 @@ pub struct Config {
     #[online_config(skip)]
     pub snap_apply_batch_size: ReadableSize,
 
+    /// When applying a Region snapshot, its SST files can be modified by TiKV
+    /// itself. However those files could be read-only, for example, a TiKV
+    /// [agent](cmd/tikv-agent) is started based on a read-only remains. So
+    /// we can set `snap_apply_copy_symlink` to `true` to make a copy on
+    /// those SST files.
+    #[online_config(skip)]
+    pub snap_apply_copy_symlink: bool,
+
     // used to periodically check whether schedule pending applies in region runner
     #[doc(hidden)]
     #[online_config(skip)]
@@ -172,6 +182,15 @@ pub struct Config {
     // Check if leader lease will expire at `current_time + renew_leader_lease_advance_duration`.
     // It will be set to raft_store_max_leader_lease/4 by default.
     pub renew_leader_lease_advance_duration: ReadableDuration,
+
+    // Set true to allow handling request vote messages within one election time
+    // after TiKV start.
+    //
+    // Note: set to true may break leader lease. It should only be true in tests.
+    #[doc(hidden)]
+    #[serde(skip)]
+    #[online_config(skip)]
+    pub allow_unsafe_vote_after_start: bool,
 
     // Right region derive origin region id when split.
     #[online_config(hidden)]
@@ -211,6 +230,7 @@ pub struct Config {
     pub store_batch_system: BatchSystemConfig,
 
     /// If it is 0, it means io tasks are handled in store threads.
+    #[online_config(skip)]
     pub store_io_pool_size: usize,
 
     #[online_config(skip)]
@@ -296,11 +316,6 @@ pub struct Config {
     // Interval to inspect the latency of raftstore for slow store detection.
     pub inspect_interval: ReadableDuration,
 
-    // The unsensitive(increase it to reduce sensitiveness) of the cause-trend detection
-    pub slow_trend_unsensitive_cause: f64,
-    // The unsensitive(increase it to reduce sensitiveness) of the result-trend detection
-    pub slow_trend_unsensitive_result: f64,
-
     // Interval to report min resolved ts, if it is zero, it means disabled.
     pub report_min_resolved_ts_interval: ReadableDuration,
 
@@ -333,20 +348,6 @@ pub struct Config {
     #[online_config(hidden)]
     // Interval to check peers availability info.
     pub check_peers_availability_interval: ReadableDuration,
-
-    #[doc(hidden)]
-    #[serde(skip_serializing)]
-    #[online_config(hidden)]
-    // Interval to check if need to request snapshot.
-    pub check_request_snapshot_interval: ReadableDuration,
-
-    /// Make raftstore v1 learners compatible with raftstore v2 by:
-    /// * Recving tablet snapshot from v2.
-    /// * Responsing GcPeerRequest from v2.
-    #[doc(hidden)]
-    #[online_config(hidden)]
-    #[serde(alias = "enable-partitioned-raft-kv-compatible-learner")]
-    pub enable_v2_compatible_learner: bool,
 }
 
 impl Default for Config {
@@ -365,7 +366,6 @@ impl Default for Config {
             raft_entry_max_size: ReadableSize::mb(8),
             raft_log_compact_sync_interval: ReadableDuration::secs(2),
             raft_log_gc_tick_interval: ReadableDuration::secs(3),
-            request_voter_replicated_index_interval: ReadableDuration::minutes(5),
             raft_log_gc_threshold: 50,
             raft_log_gc_count_limit: None,
             raft_log_gc_size_limit: None,
@@ -376,11 +376,9 @@ impl Default for Config {
             split_region_check_tick_interval: ReadableDuration::secs(10),
             region_split_check_diff: None,
             region_compact_check_interval: ReadableDuration::minutes(5),
-            region_compact_check_step: None,
+            region_compact_check_step: 100,
             region_compact_min_tombstones: 10000,
             region_compact_tombstones_percent: 30,
-            region_compact_min_redundant_rows: 50000,
-            region_compact_redundant_rows_percent: 20,
             pd_heartbeat_tick_interval: ReadableDuration::minutes(1),
             pd_store_heartbeat_tick_interval: ReadableDuration::secs(10),
             notify_capacity: 40960,
@@ -393,6 +391,7 @@ impl Default for Config {
             peer_stale_state_check_interval: ReadableDuration::minutes(5),
             leader_transfer_max_log_lag: 128,
             snap_apply_batch_size: ReadableSize::mb(10),
+            snap_apply_copy_symlink: false,
             region_worker_tick_interval: if cfg!(feature = "test") {
                 ReadableDuration::millis(200)
             } else {
@@ -450,21 +449,16 @@ impl Default for Config {
             region_split_size: ReadableSize(0),
             clean_stale_peer_delay: ReadableDuration::minutes(0),
             inspect_interval: ReadableDuration::millis(500),
-            // The param `slow_trend_unsensitive_cause == 2.0` can yield good results,
-            // make it `10.0` to reduce a bit sensitiveness because SpikeFilter is disabled
-            slow_trend_unsensitive_cause: 10.0,
-            slow_trend_unsensitive_result: 0.5,
             report_min_resolved_ts_interval: ReadableDuration::secs(1),
             check_leader_lease_interval: ReadableDuration::secs(0),
             renew_leader_lease_advance_duration: ReadableDuration::secs(0),
+            allow_unsafe_vote_after_start: false,
             report_region_buckets_tick_interval: ReadableDuration::secs(10),
             max_snapshot_file_raw_size: ReadableSize::mb(100),
             unreachable_backoff: ReadableDuration::secs(10),
             // TODO: make its value reasonable
             check_peers_availability_interval: ReadableDuration::secs(30),
-            // TODO: make its value reasonable
-            check_request_snapshot_interval: ReadableDuration::minutes(1),
-            enable_v2_compatible_learner: false,
+            unsafe_disable_check_quorum: false,
         }
     }
 }
@@ -520,10 +514,6 @@ impl Config {
         self.raft_log_gc_size_limit.unwrap()
     }
 
-    pub fn region_compact_check_step(&self) -> u64 {
-        self.region_compact_check_step.unwrap()
-    }
-
     #[inline]
     pub fn warmup_entry_cache_enabled(&self) -> bool {
         self.max_entry_cache_warmup_duration.0 != Duration::from_secs(0)
@@ -543,16 +533,6 @@ impl Config {
         false
     }
 
-    pub fn optimize_for(&mut self, raft_kv_v2: bool) {
-        if self.region_compact_check_step.is_none() {
-            if raft_kv_v2 {
-                self.region_compact_check_step = Some(5);
-            } else {
-                self.region_compact_check_step = Some(100);
-            }
-        }
-    }
-
     pub fn validate(
         &mut self,
         region_split_size: ReadableSize,
@@ -567,6 +547,12 @@ impl Config {
             warn!(
                 "Election timeout ticks needs to be same across all the cluster, \
                  otherwise it may lead to inconsistency."
+            );
+        }
+        if self.allow_unsafe_vote_after_start {
+            warn!(
+                "allow_unsafe_vote_after_start need to be false, otherwise \
+                it may lead to inconsistency"
             );
         }
 
@@ -820,7 +806,6 @@ impl Config {
                 }
             }
         }
-        assert!(self.region_compact_check_step.is_some());
 
         Ok(())
     }
@@ -865,9 +850,6 @@ impl Config {
             .with_label_values(&["raft_log_gc_tick_interval"])
             .set(self.raft_log_gc_tick_interval.as_secs_f64());
         CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["request_voter_replicated_index_interval"])
-            .set(self.request_voter_replicated_index_interval.as_secs_f64());
-        CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["raft_log_gc_threshold"])
             .set(self.raft_log_gc_threshold as f64);
         CONFIG_RAFTSTORE_GAUGE
@@ -897,16 +879,10 @@ impl Config {
             .set(self.region_compact_check_interval.as_secs_f64());
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["region_compact_check_step"])
-            .set(self.region_compact_check_step.unwrap_or_default() as f64);
+            .set(self.region_compact_check_step as f64);
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["region_compact_min_tombstones"])
             .set(self.region_compact_min_tombstones as f64);
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["region_compact_tombstones_percent"])
-            .set(self.region_compact_tombstones_percent as f64);
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["region_compact_min_redundant_rows"])
-            .set(self.region_compact_min_redundant_rows as f64);
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["region_compact_tombstones_percent"])
             .set(self.region_compact_tombstones_percent as f64);
@@ -1094,25 +1070,8 @@ impl ConfigManager for RaftstoreConfigManager {
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         {
             let change = change.clone();
-            self.config.update(move |cfg: &mut Config| {
-                // Currently, it's forbidden to modify the write mode either from `async` to
-                // `sync` or from `sync` to `async`.
-                if let Some(ConfigValue::Usize(resized_io_size)) = change.get("store_io_pool_size")
-                {
-                    if cfg.store_io_pool_size == 0 && *resized_io_size > 0 {
-                        return Err(
-                            "SYNC mode, not allowed to resize the size of store-io-pool-size"
-                                .into(),
-                        );
-                    } else if cfg.store_io_pool_size > 0 && *resized_io_size == 0 {
-                        return Err(
-                            "ASYNC mode, not allowed to be set to SYNC mode by resizing store-io-pool-size to 0"
-                                .into(),
-                        );
-                    }
-                }
-                cfg.update(change)
-            })?;
+            self.config
+                .update(move |cfg: &mut Config| cfg.update(change))?;
         }
         if let Some(ConfigValue::Module(raft_batch_system_change)) =
             change.get("store_batch_system")
@@ -1123,12 +1082,6 @@ impl ConfigManager for RaftstoreConfigManager {
             change.get("apply_batch_system")
         {
             self.schedule_config_change(RaftStoreBatchComponent::Apply, apply_batch_system_change);
-        }
-        if let Some(ConfigValue::Usize(resized_io_size)) = change.get("store_io_pool_size") {
-            let resize_io_task = RefreshConfigTask::ScaleWriters(*resized_io_size);
-            if let Err(e) = self.scheduler.schedule(resize_io_task) {
-                error!("raftstore configuration manager schedule to resize store-io-pool-size work task failed"; "err"=> ?e);
-            }
         }
         info!(
             "raftstore config changed";
@@ -1146,9 +1099,8 @@ mod tests {
 
     #[test]
     fn test_config_validate() {
-        let split_size = coprocessor::config::SPLIT_SIZE;
+        let split_size = ReadableSize::mb(coprocessor::config::SPLIT_SIZE_MB);
         let mut cfg = Config::new();
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
         assert_eq!(
             cfg.raft_min_election_timeout_ticks,
@@ -1160,50 +1112,41 @@ mod tests {
         );
 
         cfg.raft_heartbeat_ticks = 0;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.raft_election_timeout_ticks = 10;
         cfg.raft_heartbeat_ticks = 10;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.raft_min_election_timeout_ticks = 5;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
         cfg.raft_min_election_timeout_ticks = 25;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
         cfg.raft_min_election_timeout_ticks = 10;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
 
         cfg.raft_heartbeat_ticks = 11;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.raft_log_gc_threshold = 0;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.raft_log_gc_size_limit = Some(ReadableSize(0));
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.raft_log_gc_size_limit = None;
-        cfg.optimize_for(false);
         cfg.validate(ReadableSize(20), false, ReadableSize(0))
             .unwrap();
         assert_eq!(cfg.raft_log_gc_size_limit, Some(ReadableSize(15)));
@@ -1212,27 +1155,23 @@ mod tests {
         cfg.raft_base_tick_interval = ReadableDuration::secs(1);
         cfg.raft_election_timeout_ticks = 10;
         cfg.raft_store_max_leader_lease = ReadableDuration::secs(20);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.raft_log_gc_count_limit = Some(100);
         cfg.merge_max_log_gap = 110;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.raft_log_gc_count_limit = None;
-        cfg.optimize_for(false);
         cfg.validate(ReadableSize::mb(1), false, ReadableSize(0))
             .unwrap();
         assert_eq!(cfg.raft_log_gc_count_limit, Some(768));
 
         cfg = Config::new();
         cfg.merge_check_tick_interval = ReadableDuration::secs(0);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
@@ -1240,76 +1179,64 @@ mod tests {
         cfg.raft_base_tick_interval = ReadableDuration::secs(1);
         cfg.raft_election_timeout_ticks = 10;
         cfg.peer_stale_state_check_interval = ReadableDuration::secs(5);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.peer_stale_state_check_interval = ReadableDuration::minutes(2);
         cfg.abnormal_leader_missing_duration = ReadableDuration::minutes(1);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.abnormal_leader_missing_duration = ReadableDuration::minutes(2);
         cfg.max_leader_missing_duration = ReadableDuration::minutes(1);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.local_read_batch_size = 0;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.apply_batch_system.max_batch_size = Some(0);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.apply_batch_system.pool_size = 0;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.store_batch_system.max_batch_size = Some(0);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.store_batch_system.pool_size = 0;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.apply_batch_system.max_batch_size = Some(10241);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.store_batch_system.max_batch_size = Some(10241);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.hibernate_regions = true;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
         assert_eq!(cfg.store_batch_system.max_batch_size, Some(256));
         assert_eq!(cfg.apply_batch_system.max_batch_size, Some(256));
 
         cfg = Config::new();
         cfg.hibernate_regions = false;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
         assert_eq!(cfg.store_batch_system.max_batch_size, Some(1024));
         assert_eq!(cfg.apply_batch_system.max_batch_size, Some(256));
@@ -1318,20 +1245,17 @@ mod tests {
         cfg.hibernate_regions = true;
         cfg.store_batch_system.max_batch_size = Some(123);
         cfg.apply_batch_system.max_batch_size = Some(234);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
         assert_eq!(cfg.store_batch_system.max_batch_size, Some(123));
         assert_eq!(cfg.apply_batch_system.max_batch_size, Some(234));
 
         cfg = Config::new();
         cfg.future_poll_size = 0;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
         cfg = Config::new();
         cfg.snap_generator_pool_size = 0;
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
@@ -1339,7 +1263,6 @@ mod tests {
         cfg.raft_base_tick_interval = ReadableDuration::secs(1);
         cfg.raft_election_timeout_ticks = 11;
         cfg.raft_store_max_leader_lease = ReadableDuration::secs(11);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
 
@@ -1347,54 +1270,43 @@ mod tests {
         cfg.hibernate_regions = true;
         cfg.max_peer_down_duration = ReadableDuration::minutes(5);
         cfg.peer_stale_state_check_interval = ReadableDuration::minutes(5);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
         assert_eq!(cfg.max_peer_down_duration, ReadableDuration::minutes(10));
 
         cfg = Config::new();
         cfg.raft_max_size_per_msg = ReadableSize(0);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
         cfg.raft_max_size_per_msg = ReadableSize::gb(64);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
         cfg.raft_max_size_per_msg = ReadableSize::gb(3);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
 
         cfg = Config::new();
         cfg.raft_entry_max_size = ReadableSize(0);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
         cfg.raft_entry_max_size = ReadableSize::mb(3073);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0))
             .unwrap_err();
         cfg.raft_entry_max_size = ReadableSize::gb(3);
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
 
         cfg = Config::new();
-        cfg.optimize_for(false);
         cfg.validate(split_size, false, ReadableSize(0)).unwrap();
         assert_eq!(cfg.region_split_check_diff(), split_size / 16);
 
         cfg = Config::new();
-        cfg.optimize_for(false);
         cfg.validate(split_size, true, split_size / 8).unwrap();
         assert_eq!(cfg.region_split_check_diff(), split_size / 16);
 
         cfg = Config::new();
-        cfg.optimize_for(false);
         cfg.validate(split_size, true, split_size / 20).unwrap();
         assert_eq!(cfg.region_split_check_diff(), split_size / 20);
 
         cfg = Config::new();
         cfg.region_split_check_diff = Some(ReadableSize(1));
-        cfg.optimize_for(false);
         cfg.validate(split_size, true, split_size / 20).unwrap();
         assert_eq!(cfg.region_split_check_diff(), ReadableSize(1));
     }

@@ -74,7 +74,7 @@ end-point-enable-batch-if-possible = true
 end-point-request-max-handle-duration = "12s"
 end-point-max-concurrency = 10
 end-point-perf-level = 5
-snap-io-max-bytes-per-sec = "10MB"
+snap-max-write-bytes-per-sec = "10MB"
 snap-max-total-size = "10GB"
 stats-concurrency = 10
 heavy-load-threshold = 25
@@ -90,7 +90,6 @@ a = "b"
 
 [storage]
 data-dir = "/var"
-engine = "partitioned-raft-kv"
 gc-ratio-threshold = 1.2
 max-key-size = 4096
 scheduler-concurrency = 123
@@ -103,6 +102,7 @@ enable-ttl = true
 ttl-check-poll-interval = "0s"
 
 [storage.block-cache]
+shared = true
 capacity = "40GB"
 num-shard-bits = 10
 strict-capacity-limit = true
@@ -167,8 +167,6 @@ clean-stale-peer-delay = "0s"
 region-compact-check-step = 1234
 region-compact-min-tombstones = 999
 region-compact-tombstones-percent = 33
-region-compact-min-redundant-rows = 999
-region-compact-redundant-rows-percent = 33
 pd-heartbeat-tick-interval = "12m"
 pd-store-heartbeat-tick-interval = "12s"
 snap-mgr-gc-tick-interval = "12m"
@@ -183,6 +181,7 @@ abnormal-leader-missing-duration = "6h"
 peer-stale-state-check-interval = "2h"
 leader-transfer-max-log-lag = 123
 snap-apply-batch-size = "12MB"
+snap-apply-copy-symlink = true
 consistency-check-interval = "12s"
 report-region-flow-interval = "12m"
 raft-store-max-leader-lease = "12s"
@@ -228,7 +227,6 @@ report-region-buckets-tick-interval = "1234s"
 max-snapshot-file-raw-size = "10GB"
 unreachable-backoff = "111s"
 max-entry-cache-warmup-duration = "2s"
-enable-partitioned-raft-kv-compatible-learner = false
 
 [coprocessor]
 split-region-on-table = false
@@ -255,6 +253,7 @@ max-background-flushes = 4
 max-manifest-file-size = "12MB"
 create-if-missing = false
 max-open-files = 12345
+enable-statistics = false
 stats-dump-period = "12m"
 compaction-readahead-size = "1KB"
 info-log-max-size = "1KB"
@@ -271,10 +270,7 @@ max-sub-compactions = 12
 writable-file-max-buffer-size = "12MB"
 use-direct-io-for-flush-and-compaction = true
 enable-pipelined-write = false
-enable-multi-batch-write = true
 enable-unordered-write = true
-allow-concurrent-memtable-write = false
-write-buffer-limit = "1GB"
 
 [rocksdb.titan]
 enabled = true
@@ -335,7 +331,6 @@ compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
 format-version = 5
 checksum = "xxh3"
-max-compactions = 3
 
 [rocksdb.defaultcf.titan]
 min-blob-size = "2018B"
@@ -398,7 +393,6 @@ compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
 format-version = 5
 checksum = "xxh3"
-max-compactions = 3
 
 [rocksdb.lockcf]
 block-size = "12KB"
@@ -448,7 +442,6 @@ compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
 format-version = 5
 checksum = "xxh3"
-max-compactions = 3
 
 [rocksdb.raftcf]
 block-size = "12KB"
@@ -498,7 +491,6 @@ compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
 format-version = 5
 checksum = "xxh3"
-max-compactions = 3
 
 [raftdb]
 wal-recovery-mode = "skip-any-corrupted-records"
@@ -511,6 +503,7 @@ max-background-flushes = 4
 max-manifest-file-size = "12MB"
 create-if-missing = false
 max-open-files = 12345
+enable-statistics = false
 stats-dump-period = "12m"
 compaction-readahead-size = "1KB"
 info-log-max-size = "1KB"
@@ -580,7 +573,6 @@ compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
 format-version = 5
 checksum = "xxh3"
-max-compactions = 3
 
 [raftdb.defaultcf.titan]
 min-blob-size = "2018B"
@@ -605,7 +597,6 @@ recovery-mode = "tolerate-tail-corruption"
 recovery-read-block-size = "1KB"
 recovery-threads = 2
 memory-limit = "1GB"
-enable-log-recycle = true # enable by default
 
 [security]
 ca-path = "invalid path"
@@ -693,6 +684,3 @@ sample-threshold = 100
 byte-threshold = 31457280
 split.split-balance-score = 0.25
 split.split-contained-score = 0.5
-
-[resource-control]
-enabled = false

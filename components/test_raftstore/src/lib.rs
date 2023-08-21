@@ -11,7 +11,7 @@ mod node;
 mod router;
 mod server;
 mod transport_simulate;
-pub mod util;
+mod util;
 
 pub use crate::{
     cluster::*, config::Config, node::*, router::*, server::*, transport_simulate::*, util::*,

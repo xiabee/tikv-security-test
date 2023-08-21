@@ -38,7 +38,7 @@ use txn_types::{Key, TimeStamp};
 use super::{
     check_need_gc,
     compaction_filter::{
-        CompactionFilterInitializer, DeleteBatch, GC_COMPACTION_FILTER_MVCC_DELETION_HANDLED,
+        CompactionFilterInitializer, GC_COMPACTION_FILTER_MVCC_DELETION_HANDLED,
         GC_COMPACTION_FILTER_MVCC_DELETION_WASTED, GC_COMPACTION_FILTER_ORPHAN_VERSIONS,
     },
     config::{GcConfig, GcWorkerConfigManager},
@@ -118,11 +118,7 @@ where
     /// until `DefaultCompactionFilter` is introduced.
     ///
     /// The tracking issue: <https://github.com/tikv/tikv/issues/9719>.
-    OrphanVersions {
-        wb: DeleteBatch<E::WriteBatch>,
-        id: usize,
-        region_info_provider: Arc<dyn RegionInfoProvider>,
-    },
+    OrphanVersions { wb: E::WriteBatch, id: usize },
     #[cfg(any(test, feature = "testexport"))]
     Validate(Box<dyn FnOnce(&GcConfig, &Limiter) + Send>),
 }
@@ -166,7 +162,7 @@ where
                 .field("start_key", &format!("{}", start_key))
                 .field("end_key", &format!("{}", end_key))
                 .finish(),
-            GcTask::OrphanVersions { id, wb, .. } => f
+            GcTask::OrphanVersions { id, wb } => f
                 .debug_struct("OrphanVersions")
                 .field("id", id)
                 .field("count", &wb.count())
@@ -875,46 +871,6 @@ impl<E: Engine> GcRunner<E> {
             tikv_kv::snapshot(&mut self.engine, snap_ctx).await
         })?)
     }
-
-    fn flush_deletes(&mut self, deletes: Vec<Key>, provider: Arc<dyn RegionInfoProvider>) {
-        let mut region_modifies = HashMap::default();
-        // Should not panic.
-        let regions = match get_regions_for_range_of_keys(self.store_id, &deletes, provider) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("failed to flush deletes, will leave garbage"; "err" => ?e);
-                return;
-            }
-        };
-        if regions.is_empty() {
-            error!("no region is found, will leave garbage");
-            return;
-        }
-        let mut keys = deletes.into_iter().peekable();
-        let mut modifies = vec![];
-        for region in &regions {
-            let start_key = region.get_start_key();
-            let end_key = region.get_end_key();
-            while let Some(key) = keys.peek() {
-                if key.as_encoded().as_slice() < start_key {
-                    error!("key is not in any region, will leave garbage"; "key" => %key);
-                    keys.next();
-                    continue;
-                }
-                if !end_key.is_empty() && key.as_encoded().as_slice() >= end_key {
-                    break;
-                }
-                modifies.push(Modify::Delete(CF_DEFAULT, keys.next().unwrap()));
-            }
-            if !modifies.is_empty() {
-                region_modifies.insert(region.id, modifies);
-                modifies = vec![];
-            }
-        }
-        if let Err(e) = self.engine.modify_on_kv_engine(region_modifies) {
-            error!("failed to flush deletes, will leave garbage"; "err" => ?e);
-        }
-    }
 }
 
 impl<E: Engine> Runnable for GcRunner<E> {
@@ -1026,29 +982,19 @@ impl<E: Engine> Runnable for GcRunner<E> {
                     end_key
                 );
             }
-            GcTask::OrphanVersions {
-                wb,
-                id,
-                region_info_provider,
-            } => {
-                let count = wb.count();
-                match wb.batch {
-                    Either::Left(mut wb) => {
-                        info!("handling GcTask::OrphanVersions"; "id" => id);
-                        let mut wopts = WriteOptions::default();
-                        wopts.set_sync(true);
-                        if let Err(e) = wb.write_opt(&wopts) {
-                            error!("write GcTask::OrphanVersions fail"; "id" => id, "err" => ?e);
-                            update_metrics(true);
-                            return;
-                        }
-                        info!("write GcTask::OrphanVersions success"; "id" => id);
-                    }
-                    Either::Right(deletes) => self.flush_deletes(deletes, region_info_provider),
+            GcTask::OrphanVersions { mut wb, id } => {
+                info!("handling GcTask::OrphanVersions"; "id" => id);
+                let mut wopts = WriteOptions::default();
+                wopts.set_sync(true);
+                if let Err(e) = wb.write_opt(&wopts) {
+                    error!("write GcTask::OrphanVersions fail"; "id" => id, "err" => ?e);
+                    update_metrics(true);
+                    return;
                 }
+                info!("write GcTask::OrphanVersions success"; "id" => id);
                 GC_COMPACTION_FILTER_ORPHAN_VERSIONS
                     .with_label_values(&[STAT_TXN_KEYMODE, "cleaned"])
-                    .inc_by(count as u64);
+                    .inc_by(wb.count() as u64);
                 update_metrics(false);
             }
             #[cfg(any(test, feature = "testexport"))]
@@ -1198,7 +1144,7 @@ impl<E: Engine> GcWorker<E> {
         );
 
         info!("initialize compaction filter to perform GC when necessary");
-        self.engine.kv_engine().init_compaction_filter(
+        self.engine.kv_engine().unwrap().init_compaction_filter(
             cfg.self_store_id,
             safe_point.clone(),
             self.config_manager.clone(),
@@ -1361,7 +1307,6 @@ pub mod test_gc_worker {
                         let bytes = keys::data_end_key(key2.as_encoded());
                         *key2 = Key::from_encoded(bytes);
                     }
-                    Modify::Ingest(_) => unimplemented!(),
                 }
             }
             write_modifies(&self.kv_engine().unwrap(), modifies)
@@ -1389,7 +1334,6 @@ pub mod test_gc_worker {
                     *start_key = Key::from_encoded(keys::data_key(start_key.as_encoded()));
                     *end_key = Key::from_encoded(keys::data_end_key(end_key.as_encoded()));
                 }
-                Modify::Ingest(_) => unimplemented!(),
             });
             self.0.async_write(ctx, batch, subscribed, on_applied)
         }

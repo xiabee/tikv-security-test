@@ -591,7 +591,10 @@ impl<S: EngineSnapshot> MvccReader<S> {
         Ok((locks, has_remain))
     }
 
-    /// Scan the writes to get all the latest user keys. The return type is:
+    /// Scan the writes to get all the latest user keys. This scan will skip
+    /// `WriteType::Lock` and `WriteType::Rollback`, only return the key that
+    /// has a latest `WriteType::Put` or `WriteType::Delete` record. The return
+    /// type is:
     /// * `(Vec<key>, has_remain)`.
     ///   - `key` is the encoded user key without `commit_ts`.
     ///   - `has_remain` indicates whether there MAY be remaining user keys that
@@ -633,6 +636,15 @@ impl<S: EngineSnapshot> MvccReader<S> {
             }
             let commit_ts = key.decode_ts()?;
             let user_key = key.truncate_ts()?;
+            // Skip the key if its latest write type is not `WriteType::Put` or
+            // `WriteType::Delete`.
+            match WriteRef::parse(cursor.value(&mut self.statistics.write))?.write_type {
+                WriteType::Put | WriteType::Delete => {}
+                WriteType::Lock | WriteType::Rollback => {
+                    cursor.next(&mut self.statistics.write);
+                    continue;
+                }
+            }
             // To make sure we only check each unique user key once and the filter returns
             // true.
             let is_same_user_key = cur_user_key.as_ref() == Some(&user_key);
@@ -773,10 +785,6 @@ impl<S: EngineSnapshot> MvccReader<S> {
         self.hint_min_ts = ts_bound;
     }
 
-    pub fn snapshot_ext(&self) -> S::Ext<'_> {
-        self.snapshot.ext()
-    }
-
     pub fn snapshot(&self) -> &S {
         &self.snapshot
     }
@@ -912,7 +920,6 @@ pub mod tests {
                 m,
                 &None,
                 SkipPessimisticCheck,
-                None,
             )
             .unwrap();
             self.write(txn.into_modifies());
@@ -937,7 +944,6 @@ pub mod tests {
                 m,
                 &None,
                 DoPessimisticCheck,
-                None,
             )
             .unwrap();
             self.write(txn.into_modifies());
@@ -1047,7 +1053,6 @@ pub mod tests {
                             wb.delete_range_cf(cf, &k1, &k2).unwrap();
                         }
                     }
-                    Modify::Ingest(_) => unimplemented!(),
                 }
             }
             wb.write().unwrap();
@@ -1061,7 +1066,7 @@ pub mod tests {
 
         pub fn compact(&mut self) {
             for cf in ALL_CFS {
-                self.db.compact_range_cf(cf, None, None, false, 1).unwrap();
+                self.db.compact_range(cf, None, None, false, 1).unwrap();
             }
         }
     }
@@ -1254,7 +1259,7 @@ pub mod tests {
         let overlapped_write = reader
             .get_txn_commit_record(&key, 55.into())
             .unwrap()
-            .unwrap_none(0);
+            .unwrap_none();
         assert!(overlapped_write.is_none());
 
         // When no such record is found but a record of another txn has a write record
@@ -1262,7 +1267,7 @@ pub mod tests {
         let overlapped_write = reader
             .get_txn_commit_record(&key, 50.into())
             .unwrap()
-            .unwrap_none(0)
+            .unwrap_none()
             .unwrap();
         assert_eq!(overlapped_write.write.start_ts, 45.into());
         assert_eq!(overlapped_write.write.write_type, WriteType::Put);
@@ -1856,13 +1861,27 @@ pub mod tests {
             8,
         );
         engine.commit(b"k3", 8, 9);
-        // Prewrite and rollback k4.
+        // Prewrite and commit k4.
         engine.prewrite(
             Mutation::make_put(Key::from_raw(b"k4"), b"v4@1".to_vec()),
             b"k4",
             10,
         );
-        engine.rollback(b"k4", 10);
+        engine.commit(b"k4", 10, 11);
+        // Prewrite and rollback k4.
+        engine.prewrite(
+            Mutation::make_put(Key::from_raw(b"k4"), b"v4@2".to_vec()),
+            b"k4",
+            12,
+        );
+        engine.rollback(b"k4", 12);
+        // Prewrite and rollback k5.
+        engine.prewrite(
+            Mutation::make_put(Key::from_raw(b"k5"), b"v5@1".to_vec()),
+            b"k5",
+            13,
+        );
+        engine.rollback(b"k5", 13);
 
         // Current MVCC keys in `CF_WRITE` should be:
         // PUT      k0 -> v0@999
@@ -1874,7 +1893,9 @@ pub mod tests {
         // PUT      k3 -> v3@8
         // ROLLBACK k3 -> v3@7
         // PUT      k3 -> v3@5
-        // ROLLBACK k4 -> v4@1
+        // ROLLBACK k4 -> v4@2
+        // PUT      k4 -> v4@1
+        // ROLLBACK k5 -> v5@1
 
         struct Case {
             start_key: Option<Key>,

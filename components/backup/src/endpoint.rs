@@ -11,7 +11,8 @@ use std::{
 use async_channel::SendError;
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
-use engine_traits::{name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, SstCompressionType};
+use engine_rocks::RocksEngine;
+use engine_traits::{name_to_cf, raw_ttl::ttl_current_ts, CfName, SstCompressionType};
 use external_storage::{BackendConfig, HdfsConfig};
 use external_storage_export::{create_storage, ExternalStorage};
 use futures::{channel::mpsc::*, executor::block_on};
@@ -27,7 +28,7 @@ use raftstore::coprocessor::RegionInfoProvider;
 use tikv::{
     config::BackupConfig,
     storage::{
-        kv::{CursorBuilder, Engine, LocalTablets, ScanMode, SnapContext},
+        kv::{CursorBuilder, Engine, ScanMode, SnapContext},
         mvcc::Error as MvccError,
         raw::raw_mvcc::RawMvccSnapshot,
         txn::{EntryBatch, Error as TxnError, SnapshotStore, TxnEntryScanner, TxnEntryStore},
@@ -70,7 +71,6 @@ struct Request {
     compression_type: CompressionType,
     compression_level: i32,
     cipher: CipherInfo,
-    replica_read: bool,
 }
 
 /// Backup Task.
@@ -131,7 +131,6 @@ impl Task {
                 cf,
                 compression_type: req.get_compression_type(),
                 compression_level: req.get_compression_level(),
-                replica_read: req.get_replica_read(),
                 cipher: req.cipher_info.unwrap_or_else(|| {
                     let mut cipher = CipherInfo::default();
                     cipher.set_cipher_type(EncryptionMethod::Plaintext);
@@ -154,20 +153,19 @@ pub struct BackupRange {
     start_key: Option<Key>,
     end_key: Option<Key>,
     region: Region,
-    peer: Peer,
+    leader: Peer,
     codec: KeyValueCodec,
     cf: CfName,
-    uses_replica_read: bool,
 }
 
 /// The generic saveable writer. for generic `InMemBackupFiles`.
 /// Maybe what we really need is make Writer a trait...
-enum KvWriter<EK: KvEngine> {
-    Txn(BackupWriter<EK>),
-    Raw(BackupRawKvWriter<EK>),
+enum KvWriter {
+    Txn(BackupWriter),
+    Raw(BackupRawKvWriter),
 }
 
-impl<EK: KvEngine> std::fmt::Debug for KvWriter<EK> {
+impl std::fmt::Debug for KvWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Txn(_) => f.debug_tuple("Txn").finish(),
@@ -176,7 +174,7 @@ impl<EK: KvEngine> std::fmt::Debug for KvWriter<EK> {
     }
 }
 
-impl<EK: KvEngine> KvWriter<EK> {
+impl KvWriter {
     async fn save(self, storage: &dyn ExternalStorage) -> Result<Vec<File>> {
         match self {
             Self::Txn(writer) => writer.save(storage).await,
@@ -193,8 +191,8 @@ impl<EK: KvEngine> KvWriter<EK> {
 }
 
 #[derive(Debug)]
-struct InMemBackupFiles<EK: KvEngine> {
-    files: KvWriter<EK>,
+struct InMemBackupFiles {
+    files: KvWriter,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
     start_version: TimeStamp,
@@ -202,8 +200,8 @@ struct InMemBackupFiles<EK: KvEngine> {
     region: Region,
 }
 
-async fn save_backup_file_worker<EK: KvEngine>(
-    rx: async_channel::Receiver<InMemBackupFiles<EK>>,
+async fn save_backup_file_worker(
+    rx: async_channel::Receiver<InMemBackupFiles>,
     tx: UnboundedSender<BackupResponse>,
     storage: Arc<dyn ExternalStorage>,
     codec: KeyValueCodec,
@@ -275,10 +273,10 @@ async fn save_backup_file_worker<EK: KvEngine>(
 
 /// Send the save task to the save worker.
 /// Record the wait time at the same time.
-async fn send_to_worker_with_metrics<EK: KvEngine>(
-    tx: &async_channel::Sender<InMemBackupFiles<EK>>,
-    files: InMemBackupFiles<EK>,
-) -> std::result::Result<(), SendError<InMemBackupFiles<EK>>> {
+async fn send_to_worker_with_metrics(
+    tx: &async_channel::Sender<InMemBackupFiles>,
+    files: InMemBackupFiles,
+) -> std::result::Result<(), SendError<InMemBackupFiles>> {
     let files = match tx.try_send(files) {
         Ok(_) => return Ok(()),
         Err(e) => e.into_inner(),
@@ -293,12 +291,12 @@ impl BackupRange {
     /// Get entries from the scanner and save them to storage
     async fn backup<E: Engine>(
         &self,
-        writer_builder: BackupWriterBuilder<E::Local>,
+        writer_builder: BackupWriterBuilder,
         mut engine: E,
         concurrency_manager: ConcurrencyManager,
         backup_ts: TimeStamp,
         begin_ts: TimeStamp,
-        saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
+        saver: async_channel::Sender<InMemBackupFiles>,
         storage_name: &str,
     ) -> Result<Statistics> {
         assert!(!self.codec.is_raw_kv);
@@ -306,45 +304,35 @@ impl BackupRange {
         let mut ctx = Context::default();
         ctx.set_region_id(self.region.get_id());
         ctx.set_region_epoch(self.region.get_region_epoch().to_owned());
-        ctx.set_peer(self.peer.clone());
-        ctx.set_replica_read(self.uses_replica_read);
-        ctx.set_isolation_level(IsolationLevel::Si);
+        ctx.set_peer(self.leader.clone());
 
-        let mut snap_ctx = SnapContext {
+        // Update max_ts and check the in-memory lock table before getting the snapshot
+        concurrency_manager.update_max_ts(backup_ts);
+        concurrency_manager
+            .read_range_check(
+                self.start_key.as_ref(),
+                self.end_key.as_ref(),
+                |key, lock| {
+                    Lock::check_ts_conflict(
+                        Cow::Borrowed(lock),
+                        key,
+                        backup_ts,
+                        &Default::default(),
+                        IsolationLevel::Si,
+                    )
+                },
+            )
+            .map_err(MvccError::from)
+            .map_err(TxnError::from)?;
+
+        // Currently backup always happens on the leader, so we don't need
+        // to set key ranges and start ts to check.
+        assert!(!ctx.get_replica_read());
+        let snap_ctx = SnapContext {
             pb_ctx: &ctx,
             allowed_in_flashback: self.region.is_in_flashback,
             ..Default::default()
         };
-        if self.uses_replica_read {
-            snap_ctx.start_ts = Some(backup_ts);
-            let mut key_range = KeyRange::default();
-            if let Some(start_key) = self.start_key.as_ref() {
-                key_range.set_start_key(start_key.clone().into_encoded());
-            }
-            if let Some(end_key) = self.end_key.as_ref() {
-                key_range.set_end_key(end_key.clone().into_encoded());
-            }
-            snap_ctx.key_ranges = vec![key_range];
-        } else {
-            // Update max_ts and check the in-memory lock table before getting the snapshot
-            concurrency_manager.update_max_ts(backup_ts);
-            concurrency_manager
-                .read_range_check(
-                    self.start_key.as_ref(),
-                    self.end_key.as_ref(),
-                    |key, lock| {
-                        Lock::check_ts_conflict(
-                            Cow::Borrowed(lock),
-                            key,
-                            backup_ts,
-                            &Default::default(),
-                            IsolationLevel::Si,
-                        )
-                    },
-                )
-                .map_err(MvccError::from)
-                .map_err(TxnError::from)?;
-        }
 
         let start_snapshot = Instant::now();
         let snapshot = match engine.snapshot(snap_ctx) {
@@ -459,9 +447,9 @@ impl BackupRange {
         Ok(stat)
     }
 
-    fn backup_raw<EK: KvEngine, S: Snapshot>(
+    fn backup_raw<S: Snapshot>(
         &self,
-        writer: &mut BackupRawKvWriter<EK>,
+        writer: &mut BackupRawKvWriter,
         snapshot: &S,
     ) -> Result<Statistics> {
         assert!(self.codec.is_raw_kv);
@@ -523,14 +511,14 @@ impl BackupRange {
     async fn backup_raw_kv_to_file<E: Engine>(
         &self,
         mut engine: E,
-        db: E::Local,
+        db: RocksEngine,
         limiter: &Limiter,
         file_name: String,
         cf: CfNameWrap,
         compression_type: Option<SstCompressionType>,
         compression_level: i32,
         cipher: CipherInfo,
-        saver_tx: async_channel::Sender<InMemBackupFiles<E::Local>>,
+        saver_tx: async_channel::Sender<InMemBackupFiles>,
     ) -> Result<Statistics> {
         let mut writer = match BackupRawKvWriter::new(
             db,
@@ -552,8 +540,7 @@ impl BackupRange {
         let mut ctx = Context::default();
         ctx.set_region_id(self.region.get_id());
         ctx.set_region_epoch(self.region.get_region_epoch().to_owned());
-        ctx.set_peer(self.peer.clone());
-
+        ctx.set_peer(self.leader.clone());
         let snap_ctx = SnapContext {
             pb_ctx: &ctx,
             ..Default::default()
@@ -678,7 +665,7 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     store_id: u64,
     pool: RefCell<ControlThreadPool>,
     io_pool: Runtime,
-    tablets: LocalTablets<E::Local>,
+    db: RocksEngine,
     config_manager: ConfigManager,
     concurrency_manager: ConcurrencyManager,
     softlimit: SoftLimitKeeper,
@@ -752,7 +739,7 @@ impl<R: RegionInfoProvider> Progress<R> {
     /// Forward the progress by `ranges` BackupRanges
     ///
     /// The size of the returned BackupRanges should <= `ranges`
-    fn forward(&mut self, limit: usize, replica_read: bool) -> Vec<BackupRange> {
+    fn forward(&mut self, limit: usize) -> Vec<BackupRange> {
         if self.finished {
             return Vec::new();
         }
@@ -782,20 +769,18 @@ impl<R: RegionInfoProvider> Progress<R> {
                             break;
                         }
                     }
-                    let peer = find_peer(region, store_id).unwrap().to_owned();
-                    // Raft peer role has to match the replica read flag.
-                    if replica_read || info.role == StateRole::Leader {
+                    if info.role == StateRole::Leader {
                         let ekey = get_min_end_key(end_key.as_ref(), region);
                         let skey = get_max_start_key(start_key.as_ref(), region);
                         assert!(!(skey == ekey && ekey.is_some()), "{:?} {:?}", skey, ekey);
+                        let leader = find_peer(region, store_id).unwrap().to_owned();
                         let backup_range = BackupRange {
                             start_key: skey,
                             end_key: ekey,
                             region: region.clone(),
-                            peer,
+                            leader,
                             codec,
                             cf: cf_name,
-                            uses_replica_read: info.role != StateRole::Leader,
                         };
                         tx.send(backup_range).unwrap();
                         count += 1;
@@ -833,7 +818,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         store_id: u64,
         engine: E,
         region_info: R,
-        tablets: LocalTablets<E::Local>,
+        db: RocksEngine,
         config: BackupConfig,
         concurrency_manager: ConcurrencyManager,
         api_version: ApiVersion,
@@ -849,7 +834,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             engine,
             region_info,
             pool: RefCell::new(pool),
-            tablets,
+            db,
             io_pool: rt,
             softlimit,
             config_manager,
@@ -884,14 +869,14 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         &self,
         prs: Arc<Mutex<Progress<R>>>,
         request: Request,
-        saver_tx: async_channel::Sender<InMemBackupFiles<E::Local>>,
+        saver_tx: async_channel::Sender<InMemBackupFiles>,
         resp_tx: UnboundedSender<BackupResponse>,
         _backend: Arc<dyn ExternalStorage>,
     ) {
         let start_ts = request.start_ts;
         let backup_ts = request.end_ts;
         let engine = self.engine.clone();
-        let tablets = self.tablets.clone();
+        let db = self.db.clone();
         let store_id = self.store_id;
         let concurrency_manager = self.concurrency_manager.clone();
         let batch_size = self.config_manager.0.read().unwrap().batch_size;
@@ -922,7 +907,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     // (See https://tokio.rs/tokio/tutorial/shared-state)
                     // Use &mut and mark the type for making rust-analyzer happy.
                     let progress: &mut Progress<_> = &mut prs.lock().unwrap();
-                    let batch = progress.forward(batch_size, request.replica_read);
+                    let batch = progress.forward(batch_size);
                     if batch.is_empty() {
                         return;
                     }
@@ -946,19 +931,12 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     });
                     let name = backup_file_name(store_id, &brange.region, key, _backend.name());
                     let ct = to_sst_compression_type(request.compression_type);
-                    let db = match tablets.get(brange.region.id) {
-                        Some(t) => t,
-                        None => {
-                            warn!("backup region not found"; "region" => ?brange.region.id);
-                            return;
-                        }
-                    };
 
                     let stat = if is_raw_kv {
                         brange
                             .backup_raw_kv_to_file(
                                 engine,
-                                db.into_owned(),
+                                db.clone(),
                                 &request.limiter,
                                 name,
                                 cf.into(),
@@ -973,7 +951,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             store_id,
                             request.limiter.clone(),
                             brange.region.clone(),
-                            db.into_owned(),
+                            db.clone(),
                             ct,
                             request.compression_level,
                             sst_max_size,
@@ -1102,6 +1080,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         let backend = Arc::<dyn ExternalStorage>::from(backend);
         let concurrency = self.config_manager.0.read().unwrap().num_threads;
         self.pool.borrow_mut().adjust_with(concurrency);
+        // make the buffer small enough to implement back pressure.
         let (tx, rx) = async_channel::bounded(1);
         for _ in 0..concurrency {
             self.spawn_backup_worker(
@@ -1276,7 +1255,6 @@ pub mod tests {
     use tikv::{
         coprocessor::checksum_crc64_xor,
         storage::{
-            kv::LocalTablets,
             txn::tests::{must_commit, must_prewrite_put},
             RocksEngine, TestEngineBuilder,
         },
@@ -1329,38 +1307,6 @@ pub mod tests {
                 map.create_region(r, StateRole::Leader);
             }
         }
-        pub fn add_region(
-            &self,
-            id: u64,
-            mut start_key: Vec<u8>,
-            mut end_key: Vec<u8>,
-            peer_role: metapb::PeerRole,
-            state_role: StateRole,
-        ) {
-            let mut region = metapb::Region::default();
-            region.set_id(id);
-            if !start_key.is_empty() {
-                if self.need_encode_key {
-                    start_key = Key::from_raw(&start_key).into_encoded();
-                } else {
-                    start_key = Key::from_encoded(start_key).into_encoded();
-                }
-            }
-            if !end_key.is_empty() {
-                if self.need_encode_key {
-                    end_key = Key::from_raw(&end_key).into_encoded();
-                } else {
-                    end_key = Key::from_encoded(end_key).into_encoded();
-                }
-            }
-            region.set_start_key(start_key);
-            region.set_end_key(end_key);
-            let mut new_peer = new_peer(1, 1);
-            new_peer.set_role(peer_role);
-            region.mut_peers().push(new_peer);
-            let mut map = self.regions.lock().unwrap();
-            map.create_region(region, state_role);
-        }
         fn canecl_on_seek(&mut self, cancel: Arc<AtomicBool>) {
             self.cancel = Some(cancel);
         }
@@ -1409,7 +1355,7 @@ pub mod tests {
                 1,
                 rocks,
                 MockRegionInfoProvider::new(need_encode_key),
-                LocalTablets::Singleton(db),
+                db,
                 BackupConfig {
                     num_threads: 4,
                     batch_size: 8,
@@ -1510,7 +1456,7 @@ pub mod tests {
                 let mut ranges = Vec::with_capacity(expect.len());
                 while ranges.len() != expect.len() {
                     let n = (rand::random::<usize>() % 3) + 1;
-                    let mut r = prs.forward(n, false);
+                    let mut r = prs.forward(n);
                     // The returned backup ranges should <= n
                     assert!(r.len() <= n);
 
@@ -1562,7 +1508,6 @@ pub mod tests {
                         compression_type: CompressionType::Unknown,
                         compression_level: 0,
                         cipher: CipherInfo::default(),
-                        replica_read: false,
                     },
                     resp: tx,
                 };
@@ -1619,108 +1564,6 @@ pub mod tests {
     }
 
     #[test]
-    fn test_backup_replica_read() {
-        let (_tmp, endpoint) = new_endpoint();
-
-        endpoint.region_info.add_region(
-            1,
-            b"".to_vec(),
-            b"1".to_vec(),
-            metapb::PeerRole::Voter,
-            StateRole::Leader,
-        );
-        endpoint.region_info.add_region(
-            2,
-            b"1".to_vec(),
-            b"2".to_vec(),
-            metapb::PeerRole::Voter,
-            StateRole::Follower,
-        );
-        endpoint.region_info.add_region(
-            3,
-            b"2".to_vec(),
-            b"3".to_vec(),
-            metapb::PeerRole::Learner,
-            StateRole::Follower,
-        );
-
-        let tmp = TempDir::new().unwrap();
-        let backend = make_local_backend(tmp.path());
-
-        let (tx, rx) = unbounded();
-        let mut ranges = vec![];
-        let key_range = KeyRange {
-            start_key: b"".to_vec(),
-            end_key: b"3".to_vec(),
-            ..Default::default()
-        };
-        ranges.push(key_range);
-        let read_leader_task = Task {
-            request: Request {
-                start_key: b"1".to_vec(),
-                end_key: b"2".to_vec(),
-                sub_ranges: ranges.clone(),
-                start_ts: 1.into(),
-                end_ts: 1.into(),
-                backend: backend.clone(),
-                limiter: Limiter::new(f64::INFINITY),
-                cancel: Arc::default(),
-                is_raw_kv: false,
-                dst_api_ver: ApiVersion::V1,
-                cf: engine_traits::CF_DEFAULT,
-                compression_type: CompressionType::Unknown,
-                compression_level: 0,
-                cipher: CipherInfo::default(),
-                replica_read: false,
-            },
-            resp: tx,
-        };
-        endpoint.handle_backup_task(read_leader_task);
-        let resps: Vec<_> = block_on(rx.collect());
-        assert_eq!(resps.len(), 1);
-        for a in &resps {
-            assert_eq!(a.get_start_key(), b"");
-            assert_eq!(a.get_end_key(), b"1");
-        }
-
-        let (tx, rx) = unbounded();
-        let replica_read_task = Task {
-            request: Request {
-                start_key: b"".to_vec(),
-                end_key: b"3".to_vec(),
-                sub_ranges: ranges.clone(),
-                start_ts: 1.into(),
-                end_ts: 1.into(),
-                backend,
-                limiter: Limiter::new(f64::INFINITY),
-                cancel: Arc::default(),
-                is_raw_kv: false,
-                dst_api_ver: ApiVersion::V1,
-                cf: engine_traits::CF_DEFAULT,
-                compression_type: CompressionType::Unknown,
-                compression_level: 0,
-                cipher: CipherInfo::default(),
-                replica_read: true,
-            },
-            resp: tx,
-        };
-        endpoint.handle_backup_task(replica_read_task);
-        let resps: Vec<_> = block_on(rx.collect());
-        let expected: Vec<(&[u8], &[u8])> = vec![(b"", b"1"), (b"1", b"2"), (b"2", b"3")];
-        assert_eq!(resps.len(), 3);
-        for a in &resps {
-            assert!(
-                expected
-                    .iter()
-                    .any(|b| { a.get_start_key() == b.0 && a.get_end_key() == b.1 }),
-                "{:?} {:?}",
-                resps,
-                expected
-            );
-        }
-    }
-
-    #[test]
     fn test_seek_ranges() {
         let (_tmp, endpoint) = new_endpoint();
 
@@ -1751,7 +1594,7 @@ pub mod tests {
                 let mut ranges = Vec::with_capacity(expect.len());
                 while ranges.len() != expect.len() {
                     let n = (rand::random::<usize>() % 3) + 1;
-                    let mut r = prs.forward(n, false);
+                    let mut r = prs.forward(n);
                     // The returned backup ranges should <= n
                     assert!(r.len() <= n);
 
@@ -1813,7 +1656,6 @@ pub mod tests {
                         compression_type: CompressionType::Unknown,
                         compression_level: 0,
                         cipher: CipherInfo::default(),
-                        replica_read: false,
                     },
                     resp: tx,
                 };

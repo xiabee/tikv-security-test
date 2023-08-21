@@ -12,7 +12,12 @@ use std::{
 
 use collections::HashMap;
 use crossbeam::channel::{SendError, TrySendError};
-use tikv_util::{debug, info, lru::LruCache, time::Instant, Either};
+use tikv_util::{
+    debug, info,
+    lru::LruCache,
+    time::{duration_to_sec, Instant},
+    Either,
+};
 
 use crate::{
     fsm::{Fsm, FsmScheduler, FsmState},
@@ -183,18 +188,10 @@ where
         mailbox: BasicMailbox<N>,
         msg: N::Message,
     ) -> Result<(), (BasicMailbox<N>, N::Message)> {
-        let mut normals = self.normals.lock().unwrap();
-        // Send has to be done within lock, otherwise the message may be handled
-        // before the mailbox is register.
         if let Err(SendError(m)) = mailbox.force_send(msg, &self.normal_scheduler) {
             return Err((mailbox, m));
         }
-        if let Some(mailbox) = normals.map.insert(addr, mailbox) {
-            mailbox.close();
-        }
-        normals
-            .alive_cnt
-            .store(normals.map.len(), Ordering::Relaxed);
+        self.register(addr, mailbox);
         Ok(())
     }
 
@@ -325,7 +322,7 @@ where
         for mailbox in mailboxes.map.values() {
             let _ = mailbox.force_send(msg_gen(), &self.normal_scheduler);
         }
-        BROADCAST_NORMAL_DURATION.observe(timer.saturating_elapsed_secs());
+        BROADCAST_NORMAL_DURATION.observe(duration_to_sec(timer.saturating_elapsed()));
     }
 
     /// Try to notify all FSMs that the cluster is being shutdown.
@@ -345,7 +342,7 @@ where
 
     /// Close the mailbox of address.
     pub fn close(&self, addr: u64) {
-        info!("shutdown mailbox"; "region_id" => addr);
+        info!("[region {}] shutdown mailbox", addr);
         unsafe { &mut *self.caches.as_ptr() }.remove(&addr);
         let mut mailboxes = self.normals.lock().unwrap();
         if let Some(mb) = mailboxes.map.remove(&addr) {

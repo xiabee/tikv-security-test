@@ -1,29 +1,11 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{DeleteStrategy, MiscExt, Range, RangeStats, Result, StatisticsReporter};
+use engine_traits::{DeleteStrategy, MiscExt, Range, Result};
 
 use crate::engine::PanicEngine;
 
-pub struct PanicReporter;
-
-impl StatisticsReporter<PanicEngine> for PanicReporter {
-    fn new(name: &str) -> Self {
-        panic!()
-    }
-
-    fn collect(&mut self, engine: &PanicEngine) {
-        panic!()
-    }
-
-    fn flush(&mut self) {
-        panic!()
-    }
-}
-
 impl MiscExt for PanicEngine {
-    type StatisticsReporter = PanicReporter;
-
-    fn flush_cfs(&self, cfs: &[&str], wait: bool) -> Result<()> {
+    fn flush_cfs(&self, wait: bool) -> Result<()> {
         panic!()
     }
 
@@ -64,19 +46,7 @@ impl MiscExt for PanicEngine {
         panic!()
     }
 
-    fn pause_background_work(&self) -> Result<()> {
-        panic!()
-    }
-
-    fn continue_background_work(&self) -> Result<()> {
-        panic!()
-    }
-
     fn exists(path: &str) -> bool {
-        panic!()
-    }
-
-    fn locked(path: &str) -> Result<bool> {
         panic!()
     }
 
@@ -96,11 +66,12 @@ impl MiscExt for PanicEngine {
         panic!()
     }
 
-    fn get_num_keys(&self) -> Result<u64> {
-        panic!()
-    }
-
-    fn get_range_stats(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Option<RangeStats>> {
+    fn get_range_entries_and_versions(
+        &self,
+        cf: &str,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Option<(u64, u64)>> {
         panic!()
     }
 

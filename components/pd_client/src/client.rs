@@ -1,6 +1,7 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
+    collections::HashMap,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -14,30 +15,27 @@ use futures::{
     channel::mpsc,
     compat::{Compat, Future01CompatExt},
     executor::block_on,
-    future::{self, BoxFuture, FutureExt, TryFlattenStream, TryFutureExt},
+    future::{self, BoxFuture, FutureExt, TryFutureExt},
     sink::SinkExt,
-    stream::{ErrInto, StreamExt},
-    TryStreamExt,
+    stream::StreamExt,
 };
 use grpcio::{EnvBuilder, Environment, WriteFlags};
 use kvproto::{
-    meta_storagepb::{
-        self as mpb, GetRequest, GetResponse, PutRequest, WatchRequest, WatchResponse,
-    },
     metapb,
     pdpb::{self, Member},
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
 };
 use security::SecurityManager;
 use tikv_util::{
-    box_err, debug, error, info, thd_name, time::Instant, timer::GLOBAL_TIMER_HANDLE, warn, Either,
-    HandyRwLock,
+    box_err, debug, error, info, thd_name,
+    time::{duration_to_sec, Instant},
+    timer::GLOBAL_TIMER_HANDLE,
+    warn, Either, HandyRwLock,
 };
 use txn_types::TimeStamp;
 use yatp::{task::future::TaskCell, ThreadPool};
 
 use super::{
-    meta_storage::{Get, MetaStorageClient, Put, Watch},
     metrics::*,
     util::{call_option_inner, check_resp_header, sync_request, Client, PdConnector},
     BucketStat, Config, Error, FeatureGate, PdClient, PdFuture, RegionInfo, RegionStat, Result,
@@ -46,8 +44,8 @@ use super::{
 
 pub const CQ_COUNT: usize = 1;
 pub const CLIENT_PREFIX: &str = "pd";
+const DEFAULT_REGION_PER_BATCH: i32 = 128;
 
-#[derive(Clone)]
 pub struct RpcClient {
     cluster_id: u64,
     pd_client: Arc<Client>,
@@ -197,7 +195,9 @@ impl RpcClient {
         &self,
         key: &[u8],
     ) -> PdFuture<(metapb::Region, Option<metapb::Peer>)> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC.get_region.start_coarse_timer();
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["get_region"])
+            .start_coarse_timer();
 
         let mut req = pdpb::GetRegionRequest::default();
         req.set_header(self.header());
@@ -257,8 +257,8 @@ impl RpcClient {
             Box::pin(async move {
                 let mut resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
-                    .get_store_async
-                    .observe(timer.saturating_elapsed_secs());
+                    .with_label_values(&["get_store_async"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
                 check_resp_header(resp.get_header())?;
                 let store = resp.take_store();
                 if store.get_state() != metapb::StoreState::Tombstone {
@@ -275,41 +275,6 @@ impl RpcClient {
     }
 }
 
-fn get_region_resp_by_id(
-    pd_client: Arc<Client>,
-    header: pdpb::RequestHeader,
-    region_id: u64,
-) -> PdFuture<pdpb::GetRegionResponse> {
-    let timer = Instant::now();
-    let mut req = pdpb::GetRegionByIdRequest::default();
-    req.set_header(header);
-    req.set_region_id(region_id);
-
-    let executor = move |client: &Client, req: pdpb::GetRegionByIdRequest| {
-        let handler = {
-            let inner = client.inner.rl();
-            inner
-                .client_stub
-                .get_region_by_id_async_opt(&req, call_option_inner(&inner))
-                .unwrap_or_else(|e| {
-                    panic!("fail to request PD {} err {:?}", "get_region_by_id", e);
-                })
-        };
-        Box::pin(async move {
-            let resp = handler.await?;
-            PD_REQUEST_HISTOGRAM_VEC
-                .get_region_by_id
-                .observe(timer.saturating_elapsed_secs());
-            check_resp_header(resp.get_header())?;
-            Ok(resp)
-        }) as PdFuture<_>
-    };
-
-    pd_client
-        .request(req, executor, LEADER_CHANGE_RETRY)
-        .execute()
-}
-
 impl fmt::Debug for RpcClient {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("RpcClient")
@@ -320,49 +285,14 @@ impl fmt::Debug for RpcClient {
 }
 
 const LEADER_CHANGE_RETRY: usize = 10;
+// periodic request like store_heartbeat, we don't need to retry.
+const NO_RETRY: usize = 1;
 
 impl PdClient for RpcClient {
-    fn store_global_config(
-        &self,
-        config_path: String,
-        items: Vec<pdpb::GlobalConfigItem>,
-    ) -> PdFuture<()> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .store_global_config
-            .start_coarse_timer();
-
-        let mut req = pdpb::StoreGlobalConfigRequest::new();
-        req.set_config_path(config_path);
-        req.set_changes(items.into());
-        let executor = move |client: &Client, req| match client
-            .inner
-            .rl()
-            .client_stub
-            .store_global_config_async(&req)
-        {
-            Ok(grpc_response) => Box::pin(async move {
-                if let Err(err) = grpc_response.await {
-                    return Err(box_err!("{:?}", err));
-                }
-                Ok(())
-            }) as PdFuture<_>,
-            Err(err) => Box::pin(async move { Err(box_err!("{:?}", err)) }) as PdFuture<_>,
-        };
-        self.pd_client
-            .request(req, executor, LEADER_CHANGE_RETRY)
-            .execute()
-    }
-
-    fn load_global_config(
-        &self,
-        config_path: String,
-    ) -> PdFuture<(Vec<pdpb::GlobalConfigItem>, i64)> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .load_global_config
-            .start_coarse_timer();
-
-        let mut req = pdpb::LoadGlobalConfigRequest::new();
-        req.set_config_path(config_path);
+    fn load_global_config(&self, list: Vec<String>) -> PdFuture<HashMap<String, String>> {
+        use kvproto::pdpb::LoadGlobalConfigRequest;
+        let mut req = LoadGlobalConfigRequest::new();
+        req.set_names(list.into());
         let executor = |client: &Client, req| match client
             .inner
             .rl()
@@ -372,20 +302,21 @@ impl PdClient for RpcClient {
         {
             Ok(grpc_response) => Box::pin(async move {
                 match grpc_response.await {
-                    Ok(grpc_response) => Ok((
-                        Vec::from(grpc_response.get_items()),
-                        grpc_response.get_revision(),
-                    )),
+                    Ok(grpc_response) => {
+                        let mut res = HashMap::with_capacity(grpc_response.get_items().len());
+                        for c in grpc_response.get_items() {
+                            if c.has_error() {
+                                error!("failed to load global config with key {:?}", c.get_error());
+                            } else {
+                                res.insert(c.get_name().to_owned(), c.get_value().to_owned());
+                            }
+                        }
+                        Ok(res)
+                    }
                     Err(err) => Err(box_err!("{:?}", err)),
                 }
             }) as PdFuture<_>,
-            Err(err) => Box::pin(async move {
-                Err(box_err!(
-                    "load global config failed, path: '{}', err:  {:?}",
-                    req.get_config_path(),
-                    err
-                ))
-            }) as PdFuture<_>,
+            Err(err) => Box::pin(async move { Err(box_err!("{:?}", err)) }) as PdFuture<_>,
         };
         self.pd_client
             .request(req, executor, LEADER_CHANGE_RETRY)
@@ -394,20 +325,61 @@ impl PdClient for RpcClient {
 
     fn watch_global_config(
         &self,
-        config_path: String,
-        revision: i64,
     ) -> Result<grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .watch_global_config
-            .start_coarse_timer();
-
-        let mut req = pdpb::WatchGlobalConfigRequest::default();
-        info!("[global_config] start watch global config"; "path" => &config_path, "revision" => revision);
-        req.set_config_path(config_path);
-        req.set_revision(revision);
+        use kvproto::pdpb::WatchGlobalConfigRequest;
+        let req = WatchGlobalConfigRequest::default();
         sync_request(&self.pd_client, LEADER_CHANGE_RETRY, |client, _| {
             client.watch_global_config(&req)
         })
+    }
+
+    fn scan_regions(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: i32,
+    ) -> Result<Vec<pdpb::Region>> {
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["scan_regions"])
+            .start_coarse_timer();
+
+        let mut req = pdpb::ScanRegionsRequest::default();
+        req.set_header(self.header());
+        req.set_start_key(start_key.to_vec());
+        req.set_end_key(end_key.to_vec());
+        req.set_limit(limit);
+
+        let mut resp = sync_request(&self.pd_client, LEADER_CHANGE_RETRY, |client, option| {
+            client.scan_regions_opt(&req, option)
+        })?;
+        check_resp_header(resp.get_header())?;
+        Ok(resp.take_regions().into())
+    }
+
+    fn batch_load_regions(
+        &self,
+        mut start_key: Vec<u8>,
+        end_key: Vec<u8>,
+    ) -> Vec<Vec<pdpb::Region>> {
+        let mut res = Vec::new();
+
+        loop {
+            let regions = self
+                .scan_regions(&start_key, &end_key, DEFAULT_REGION_PER_BATCH)
+                .unwrap();
+            if regions.is_empty() {
+                break;
+            }
+            res.push(regions.clone());
+
+            let end_region = regions.last().unwrap().get_region();
+            if end_region.get_end_key().is_empty() {
+                break;
+            }
+            start_key = end_region.get_end_key().to_vec();
+        }
+
+        res
     }
 
     fn get_cluster_id(&self) -> Result<u64> {
@@ -420,7 +392,7 @@ impl PdClient for RpcClient {
         region: metapb::Region,
     ) -> Result<Option<ReplicationStatus>> {
         let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .bootstrap_cluster
+            .with_label_values(&["bootstrap_cluster"])
             .start_coarse_timer();
 
         let mut req = pdpb::BootstrapRequest::default();
@@ -437,7 +409,7 @@ impl PdClient for RpcClient {
 
     fn is_cluster_bootstrapped(&self) -> Result<bool> {
         let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .is_cluster_bootstrapped
+            .with_label_values(&["is_cluster_bootstrapped"])
             .start_coarse_timer();
 
         let mut req = pdpb::IsBootstrappedRequest::default();
@@ -452,7 +424,9 @@ impl PdClient for RpcClient {
     }
 
     fn alloc_id(&self) -> Result<u64> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC.alloc_id.start_coarse_timer();
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["alloc_id"])
+            .start_coarse_timer();
 
         let mut req = pdpb::AllocIdRequest::default();
         req.set_header(self.header());
@@ -471,7 +445,7 @@ impl PdClient for RpcClient {
 
     fn is_recovering_marked(&self) -> Result<bool> {
         let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .is_recovering_marked
+            .with_label_values(&["is_recovering_marked"])
             .start_coarse_timer();
 
         let mut req = pdpb::IsSnapshotRecoveringRequest::default();
@@ -486,7 +460,9 @@ impl PdClient for RpcClient {
     }
 
     fn put_store(&self, store: metapb::Store) -> Result<Option<ReplicationStatus>> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC.put_store.start_coarse_timer();
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["put_store"])
+            .start_coarse_timer();
 
         let mut req = pdpb::PutStoreRequest::default();
         req.set_header(self.header());
@@ -501,7 +477,9 @@ impl PdClient for RpcClient {
     }
 
     fn get_store(&self, store_id: u64) -> Result<metapb::Store> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC.get_store.start_coarse_timer();
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["get_store"])
+            .start_coarse_timer();
 
         let mut req = pdpb::GetStoreRequest::default();
         req.set_header(self.header());
@@ -525,7 +503,9 @@ impl PdClient for RpcClient {
     }
 
     fn get_all_stores(&self, exclude_tombstone: bool) -> Result<Vec<metapb::Store>> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC.get_all_stores.start_coarse_timer();
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["get_all_stores"])
+            .start_coarse_timer();
 
         let mut req = pdpb::GetAllStoresRequest::default();
         req.set_header(self.header());
@@ -541,7 +521,7 @@ impl PdClient for RpcClient {
 
     fn get_cluster_config(&self) -> Result<metapb::Cluster> {
         let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .get_cluster_config
+            .with_label_values(&["get_cluster_config"])
             .start_coarse_timer();
 
         let mut req = pdpb::GetClusterConfigRequest::default();
@@ -573,46 +553,82 @@ impl PdClient for RpcClient {
             .boxed()
     }
 
-    fn get_buckets_by_id(&self, region_id: u64) -> PdFuture<Option<metapb::Buckets>> {
-        let header = self.header();
-        let pd_client = self.pd_client.clone();
-        Box::pin(async move {
-            let mut resp = get_region_resp_by_id(pd_client, header, region_id).await?;
-            if resp.has_buckets() {
-                Ok(Some(resp.take_buckets()))
-            } else {
-                Ok(None)
-            }
-        }) as PdFuture<Option<_>>
-    }
-
     fn get_region_by_id(&self, region_id: u64) -> PdFuture<Option<metapb::Region>> {
-        let header = self.header();
-        let pd_client = self.pd_client.clone();
-        Box::pin(async move {
-            let mut resp = get_region_resp_by_id(pd_client, header, region_id).await?;
-            if resp.has_region() {
-                Ok(Some(resp.take_region()))
-            } else {
-                Ok(None)
-            }
-        })
+        let timer = Instant::now();
+
+        let mut req = pdpb::GetRegionByIdRequest::default();
+        req.set_header(self.header());
+        req.set_region_id(region_id);
+
+        let executor = move |client: &Client, req: pdpb::GetRegionByIdRequest| {
+            let handler = {
+                let inner = client.inner.rl();
+                inner
+                    .client_stub
+                    .get_region_by_id_async_opt(&req, call_option_inner(&inner))
+                    .unwrap_or_else(|e| {
+                        panic!("fail to request PD {} err {:?}", "get_region_by_id", e);
+                    })
+            };
+            Box::pin(async move {
+                let mut resp = handler.await?;
+                PD_REQUEST_HISTOGRAM_VEC
+                    .with_label_values(&["get_region_by_id"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
+                check_resp_header(resp.get_header())?;
+                if resp.has_region() {
+                    Ok(Some(resp.take_region()))
+                } else {
+                    Ok(None)
+                }
+            }) as PdFuture<_>
+        };
+
+        self.pd_client
+            .request(req, executor, LEADER_CHANGE_RETRY)
+            .execute()
     }
 
     fn get_region_leader_by_id(
         &self,
         region_id: u64,
     ) -> PdFuture<Option<(metapb::Region, metapb::Peer)>> {
-        let header = self.header();
-        let pd_client = self.pd_client.clone();
-        Box::pin(async move {
-            let mut resp = get_region_resp_by_id(pd_client, header, region_id).await?;
-            if resp.has_region() && resp.has_leader() {
-                Ok(Some((resp.take_region(), resp.take_leader())))
-            } else {
-                Ok(None)
-            }
-        })
+        let timer = Instant::now();
+
+        let mut req = pdpb::GetRegionByIdRequest::default();
+        req.set_header(self.header());
+        req.set_region_id(region_id);
+
+        let executor = move |client: &Client, req: pdpb::GetRegionByIdRequest| {
+            let handler = {
+                let inner = client.inner.rl();
+                inner
+                    .client_stub
+                    .get_region_by_id_async_opt(&req, call_option_inner(&inner))
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "fail to request PD {} err {:?}",
+                            "get_region_leader_by_id", e
+                        )
+                    })
+            };
+            Box::pin(async move {
+                let mut resp = handler.await?;
+                PD_REQUEST_HISTOGRAM_VEC
+                    .with_label_values(&["get_region_leader_by_id"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
+                check_resp_header(resp.get_header())?;
+                if resp.has_region() && resp.has_leader() {
+                    Ok(Some((resp.take_region(), resp.take_leader())))
+                } else {
+                    Ok(None)
+                }
+            }) as PdFuture<_>
+        };
+
+        self.pd_client
+            .request(req, executor, LEADER_CHANGE_RETRY)
+            .execute()
     }
 
     fn region_heartbeat(
@@ -736,8 +752,8 @@ impl PdClient for RpcClient {
             Box::pin(async move {
                 let resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
-                    .ask_split
-                    .observe(timer.saturating_elapsed_secs());
+                    .with_label_values(&["ask_split"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
                 check_resp_header(resp.get_header())?;
                 Ok(resp)
             }) as PdFuture<_>
@@ -774,8 +790,8 @@ impl PdClient for RpcClient {
             Box::pin(async move {
                 let resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
-                    .ask_batch_split
-                    .observe(timer.saturating_elapsed_secs());
+                    .with_label_values(&["ask_batch_split"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
                 check_resp_header(resp.get_header())?;
                 Ok(resp)
             }) as PdFuture<_>
@@ -818,10 +834,14 @@ impl PdClient for RpcClient {
                     })
             };
             Box::pin(async move {
-                let resp = handler.await?;
-                PD_REQUEST_HISTOGRAM_VEC
-                    .store_heartbeat
-                    .observe(timer.saturating_elapsed_secs());
+                let resp = handler
+                    .map(|res| {
+                        PD_REQUEST_HISTOGRAM_VEC
+                            .with_label_values(&["store_heartbeat"])
+                            .observe(timer.saturating_elapsed_secs());
+                        res
+                    })
+                    .await?;
                 check_resp_header(resp.get_header())?;
                 match feature_gate.set_version(resp.get_cluster_version()) {
                     Err(_) => warn!("invalid cluster version: {}", resp.get_cluster_version()),
@@ -832,9 +852,7 @@ impl PdClient for RpcClient {
             }) as PdFuture<_>
         };
 
-        self.pd_client
-            .request(req, executor, LEADER_CHANGE_RETRY)
-            .execute()
+        self.pd_client.request(req, executor, NO_RETRY).execute()
     }
 
     fn report_batch_split(&self, regions: Vec<metapb::Region>) -> PdFuture<()> {
@@ -857,8 +875,8 @@ impl PdClient for RpcClient {
             Box::pin(async move {
                 let resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
-                    .report_batch_split
-                    .observe(timer.saturating_elapsed_secs());
+                    .with_label_values(&["report_batch_split"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
                 check_resp_header(resp.get_header())?;
                 Ok(())
             }) as PdFuture<_>
@@ -870,7 +888,9 @@ impl PdClient for RpcClient {
     }
 
     fn scatter_region(&self, mut region: RegionInfo) -> Result<()> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC.scatter_region.start_coarse_timer();
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["scatter_region"])
+            .start_coarse_timer();
 
         let mut req = pdpb::ScatterRegionRequest::default();
         req.set_header(self.header());
@@ -909,8 +929,8 @@ impl PdClient for RpcClient {
             Box::pin(async move {
                 let resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
-                    .get_gc_safe_point
-                    .observe(timer.saturating_elapsed_secs());
+                    .with_label_values(&["get_gc_safe_point"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
                 check_resp_header(resp.get_header())?;
                 Ok(resp.get_safe_point())
             }) as PdFuture<_>
@@ -926,7 +946,9 @@ impl PdClient for RpcClient {
     }
 
     fn get_operator(&self, region_id: u64) -> Result<pdpb::GetOperatorResponse> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC.get_operator.start_coarse_timer();
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["get_operator"])
+            .start_coarse_timer();
 
         let mut req = pdpb::GetOperatorRequest::default();
         req.set_header(self.header());
@@ -941,7 +963,7 @@ impl PdClient for RpcClient {
     }
 
     fn batch_get_tso(&self, count: u32) -> PdFuture<TimeStamp> {
-        let timer = Instant::now();
+        let begin = Instant::now();
         let executor = move |client: &Client, _| {
             // Remove Box::pin and Compat when GLOBAL_TIMER_HANDLE supports futures 0.3
             let ts_fut = Compat::new(Box::pin(client.inner.rl().tso.get_timestamp(count)));
@@ -960,8 +982,8 @@ impl PdClient for RpcClient {
                     }
                 })?;
                 PD_REQUEST_HISTOGRAM_VEC
-                    .tso
-                    .observe(timer.saturating_elapsed_secs());
+                    .with_label_values(&["tso"])
+                    .observe(duration_to_sec(begin.saturating_elapsed()));
                 Ok(ts)
             }) as PdFuture<_>
         };
@@ -976,7 +998,7 @@ impl PdClient for RpcClient {
         safe_point: TimeStamp,
         ttl: Duration,
     ) -> PdFuture<()> {
-        let timer = Instant::now();
+        let begin = Instant::now();
         let mut req = pdpb::UpdateServiceGcSafePointRequest::default();
         req.set_header(self.header());
         req.set_service_id(name.into());
@@ -998,8 +1020,8 @@ impl PdClient for RpcClient {
             Box::pin(async move {
                 let resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
-                    .update_service_safe_point
-                    .observe(timer.saturating_elapsed_secs());
+                    .with_label_values(&["update_service_safe_point"])
+                    .observe(duration_to_sec(begin.saturating_elapsed()));
                 check_resp_header(resp.get_header())?;
                 Ok(())
             }) as PdFuture<_>
@@ -1034,8 +1056,8 @@ impl PdClient for RpcClient {
             Box::pin(async move {
                 let resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
-                    .min_resolved_ts
-                    .observe(timer.saturating_elapsed_secs());
+                    .with_label_values(&["min_resolved_ts"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
                 check_resp_header(resp.get_header())?;
                 Ok(())
             }) as PdFuture<_>
@@ -1122,92 +1144,4 @@ impl PdClient for RpcClient {
             .request(req, executor, LEADER_CHANGE_RETRY)
             .execute()
     }
-}
-
-impl RpcClient {
-    fn fill_cluster_id_for(&self, header: &mut mpb::RequestHeader) {
-        header.cluster_id = self.cluster_id;
-    }
-}
-
-impl MetaStorageClient for RpcClient {
-    fn get(&self, mut req: Get) -> PdFuture<GetResponse> {
-        let timer = Instant::now();
-        self.fill_cluster_id_for(req.inner.mut_header());
-        let executor = move |client: &Client, req: GetRequest| {
-            let handler = {
-                let inner = client.inner.rl();
-                let r = inner
-                    .meta_storage
-                    .get_async_opt(&req, call_option_inner(&inner));
-                futures::future::ready(r).err_into().try_flatten()
-            };
-            Box::pin(async move {
-                fail::fail_point!("meta_storage_get", req.key.ends_with(b"rejectme"), |_| {
-                    Err(super::Error::Grpc(grpcio::Error::RemoteStopped))
-                });
-                let resp = handler.await?;
-                PD_REQUEST_HISTOGRAM_VEC
-                    .meta_storage_get
-                    .observe(timer.saturating_elapsed_secs());
-                Ok(resp)
-            }) as _
-        };
-
-        self.pd_client
-            .request(req.into(), executor, LEADER_CHANGE_RETRY)
-            .execute()
-    }
-
-    fn put(&self, mut req: Put) -> PdFuture<kvproto::meta_storagepb::PutResponse> {
-        let timer = Instant::now();
-        self.fill_cluster_id_for(req.inner.mut_header());
-        let executor = move |client: &Client, req: PutRequest| {
-            let handler = {
-                let inner = client.inner.rl();
-                let r = inner
-                    .meta_storage
-                    .put_async_opt(&req, call_option_inner(&inner));
-                futures::future::ready(r).err_into().try_flatten()
-            };
-            Box::pin(async move {
-                let resp = handler.await?;
-                PD_REQUEST_HISTOGRAM_VEC
-                    .meta_storage_put
-                    .observe(timer.saturating_elapsed_secs());
-                Ok(resp)
-            }) as _
-        };
-
-        self.pd_client
-            .request(req.into(), executor, LEADER_CHANGE_RETRY)
-            .execute()
-    }
-
-    fn watch(&self, mut req: Watch) -> Self::WatchStream {
-        let timer = Instant::now();
-        self.fill_cluster_id_for(req.inner.mut_header());
-        let executor = move |client: &Client, req: WatchRequest| {
-            let handler = {
-                let inner = client.inner.rl();
-                inner.meta_storage.watch(&req)
-            };
-            Box::pin(async move {
-                let resp = handler?;
-                PD_REQUEST_HISTOGRAM_VEC
-                    .meta_storage_watch
-                    .observe(timer.saturating_elapsed_secs());
-                Ok(resp.err_into())
-            }) as _
-        };
-
-        self.pd_client
-            .request(req.into(), executor, LEADER_CHANGE_RETRY)
-            .execute()
-            .try_flatten_stream()
-    }
-
-    type WatchStream = TryFlattenStream<
-        PdFuture<ErrInto<grpcio::ClientSStreamReceiver<WatchResponse>, crate::Error>>,
-    >;
 }

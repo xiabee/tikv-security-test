@@ -2,14 +2,14 @@
 
 use engine_traits::{
     CfNamesExt, DeleteStrategy, ImportExt, IterOptions, Iterable, Iterator, MiscExt, Mutable,
-    Range, RangeStats, Result, SstWriter, SstWriterBuilder, WriteBatch, WriteBatchExt,
+    Range, Result, SstWriter, SstWriterBuilder, WriteBatch, WriteBatchExt, ALL_CFS,
 };
 use rocksdb::Range as RocksRange;
 use tikv_util::{box_try, keybuilder::KeyBuilder};
 
 use crate::{
-    engine::RocksEngine, r2e, rocks_metrics::RocksStatisticsReporter, rocks_metrics_defs::*,
-    sst::RocksSstWriterBuilder, util, RocksSstWriter,
+    engine::RocksEngine, r2e, rocks_metrics_defs::*, sst::RocksSstWriterBuilder, util,
+    RocksSstWriter,
 };
 
 pub const MAX_DELETE_COUNT_BY_KEY: usize = 2048;
@@ -126,17 +126,10 @@ impl RocksEngine {
 }
 
 impl MiscExt for RocksEngine {
-    type StatisticsReporter = RocksStatisticsReporter;
-
-    fn flush_cfs(&self, cfs: &[&str], wait: bool) -> Result<()> {
+    fn flush_cfs(&self, wait: bool) -> Result<()> {
         let mut handles = vec![];
-        for cf in cfs {
+        for cf in self.cf_names() {
             handles.push(util::get_cf_handle(self.as_inner(), cf)?);
-        }
-        if handles.is_empty() {
-            for cf in self.cf_names() {
-                handles.push(util::get_cf_handle(self.as_inner(), cf)?);
-            }
         }
         self.as_inner().flush_cfs(&handles, wait).map_err(r2e)
     }
@@ -258,7 +251,7 @@ impl MiscExt for RocksEngine {
 
     fn get_engine_used_size(&self) -> Result<u64> {
         let mut used_size: u64 = 0;
-        for cf in self.cf_names() {
+        for cf in ALL_CFS {
             let handle = util::get_cf_handle(self.as_inner(), cf)?;
             used_size += util::get_engine_cf_used_size(self.as_inner(), handle);
         }
@@ -273,27 +266,8 @@ impl MiscExt for RocksEngine {
         self.as_inner().sync_wal().map_err(r2e)
     }
 
-    fn pause_background_work(&self) -> Result<()> {
-        // This will make manual compaction return error instead of waiting. In practice
-        // we might want to identify this case by parsing error message.
-        self.as_inner().disable_manual_compaction();
-        self.as_inner().pause_bg_work();
-        Ok(())
-    }
-
-    fn continue_background_work(&self) -> Result<()> {
-        self.as_inner().enable_manual_compaction();
-        self.as_inner().continue_bg_work();
-        Ok(())
-    }
-
     fn exists(path: &str) -> bool {
         crate::util::db_exist(path)
-    }
-
-    fn locked(path: &str) -> Result<bool> {
-        let env = rocksdb::Env::default();
-        env.is_db_locked(path).map_err(r2e)
     }
 
     fn dump_stats(&self) -> Result<String> {
@@ -313,6 +287,11 @@ impl MiscExt for RocksEngine {
         }
 
         if let Some(v) = self.as_inner().get_property_value(ROCKSDB_DB_STATS_KEY) {
+            s.extend_from_slice(v.as_bytes());
+        }
+
+        // more stats if enable_statistics is true.
+        if let Some(v) = self.as_inner().get_statistics() {
             s.extend_from_slice(v.as_bytes());
         }
 
@@ -341,20 +320,15 @@ impl MiscExt for RocksEngine {
             .get_property_int_cf(handle, ROCKSDB_TOTAL_SST_FILES_SIZE))
     }
 
-    fn get_num_keys(&self) -> Result<u64> {
-        let mut total = 0;
-        for cf in self.cf_names() {
-            let handle = util::get_cf_handle(self.as_inner(), cf).unwrap();
-            total += self
-                .as_inner()
-                .get_property_int_cf(handle, ROCKSDB_ESTIMATE_NUM_KEYS)
-                .unwrap_or_default();
-        }
-        Ok(total)
-    }
-
-    fn get_range_stats(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Option<RangeStats>> {
-        Ok(crate::properties::get_range_stats(self, cf, start, end))
+    fn get_range_entries_and_versions(
+        &self,
+        cf: &str,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Option<(u64, u64)>> {
+        Ok(crate::properties::get_range_entries_and_versions(
+            self, cf, start, end,
+        ))
     }
 
     fn is_stalled_or_stopped(&self) -> bool {
@@ -683,7 +657,7 @@ mod tests {
         ];
         assert_eq!(sst_range, expected);
 
-        db.compact_range_cf(cf, None, None, false, 1).unwrap();
+        db.compact_range(cf, None, None, false, 1).unwrap();
         let sst_range = db.get_sst_key_ranges(cf, 0).unwrap();
         assert_eq!(sst_range.len(), 0);
         let sst_range = db.get_sst_key_ranges(cf, 1).unwrap();

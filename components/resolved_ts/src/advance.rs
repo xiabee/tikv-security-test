@@ -15,7 +15,9 @@ use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
 use fail::fail_point;
 use futures::{compat::Future01CompatExt, future::select_all, FutureExt, TryFutureExt};
-use grpcio::{ChannelBuilder, Environment, Error as GrpcError, RpcStatusCode};
+use grpcio::{
+    ChannelBuilder, CompressionAlgorithms, Environment, Error as GrpcError, RpcStatusCode,
+};
 use kvproto::{
     kvrpcpb::{CheckLeaderRequest, CheckLeaderResponse},
     metapb::{Peer, PeerRole},
@@ -24,8 +26,11 @@ use kvproto::{
 use pd_client::PdClient;
 use protobuf::Message;
 use raftstore::{
-    router::CdcHandle,
-    store::{msg::Callback, util::RegionReadProgressRegistry},
+    router::RaftStoreRouter,
+    store::{
+        msg::{Callback, SignificantMsg},
+        util::RegionReadProgressRegistry,
+    },
 };
 use security::SecurityManager;
 use tikv_util::{
@@ -43,7 +48,9 @@ use txn_types::TimeStamp;
 
 use crate::{endpoint::Task, metrics::*};
 
-const DEFAULT_CHECK_LEADER_TIMEOUT_DURATION: Duration = Duration::from_secs(5); // 5s
+pub(crate) const DEFAULT_CHECK_LEADER_TIMEOUT_DURATION: Duration = Duration::from_secs(5); // 5s
+const DEFAULT_GRPC_GZIP_COMPRESSION_LEVEL: usize = 2;
+const DEFAULT_GRPC_MIN_MESSAGE_SIZE_TO_COMPRESS: usize = 4096;
 
 pub struct AdvanceTsWorker {
     pd_client: Arc<dyn PdClient>,
@@ -54,6 +61,9 @@ pub struct AdvanceTsWorker {
     /// The concurrency manager for transactions. It's needed for CDC to check
     /// locks when calculating resolved_ts.
     concurrency_manager: ConcurrencyManager,
+
+    // cache the last pd tso, used to approximate the next timestamp w/o an actual TSO RPC
+    pub(crate) last_pd_tso: Arc<std::sync::Mutex<Option<(TimeStamp, Instant)>>>,
 }
 
 impl AdvanceTsWorker {
@@ -78,6 +88,7 @@ impl AdvanceTsWorker {
             advance_ts_interval,
             timer: SteadyTimer::default(),
             concurrency_manager,
+            last_pd_tso: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -100,9 +111,13 @@ impl AdvanceTsWorker {
             self.advance_ts_interval,
         ));
 
+        let last_pd_tso = self.last_pd_tso.clone();
         let fut = async move {
             // Ignore get tso errors since we will retry every `advdance_ts_interval`.
             let mut min_ts = pd_client.get_tso().await.unwrap_or_default();
+            if let Ok(mut last_pd_tso) = last_pd_tso.try_lock() {
+                *last_pd_tso = Some((min_ts, Instant::now()));
+            }
 
             // Sync with concurrency manager so that it can work correctly when
             // optimizations like async commit is enabled.
@@ -216,6 +231,44 @@ impl LeadershipResolver {
         }
         self.checking_regions.clear();
         self.valid_regions.clear();
+    }
+
+    pub async fn resolve_by_raft<T, E>(
+        &self,
+        regions: Vec<u64>,
+        min_ts: TimeStamp,
+        raft_router: T,
+    ) -> Vec<u64>
+    where
+        T: 'static + RaftStoreRouter<E>,
+        E: KvEngine,
+    {
+        let mut reqs = Vec::with_capacity(regions.len());
+        for region_id in regions {
+            let raft_router_clone = raft_router.clone();
+            let req = async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let msg = SignificantMsg::LeaderCallback(Callback::read(Box::new(move |resp| {
+                    let resp = if resp.response.get_header().has_error() {
+                        None
+                    } else {
+                        Some(region_id)
+                    };
+                    if tx.send(resp).is_err() {
+                        error!("cdc send tso response failed"; "region_id" => region_id);
+                    }
+                })));
+                if let Err(e) = raft_router_clone.significant_send(region_id, msg) {
+                    warn!("cdc send LeaderCallback failed"; "err" => ?e, "min_ts" => min_ts);
+                    return None;
+                }
+                rx.await.unwrap_or(None)
+            };
+            reqs.push(req);
+        }
+
+        let resps = futures::future::join_all(reqs).await;
+        resps.into_iter().flatten().collect::<Vec<u64>>()
     }
 
     // Confirms leadership of region peer before trying to advance resolved ts.
@@ -416,39 +469,6 @@ impl LeadershipResolver {
     }
 }
 
-pub async fn resolve_by_raft<T, E>(regions: Vec<u64>, min_ts: TimeStamp, cdc_handle: T) -> Vec<u64>
-where
-    T: 'static + CdcHandle<E>,
-    E: KvEngine,
-{
-    let mut reqs = Vec::with_capacity(regions.len());
-    for region_id in regions {
-        let cdc_handle_clone = cdc_handle.clone();
-        let req = async move {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let callback = Callback::read(Box::new(move |resp| {
-                let resp = if resp.response.get_header().has_error() {
-                    None
-                } else {
-                    Some(region_id)
-                };
-                if tx.send(resp).is_err() {
-                    error!("cdc send tso response failed"; "region_id" => region_id);
-                }
-            }));
-            if let Err(e) = cdc_handle_clone.check_leadership(region_id, callback) {
-                warn!("cdc send LeaderCallback failed"; "err" => ?e, "min_ts" => min_ts);
-                return None;
-            }
-            rx.await.unwrap_or(None)
-        };
-        reqs.push(req);
-    }
-
-    let resps = futures::future::join_all(reqs).await;
-    resps.into_iter().flatten().collect::<Vec<u64>>()
-}
-
 fn region_has_quorum(peers: &[Peer], stores: &[u64]) -> bool {
     let mut voters = 0;
     let mut incoming_voters = 0;
@@ -520,10 +540,17 @@ async fn get_tikv_client(
     let mut clients = tikv_clients.lock().await;
     let start = Instant::now_coarse();
     // hack: so it's different args, grpc will always create a new connection.
-    let cb = ChannelBuilder::new(env.clone()).raw_cfg_int(
-        CString::new("random id").unwrap(),
-        CONN_ID.fetch_add(1, Ordering::SeqCst),
-    );
+    // the check leader requests may be large but not frequent, compress it to
+    // reduce the traffic.
+    let cb = ChannelBuilder::new(env.clone())
+        .raw_cfg_int(
+            CString::new("random id").unwrap(),
+            CONN_ID.fetch_add(1, Ordering::SeqCst),
+        )
+        .default_compression_algorithm(CompressionAlgorithms::GRPC_COMPRESS_GZIP)
+        .default_gzip_compression_level(DEFAULT_GRPC_GZIP_COMPRESSION_LEVEL)
+        .default_grpc_min_message_size_to_compress(DEFAULT_GRPC_MIN_MESSAGE_SIZE_TO_COMPRESS);
+
     let channel = security_mgr.connect(cb, &store.peer_address);
     let cli = TikvClient::new(channel);
     clients.insert(store_id, cli.clone());

@@ -7,16 +7,15 @@ use std::{
     mem,
 };
 
-use engine_traits::{
-    CfName, IterOptions, Iterable, Iterator, KvEngine, TabletRegistry, CF_WRITE, LARGE_CFS,
-};
+use engine_traits::{CfName, IterOptions, Iterable, Iterator, KvEngine, CF_WRITE, LARGE_CFS};
 use file_system::{IoType, WithIoType};
 use itertools::Itertools;
-use kvproto::{metapb::Region, pdpb::CheckPolicy};
-use online_config::{ConfigChange, OnlineConfig};
-use tikv_util::{
-    box_err, debug, error, info, keybuilder::KeyBuilder, warn, worker::Runnable, Either,
+use kvproto::{
+    metapb::{Region, RegionEpoch},
+    pdpb::CheckPolicy,
 };
+use online_config::{ConfigChange, OnlineConfig};
+use tikv_util::{box_err, debug, error, info, keybuilder::KeyBuilder, warn, worker::Runnable};
 use txn_types::Key;
 
 use super::metrics::*;
@@ -24,10 +23,10 @@ use super::metrics::*;
 use crate::coprocessor::Config;
 use crate::{
     coprocessor::{
-        dispatcher::StoreHandle,
         split_observer::{is_valid_split_key, strip_timestamp_if_exists},
         CoprocessorHost, SplitCheckerHost,
     },
+    store::{Callback, CasualMessage, CasualRouter},
     Result,
 };
 
@@ -132,10 +131,10 @@ where
     }
 }
 
-#[derive(Default, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug)]
 pub struct BucketRange(pub Vec<u8>, pub Vec<u8>);
 
-#[derive(Default, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug)]
 pub struct Bucket {
     // new proposed split keys under the bucket for split
     // if it does not need split, it's empty
@@ -220,30 +219,23 @@ impl Display for Task {
     }
 }
 
-pub struct Runner<EK: KvEngine, S> {
-    // We can't just use `TabletRegistry` here, otherwise v1 may create many
-    // invalid records and cause other problems.
-    engine: Either<EK, TabletRegistry<EK>>,
+pub struct Runner<E, S>
+where
+    E: KvEngine,
+{
+    engine: E,
     router: S,
-    coprocessor: CoprocessorHost<EK>,
+    coprocessor: CoprocessorHost<E>,
 }
 
-impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
-    pub fn new(engine: EK, router: S, coprocessor: CoprocessorHost<EK>) -> Runner<EK, S> {
+impl<E, S> Runner<E, S>
+where
+    E: KvEngine,
+    S: CasualRouter<E>,
+{
+    pub fn new(engine: E, router: S, coprocessor: CoprocessorHost<E>) -> Runner<E, S> {
         Runner {
-            engine: Either::Left(engine),
-            router,
-            coprocessor,
-        }
-    }
-
-    pub fn with_registry(
-        registry: TabletRegistry<EK>,
-        router: S,
-        coprocessor: CoprocessorHost<EK>,
-    ) -> Runner<EK, S> {
-        Runner {
-            engine: Either::Right(registry),
+            engine,
             router,
             coprocessor,
         }
@@ -251,9 +243,8 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
 
     fn approximate_check_bucket(
         &self,
-        tablet: &EK,
         region: &Region,
-        host: &mut SplitCheckerHost<'_, EK>,
+        host: &mut SplitCheckerHost<'_, E>,
         bucket_ranges: Option<Vec<BucketRange>>,
     ) -> Result<()> {
         let ranges = bucket_ranges.clone().unwrap_or_else(|| {
@@ -267,7 +258,7 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
             let mut bucket = region.clone();
             bucket.set_start_key(range.0.clone());
             bucket.set_end_key(range.1.clone());
-            let bucket_entry = host.approximate_bucket_keys(&bucket, tablet)?;
+            let bucket_entry = host.approximate_bucket_keys(&bucket, &self.engine)?;
             debug!(
                 "bucket_entry size {} keys count {}",
                 bucket_entry.size,
@@ -337,11 +328,14 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
         region: &Region,
         bucket_ranges: Option<Vec<BucketRange>>,
     ) {
-        self.router.refresh_region_buckets(
+        let _ = self.router.send(
             region.get_id(),
-            region.get_region_epoch().clone(),
-            buckets,
-            bucket_ranges,
+            CasualMessage::RefreshRegionBuckets {
+                region_epoch: region.get_region_epoch().clone(),
+                buckets,
+                bucket_ranges,
+                cb: Callback::None,
+            },
         );
     }
 
@@ -356,20 +350,6 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
         policy: CheckPolicy,
         bucket_ranges: Option<Vec<BucketRange>>,
     ) {
-        let mut cached;
-        let tablet = match &self.engine {
-            Either::Left(e) => e,
-            Either::Right(r) => match r.get(region.get_id()) {
-                Some(c) => {
-                    cached = Some(c);
-                    match cached.as_mut().unwrap().latest() {
-                        Some(t) => t,
-                        None => return,
-                    }
-                }
-                None => return,
-            },
-        };
         let region_id = region.get_id();
         let is_key_range = start_key.is_some() && end_key.is_some();
         let start_key = if is_key_range {
@@ -392,9 +372,9 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
             "policy" => ?policy,
         );
         CHECK_SPILT_COUNTER.all.inc();
-        let mut host = self
-            .coprocessor
-            .new_split_checker_host(region, tablet, auto_split, policy);
+        let mut host =
+            self.coprocessor
+                .new_split_checker_host(region, &self.engine, auto_split, policy);
 
         if host.skip() {
             debug!("skip split check";
@@ -410,7 +390,6 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
             CheckPolicy::Scan => {
                 match self.scan_split_keys(
                     &mut host,
-                    tablet,
                     region,
                     is_key_range,
                     &start_key,
@@ -429,11 +408,11 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
                     }
                 }
             }
-            CheckPolicy::Approximate => match host.approximate_split_keys(region, tablet) {
+            CheckPolicy::Approximate => match host.approximate_split_keys(region, &self.engine) {
                 Ok(keys) => {
                     if host.enable_region_bucket() {
                         if let Err(e) =
-                            self.approximate_check_bucket(tablet, region, &mut host, bucket_ranges)
+                            self.approximate_check_bucket(region, &mut host, bucket_ranges)
                         {
                             error!(%e;
                                 "approximate_check_bucket failed";
@@ -458,7 +437,6 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
                     );
                     match self.scan_split_keys(
                         &mut host,
-                        tablet,
                         region,
                         is_key_range,
                         &start_key,
@@ -483,8 +461,12 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
 
         if !split_keys.is_empty() {
             let region_epoch = region.get_region_epoch().clone();
-            self.router
-                .ask_split(region_id, region_epoch, split_keys, "split checker".into());
+            let msg = new_split_region(region_epoch, split_keys, "split checker");
+            let res = self.router.send(region_id, msg);
+            if let Err(e) = res {
+                warn!("failed to send check result"; "region_id" => region_id, "err" => %e);
+            }
+
             CHECK_SPILT_COUNTER.success.inc();
         } else {
             debug!(
@@ -502,8 +484,7 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
     ///                If it's Some(vec![]), skip generating buckets.
     fn scan_split_keys(
         &self,
-        host: &mut SplitCheckerHost<'_, EK>,
-        tablet: &EK,
+        host: &mut SplitCheckerHost<'_, E>,
         region: &Region,
         is_key_range: bool,
         start_key: &[u8],
@@ -524,8 +505,12 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
                 (!host.enable_region_bucket(), &empty_bucket)
             };
 
-        MergedIterator::<<EK as Iterable>::Iterator>::new(
-            tablet, LARGE_CFS, start_key, end_key, false,
+        MergedIterator::<<E as Iterable>::Iterator>::new(
+            &self.engine,
+            LARGE_CFS,
+            start_key,
+            end_key,
+            false,
         )
         .map(|mut iter| {
             let mut size = 0;
@@ -610,8 +595,14 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
                 "bucket_count" => buckets.len(),
                 "bucket_size" => bucket_size,
             );
-            self.router.update_approximate_size(region.get_id(), size);
-            self.router.update_approximate_keys(region.get_id(), keys);
+            let _ = self.router.send(
+                region.get_id(),
+                CasualMessage::RegionApproximateSize { size },
+            );
+            let _ = self.router.send(
+                region.get_id(),
+                CasualMessage::RegionApproximateKeys { keys },
+            );
         })?;
 
         if host.enable_region_bucket() {
@@ -641,10 +632,10 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
     }
 }
 
-impl<EK, S> Runnable for Runner<EK, S>
+impl<E, S> Runnable for Runner<E, S>
 where
-    EK: KvEngine,
-    S: StoreHandle,
+    E: KvEngine,
+    S: CasualRouter<E>,
 {
     type Task = Task;
     fn run(&mut self, task: Task) {
@@ -667,29 +658,14 @@ where
             ),
             Task::ChangeConfig(c) => self.change_cfg(c),
             Task::ApproximateBuckets(region) => {
-                if self.coprocessor.cfg.enable_region_bucket() {
-                    let mut cached;
-                    let tablet = match &self.engine {
-                        Either::Left(e) => e,
-                        Either::Right(r) => match r.get(region.get_id()) {
-                            Some(c) => {
-                                cached = Some(c);
-                                match cached.as_mut().unwrap().latest() {
-                                    Some(t) => t,
-                                    None => return,
-                                }
-                            }
-                            None => return,
-                        },
-                    };
+                if self.coprocessor.cfg.enable_region_bucket {
                     let mut host = self.coprocessor.new_split_checker_host(
                         &region,
-                        tablet,
+                        &self.engine,
                         false,
                         CheckPolicy::Approximate,
                     );
-                    if let Err(e) = self.approximate_check_bucket(tablet, &region, &mut host, None)
-                    {
+                    if let Err(e) = self.approximate_check_bucket(&region, &mut host, None) {
                         error!(%e;
                             "approximate_check_bucket failed";
                             "region_id" => region.get_id(),
@@ -700,5 +676,21 @@ where
             #[cfg(any(test, feature = "testexport"))]
             Task::Validate(f) => f(&self.coprocessor.cfg),
         }
+    }
+}
+
+fn new_split_region<E>(
+    region_epoch: RegionEpoch,
+    split_keys: Vec<Vec<u8>>,
+    source: &'static str,
+) -> CasualMessage<E>
+where
+    E: KvEngine,
+{
+    CasualMessage::SplitRegion {
+        region_epoch,
+        split_keys,
+        callback: Callback::None,
+        source: source.into(),
     }
 }

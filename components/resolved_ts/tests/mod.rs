@@ -13,7 +13,7 @@ use kvproto::{
     tikvpb::TikvClient,
 };
 use online_config::ConfigValue;
-use raftstore::{coprocessor::CoprocessorHost, router::CdcRaftRouter};
+use raftstore::coprocessor::CoprocessorHost;
 use resolved_ts::{Observer, Task};
 use test_raftstore::*;
 use tikv::config::ResolvedTsConfig;
@@ -40,7 +40,7 @@ impl TestSuite {
     pub fn new(count: usize) -> Self {
         let mut cluster = new_server_cluster(1, count);
         // Increase the Raft tick interval to make this test case running reliably.
-        configure_for_lease_read(&mut cluster.cfg, Some(100), None);
+        configure_for_lease_read(&mut cluster, Some(100), None);
         Self::with_cluster(count, cluster)
     }
 
@@ -81,7 +81,7 @@ impl TestSuite {
             let rts_endpoint = resolved_ts::Endpoint::new(
                 &cfg,
                 worker.scheduler(),
-                CdcRaftRouter(raft_router),
+                raft_router,
                 cluster.store_metas[id].clone(),
                 pd_cli.clone(),
                 cm.clone(),

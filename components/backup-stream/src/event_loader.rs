@@ -7,8 +7,8 @@ use futures::executor::block_on;
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 use raftstore::{
     coprocessor::{ObserveHandle, RegionInfoProvider},
-    router::CdcHandle,
-    store::{fsm::ChangeObserver, Callback},
+    router::RaftStoreRouter,
+    store::{fsm::ChangeObserver, Callback, SignificantMsg},
 };
 use tikv::storage::{
     kv::StatisticsSummary,
@@ -39,7 +39,7 @@ use crate::{
     Task,
 };
 
-const MAX_GET_SNAPSHOT_RETRY: usize = 5;
+const MAX_GET_SNAPSHOT_RETRY: usize = 3;
 
 #[derive(Clone)]
 pub struct PendingMemoryQuota(Arc<Semaphore>);
@@ -200,7 +200,7 @@ impl<E, R, RT> InitialDataLoader<E, R, RT>
 where
     E: KvEngine,
     R: RegionInfoProvider + Clone + 'static,
-    RT: CdcHandle<E>,
+    RT: RaftStoreRouter<E>,
 {
     pub fn new(
         router: RT,
@@ -265,7 +265,7 @@ where
                     if !can_retry {
                         break;
                     }
-                    std::thread::sleep(Duration::from_secs(1));
+                    std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
             }
@@ -288,33 +288,33 @@ where
 
         let (callback, fut) =
             tikv_util::future::paired_future_callback::<std::result::Result<_, Error>>();
-
         self.router
-            .capture_change(
-                region.get_id(),
-                region.get_region_epoch().clone(),
-                cmd,
-                Callback::read(Box::new(|snapshot| {
-                    if snapshot.response.get_header().has_error() {
-                        callback(Err(Error::RaftRequest(
-                            snapshot.response.get_header().get_error().clone(),
-                        )));
-                        return;
-                    }
-                    if let Some(snap) = snapshot.snapshot {
-                        callback(Ok(snap));
-                        return;
-                    }
-                    callback(Err(Error::Other(box_err!(
-                        "PROBABLY BUG: the response contains neither error nor snapshot"
-                    ))))
-                })),
+            .significant_send(
+                region.id,
+                SignificantMsg::CaptureChange {
+                    cmd,
+                    region_epoch: region.get_region_epoch().clone(),
+                    callback: Callback::read(Box::new(|snapshot| {
+                        if snapshot.response.get_header().has_error() {
+                            callback(Err(Error::RaftRequest(
+                                snapshot.response.get_header().get_error().clone(),
+                            )));
+                            return;
+                        }
+                        if let Some(snap) = snapshot.snapshot {
+                            callback(Ok(snap));
+                            return;
+                        }
+                        callback(Err(Error::Other(box_err!(
+                            "PROBABLY BUG: the response contains neither error nor snapshot"
+                        ))))
+                    })),
+                },
             )
             .context(format_args!(
                 "failed to register the observer to region {}",
                 region.get_id()
             ))?;
-
         let snap = block_on(fut)
             .map_err(|err| {
                 annotate!(
