@@ -7,7 +7,6 @@ use std::{
 
 use causal_ts::CausalTsProvider;
 use engine_traits::{KvEngine, RaftEngine};
-use fail::fail_point;
 use futures::{compat::Future01CompatExt, FutureExt};
 use pd_client::PdClient;
 use raftstore::{store::TxnExt, Result};
@@ -34,6 +33,8 @@ where
         let causal_ts_provider = self.causal_ts_provider.clone();
         let logger = self.logger.clone();
         let shutdown = self.shutdown.clone();
+        let log_interval = Duration::from_secs(5);
+        let mut last_log_ts = Instant::now().checked_sub(log_interval).unwrap();
 
         let f = async move {
             let mut success = false;
@@ -74,10 +75,15 @@ where
                         break;
                     }
                     Err(e) => {
-                        warn!(
-                            logger,
-                            "failed to update max timestamp for region {}: {:?}", region_id, e
-                        );
+                        if last_log_ts.elapsed() > log_interval {
+                            warn!(
+                                logger,
+                                "failed to update max timestamp for region";
+                                "region_id" => region_id,
+                                "error" => ?e
+                            );
+                            last_log_ts = Instant::now();
+                        }
                     }
                 }
             }
@@ -95,7 +101,7 @@ where
         };
 
         let delay = (|| {
-            fail_point!("delay_update_max_ts", |_| true);
+            fail::fail_point!("delay_update_max_ts", |_| true);
             false
         })();
 
@@ -107,5 +113,18 @@ where
         } else {
             self.remote.spawn(f);
         }
+    }
+
+    pub fn handle_report_min_resolved_ts(&mut self, store_id: u64, min_resolved_ts: u64) {
+        let resp = self
+            .pd_client
+            .report_min_resolved_ts(store_id, min_resolved_ts);
+        let logger = self.logger.clone();
+        let f = async move {
+            if let Err(e) = resp.await {
+                warn!(logger, "report min resolved_ts failed"; "err" => ?e);
+            }
+        };
+        self.remote.spawn(f);
     }
 }

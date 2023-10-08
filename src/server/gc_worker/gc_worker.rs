@@ -38,7 +38,7 @@ use txn_types::{Key, TimeStamp};
 use super::{
     check_need_gc,
     compaction_filter::{
-        CompactionFilterInitializer, GC_COMPACTION_FILTER_MVCC_DELETION_HANDLED,
+        CompactionFilterInitializer, DeleteBatch, GC_COMPACTION_FILTER_MVCC_DELETION_HANDLED,
         GC_COMPACTION_FILTER_MVCC_DELETION_WASTED, GC_COMPACTION_FILTER_ORPHAN_VERSIONS,
     },
     config::{GcConfig, GcWorkerConfigManager},
@@ -118,7 +118,11 @@ where
     /// until `DefaultCompactionFilter` is introduced.
     ///
     /// The tracking issue: <https://github.com/tikv/tikv/issues/9719>.
-    OrphanVersions { wb: E::WriteBatch, id: usize },
+    OrphanVersions {
+        wb: DeleteBatch<E::WriteBatch>,
+        id: usize,
+        region_info_provider: Arc<dyn RegionInfoProvider>,
+    },
     #[cfg(any(test, feature = "testexport"))]
     Validate(Box<dyn FnOnce(&GcConfig, &Limiter) + Send>),
 }
@@ -162,7 +166,7 @@ where
                 .field("start_key", &format!("{}", start_key))
                 .field("end_key", &format!("{}", end_key))
                 .finish(),
-            GcTask::OrphanVersions { id, wb } => f
+            GcTask::OrphanVersions { id, wb, .. } => f
                 .debug_struct("OrphanVersions")
                 .field("id", id)
                 .field("count", &wb.count())
@@ -732,6 +736,7 @@ impl<E: Engine> GcRunner<E> {
             for cf in cfs {
                 local_storage
                 .delete_ranges_cf(
+                    &WriteOptions::default(),
                     cf,
                     DeleteStrategy::DeleteFiles,
                     &[Range::new(&start_data_key, &end_data_key)],
@@ -755,6 +760,7 @@ impl<E: Engine> GcRunner<E> {
                 // TODO: set use_delete_range with config here.
                 local_storage
                     .delete_ranges_cf(
+                        &WriteOptions::default(),
                         cf,
                         DeleteStrategy::DeleteByKey,
                         &[Range::new(&start_data_key, &end_data_key)],
@@ -766,6 +772,7 @@ impl<E: Engine> GcRunner<E> {
                     })?;
                 local_storage
                 .delete_ranges_cf(
+                    &WriteOptions::default(),
                     cf,
                     DeleteStrategy::DeleteBlobs,
                     &[Range::new(&start_data_key, &end_data_key)],
@@ -870,6 +877,46 @@ impl<E: Engine> GcRunner<E> {
         Ok(block_on(async {
             tikv_kv::snapshot(&mut self.engine, snap_ctx).await
         })?)
+    }
+
+    fn flush_deletes(&mut self, deletes: Vec<Key>, provider: Arc<dyn RegionInfoProvider>) {
+        let mut region_modifies = HashMap::default();
+        // Should not panic.
+        let regions = match get_regions_for_range_of_keys(self.store_id, &deletes, provider) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("failed to flush deletes, will leave garbage"; "err" => ?e);
+                return;
+            }
+        };
+        if regions.is_empty() {
+            error!("no region is found, will leave garbage");
+            return;
+        }
+        let mut keys = deletes.into_iter().peekable();
+        let mut modifies = vec![];
+        for region in &regions {
+            let start_key = region.get_start_key();
+            let end_key = region.get_end_key();
+            while let Some(key) = keys.peek() {
+                if key.as_encoded().as_slice() < start_key {
+                    error!("key is not in any region, will leave garbage"; "key" => %key);
+                    keys.next();
+                    continue;
+                }
+                if !end_key.is_empty() && key.as_encoded().as_slice() >= end_key {
+                    break;
+                }
+                modifies.push(Modify::Delete(CF_DEFAULT, keys.next().unwrap()));
+            }
+            if !modifies.is_empty() {
+                region_modifies.insert(region.id, modifies);
+                modifies = vec![];
+            }
+        }
+        if let Err(e) = self.engine.modify_on_kv_engine(region_modifies) {
+            error!("failed to flush deletes, will leave garbage"; "err" => ?e);
+        }
     }
 }
 
@@ -982,19 +1029,29 @@ impl<E: Engine> Runnable for GcRunner<E> {
                     end_key
                 );
             }
-            GcTask::OrphanVersions { mut wb, id } => {
-                info!("handling GcTask::OrphanVersions"; "id" => id);
-                let mut wopts = WriteOptions::default();
-                wopts.set_sync(true);
-                if let Err(e) = wb.write_opt(&wopts) {
-                    error!("write GcTask::OrphanVersions fail"; "id" => id, "err" => ?e);
-                    update_metrics(true);
-                    return;
+            GcTask::OrphanVersions {
+                wb,
+                id,
+                region_info_provider,
+            } => {
+                let count = wb.count();
+                match wb.batch {
+                    Either::Left(mut wb) => {
+                        info!("handling GcTask::OrphanVersions"; "id" => id);
+                        let mut wopts = WriteOptions::default();
+                        wopts.set_sync(true);
+                        if let Err(e) = wb.write_opt(&wopts) {
+                            error!("write GcTask::OrphanVersions fail"; "id" => id, "err" => ?e);
+                            update_metrics(true);
+                            return;
+                        }
+                        info!("write GcTask::OrphanVersions success"; "id" => id);
+                    }
+                    Either::Right(deletes) => self.flush_deletes(deletes, region_info_provider),
                 }
-                info!("write GcTask::OrphanVersions success"; "id" => id);
                 GC_COMPACTION_FILTER_ORPHAN_VERSIONS
                     .with_label_values(&[STAT_TXN_KEYMODE, "cleaned"])
-                    .inc_by(wb.count() as u64);
+                    .inc_by(count as u64);
                 update_metrics(false);
             }
             #[cfg(any(test, feature = "testexport"))]
@@ -1144,7 +1201,7 @@ impl<E: Engine> GcWorker<E> {
         );
 
         info!("initialize compaction filter to perform GC when necessary");
-        self.engine.kv_engine().unwrap().init_compaction_filter(
+        self.engine.kv_engine().init_compaction_filter(
             cfg.self_store_id,
             safe_point.clone(),
             self.config_manager.clone(),
@@ -1307,6 +1364,7 @@ pub mod test_gc_worker {
                         let bytes = keys::data_end_key(key2.as_encoded());
                         *key2 = Key::from_encoded(bytes);
                     }
+                    Modify::Ingest(_) => unimplemented!(),
                 }
             }
             write_modifies(&self.kv_engine().unwrap(), modifies)
@@ -1334,6 +1392,7 @@ pub mod test_gc_worker {
                     *start_key = Key::from_encoded(keys::data_key(start_key.as_encoded()));
                     *end_key = Key::from_encoded(keys::data_end_key(end_key.as_encoded()));
                 }
+                Modify::Ingest(_) => unimplemented!(),
             });
             self.0.async_write(ctx, batch, subscribed, on_applied)
         }
@@ -1423,7 +1482,7 @@ mod tests {
     };
 
     use api_version::{ApiV2, KvFormat, RawValue};
-    use engine_rocks::{util::get_cf_handle, RocksEngine};
+    use engine_rocks::{raw::FlushOptions, util::get_cf_handle, RocksEngine};
     use engine_traits::Peekable as _;
     use futures::executor::block_on;
     use kvproto::{kvrpcpb::ApiVersion, metapb::Peer};
@@ -1799,7 +1858,9 @@ mod tests {
             must_prewrite_delete(&mut prefixed_engine, &k, &k, 151);
             must_commit(&mut prefixed_engine, &k, 151, 152);
         }
-        db.flush_cf(cf, true).unwrap();
+        let mut fopts = FlushOptions::default();
+        fopts.set_wait(true);
+        db.flush_cf(cf, &fopts).unwrap();
 
         db.compact_range_cf(cf, None, None);
         for i in 0..100 {
@@ -1874,7 +1935,9 @@ mod tests {
             must_commit(&mut prefixed_engine, &k, 151, 152);
             keys.push(Key::from_raw(&k));
         }
-        db.flush_cf(cf, true).unwrap();
+        let mut fopts = FlushOptions::default();
+        fopts.set_wait(true);
+        db.flush_cf(cf, &fopts).unwrap();
 
         assert_eq!(runner.mut_stats(GcKeyMode::txn).write.seek, 0);
         assert_eq!(runner.mut_stats(GcKeyMode::txn).write.next, 0);
@@ -2032,7 +2095,9 @@ mod tests {
         for i in 10u64..30 {
             must_rollback(&mut prefixed_engine, b"k2\x00", i, true);
         }
-        db.flush_cf(cf, true).unwrap();
+        let mut fopts = FlushOptions::default();
+        fopts.set_wait(true);
+        db.flush_cf(cf, &fopts).unwrap();
         must_gc(&mut prefixed_engine, b"k2\x00", 30);
 
         // Test tombstone counter works
@@ -2091,7 +2156,9 @@ mod tests {
             must_prewrite_put(&mut prefixed_engine, b"k2", b"v2", b"k2", start_ts);
             must_commit(&mut prefixed_engine, b"k2", start_ts, commit_ts);
         }
-        db.flush_cf(cf, true).unwrap();
+        let mut fopts = FlushOptions::default();
+        fopts.set_wait(true);
+        db.flush_cf(cf, &fopts).unwrap();
         let safepoint = versions as u64 * 2;
 
         runner
@@ -2124,7 +2191,9 @@ mod tests {
         must_commit(&mut engine, b"key", 10, 20);
         let db = engine.kv_engine().unwrap().as_inner().clone();
         let cf = get_cf_handle(&db, CF_WRITE).unwrap();
-        db.flush_cf(cf, true).unwrap();
+        let mut fopts = FlushOptions::default();
+        fopts.set_wait(true);
+        db.flush_cf(cf, &fopts).unwrap();
 
         let gate = FeatureGate::default();
         gate.set_version("5.0.0").unwrap();

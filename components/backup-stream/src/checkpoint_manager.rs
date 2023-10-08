@@ -207,7 +207,7 @@ impl CheckpointManager {
 
     /// update a region checkpoint in need.
     #[cfg(test)]
-    pub fn update_region_checkpoint(&mut self, region: &Region, checkpoint: TimeStamp) {
+    fn update_region_checkpoint(&mut self, region: &Region, checkpoint: TimeStamp) {
         Self::update_ts(&mut self.checkpoint_ts, region.clone(), checkpoint)
     }
 

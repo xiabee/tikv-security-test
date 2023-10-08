@@ -10,7 +10,8 @@ use kvproto::{
 use protobuf::Message;
 use raftstore::store::Bucket;
 use test_coprocessor::*;
-use test_raftstore::{Cluster, ServerCluster};
+use test_raftstore::*;
+use test_raftstore_macro::test_case;
 use test_storage::*;
 use tidb_query_datatype::{
     codec::{datum, Datum},
@@ -303,6 +304,7 @@ fn test_scan_detail() {
         assert_eq!(scan_detail.get_lock().get_total(), 1);
 
         assert!(resp.get_exec_details_v2().has_time_detail());
+        assert!(resp.get_exec_details_v2().has_time_detail_v2());
         let scan_detail_v2 = resp.get_exec_details_v2().get_scan_detail_v2();
         assert_eq!(scan_detail_v2.get_total_versions(), 5);
         assert_eq!(scan_detail_v2.get_processed_versions(), 4);
@@ -1017,6 +1019,7 @@ fn test_del_select() {
     assert_eq!(row_count, 5);
 
     assert!(resp.get_exec_details_v2().has_time_detail());
+    assert!(resp.get_exec_details_v2().has_time_detail_v2());
     let scan_detail_v2 = resp.get_exec_details_v2().get_scan_detail_v2();
     assert_eq!(scan_detail_v2.get_total_versions(), 8);
     assert_eq!(scan_detail_v2.get_processed_versions(), 5);
@@ -1722,6 +1725,7 @@ fn test_exec_details() {
     assert!(resp.has_exec_details_v2());
     let exec_details = resp.get_exec_details_v2();
     assert!(exec_details.has_time_detail());
+    assert!(exec_details.has_time_detail_v2());
     assert!(exec_details.has_scan_detail_v2());
 }
 
@@ -1759,18 +1763,34 @@ fn test_snapshot_failed() {
     assert!(resp.get_region_error().has_store_not_match());
 }
 
-#[test]
+#[test_case(test_raftstore::new_server_cluster)]
+#[test_case(test_raftstore_v2::new_server_cluster)]
+fn test_empty_data_cache_miss() {
+    let mut cluster = new_cluster(0, 1);
+    let (raft_engine, ctx) = prepare_raft_engine!(cluster, "");
+
+    let product = ProductTable::new();
+    let (_, endpoint, _) =
+        init_data_with_engine_and_commit(ctx.clone(), raft_engine, &product, &[], false);
+    let mut req = DagSelect::from(&product).build_with(ctx, &[0]);
+    req.set_is_cache_enabled(true);
+    let resp = handle_request(&endpoint, req);
+    assert!(!resp.get_is_cache_hit());
+}
+
+#[test_case(test_raftstore::new_server_cluster)]
+#[test_case(test_raftstore_v2::new_server_cluster)]
 fn test_cache() {
+    let mut cluster = new_cluster(0, 1);
+    let (raft_engine, ctx) = prepare_raft_engine!(cluster, "");
+
     let data = vec![
         (1, Some("name:0"), 2),
         (2, Some("name:4"), 3),
         (4, Some("name:3"), 1),
         (5, Some("name:1"), 4),
     ];
-
     let product = ProductTable::new();
-    let (_cluster, raft_engine, ctx) = new_raft_engine(1, "");
-
     let (_, endpoint, _) =
         init_data_with_engine_and_commit(ctx.clone(), raft_engine, &product, &data, true);
 
@@ -2052,6 +2072,39 @@ fn test_buckets() {
 }
 
 #[test]
+fn test_select_v2_format_with_checksum() {
+    let data = vec![
+        (1, Some("name:0"), 2),
+        (2, Some("name:4"), 3),
+        (4, Some("name:3"), 1),
+        (5, Some("name:1"), 4),
+        (9, Some("name:8"), 7),
+        (10, Some("name:6"), 8),
+    ];
+
+    let product = ProductTable::new();
+    for extra_checksum in [None, Some(132423)] {
+        // The row value encoded with checksum bytes should have no impact on cop task
+        // processing and related result chunk filling.
+        let (_, endpoint) =
+            init_data_with_commit_v2_checksum(&product, &data, true, extra_checksum);
+        let req = DagSelect::from(&product).build();
+        let mut resp = handle_select(&endpoint, req);
+        let spliter = DagChunkSpliter::new(resp.take_chunks().into(), 3);
+        for (row, (id, name, cnt)) in spliter.zip(data.clone()) {
+            let name_datum = name.map(|s| s.as_bytes()).into();
+            let expected_encoded = datum::encode_value(
+                &mut EvalContext::default(),
+                &[Datum::I64(id), name_datum, cnt.into()],
+            )
+            .unwrap();
+            let result_encoded = datum::encode_value(&mut EvalContext::default(), &row).unwrap();
+            assert_eq!(result_encoded, &*expected_encoded);
+        }
+    }
+}
+
+#[test]
 fn test_batch_request() {
     let data = vec![
         (1, Some("name:0"), 2),
@@ -2288,6 +2341,7 @@ fn test_batch_request() {
                     TimeStamp::zero(),
                     1,
                     TimeStamp::zero(),
+                    false,
                 );
                 cluster.must_put_cf(CF_LOCK, lock_key.as_encoded(), lock.to_bytes().as_slice());
             }

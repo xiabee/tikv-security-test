@@ -496,11 +496,11 @@ pub enum Cmd {
     /// Show range properties
     RangeProperties {
         #[structopt(long, default_value = "")]
-        /// hex start key
+        /// hex start key (not starts with "z")
         start: String,
 
         #[structopt(long, default_value = "")]
-        /// hex end key
+        /// hex end key (not starts with "z")
         end: String,
     },
     /// Split the region
@@ -579,7 +579,7 @@ pub enum Cmd {
     /// modifications on the remained TiKV.
     ///
     /// NOTE: The remained TiKV can't run concurrently with the agent.
-    ForkReadonlyTikv {
+    ReuseReadonlyRemains {
         /// Data directory path of the remained TiKV.
         #[structopt(long)]
         data_dir: String,
@@ -627,7 +627,7 @@ pub enum Cmd {
         /// hex end key
         end: String,
     },
-    /// Get diagnosis info about resolved-ts and safe-ts
+    /// Get the state of a region's RegionReadProgress.
     GetRegionReadProgress {
         #[structopt(short = "r", long)]
         /// The target region id

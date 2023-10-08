@@ -1,23 +1,21 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use collections::HashMap;
 use engine_traits::{KvEngine, RaftEngine};
-use kvproto::{
-    metapb, pdpb,
-    raft_cmdpb::{
-        AdminCmdType, AdminRequest, ChangePeerRequest, ChangePeerV2Request, RaftCmdRequest,
-        SplitRequest,
-    },
-    raft_serverpb::RaftMessage,
-    replication_modepb::{RegionReplicationStatus, StoreDrAutoSyncStatus},
-};
-use pd_client::{metrics::PD_HEARTBEAT_COUNTER_VEC, PdClient, RegionStat};
-use raft::eraftpb::ConfChangeType;
+use kvproto::{metapb, pdpb};
+use pd_client::{metrics::PD_HEARTBEAT_COUNTER_VEC, BucketStat, PdClient, RegionStat};
+use raftstore::store::{ReadStats, WriteStats};
+use resource_metering::RawRecords;
 use slog::{debug, error, info};
 use tikv_util::{store::QueryStats, time::UnixSecs};
 
 use super::{requests::*, Runner};
+use crate::{
+    operation::{RequestHalfSplit, RequestSplit},
+    router::{CmdResChannel, PeerMsg},
+};
 
 pub struct RegionHeartbeatTask {
     pub term: u64,
@@ -51,6 +49,49 @@ pub struct PeerStat {
     pub last_store_report_query_stats: QueryStats,
     pub approximate_keys: u64,
     pub approximate_size: u64,
+}
+
+#[derive(Default)]
+pub struct ReportBucket {
+    current_stat: BucketStat,
+    last_report_stat: Option<BucketStat>,
+    last_report_ts: UnixSecs,
+}
+
+impl ReportBucket {
+    fn new(current_stat: BucketStat) -> Self {
+        Self {
+            current_stat,
+            ..Default::default()
+        }
+    }
+
+    fn report(&mut self) -> BucketStat {
+        match self.last_report_stat.replace(self.current_stat.clone()) {
+            Some(last) => {
+                let mut delta = BucketStat::from_meta(self.current_stat.meta.clone());
+                // Buckets may be changed, recalculate last stats according to current meta.
+                delta.merge(&last);
+                for i in 0..delta.meta.keys.len() - 1 {
+                    delta.stats.write_bytes[i] =
+                        self.current_stat.stats.write_bytes[i] - delta.stats.write_bytes[i];
+                    delta.stats.write_keys[i] =
+                        self.current_stat.stats.write_keys[i] - delta.stats.write_keys[i];
+                    delta.stats.write_qps[i] =
+                        self.current_stat.stats.write_qps[i] - delta.stats.write_qps[i];
+
+                    delta.stats.read_bytes[i] =
+                        self.current_stat.stats.read_bytes[i] - delta.stats.read_bytes[i];
+                    delta.stats.read_keys[i] =
+                        self.current_stat.stats.read_keys[i] - delta.stats.read_keys[i];
+                    delta.stats.read_qps[i] =
+                        self.current_stat.stats.read_qps[i] - delta.stats.read_qps[i];
+                }
+                delta
+            }
+            None => self.current_stat.clone(),
+        }
+    }
 }
 
 impl<EK, ER, T> Runner<EK, ER, T>
@@ -193,7 +234,7 @@ where
                             change_peer.get_change_type(),
                             change_peer.take_peer(),
                         );
-                        send_admin_request(&logger, &router, region_id, epoch, peer, req);
+                        send_admin_request(&logger, &router, region_id, epoch, peer, req, None);
                     } else if resp.has_change_peer_v2() {
                         PD_HEARTBEAT_COUNTER_VEC
                             .with_label_values(&["change peer"])
@@ -207,7 +248,7 @@ where
                             "changes" => ?change_peer_v2.get_changes(),
                         );
                         let req = new_change_peer_v2_request(change_peer_v2.take_changes().into());
-                        send_admin_request(&logger, &router, region_id, epoch, peer, req);
+                        send_admin_request(&logger, &router, region_id, epoch, peer, req, None);
                     } else if resp.has_transfer_leader() {
                         PD_HEARTBEAT_COUNTER_VEC
                             .with_label_values(&["transfer leader"])
@@ -226,13 +267,57 @@ where
                             transfer_leader.take_peer(),
                             transfer_leader.take_peers().into(),
                         );
-                        send_admin_request(&logger, &router, region_id, epoch, peer, req);
+                        send_admin_request(&logger, &router, region_id, epoch, peer, req, None);
                     } else if resp.has_split_region() {
-                        // TODO
-                        info!(logger, "pd asks for split but ignored");
+                        PD_HEARTBEAT_COUNTER_VEC
+                            .with_label_values(&["split region"])
+                            .inc();
+
+                        let mut split_region = resp.take_split_region();
+                        info!(
+                            logger,
+                            "try to split";
+                            "region_id" => region_id,
+                            "region_epoch" => ?epoch,
+                        );
+
+                        let (ch, _) = CmdResChannel::pair();
+                        let msg = if split_region.get_policy() == pdpb::CheckPolicy::Usekey {
+                            PeerMsg::RequestSplit {
+                                request: RequestSplit {
+                                    epoch,
+                                    split_keys: split_region.take_keys().into(),
+                                    source: "pd".into(),
+                                    share_source_region_size: false,
+                                },
+                                ch,
+                            }
+                        } else {
+                            PeerMsg::RequestHalfSplit {
+                                request: RequestHalfSplit {
+                                    epoch,
+                                    start_key: None,
+                                    end_key: None,
+                                    policy: split_region.get_policy(),
+                                    source: "pd".into(),
+                                },
+                                ch,
+                            }
+                        };
+                        if let Err(e) = router.send(region_id, msg) {
+                            error!(logger,
+                                "send split request failed";
+                                "region_id" => region_id,
+                                "err" => ?e
+                            );
+                        }
                     } else if resp.has_merge() {
-                        // TODO
-                        info!(logger, "pd asks for merge but ignored");
+                        PD_HEARTBEAT_COUNTER_VEC.with_label_values(&["merge"]).inc();
+
+                        let merge = resp.take_merge();
+                        info!(logger, "try to merge"; "region_id" => region_id, "merge" => ?merge);
+                        let req = new_merge_request(merge);
+                        send_admin_request(&logger, &router, region_id, epoch, peer, req, None);
                     } else {
                         PD_HEARTBEAT_COUNTER_VEC.with_label_values(&["noop"]).inc();
                     }
@@ -252,5 +337,119 @@ where
         };
         self.remote.spawn(f);
         self.is_hb_receiver_scheduled = true;
+    }
+
+    pub fn handle_report_region_buckets(&mut self, region_buckets: BucketStat) {
+        let region_id = region_buckets.meta.region_id;
+        self.merge_buckets(region_buckets);
+        let report_buckets = self.region_buckets.get_mut(&region_id).unwrap();
+        let last_report_ts = if report_buckets.last_report_ts.is_zero() {
+            self.start_ts
+        } else {
+            report_buckets.last_report_ts
+        };
+        let now = UnixSecs::now();
+        let interval_second = now.into_inner() - last_report_ts.into_inner();
+        report_buckets.last_report_ts = now;
+        let delta = report_buckets.report();
+        let resp = self
+            .pd_client
+            .report_region_buckets(&delta, Duration::from_secs(interval_second));
+        let logger = self.logger.clone();
+        let f = async move {
+            if let Err(e) = resp.await {
+                debug!(
+                    logger,
+                    "failed to send buckets";
+                    "region_id" => region_id,
+                    "version" => delta.meta.version,
+                    "region_epoch" => ?delta.meta.region_epoch,
+                    "err" => ?e
+                );
+            }
+        };
+        self.remote.spawn(f);
+    }
+
+    pub fn handle_update_read_stats(&mut self, mut stats: ReadStats) {
+        for (region_id, region_info) in stats.region_infos.iter_mut() {
+            let peer_stat = self
+                .region_peers
+                .entry(*region_id)
+                .or_insert_with(PeerStat::default);
+            peer_stat.read_bytes += region_info.flow.read_bytes as u64;
+            peer_stat.read_keys += region_info.flow.read_keys as u64;
+            self.store_stat.engine_total_bytes_read += region_info.flow.read_bytes as u64;
+            self.store_stat.engine_total_keys_read += region_info.flow.read_keys as u64;
+            peer_stat
+                .query_stats
+                .add_query_stats(&region_info.query_stats.0);
+            self.store_stat
+                .engine_total_query_num
+                .add_query_stats(&region_info.query_stats.0);
+        }
+        for (_, region_buckets) in std::mem::take(&mut stats.region_buckets) {
+            self.merge_buckets(region_buckets);
+        }
+        if !stats.region_infos.is_empty() {
+            self.stats_monitor.maybe_send_read_stats(stats);
+        }
+    }
+
+    pub fn handle_update_write_stats(&mut self, mut stats: WriteStats) {
+        for (region_id, region_info) in stats.region_infos.iter_mut() {
+            let peer_stat = self
+                .region_peers
+                .entry(*region_id)
+                .or_insert_with(PeerStat::default);
+            peer_stat.query_stats.add_query_stats(&region_info.0);
+            self.store_stat
+                .engine_total_query_num
+                .add_query_stats(&region_info.0);
+        }
+    }
+
+    pub fn handle_update_region_cpu_records(&mut self, records: Arc<RawRecords>) {
+        // Send Region CPU info to AutoSplitController inside the stats_monitor.
+        self.stats_monitor.maybe_send_cpu_stats(&records);
+        Self::calculate_region_cpu_records(self.store_id, records, &mut self.region_cpu_records);
+    }
+
+    pub fn handle_destroy_peer(&mut self, region_id: u64) {
+        match self.region_peers.remove(&region_id) {
+            None => {}
+            Some(_) => {
+                info!(self.logger, "remove peer statistic record in pd"; "region_id" => region_id)
+            }
+        }
+    }
+
+    fn merge_buckets(&mut self, mut buckets: BucketStat) {
+        let region_id = buckets.meta.region_id;
+        self.region_buckets
+            .entry(region_id)
+            .and_modify(|report_bucket| {
+                let current = &mut report_bucket.current_stat;
+                if current.meta < buckets.meta {
+                    std::mem::swap(current, &mut buckets);
+                }
+                current.merge(&buckets);
+            })
+            .or_insert_with(|| ReportBucket::new(buckets));
+    }
+
+    fn calculate_region_cpu_records(
+        store_id: u64,
+        records: Arc<RawRecords>,
+        region_cpu_records: &mut HashMap<u64, u32>,
+    ) {
+        for (tag, record) in &records.records {
+            let record_store_id = tag.store_id;
+            if record_store_id != store_id {
+                continue;
+            }
+            // Reporting a region heartbeat later will clear the corresponding record.
+            *region_cpu_records.entry(tag.region_id).or_insert(0) += record.cpu_time;
+        }
     }
 }

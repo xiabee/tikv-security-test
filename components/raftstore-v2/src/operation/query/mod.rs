@@ -11,28 +11,26 @@
 //! Follower's read index and replica read is implemenented replica module.
 //! Leader's read index and lease renew is implemented in lease module.
 
-use std::{cmp, sync::Arc};
+use std::cmp;
 
 use crossbeam::channel::TrySendError;
 use engine_traits::{KvEngine, RaftEngine};
 use kvproto::{
     errorpb,
     raft_cmdpb::{CmdType, RaftCmdRequest, RaftCmdResponse, StatusCmdType},
-    raft_serverpb::RaftApplyState,
 };
-use raft::Ready;
+use raft::{Ready, StateRole};
 use raftstore::{
     errors::RAFTSTORE_IS_BUSY,
     store::{
-        cmd_resp, fsm::ApplyMetrics, local_metrics::RaftMetrics,
-        metrics::RAFT_READ_INDEX_PENDING_COUNT, msg::ErrorCallback, region_meta::RegionMeta, util,
-        util::LeaseState, GroupState, ReadCallback, ReadIndexContext, ReadProgress, RequestPolicy,
-        Transport,
+        cmd_resp, local_metrics::RaftMetrics, metrics::RAFT_READ_INDEX_PENDING_COUNT,
+        msg::ErrorCallback, region_meta::RegionMeta, util, util::LeaseState, GroupState,
+        ReadIndexContext, ReadProgress, RequestPolicy,
     },
     Error, Result,
 };
-use slog::info;
-use tikv_util::box_err;
+use slog::{debug, info};
+use tikv_util::{box_err, log::SlogFormat};
 use txn_types::WriteBatchFlags;
 
 use crate::{
@@ -40,16 +38,16 @@ use crate::{
     fsm::PeerFsmDelegate,
     raft::Peer,
     router::{
-        message::RaftRequest, ApplyRes, DebugInfoChannel, PeerMsg, QueryResChannel, QueryResult,
-        ReadResponse,
+        message::RaftRequest, DebugInfoChannel, PeerMsg, QueryResChannel, QueryResult, ReadResponse,
     },
 };
 
+mod capture;
 mod lease;
 mod local;
 mod replica;
 
-pub(crate) use self::local::LocalReader;
+pub(crate) use self::local::{LocalReader, ReadDelegatePair, SharedReadTablet};
 
 impl<'a, EK: KvEngine, ER: RaftEngine, T: raftstore::store::Transport>
     PeerFsmDelegate<'a, EK, ER, T>
@@ -131,7 +129,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         }
 
         // Check store_id, make sure that the msg is dispatched to the right place.
-        if let Err(e) = util::check_store_id(msg, self.peer().get_store_id()) {
+        if let Err(e) = util::check_store_id(msg.get_header(), self.peer().get_store_id()) {
             raft_metrics.invalid_proposal.mismatch_store_id.inc();
             return Err(e);
         }
@@ -143,13 +141,8 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             ));
         }
 
-        // TODO: add flashback_state check
-
         // Check whether the store has the right peer to handle the request.
-        let leader_id = self.leader_id();
         let request = msg.get_requests();
-
-        // TODO: add force leader
 
         // ReadIndex can be processed on the replicas.
         let is_read_index_request =
@@ -158,38 +151,64 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         let allow_replica_read = msg.get_header().get_replica_read();
         if !self.is_leader() && !is_read_index_request && !allow_replica_read {
             raft_metrics.invalid_proposal.not_leader.inc();
-            return Err(Error::NotLeader(self.region_id(), None));
+            return Err(Error::NotLeader(self.region_id(), self.leader()));
         }
 
         // peer_id must be the same as peer's.
-        if let Err(e) = util::check_peer_id(msg, self.peer_id()) {
+        if let Err(e) = util::check_peer_id(msg.get_header(), self.peer_id()) {
             raft_metrics.invalid_proposal.mismatch_peer_id.inc();
             return Err(e);
         }
 
-        // TODO: check applying snapshot
+        if self.has_force_leader() {
+            raft_metrics.invalid_proposal.force_leader.inc();
+            // in force leader state, forbid requests to make the recovery
+            // progress less error-prone.
+            return Err(Error::RecoveryInProgress(self.region_id()));
+        }
+
+        // Check whether the peer is initialized.
+        if !self.storage().is_initialized() {
+            raft_metrics.invalid_proposal.region_not_initialized.inc();
+            let region_id = msg.get_header().get_region_id();
+            return Err(Error::RegionNotInitialized(region_id));
+        }
 
         // Check whether the term is stale.
-        if let Err(e) = util::check_term(msg, self.term()) {
+        if let Err(e) = util::check_term(msg.get_header(), self.term()) {
             raft_metrics.invalid_proposal.stale_command.inc();
             return Err(e);
         }
 
         // TODO: add check of sibling region for split
-        util::check_region_epoch(msg, self.region(), true)
+        util::check_req_region_epoch(msg, self.region(), true)
     }
 
     // For these cases it won't be proposed:
     // 1. The region is in merging or splitting;
     // 2. The message is stale and dropped by the Raft group internally;
     // 3. There is already a read request proposed in the current lease;
-    fn read_index<T: Transport>(
+    fn read_index<T>(
         &mut self,
         ctx: &mut StoreContext<EK, ER, T>,
-        mut req: RaftCmdRequest,
+        req: RaftCmdRequest,
         ch: QueryResChannel,
     ) {
-        // TODO: add pre_read_index to handle splitting or merging
+        if let Err(e) = self.pre_read_index() {
+            debug!(
+                self.logger,
+                "prevents unsafe read index";
+                "err" => ?e,
+            );
+            ctx.raft_metrics.propose.unsafe_read_index.inc();
+            let mut resp = RaftCmdResponse::default();
+            let term = self.term();
+            cmd_resp::bind_term(&mut resp, term);
+            cmd_resp::bind_error(&mut resp, e);
+            ch.report_error(resp);
+            return;
+        }
+
         if self.is_leader() {
             self.read_index_leader(ctx, req, ch);
         } else {
@@ -222,7 +241,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
 
             if self.ready_to_handle_read() {
                 while let Some(mut read) = self.pending_reads_mut().pop_front() {
-                    self.respond_read_index(&mut read, ctx);
+                    self.respond_read_index(&mut read);
                 }
             }
         }
@@ -263,10 +282,21 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 && read.cmds()[0].0.get_requests().len() == 1
                 && read.cmds()[0].0.get_requests()[0].get_cmd_type() == CmdType::ReadIndex;
 
+            let read_index = read.read_index.unwrap();
             if is_read_index_request {
-                self.respond_read_index(&mut read, ctx);
-            } else if self.ready_to_handle_unsafe_replica_read(read.read_index.unwrap()) {
-                self.respond_replica_read(&mut read, ctx);
+                self.respond_read_index(&mut read);
+            } else if self.ready_to_handle_unsafe_replica_read(read_index) {
+                self.respond_replica_read(&mut read);
+            } else if self.storage().apply_state().get_applied_index()
+                + ctx.cfg.follower_read_max_log_gap()
+                <= read_index
+            {
+                let mut response = cmd_resp::new_error(Error::ReadIndexNotReady {
+                    region_id: self.region_id(),
+                    reason: "applied index fail behind read index too long",
+                });
+                cmd_resp::bind_term(&mut response, self.term());
+                self.respond_replica_read_error(&mut read, response);
             } else {
                 // TODO: `ReadIndex` requests could be blocked.
                 self.pending_reads_mut().push_front(read);
@@ -285,7 +315,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         self.storage().apply_state().get_applied_index() >= read_index
             // If it is in pending merge state(i.e. applied PrepareMerge), the data may be stale.
             // TODO: Add a test to cover this case
-            && !self.has_pending_merge_state()
+            && !self.proposal_control().has_applied_prepare_merge()
     }
 
     #[inline]
@@ -344,7 +374,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
     }
 
     fn query_status(&mut self, req: &RaftCmdRequest, resp: &mut RaftCmdResponse) -> Result<()> {
-        util::check_store_id(req, self.peer().get_store_id())?;
+        util::check_store_id(req.get_header(), self.peer().get_store_id())?;
         let cmd_type = req.get_status_request().get_cmd_type();
         let status_resp = resp.mut_status_response();
         status_resp.set_cmd_type(cmd_type);
@@ -367,7 +397,10 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 }
             }
             StatusCmdType::InvalidStatus => {
-                return Err(box_err!("{:?} invalid status command!", self.logger.list()));
+                return Err(box_err!(
+                    "{} invalid status command!",
+                    SlogFormat(&self.logger)
+                ));
             }
         }
 
@@ -379,16 +412,22 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
     /// Query internal states for debugging purpose.
     pub fn on_query_debug_info(&self, ch: DebugInfoChannel) {
         let entry_storage = self.storage().entry_storage();
+        let mut status = self.raft_group().status();
+        status
+            .progress
+            .get_or_insert_with(|| self.raft_group().raft.prs());
         let mut meta = RegionMeta::new(
             self.storage().region_state(),
             entry_storage.apply_state(),
             GroupState::Ordered,
-            self.raft_group().status(),
+            status,
+            self.raft_group().raft.raft_log.last_index(),
+            self.raft_group().raft.raft_log.persisted,
         );
         // V2 doesn't persist commit index and term, fill them with in-memory values.
         meta.raft_apply.commit_index = cmp::min(
             self.raft_group().raft.raft_log.committed,
-            self.raft_group().raft.raft_log.persisted,
+            self.persisted_index(),
         );
         meta.raft_apply.commit_term = self
             .raft_group()
@@ -396,6 +435,13 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             .raft_log
             .term(meta.raft_apply.commit_index)
             .unwrap();
+        if let Some(bucket_stats) = self.region_buckets_info().bucket_stat() {
+            meta.bucket_keys = bucket_stats.meta.keys.clone();
+        }
+        debug!(self.logger, "on query debug info";
+            "tick" => self.raft_group().raft.election_elapsed,
+            "election_timeout" => self.raft_group().raft.randomized_election_timeout(),
+        );
         ch.set_result(meta);
     }
 
@@ -416,7 +462,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             self.post_pending_read_index_on_replica(ctx)
         } else if self.ready_to_handle_read() {
             while let Some(mut read) = self.pending_reads_mut().pop_front() {
-                self.respond_read_index(&mut read, ctx);
+                self.respond_read_index(&mut read);
             }
         }
         self.pending_reads_mut().gc();
@@ -424,12 +470,13 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
 
         // Only leaders need to update applied_term.
         if progress_to_be_updated && self.is_leader() {
-            // TODO: add coprocessor_host hook
+            if applied_term == self.term() {
+                ctx.coprocessor_host
+                    .on_applied_current_term(StateRole::Leader, self.region());
+            }
             let progress = ReadProgress::applied_term(applied_term);
-            // TODO: remove it
-            self.add_reader_if_necessary(&ctx.store_meta);
             let mut meta = ctx.store_meta.lock().unwrap();
-            let reader = meta.readers.get_mut(&self.region_id()).unwrap();
+            let reader = &mut meta.readers.get_mut(&self.region_id()).unwrap().0;
             self.maybe_update_read_progress(reader, progress);
         }
     }

@@ -14,15 +14,16 @@ mod util;
 
 mod config;
 pub mod errors;
-use std::{cmp::Ordering, collections::HashMap, ops::Deref, sync::Arc, time::Duration};
+pub mod meta_storage;
+use std::{cmp::Ordering, ops::Deref, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
-use grpcio::ClientSStreamReceiver;
 use kvproto::{
     metapb, pdpb,
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
+    resource_manager::TokenBucketsRequest,
 };
-use pdpb::{QueryStats, WatchGlobalConfigResponse};
+use pdpb::QueryStats;
 use tikv_util::time::{Instant, UnixSecs};
 use txn_types::TimeStamp;
 
@@ -125,6 +126,11 @@ impl BucketMeta {
         self.keys.remove(idx);
         self.sizes.remove(idx);
     }
+
+    // total size of the whole buckets
+    pub fn total_size(&self) -> u64 {
+        self.sizes.iter().sum()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +159,33 @@ impl BucketStat {
         }
     }
 
+    pub fn from_meta(meta: Arc<BucketMeta>) -> Self {
+        let stats = new_bucket_stats(&meta);
+        Self::new(meta, stats)
+    }
+
+    pub fn set_meta(&mut self, meta: Arc<BucketMeta>) {
+        self.stats = new_bucket_stats(&meta);
+        self.meta = meta;
+    }
+
+    pub fn clear_stats(&mut self) {
+        self.stats = new_bucket_stats(&self.meta);
+    }
+
+    pub fn merge(&mut self, delta: &BucketStat) {
+        merge_bucket_stats(
+            &self.meta.keys,
+            &mut self.stats,
+            &delta.meta.keys,
+            &delta.stats,
+        );
+    }
+
+    pub fn add_flows<I: AsRef<[u8]>>(&mut self, incoming: &[I], delta_stats: &metapb::BucketStats) {
+        merge_bucket_stats(&self.meta.keys, &mut self.stats, incoming, delta_stats);
+    }
+
     pub fn write_key(&mut self, key: &[u8], value_size: u64) {
         let idx = match util::find_bucket_index(key, &self.meta.keys) {
             Some(idx) => idx,
@@ -163,6 +196,18 @@ impl BucketStat {
         }
         if let Some(bytes) = self.stats.mut_write_bytes().get_mut(idx) {
             *bytes += key.len() as u64 + value_size;
+        }
+    }
+
+    // Notice: It's not evenly distributed, so we update all buckets after ingest
+    // sst. Generally, sst file size is region split size, and this region is
+    // empty region.
+    pub fn ingest_sst(&mut self, key_count: u64, value_size: u64) {
+        for stat in self.stats.mut_write_bytes() {
+            *stat += value_size;
+        }
+        for stat in self.stats.mut_write_keys() {
+            *stat += key_count;
         }
     }
 
@@ -201,6 +246,9 @@ impl BucketStat {
 }
 
 pub const INVALID_ID: u64 = 0;
+// TODO: Implementation of config registration for each module
+pub const RESOURCE_CONTROL_CONFIG_PATH: &str = "resource_group/settings";
+pub const RESOURCE_CONTROL_CONTROLLER_CONFIG_PATH: &str = "resource_group/controller";
 
 /// PdClient communicates with Placement Driver (PD).
 /// Because now one PD only supports one cluster, so it is no need to pass
@@ -209,17 +257,28 @@ pub const INVALID_ID: u64 = 0;
 /// all the time.
 pub trait PdClient: Send + Sync {
     /// Load a list of GlobalConfig
-    fn load_global_config(&self, _list: Vec<String>) -> PdFuture<HashMap<String, String>> {
+    fn load_global_config(
+        &self,
+        _config_path: String,
+    ) -> PdFuture<(Vec<pdpb::GlobalConfigItem>, i64)> {
         unimplemented!();
     }
 
     /// Store a list of GlobalConfig
-    fn store_global_config(&self, _list: HashMap<String, String>) -> PdFuture<()> {
+    fn store_global_config(
+        &self,
+        _config_path: String,
+        _items: Vec<pdpb::GlobalConfigItem>,
+    ) -> PdFuture<()> {
         unimplemented!();
     }
 
     /// Watching change of GlobalConfig
-    fn watch_global_config(&self) -> Result<ClientSStreamReceiver<WatchGlobalConfigResponse>> {
+    fn watch_global_config(
+        &self,
+        _config_path: String,
+        _revision: i64,
+    ) -> Result<grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>> {
         unimplemented!();
     }
 
@@ -330,6 +389,11 @@ pub trait PdClient: Send + Sync {
 
     /// Gets Region by Region id.
     fn get_region_by_id(&self, _region_id: u64) -> PdFuture<Option<metapb::Region>> {
+        unimplemented!();
+    }
+
+    // Gets Buckets by Region id.
+    fn get_buckets_by_id(&self, _region_id: u64) -> PdFuture<Option<metapb::Buckets>> {
         unimplemented!();
     }
 
@@ -474,6 +538,10 @@ pub trait PdClient: Send + Sync {
 
     /// Region's Leader uses this to report buckets to PD.
     fn report_region_buckets(&self, _bucket_stat: &BucketStat, _period: Duration) -> PdFuture<()> {
+        unimplemented!();
+    }
+
+    fn report_ru_metrics(&self, _req: TokenBucketsRequest) -> PdFuture<()> {
         unimplemented!();
     }
 }

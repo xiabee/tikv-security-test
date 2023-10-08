@@ -11,7 +11,7 @@ use kvproto::{
 use raft::eraftpb::MessageType;
 use raftstore::store::msg::*;
 use test_raftstore::*;
-use tikv_util::{config::ReadableDuration, time::Instant};
+use tikv_util::{config::ReadableDuration, future::block_on_timeout, time::Instant};
 
 fn assert_disk_full(resp: &RaftCmdResponse) {
     assert!(resp.get_header().get_error().has_disk_full());
@@ -67,7 +67,7 @@ fn ensure_disk_usage_is_reported<T: Simulator>(
     let peer = new_peer(store_id, peer_id);
     let key = region.get_start_key();
     let ch = async_read_on_peer(cluster, peer, region.clone(), key, true, true);
-    ch.recv_timeout(Duration::from_secs(1)).unwrap();
+    block_on_timeout(ch, Duration::from_secs(1)).unwrap();
 }
 
 fn test_disk_full_leader_behaviors(usage: DiskUsage) {
@@ -87,7 +87,7 @@ fn test_disk_full_leader_behaviors(usage: DiskUsage) {
     // Test new normal proposals won't be allowed when disk is full.
     let old_last_index = cluster.raft_local_state(1, 1).last_index;
     let rx = cluster.async_put(b"k2", b"v2").unwrap();
-    assert_disk_full(&rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    assert_disk_full(&block_on_timeout(rx, Duration::from_secs(2)).unwrap());
     let new_last_index = cluster.raft_local_state(1, 1).last_index;
     assert_eq!(old_last_index, new_last_index);
 
@@ -262,7 +262,7 @@ fn test_disk_full_txn_behaviors(usage: DiskUsage) {
     let lock_ts = get_tso(&pd_client);
     lead_client.must_kv_pessimistic_lock(b"k8".to_vec(), lock_ts);
 
-    // Test pessmistic rollback is allowed.
+    // Test pessimistic rollback is allowed.
     fail::cfg(get_fp(usage, 1), "return").unwrap();
     lead_client.must_kv_pessimistic_rollback(b"k8".to_vec(), lock_ts);
 
@@ -300,7 +300,7 @@ fn test_majority_disk_full() {
 
     // Normal proposals will be rejected because of majority peers' disk full.
     let ch = cluster.async_put(b"k2", b"v2").unwrap();
-    let resp = ch.recv_timeout(Duration::from_secs(1)).unwrap();
+    let resp = block_on_timeout(ch, Duration::from_secs(1)).unwrap();
     assert_eq!(disk_full_stores(&resp), vec![2, 3]);
 
     // Proposals with special `DiskFullOpt`s can be accepted even if all peers are
@@ -311,7 +311,7 @@ fn test_majority_disk_full() {
     let mut opts = RaftCmdExtraOpts::default();
     opts.disk_full_opt = DiskFullOpt::AllowedOnAlmostFull;
     let ch = cluster.async_request_with_opts(put, opts).unwrap();
-    let resp = ch.recv_timeout(Duration::from_secs(1)).unwrap();
+    let resp = block_on_timeout(ch, Duration::from_secs(1)).unwrap();
     assert!(!resp.get_header().has_error());
 
     // Reset disk full status for peer 2 and 3. 2 follower reads must success
@@ -336,7 +336,7 @@ fn test_majority_disk_full() {
     let mut opts = RaftCmdExtraOpts::default();
     opts.disk_full_opt = DiskFullOpt::AllowedOnAlmostFull;
     let ch = cluster.async_request_with_opts(put, opts).unwrap();
-    let resp = ch.recv_timeout(Duration::from_secs(10)).unwrap();
+    let resp = block_on_timeout(ch, Duration::from_secs(10)).unwrap();
     assert_eq!(disk_full_stores(&resp), vec![2, 3]);
 
     // Peer 2 disk usage changes from already full to almost full.
@@ -355,7 +355,7 @@ fn test_majority_disk_full() {
     let mut opts = RaftCmdExtraOpts::default();
     opts.disk_full_opt = DiskFullOpt::AllowedOnAlmostFull;
     let ch = cluster.async_request_with_opts(put, opts).unwrap();
-    let resp = ch.recv_timeout(Duration::from_secs(1)).unwrap();
+    let resp = block_on_timeout(ch, Duration::from_secs(1)).unwrap();
     assert_eq!(disk_full_stores(&resp), vec![3]);
 
     for i in 0..3 {
