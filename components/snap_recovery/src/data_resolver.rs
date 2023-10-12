@@ -96,10 +96,13 @@ impl DataResolverManager {
             .name("cleanup_lock".to_string())
             .spawn_wrapper(move || {
                 tikv_util::thread_group::set_properties(props);
+                tikv_alloc::add_thread_memory_accessor();
 
                 worker
                     .cleanup_lock(&mut wb)
                     .expect("cleanup lock failed when delete data from invalid cf");
+
+                tikv_alloc::remove_thread_memory_accessor();
             })
             .expect("failed to spawn resolve_kv_data thread");
         self.workers.lock().unwrap().push(handle);
@@ -120,11 +123,14 @@ impl DataResolverManager {
             .name("resolve_write".to_string())
             .spawn_wrapper(move || {
                 tikv_util::thread_group::set_properties(props);
+                tikv_alloc::add_thread_memory_accessor();
 
                 if let Err(e) = worker.resolve_write(&mut wb) {
                     error!("failed to resolve write cf"; 
                     "error" => ?e);
                 }
+
+                tikv_alloc::remove_thread_memory_accessor();
             })
             .expect("failed to spawn resolve_kv_data thread");
 
@@ -376,7 +382,6 @@ mod tests {
                 for_update_ts.into(),
                 0,
                 TimeStamp::zero(),
-                false,
             );
             kv.push((CF_LOCK, Key::from_raw(key), lock.to_bytes()));
         }

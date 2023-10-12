@@ -1,6 +1,6 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{fmt::Write, path::Path, sync::Arc, thread, time::Duration};
+use std::{fmt::Write, sync::Arc, thread, time::Duration};
 
 use encryption_export::{data_key_manager_from_config, DataKeyManager};
 use engine_rocks::{RocksEngine, RocksStatistics};
@@ -9,26 +9,24 @@ use engine_traits::{CfName, KvEngine, TabletRegistry, CF_DEFAULT};
 use file_system::IoRateLimiter;
 use futures::future::BoxFuture;
 use kvproto::{
-    encryptionpb::EncryptionMethod,
     kvrpcpb::Context,
     metapb,
-    raft_cmdpb::{CmdType, RaftCmdRequest, RaftCmdResponse},
+    raft_cmdpb::{RaftCmdRequest, RaftCmdResponse},
 };
-use raftstore::{store::ReadResponse, Result};
+use raftstore::Result;
 use rand::{prelude::SliceRandom, RngCore};
 use server::common::ConfiguredRaftEngine;
 use tempfile::TempDir;
-use test_raftstore::{new_get_cmd, new_put_cf_cmd, new_request, new_snap_cmd, Config};
+use test_raftstore::{must_get_value, new_get_cmd, new_put_cf_cmd, new_request, Config};
 use tikv::{
     server::KvEngineFactoryBuilder,
     storage::{
+        config::EngineType,
         kv::{SnapContext, SnapshotExt},
         point_key_range, Engine, Snapshot,
     },
 };
-use tikv_util::{
-    config::ReadableDuration, escape, future::block_on_timeout, worker::LazyWorker, HandyRwLock,
-};
+use tikv_util::{config::ReadableDuration, escape, worker::LazyWorker, HandyRwLock};
 use txn_types::Key;
 
 use crate::{bootstrap_store, cluster::Cluster, ServerCluster, Simulator};
@@ -56,7 +54,10 @@ pub fn create_test_engine(
         data_key_manager_from_config(&cfg.security.encryption, dir.path().to_str().unwrap())
             .unwrap()
             .map(Arc::new);
-    let cache = cfg.storage.block_cache.build_shared_cache();
+    let cache = cfg
+        .storage
+        .block_cache
+        .build_shared_cache(EngineType::RaftKv2);
     let env = cfg
         .build_shared_rocks_env(key_manager.clone(), limiter)
         .unwrap();
@@ -71,8 +72,8 @@ pub fn create_test_engine(
         bootstrap_store(&raft_engine, cluster_id, store_id).unwrap();
     }
 
-    let builder = KvEngineFactoryBuilder::new(env, &cfg.tikv, cache, key_manager.clone())
-        .sst_recovery_sender(Some(scheduler));
+    let builder =
+        KvEngineFactoryBuilder::new(env, &cfg.tikv, cache).sst_recovery_sender(Some(scheduler));
 
     let factory = Box::new(builder.build());
     let rocks_statistics = factory.rocks_statistics();
@@ -130,22 +131,12 @@ pub fn put_cf_till_size<T: Simulator<EK>, EK: KvEngine>(
     key.into_bytes()
 }
 
-pub fn configure_for_encryption(config: &mut Config) {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    let cfg = &mut config.security.encryption;
-    cfg.data_encryption_method = EncryptionMethod::Aes128Ctr;
-    cfg.data_key_rotation_period = ReadableDuration(Duration::from_millis(100));
-    cfg.master_key = test_util::new_test_file_master_key(manifest_dir);
-}
-
 pub fn configure_for_snapshot(config: &mut Config) {
     // Truncate the log quickly so that we can force sending snapshot.
     config.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(20);
     config.raft_store.raft_log_gc_count_limit = Some(2);
     config.raft_store.merge_max_log_gap = 1;
     config.raft_store.snap_mgr_gc_tick_interval = ReadableDuration::millis(50);
-    configure_for_encryption(config);
 }
 
 pub fn configure_for_lease_read_v2<T: Simulator<EK>, EK: KvEngine>(
@@ -250,44 +241,6 @@ pub fn async_read_on_peer<T: Simulator<EK>, EK: KvEngine>(
     Box::pin(async move { f.await.unwrap() })
 }
 
-pub fn batch_read_on_peer<T: Simulator<EK>, EK: KvEngine>(
-    cluster: &mut Cluster<T, EK>,
-    requests: &[(metapb::Peer, metapb::Region)],
-) -> Vec<ReadResponse<<EK as KvEngine>::Snapshot>> {
-    let mut results = vec![];
-    for (peer, region) in requests {
-        let node_id = peer.get_store_id();
-        let mut request = new_request(
-            region.get_id(),
-            region.get_region_epoch().clone(),
-            vec![new_snap_cmd()],
-            false,
-        );
-        request.mut_header().set_peer(peer.clone());
-        let snap = cluster.sim.wl().async_snapshot(node_id, request);
-        let resp = block_on_timeout(
-            async move {
-                match snap.await {
-                    Ok(snap) => ReadResponse {
-                        response: Default::default(),
-                        snapshot: Some(snap),
-                        txn_extra_op: Default::default(),
-                    },
-                    Err(resp) => ReadResponse {
-                        response: resp,
-                        snapshot: None,
-                        txn_extra_op: Default::default(),
-                    },
-                }
-            },
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        results.push(resp);
-    }
-    results
-}
-
 pub fn async_read_index_on_peer<T: Simulator<EK>, EK: KvEngine>(
     cluster: &mut Cluster<T, EK>,
     peer: metapb::Peer,
@@ -355,16 +308,6 @@ pub fn test_delete_range<T: Simulator<EK>, EK: KvEngine>(cluster: &mut Cluster<T
     }
 }
 
-pub fn must_get_value(resp: &RaftCmdResponse) -> Vec<u8> {
-    if resp.get_header().has_error() {
-        panic!("failed to read {:?}", resp);
-    }
-    assert_eq!(resp.get_responses().len(), 1);
-    assert_eq!(resp.get_responses()[0].get_cmd_type(), CmdType::Get);
-    assert!(resp.get_responses()[0].has_get());
-    resp.get_responses()[0].get_get().get_value().to_vec()
-}
-
 pub fn must_read_on_peer<T: Simulator<EK>, EK: KvEngine>(
     cluster: &mut Cluster<T, EK>,
     peer: metapb::Peer,
@@ -401,49 +344,4 @@ pub fn must_error_read_on_peer<T: Simulator<EK>, EK: KvEngine>(
             );
         }
     }
-}
-
-pub fn put_with_timeout<T: Simulator<EK>, EK: KvEngine>(
-    cluster: &mut Cluster<T, EK>,
-    node_id: u64,
-    key: &[u8],
-    value: &[u8],
-    timeout: Duration,
-) -> Result<RaftCmdResponse> {
-    let mut region = cluster.get_region(key);
-    let region_id = region.get_id();
-    let mut req = new_request(
-        region_id,
-        region.take_region_epoch(),
-        vec![new_put_cf_cmd(CF_DEFAULT, key, value)],
-        false,
-    );
-    req.mut_header().set_peer(
-        region
-            .get_peers()
-            .iter()
-            .find(|p| p.store_id == node_id)
-            .unwrap()
-            .clone(),
-    );
-    cluster.call_command_on_node(node_id, req, timeout)
-}
-
-pub fn wait_down_peers<T: Simulator<EK>, EK: KvEngine>(
-    cluster: &Cluster<T, EK>,
-    count: u64,
-    peer: Option<u64>,
-) {
-    let mut peers = cluster.get_down_peers();
-    for _ in 1..1000 {
-        if peers.len() == count as usize && peer.as_ref().map_or(true, |p| peers.contains_key(p)) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-        peers = cluster.get_down_peers();
-    }
-    panic!(
-        "got {:?}, want {} peers which should include {:?}",
-        peers, count, peer
-    );
 }

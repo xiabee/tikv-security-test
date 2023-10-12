@@ -1,31 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    io::{Cursor, Write},
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{sync::Arc, thread, time::Duration};
 
-use collections::HashMap;
 use engine_rocks::RocksEngine;
-use engine_traits::CF_DEFAULT;
-use external_storage_export::{ExternalStorage, UnpinReader};
-use futures::{executor::block_on, io::Cursor as AsyncCursor, stream, SinkExt};
+use futures::{executor::block_on, stream, SinkExt};
 use grpcio::{ChannelBuilder, Environment, Result, WriteFlags};
-use kvproto::{
-    brpb::{Local, StorageBackend},
-    import_sstpb::{KvMeta, *},
-    kvrpcpb::*,
-    tikvpb::*,
-};
+use kvproto::{import_sstpb::*, kvrpcpb::*, tikvpb::*};
 use security::SecurityConfig;
-use tempfile::TempDir;
 use test_raftstore::*;
-use test_raftstore_v2::{Cluster as ClusterV2, ServerCluster as ServerClusterV2};
 use tikv::config::TikvConfig;
-use tikv_util::{codec::stream_event::EventEncoder, stream::block_on_external_io, HandyRwLock};
-use txn_types::Key;
+use tikv_util::HandyRwLock;
 use uuid::Uuid;
 
 const CLEANUP_SST_MILLIS: u64 = 10;
@@ -33,31 +17,6 @@ const CLEANUP_SST_MILLIS: u64 = 10;
 pub fn new_cluster(cfg: TikvConfig) -> (Cluster<ServerCluster>, Context) {
     let count = 1;
     let mut cluster = new_server_cluster(0, count);
-    cluster.cfg = Config {
-        tikv: cfg,
-        prefer_mem: true,
-    };
-    cluster.run();
-
-    let region_id = 1;
-    let leader = cluster.leader_of_region(region_id).unwrap();
-    let epoch = cluster.get_region_epoch(region_id);
-    let mut ctx = Context::default();
-    ctx.set_region_id(region_id);
-    ctx.set_peer(leader);
-    ctx.set_region_epoch(epoch);
-
-    (cluster, ctx)
-}
-
-pub fn new_cluster_v2(
-    cfg: TikvConfig,
-) -> (
-    ClusterV2<ServerClusterV2<RocksEngine>, RocksEngine>,
-    Context,
-) {
-    let count = 1;
-    let mut cluster = test_raftstore_v2::new_server_cluster(0, count);
     cluster.cfg = Config {
         tikv: cfg,
         prefer_mem: true,
@@ -110,24 +69,35 @@ pub fn open_cluster_and_tikv_import_client(
     (cluster, ctx, tikv, import)
 }
 
+#[allow(dead_code)]
 pub fn open_cluster_and_tikv_import_client_v2(
     cfg: Option<TikvConfig>,
-) -> (
-    ClusterV2<ServerClusterV2<RocksEngine>, RocksEngine>,
-    Context,
-    TikvClient,
-    ImportSstClient,
-) {
+    cluster: &mut test_raftstore_v2::Cluster<
+        test_raftstore_v2::ServerCluster<RocksEngine>,
+        RocksEngine,
+    >,
+) -> (Context, TikvClient, ImportSstClient) {
     let cfg = cfg.unwrap_or_else(|| {
         let mut config = TikvConfig::default();
         config.server.addr = "127.0.0.1:0".to_owned();
-        let cleanup_interval = Duration::from_millis(CLEANUP_SST_MILLIS);
+        let cleanup_interval = Duration::from_millis(10);
         config.raft_store.cleanup_import_sst_interval.0 = cleanup_interval;
         config.server.grpc_concurrency = 1;
         config
     });
+    cluster.cfg = Config {
+        tikv: cfg.clone(),
+        prefer_mem: true,
+    };
+    cluster.run();
 
-    let (cluster, ctx) = new_cluster_v2(cfg.clone());
+    let region_id = 1;
+    let leader = cluster.leader_of_region(region_id).unwrap();
+    let epoch = cluster.get_region_epoch(region_id);
+    let mut ctx = Context::default();
+    ctx.set_region_id(region_id);
+    ctx.set_peer(leader);
+    ctx.set_region_epoch(epoch);
 
     let ch = {
         let env = Arc::new(Environment::new(1));
@@ -147,7 +117,7 @@ pub fn open_cluster_and_tikv_import_client_v2(
     let tikv = TikvClient::new(ch.clone());
     let import = ImportSstClient::new(ch);
 
-    (cluster, ctx, tikv, import)
+    (ctx, tikv, import)
 }
 
 pub fn new_cluster_and_tikv_import_client()
@@ -261,40 +231,6 @@ pub fn check_ingested_kvs_cf(tikv: &TikvClient, ctx: &Context, cf: &str, sst_ran
     }
 }
 
-#[track_caller]
-pub fn check_applied_kvs_cf<K: AsRef<[u8]>, V: AsRef<[u8]> + std::fmt::Debug>(
-    tikv: &TikvClient,
-    ctx: &Context,
-    cf: &str,
-    entries: impl Iterator<Item = (K, V, u64)>,
-) {
-    let mut get = RawBatchGetRequest::default();
-    get.set_cf(cf.to_owned());
-    get.set_context(ctx.clone());
-    let mut keymap = HashMap::default();
-    for (key, value, ts) in entries {
-        let the_key = Key::from_raw(key.as_ref())
-            .append_ts(ts.into())
-            .into_encoded();
-        keymap.insert(the_key.clone(), value);
-        get.mut_keys().push(the_key);
-    }
-    for pair in tikv.raw_batch_get(&get).unwrap().get_pairs() {
-        let entry = keymap.remove(pair.get_key()).expect("unexpected key");
-        assert_eq!(
-            entry.as_ref(),
-            pair.get_value(),
-            "key is {:?}",
-            pair.get_key()
-        );
-    }
-    assert!(
-        keymap.is_empty(),
-        "not all keys consumed, remained {:?}",
-        keymap
-    );
-}
-
 pub fn check_ingested_txn_kvs(
     tikv: &TikvClient,
     ctx: &Context,
@@ -321,68 +257,4 @@ pub fn check_sst_deleted(client: &ImportSstClient, meta: &SstMeta, data: &[u8]) 
         thread::sleep(Duration::from_millis(CLEANUP_SST_MILLIS));
     }
     send_upload_sst(client, meta, data).unwrap();
-}
-
-pub fn make_plain_file<I, K, V>(storage: &dyn ExternalStorage, name: &str, kvs: I) -> KvMeta
-where
-    I: Iterator<Item = (K, V, u64)>,
-    K: AsRef<[u8]>,
-    V: AsRef<[u8]>,
-{
-    let mut buf = vec![];
-    let mut file = Cursor::new(&mut buf);
-    let mut start_ts: Option<u64> = None;
-    for (key, value, ts) in kvs {
-        let the_key = Key::from_raw(key.as_ref())
-            .append_ts(ts.into())
-            .into_encoded();
-        start_ts = Some(start_ts.map_or(ts, |ts0| ts0.min(ts)));
-        for segment in EventEncoder::encode_event(&the_key, value.as_ref()) {
-            file.write_all(segment.as_ref()).unwrap();
-        }
-    }
-    file.flush().unwrap();
-    let len = buf.len() as u64;
-    block_on_external_io(storage.write(name, UnpinReader(Box::new(AsyncCursor::new(buf))), len))
-        .unwrap();
-    let mut meta = KvMeta::new();
-    meta.set_start_ts(start_ts.unwrap_or_default());
-    meta.set_length(len);
-    meta.set_restore_ts(u64::MAX);
-    meta.set_compression_type(kvproto::brpb::CompressionType::Unknown);
-    meta.set_name(name.to_owned());
-    meta.set_cf(CF_DEFAULT.to_owned());
-    meta
-}
-
-pub fn rewrite_for(meta: &mut KvMeta, old_prefix: &[u8], new_prefix: &[u8]) -> RewriteRule {
-    assert_eq!(old_prefix.len(), new_prefix.len());
-    fn rewrite(key: &mut Vec<u8>, old_prefix: &[u8], new_prefix: &[u8]) {
-        assert!(key.starts_with(old_prefix));
-        let len = old_prefix.len();
-        key.splice(..len, new_prefix.iter().cloned());
-    }
-    rewrite(meta.mut_start_key(), old_prefix, new_prefix);
-    rewrite(meta.mut_end_key(), old_prefix, new_prefix);
-    let mut rule = RewriteRule::default();
-    rule.set_old_key_prefix(old_prefix.to_vec());
-    rule.set_new_key_prefix(new_prefix.to_vec());
-    rule
-}
-
-pub fn register_range_for(meta: &mut KvMeta, start: &[u8], end: &[u8]) {
-    let start = Key::from_raw(start);
-    let end = Key::from_raw(end);
-    meta.set_start_key(start.into_encoded());
-    meta.set_end_key(end.into_encoded());
-}
-
-pub fn local_storage(tmp: &TempDir) -> StorageBackend {
-    let mut backend = StorageBackend::default();
-    backend.set_local({
-        let mut local = Local::default();
-        local.set_path(tmp.path().to_str().unwrap().to_owned());
-        local
-    });
-    backend
 }

@@ -29,7 +29,6 @@ use tikv_util::{
     time::{monotonic_raw_now, ThreadReadId},
 };
 use time::Timespec;
-use tracker::GLOBAL_TRACKERS;
 use txn_types::TimeStamp;
 
 use super::metrics::*;
@@ -500,11 +499,6 @@ impl ReadDelegate {
                 self.leader_lease = leader_lease;
             }
             Progress::RegionBuckets(bucket_meta) => {
-                if let Some(meta) = &self.bucket_meta {
-                    if meta.version >= bucket_meta.version {
-                        return;
-                    }
-                }
                 self.bucket_meta = Some(bucket_meta);
             }
             Progress::WaitData(wait_data) => {
@@ -567,7 +561,6 @@ impl ReadDelegate {
 
     pub fn check_stale_read_safe(&self, read_ts: u64) -> std::result::Result<(), RaftCmdResponse> {
         let safe_ts = self.read_progress.safe_ts();
-        fail_point!("skip_check_stale_read_safe", |_| Ok(()));
         if safe_ts >= read_ts {
             return Ok(());
         }
@@ -810,7 +803,6 @@ where
                 "check term";
                 "delegate_term" => delegate.term,
                 "header_term" => req.get_header().get_term(),
-                "tag" => &delegate.tag,
             );
             TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().reject_reason.term_mismatch.inc());
             return Err(e);
@@ -1051,12 +1043,6 @@ where
                     }
                     _ => unreachable!(),
                 };
-
-                cb.read_tracker().map(|tracker| {
-                    GLOBAL_TRACKERS.with_tracker(tracker, |t| {
-                        t.metrics.local_read = true;
-                    })
-                });
 
                 TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().local_executed_requests.inc());
                 if !snap_updated {

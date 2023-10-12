@@ -12,7 +12,7 @@ use std::{
 
 use collections::HashSet;
 use engine_traits::{KvEngine, RaftEngine, CF_LOCK};
-use futures::{future::BoxFuture, Future, Stream, StreamExt, TryFutureExt};
+use futures::{future::BoxFuture, Future, Stream, StreamExt};
 use kvproto::{
     kvrpcpb::Context,
     raft_cmdpb::{AdminCmdType, CmdType, RaftCmdRequest, Request},
@@ -28,7 +28,6 @@ use raftstore_v2::{
 };
 use tikv_kv::{Modify, WriteEvent};
 use tikv_util::time::Instant;
-use tracker::{get_tls_tracker_token, GLOBAL_TRACKERS};
 use txn_types::{TxnExtra, TxnExtraScheduler, WriteBatchFlags};
 
 use super::{
@@ -173,7 +172,7 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
                 .set_key_ranges(mem::take(&mut ctx.key_ranges).into());
         }
         ASYNC_REQUESTS_COUNTER_VEC.snapshot.all.inc();
-        let begin_instant = Instant::now();
+        let begin_instant = Instant::now_coarse();
 
         let mut header = new_request_header(ctx.pb_ctx);
         let mut flags = 0;
@@ -201,32 +200,9 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
             let res = f.await;
             match res {
                 Ok(snap) => {
-                    let elapse = begin_instant.saturating_elapsed_secs();
-                    let tracker = get_tls_tracker_token();
-                    GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                        if tracker.metrics.read_index_propose_wait_nanos > 0 {
-                            ASYNC_REQUESTS_DURATIONS_VEC
-                                .snapshot_read_index_propose_wait
-                                .observe(
-                                    tracker.metrics.read_index_propose_wait_nanos as f64
-                                        / 1_000_000_000.0,
-                                );
-                            // snapshot may be handled by lease read in raftstore
-                            if tracker.metrics.read_index_confirm_wait_nanos > 0 {
-                                ASYNC_REQUESTS_DURATIONS_VEC
-                                    .snapshot_read_index_confirm
-                                    .observe(
-                                        tracker.metrics.read_index_confirm_wait_nanos as f64
-                                            / 1_000_000_000.0,
-                                    );
-                            }
-                        } else if tracker.metrics.local_read {
-                            ASYNC_REQUESTS_DURATIONS_VEC
-                                .snapshot_local_read
-                                .observe(elapse);
-                        }
-                    });
-                    ASYNC_REQUESTS_DURATIONS_VEC.snapshot.observe(elapse);
+                    ASYNC_REQUESTS_DURATIONS_VEC
+                        .snapshot
+                        .observe(begin_instant.saturating_elapsed_secs());
                     ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
                     Ok(snap)
                 }
@@ -261,8 +237,6 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
         subscribed: u8,
         on_applied: Option<tikv_kv::OnAppliedCb>,
     ) -> Self::WriteRes {
-        fail_point!("raftkv_async_write");
-
         let region_id = ctx.region_id;
         ASYNC_REQUESTS_COUNTER_VEC.write.all.inc();
         let begin_instant = Instant::now_coarse();
@@ -380,35 +354,19 @@ fn exec_admin<EK: KvEngine, ER: RaftEngine>(
     req: RaftCmdRequest,
 ) -> BoxFuture<'static, tikv_kv::Result<()>> {
     let region_id = req.get_header().get_region_id();
-    let peer_id = req.get_header().get_peer().get_id();
-    let term = req.get_header().get_term();
-    let epoch = req.get_header().get_region_epoch().clone();
     let admin_type = req.get_admin_request().get_cmd_type();
     let (msg, sub) = PeerMsg::admin_command(req);
     let res = router.check_send(region_id, msg);
-    Box::pin(
-        async move {
-            res?;
-            let mut resp = sub.result().await.ok_or_else(|| -> tikv_kv::Error {
-                box_err!(
-                    "region {} exec_admin {:?} without response",
-                    region_id,
-                    admin_type
-                )
-            })?;
-            check_raft_cmd_response(&mut resp)?;
-            Ok(())
-        }
-        .map_err(move |e| {
-            warn!("failed to execute admin command";
-                "err" => ?e,
-                "admin_type" => ?admin_type,
-                "term" => term,
-                "region_epoch" => ?epoch,
-                "peer_id" => peer_id,
-                "region_id" => region_id,
-            );
-            e
-        }),
-    )
+    Box::pin(async move {
+        res?;
+        let mut resp = sub.result().await.ok_or_else(|| -> tikv_kv::Error {
+            box_err!(
+                "region {} exec_admin {:?} without response",
+                region_id,
+                admin_type
+            )
+        })?;
+        check_raft_cmd_response(&mut resp)?;
+        Ok(())
+    })
 }

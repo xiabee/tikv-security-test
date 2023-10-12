@@ -31,7 +31,7 @@ use super::{local_metrics::TimeTracker, region_meta::RegionMeta, FetchedLogs, Re
 use crate::store::{
     fsm::apply::{CatchUpLogs, ChangeObserver, TaskRes as ApplyTaskRes},
     metrics::RaftEventDurationType,
-    unsafe_recovery::{
+    peer::{
         SnapshotRecoveryWaitApplySyncer, UnsafeRecoveryExecutePlanSyncer,
         UnsafeRecoveryFillOutReportSyncer, UnsafeRecoveryForceLeaderSyncer,
         UnsafeRecoveryWaitApplySyncer,

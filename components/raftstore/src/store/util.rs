@@ -5,7 +5,7 @@ use std::{
     cmp,
     collections::{HashMap, VecDeque},
     fmt,
-    fmt::{Debug, Display},
+    fmt::Display,
     option::Option,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
@@ -98,13 +98,13 @@ fn is_first_vote_msg(msg: &eraftpb::Message) -> bool {
 /// received but there is no such region in `Store::region_peers`. In this case
 /// we should put `msg` into `pending_msg` instead of create the peer.
 #[inline]
-pub fn is_first_append_entry(msg: &eraftpb::Message) -> bool {
+fn is_first_append_entry(msg: &eraftpb::Message) -> bool {
     match msg.get_msg_type() {
         MessageType::MsgAppend => {
-            let entries = msg.get_entries();
-            !entries.is_empty()
-                && entries[0].data.is_empty()
-                && entries[0].index == peer_storage::RAFT_INIT_LOG_INDEX + 1
+            let ent = msg.get_entries();
+            ent.len() == 1
+                && ent[0].data.is_empty()
+                && ent[0].index == peer_storage::RAFT_INIT_LOG_INDEX + 1
         }
         _ => false,
     }
@@ -423,10 +423,11 @@ pub fn check_peer_id(header: &RaftRequestHeader, peer_id: u64) -> Result<()> {
     if header.get_peer().get_id() == peer_id {
         Ok(())
     } else {
-        Err(Error::MismatchPeerId {
-            request_peer_id: header.get_peer().get_id(),
-            store_peer_id: peer_id,
-        })
+        Err(box_err!(
+            "mismatch peer id {} != {}",
+            header.get_peer().get_id(),
+            peer_id
+        ))
     }
 }
 
@@ -1085,7 +1086,7 @@ pub fn check_conf_change(
         let promoted_commit_index = after_progress.maximal_committed_index().0;
         let first_index = node.raft.raft_log.first_index();
         if current_progress.is_singleton() // It's always safe if there is only one node in the cluster.
-            || promoted_commit_index + 1 >= first_index
+                || promoted_commit_index + 1 >= first_index
         {
             return Ok(());
         }
@@ -1095,12 +1096,10 @@ pub fn check_conf_change(
             .inc();
 
         Err(box_err!(
-            "{:?}: before: {:?}, {:?}; after: {:?}, {:?}; first index {}; promoted commit index {}",
+            "{:?}: before: {:?}, after: {:?}, first index {}, promoted commit index {}",
             change_peers,
-            current_progress.conf(),
-            current_progress.iter().collect::<Vec<_>>(),
-            after_progress.conf(),
-            current_progress.iter().collect::<Vec<_>>(),
+            current_progress.conf().to_conf_state(),
+            after_progress.conf().to_conf_state(),
             first_index,
             promoted_commit_index
         ))
@@ -1713,7 +1712,6 @@ pub struct RaftstoreDuration {
     pub store_wait_duration: Option<std::time::Duration>,
     pub store_process_duration: Option<std::time::Duration>,
     pub store_write_duration: Option<std::time::Duration>,
-    pub store_commit_duration: Option<std::time::Duration>,
     pub apply_wait_duration: Option<std::time::Duration>,
     pub apply_process_duration: Option<std::time::Duration>,
 }
@@ -1723,7 +1721,6 @@ impl RaftstoreDuration {
         self.store_wait_duration.unwrap_or_default()
             + self.store_process_duration.unwrap_or_default()
             + self.store_write_duration.unwrap_or_default()
-            + self.store_commit_duration.unwrap_or_default()
             + self.apply_wait_duration.unwrap_or_default()
             + self.apply_process_duration.unwrap_or_default()
     }
@@ -1734,16 +1731,6 @@ pub struct LatencyInspector {
     id: u64,
     duration: RaftstoreDuration,
     cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>,
-}
-
-impl Debug for LatencyInspector {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            fmt,
-            "LatencyInspector: id {} duration: {:?}",
-            self.id, self.duration
-        )
-    }
 }
 
 impl LatencyInspector {
@@ -1765,10 +1752,6 @@ impl LatencyInspector {
 
     pub fn record_store_write(&mut self, duration: std::time::Duration) {
         self.duration.store_write_duration = Some(duration);
-    }
-
-    pub fn record_store_commit(&mut self, duration: std::time::Duration) {
-        self.duration.store_commit_duration = Some(duration);
     }
 
     pub fn record_apply_wait(&mut self, duration: std::time::Duration) {
@@ -2142,12 +2125,12 @@ mod tests {
         for (msg_type, index, is_append) in tbl {
             let mut msg = Message::default();
             msg.set_msg_type(msg_type);
-            let mut ent = Entry::default();
-            ent.set_index(index);
-            msg.mut_entries().push(ent.clone());
-            assert_eq!(is_first_append_entry(&msg), is_append);
-            ent.set_index(index + 1);
-            msg.mut_entries().push(ent);
+            let ent = {
+                let mut e = Entry::default();
+                e.set_index(index);
+                e
+            };
+            msg.set_entries(vec![ent].into());
             assert_eq!(is_first_append_entry(&msg), is_append);
         }
     }
@@ -2445,24 +2428,5 @@ mod tests {
             rrp.core.lock().unwrap().get_local_leader_info().peers,
             *region.get_peers(),
         );
-    }
-
-    #[test]
-    fn test_peer_id_mismatch() {
-        use kvproto::errorpb::{Error, MismatchPeerId};
-        let mut header = RaftRequestHeader::default();
-        let mut peer = Peer::default();
-        peer.set_id(1);
-        header.set_peer(peer);
-        // match
-        check_peer_id(&header, 1).unwrap();
-        // mismatch
-        let err = check_peer_id(&header, 2).unwrap_err();
-        let region_err: Error = err.into();
-        assert!(region_err.has_mismatch_peer_id());
-        let mut mismatch_err = MismatchPeerId::default();
-        mismatch_err.set_request_peer_id(1);
-        mismatch_err.set_store_peer_id(2);
-        assert_eq!(region_err.get_mismatch_peer_id(), &mismatch_err)
     }
 }

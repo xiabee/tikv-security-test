@@ -40,9 +40,8 @@ use openssl::{
 };
 use pin_project::pin_project;
 pub use profile::{
-    activate_heap_profile, deactivate_heap_profile, heap_profiles_dir, jeprof_heap_profile,
-    list_heap_profiles, read_file, start_one_cpu_profile, start_one_heap_profile,
-    HEAP_PROFILE_REGEX,
+    activate_heap_profile, deactivate_heap_profile, jeprof_heap_profile, list_heap_profiles,
+    read_file, start_one_cpu_profile, start_one_heap_profile,
 };
 use prometheus::TEXT_FORMAT;
 use regex::Regex;
@@ -115,10 +114,8 @@ where
             .enable_all()
             .worker_threads(status_thread_pool_size)
             .thread_name("status-server")
-            .with_sys_and_custom_hooks(
-                || debug!("Status server started"),
-                || debug!("stopping status server"),
-            )
+            .after_start_wrapper(|| debug!("Status server started"))
+            .before_stop_wrapper(|| debug!("stopping status server"))
             .build()?;
 
         let (tx, rx) = oneshot::channel::<()>();
@@ -208,34 +205,10 @@ where
         let use_jeprof = query_pairs.get("jeprof").map(|x| x.as_ref()) == Some("true");
 
         let result = if let Some(name) = query_pairs.get("name") {
-            let re = Regex::new(HEAP_PROFILE_REGEX).unwrap();
-            if !re.is_match(name) {
-                let errmsg = format!("heap profile name {} is invalid", name);
-                return Ok(make_response(StatusCode::BAD_REQUEST, errmsg));
-            }
-            let profiles = match list_heap_profiles() {
-                Ok(s) => s,
-                Err(e) => return Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, e)),
-            };
-            if profiles.iter().any(|(f, _)| f == name) {
-                let dir = match heap_profiles_dir() {
-                    Some(path) => path,
-                    None => {
-                        return Ok(make_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "heap profile is not active",
-                        ));
-                    }
-                };
-                let path = dir.join(name.as_ref());
-                if use_jeprof {
-                    jeprof_heap_profile(path.to_str().unwrap())
-                } else {
-                    read_file(path.to_str().unwrap())
-                }
+            if use_jeprof {
+                jeprof_heap_profile(name)
             } else {
-                let errmsg = format!("heap profile {} not found", name);
-                return Ok(make_response(StatusCode::BAD_REQUEST, errmsg));
+                read_file(name)
             }
         } else {
             let mut seconds = 10;
@@ -313,18 +286,6 @@ where
         req: Request<Body>,
     ) -> hyper::Result<Response<Body>> {
         let mut body = Vec::new();
-        let mut persist = true;
-        if let Some(query) = req.uri().query() {
-            let query_pairs: HashMap<_, _> =
-                url::form_urlencoded::parse(query.as_bytes()).collect();
-            persist = match query_pairs.get("persist") {
-                Some(val) => match val.parse() {
-                    Ok(val) => val,
-                    Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
-                },
-                None => true,
-            };
-        }
         req.into_body()
             .try_for_each(|bytes| {
                 body.extend(bytes);
@@ -332,11 +293,7 @@ where
             })
             .await?;
         Ok(match decode_json(&body) {
-            Ok(change) => match if persist {
-                cfg_controller.update(change)
-            } else {
-                cfg_controller.update_without_persist(change)
-            } {
+            Ok(change) => match cfg_controller.update(change) {
                 Err(e) => {
                     if let Some(e) = e.downcast_ref::<std::io::Error>() {
                         make_response(
@@ -690,9 +647,9 @@ where
                             (Method::GET, "/debug/pprof/heap_deactivate") => {
                                 Self::deactivate_heap_prof(req)
                             }
-                            (Method::GET, "/debug/pprof/heap") => {
-                                Self::dump_heap_prof_to_resp(req).await
-                            }
+                            // (Method::GET, "/debug/pprof/heap") => {
+                            //     Self::dump_heap_prof_to_resp(req).await
+                            // }
                             (Method::GET, "/config") => {
                                 Self::get_config(req, &cfg_controller).await
                             }
@@ -806,20 +763,14 @@ where
 }
 
 #[derive(Serialize)]
-struct BackgroundSetting {
-    task_types: Vec<String>,
-}
-
-#[derive(Serialize)]
 struct ResourceGroupSetting {
     name: String,
     ru: u64,
     priority: u32,
     burst_limit: i64,
-    background: BackgroundSetting,
 }
 
-fn into_debug_request_group(mut rg: ResourceGroup) -> ResourceGroupSetting {
+fn into_debug_request_group(rg: ResourceGroup) -> ResourceGroupSetting {
     ResourceGroupSetting {
         name: rg.name,
         ru: rg
@@ -835,12 +786,6 @@ fn into_debug_request_group(mut rg: ResourceGroup) -> ResourceGroupSetting {
             .get_r_u()
             .get_settings()
             .get_burst_limit(),
-        background: BackgroundSetting {
-            task_types: rg
-                .background_settings
-                .as_mut()
-                .map_or(vec![], |s| s.take_job_types().into()),
-        },
     }
 }
 
@@ -1241,76 +1186,6 @@ mod tests {
         });
         block_on(handle).unwrap();
         status_server.stop();
-    }
-
-    #[test]
-    fn test_update_config_endpoint() {
-        let test_config = |persist: bool| {
-            let temp_dir = tempfile::TempDir::new().unwrap();
-            let mut config = TikvConfig::default();
-            config.cfg_path = temp_dir
-                .path()
-                .join("tikv.toml")
-                .to_str()
-                .unwrap()
-                .to_string();
-            let mut status_server = StatusServer::new(
-                1,
-                ConfigController::new(config),
-                Arc::new(SecurityConfig::default()),
-                MockRouter,
-                temp_dir.path().to_path_buf(),
-                None,
-                GrpcServiceManager::dummy(),
-            )
-            .unwrap();
-            let addr = "127.0.0.1:0".to_owned();
-            let _ = status_server.start(addr);
-            let client = Client::new();
-            let uri = if persist {
-                Uri::builder()
-                    .scheme("http")
-                    .authority(status_server.listening_addr().to_string().as_str())
-                    .path_and_query("/config")
-                    .build()
-                    .unwrap()
-            } else {
-                Uri::builder()
-                    .scheme("http")
-                    .authority(status_server.listening_addr().to_string().as_str())
-                    .path_and_query("/config?persist=false")
-                    .build()
-                    .unwrap()
-            };
-            let mut req = Request::new(Body::from("{\"coprocessor.region-split-size\": \"1GB\"}"));
-            *req.method_mut() = Method::POST;
-            *req.uri_mut() = uri.clone();
-            let handle = status_server.thread_pool.spawn(async move {
-                let resp = client.request(req).await.unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
-            });
-            block_on(handle).unwrap();
-
-            let client = Client::new();
-            let handle2 = status_server.thread_pool.spawn(async move {
-                let resp = client.get(uri).await.unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
-                let mut v = Vec::new();
-                resp.into_body()
-                    .try_for_each(|bytes| {
-                        v.extend(bytes);
-                        ok(())
-                    })
-                    .await
-                    .unwrap();
-                let resp_json = String::from_utf8_lossy(&v).to_string();
-                assert!(resp_json.contains("\"region-split-size\":\"1GiB\""));
-            });
-            block_on(handle2).unwrap();
-            status_server.stop();
-        };
-        test_config(true);
-        test_config(false);
     }
 
     #[cfg(feature = "failpoints")]

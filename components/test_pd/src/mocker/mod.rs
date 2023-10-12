@@ -3,11 +3,7 @@
 use std::result;
 
 use futures::executor::block_on;
-use kvproto::{
-    meta_storagepb as mpb,
-    pdpb::*,
-    resource_manager::{TokenBucketsRequest, TokenBucketsResponse},
-};
+use kvproto::{meta_storagepb as mpb, pdpb::*};
 
 mod bootstrap;
 pub mod etcd;
@@ -218,13 +214,6 @@ pub trait PdMocker {
     }
 
     fn get_operator(&self, _: &GetOperatorRequest) -> Option<Result<GetOperatorResponse>> {
-        None
-    }
-
-    fn report_ru_metrics(&self, req: &TokenBucketsRequest) -> Option<Result<TokenBucketsResponse>> {
-        req.get_requests().iter().for_each(|r| {
-            assert_eq!(r.get_is_background(), true);
-        });
         None
     }
 }

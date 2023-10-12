@@ -182,7 +182,6 @@ where
     pub abort: Arc<AtomicUsize>,
     pub write_batch_size: usize,
     pub coprocessor_host: CoprocessorHost<EK>,
-    pub ingest_copy_symlink: bool,
 }
 
 // A helper function to copy snapshot.
@@ -771,26 +770,32 @@ impl Snapshot {
         )
     }
 
-    fn validate<F>(&self, post_check: F) -> RaftStoreResult<()>
-    where
-        F: Fn(&CfFile, usize) -> RaftStoreResult<()>,
-    {
+    fn validate(&self, for_send: bool) -> RaftStoreResult<()> {
         for cf_file in &self.cf_files {
             let file_paths = cf_file.file_paths();
-            for i in 0..file_paths.len() {
+            let clone_file_paths = cf_file.clone_file_paths();
+            for (i, file_path) in file_paths.iter().enumerate() {
                 if cf_file.size[i] == 0 {
                     // Skip empty file. The checksum of this cf file should be 0 and
                     // this is checked when loading the snapshot meta.
                     continue;
                 }
 
+                let file_path = Path::new(file_path);
                 check_file_size_and_checksum(
-                    Path::new(&file_paths[i]),
+                    file_path,
                     cf_file.size[i],
                     cf_file.checksum[i],
                     self.mgr.encryption_key_manager.as_ref(),
                 )?;
-                post_check(cf_file, i)?;
+
+                if !for_send && !plain_file_used(cf_file.cf) {
+                    sst_importer::prepare_sst_for_ingestion(
+                        file_path,
+                        Path::new(&clone_file_paths[i]),
+                        self.mgr.encryption_key_manager.as_deref(),
+                    )?;
+                }
             }
         }
         Ok(())
@@ -846,7 +851,7 @@ impl Snapshot {
     {
         fail_point!("snapshot_enter_do_build");
         if self.exists() {
-            match self.validate(|_, _| -> RaftStoreResult<()> { Ok(()) }) {
+            match self.validate(true) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     error!(?e;
@@ -900,7 +905,7 @@ impl Snapshot {
                 }
                 if let Some(ref mgr) = self.mgr.encryption_key_manager {
                     for tmp_file_path in cf_file.tmp_file_paths() {
-                        mgr.delete_file(&tmp_file_path, None)?;
+                        mgr.delete_file(&tmp_file_path)?;
                     }
                 }
             }
@@ -948,7 +953,7 @@ impl Snapshot {
                     if file_exists(&file_path) {
                         delete_file_if_exist(&file_path).unwrap();
                         if let Some(ref mgr) = self.mgr.encryption_key_manager {
-                            mgr.delete_file(file_path.to_str().unwrap(), None).unwrap();
+                            mgr.delete_file(file_path.to_str().unwrap()).unwrap();
                         }
                         file_id += 1;
                     } else {
@@ -998,7 +1003,7 @@ impl Snapshot {
                 }
                 if let Some(ref mgr) = self.mgr.encryption_key_manager {
                     for file_path in &file_paths {
-                        mgr.delete_file(file_path, None).unwrap();
+                        mgr.delete_file(file_path).unwrap();
                     }
                 }
             }
@@ -1098,28 +1103,7 @@ impl Snapshot {
     }
 
     pub fn apply<EK: KvEngine>(&mut self, options: ApplyOptions<EK>) -> Result<()> {
-        let post_check = |cf_file: &CfFile, offset: usize| {
-            if !plain_file_used(cf_file.cf) {
-                let file_paths = cf_file.file_paths();
-                let clone_file_paths = cf_file.clone_file_paths();
-                if options.ingest_copy_symlink && is_symlink(&file_paths[offset])? {
-                    sst_importer::copy_sst_for_ingestion(
-                        &file_paths[offset],
-                        &clone_file_paths[offset],
-                        self.mgr.encryption_key_manager.as_deref(),
-                    )?;
-                } else {
-                    sst_importer::prepare_sst_for_ingestion(
-                        &file_paths[offset],
-                        &clone_file_paths[offset],
-                        self.mgr.encryption_key_manager.as_deref(),
-                    )?;
-                }
-            }
-            Ok(())
-        };
-
-        box_try!(self.validate(post_check));
+        box_try!(self.validate(false));
 
         let abort_checker = ApplyAbortChecker(options.abort);
         let coprocessor_host = options.coprocessor_host;
@@ -1916,14 +1900,14 @@ impl SnapManagerCore {
                 // because without metadata file, saved cf files are nothing.
                 while let Err(e) = mgr.link_file(src, dst) {
                     if e.kind() == ErrorKind::AlreadyExists {
-                        mgr.delete_file(dst, None)?;
+                        mgr.delete_file(dst)?;
                         continue;
                     }
                     return Err(e.into());
                 }
                 let r = file_system::rename(src, dst);
                 let del_file = if r.is_ok() { src } else { dst };
-                if let Err(e) = mgr.delete_file(del_file, None) {
+                if let Err(e) = mgr.delete_file(del_file) {
                     warn!("fail to remove encryption metadata during 'rename_tmp_cf_file_for_send'";
                           "err" => ?e);
                 }
@@ -2054,22 +2038,6 @@ impl TabletSnapKey {
         let term = snap.get_metadata().get_term();
         TabletSnapKey::new(region_id, to_peer, term, index)
     }
-
-    pub fn from_path<T: Into<PathBuf>>(path: T) -> Result<TabletSnapKey> {
-        let path = path.into();
-        let name = path.file_name().unwrap().to_str().unwrap();
-        let numbers: Vec<u64> = name
-            .split('_')
-            .skip(1)
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if numbers.len() < 4 {
-            return Err(box_err!("invalid tablet snapshot file name:{}", name));
-        }
-        Ok(TabletSnapKey::new(
-            numbers[0], numbers[1], numbers[2], numbers[3],
-        ))
-    }
 }
 
 impl Display for TabletSnapKey {
@@ -2190,7 +2158,6 @@ impl TabletSnapManager {
 
     pub fn delete_snapshot(&self, key: &TabletSnapKey) -> bool {
         let path = self.tablet_gen_path(key);
-        debug!("delete tablet snapshot file";"path" => %path.display());
         if path.exists() {
             if let Err(e) = encryption::trash_dir_all(&path, self.key_manager.as_deref()) {
                 error!(
@@ -2202,26 +2169,6 @@ impl TabletSnapManager {
             }
         }
         true
-    }
-
-    pub fn list_snapshot(&self) -> Result<Vec<PathBuf>> {
-        let mut paths = Vec::new();
-        for entry in file_system::read_dir(&self.base)? {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) => return Err(Error::from(e)),
-            };
-
-            let path = entry.path();
-            if path.file_name().and_then(|n| n.to_str()).map_or(true, |n| {
-                !n.starts_with(SNAP_GEN_PREFIX) || n.ends_with(TMP_FILE_SUFFIX)
-            }) {
-                continue;
-            }
-            paths.push(path);
-        }
-        Ok(paths)
     }
 
     pub fn total_snap_size(&self) -> Result<u64> {
@@ -2287,11 +2234,6 @@ impl TabletSnapManager {
     pub fn key_manager(&self) -> &Option<Arc<DataKeyManager>> {
         &self.key_manager
     }
-}
-
-fn is_symlink<P: AsRef<Path>>(path: P) -> Result<bool> {
-    let metadata = box_try!(std::fs::symlink_metadata(path));
-    Ok(metadata.is_symlink())
 }
 
 #[cfg(test)]
@@ -2700,7 +2642,6 @@ pub mod tests {
             abort: Arc::new(AtomicUsize::new(JOB_STATUS_RUNNING)),
             write_batch_size: TEST_WRITE_BATCH_SIZE,
             coprocessor_host: CoprocessorHost::<KvTestEngine>::default(),
-            ingest_copy_symlink: false,
         };
         // Verify the snapshot applying is ok.
         s4.apply(options).unwrap();
@@ -2945,7 +2886,6 @@ pub mod tests {
             abort: Arc::new(AtomicUsize::new(JOB_STATUS_RUNNING)),
             write_batch_size: TEST_WRITE_BATCH_SIZE,
             coprocessor_host: CoprocessorHost::<KvTestEngine>::default(),
-            ingest_copy_symlink: false,
         };
         s5.apply(options).unwrap_err();
 
@@ -3399,16 +3339,5 @@ pub mod tests {
         let snap_mgr = builder.build(path.to_str().unwrap());
         snap_mgr.init().unwrap();
         assert!(path.exists());
-    }
-
-    #[test]
-    fn test_from_path() {
-        let snap_dir = Builder::new().prefix("test_from_path").tempdir().unwrap();
-        let path = snap_dir.path().join("gen_1_2_3_4");
-        let key = TabletSnapKey::from_path(path).unwrap();
-        let expect_key = TabletSnapKey::new(1, 2, 3, 4);
-        assert_eq!(expect_key, key);
-        let path = snap_dir.path().join("gen_1_2_3_4.tmp");
-        TabletSnapKey::from_path(path).unwrap_err();
     }
 }

@@ -31,7 +31,7 @@ use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_traits::{
     util::SequenceNumber, DeleteStrategy, KvEngine, Mutable, PerfContext, PerfContextKind,
     RaftEngine, RaftEngineReadOnly, Range as EngineRange, Snapshot, SstMetaInfo, WriteBatch,
-    WriteOptions, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
+    ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
 };
 use fail::fail_point;
 use kvproto::{
@@ -1949,9 +1949,8 @@ where
                     e
                 )
             };
-            let wopts = WriteOptions::default();
             engine
-                .delete_ranges_cf(&wopts, cf, DeleteStrategy::DeleteFiles, &range)
+                .delete_ranges_cf(cf, DeleteStrategy::DeleteFiles, &range)
                 .unwrap_or_else(|e| fail_f(e, DeleteStrategy::DeleteFiles));
 
             let strategy = if use_delete_range {
@@ -1961,10 +1960,10 @@ where
             };
             // Delete all remaining keys.
             engine
-                .delete_ranges_cf(&wopts, cf, strategy.clone(), &range)
+                .delete_ranges_cf(cf, strategy.clone(), &range)
                 .unwrap_or_else(move |e| fail_f(e, strategy));
             engine
-                .delete_ranges_cf(&wopts, cf, DeleteStrategy::DeleteBlobs, &range)
+                .delete_ranges_cf(cf, DeleteStrategy::DeleteBlobs, &range)
                 .unwrap_or_else(move |e| fail_f(e, DeleteStrategy::DeleteBlobs));
         }
 
@@ -2115,14 +2114,14 @@ where
 
         match change_type {
             ConfChangeType::AddNode => {
-                let add_node_fp = || {
+                let add_ndoe_fp = || {
                     fail_point!(
                         "apply_on_add_node_1_2",
                         self.id() == 2 && self.region_id() == 1,
                         |_| {}
                     )
                 };
-                add_node_fp();
+                add_ndoe_fp();
 
                 PEER_ADMIN_CMD_COUNTER_VEC
                     .with_label_values(&["add_peer", "all"])
@@ -2385,8 +2384,8 @@ where
                             "region_id" => self.region_id(),
                             "peer_id" => self.id(),
                             "peer" => ?peer,
-                            "exist_peer" => ?exist_peer,
-                            "confchange_type" => ?change_type,
+                            "exist peer" => ?exist_peer,
+                            "confchange type" => ?change_type,
                             "region" => ?&self.region
                         );
                         return Err(box_err!(
@@ -5065,14 +5064,7 @@ mod tests {
     pub fn create_tmp_importer(path: &str) -> (TempDir, Arc<SstImporter>) {
         let dir = Builder::new().prefix(path).tempdir().unwrap();
         let importer = Arc::new(
-            SstImporter::new(
-                &ImportConfig::default(),
-                dir.path(),
-                None,
-                ApiVersion::V1,
-                false,
-            )
-            .unwrap(),
+            SstImporter::new(&ImportConfig::default(), dir.path(), None, ApiVersion::V1).unwrap(),
         );
         (dir, importer)
     }
@@ -5384,9 +5376,6 @@ mod tests {
         reg.apply_state.set_applied_index(3);
         router.schedule_task(2, Msg::Registration(reg.dup()));
         validate(&router, 2, move |delegate| {
-            // Migrated to 2021 migration. This let statement is probably not needed, see
-            //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
-            let _ = &reg;
             assert_eq!(delegate.id(), 1);
             assert_eq!(delegate.peer, peer);
             assert_eq!(delegate.tag, "[region 2] 1");

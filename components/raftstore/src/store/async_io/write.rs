@@ -21,10 +21,7 @@ use engine_traits::{
 use error_code::ErrorCodeExt;
 use fail::fail_point;
 use file_system::{set_io_type, IoType};
-use kvproto::{
-    metapb::RegionEpoch,
-    raft_serverpb::{RaftLocalState, RaftMessage},
-};
+use kvproto::raft_serverpb::{RaftLocalState, RaftMessage};
 use parking_lot::Mutex;
 use protobuf::Message;
 use raft::eraftpb::Entry;
@@ -203,7 +200,6 @@ where
     pub messages: Vec<RaftMessage>,
     pub trackers: Vec<TimeTracker>,
     pub has_snapshot: bool,
-    pub flushed_epoch: Option<RegionEpoch>,
 }
 
 impl<EK, ER> WriteTask<EK, ER>
@@ -226,7 +222,6 @@ where
             trackers: vec![],
             persisted_cbs: Vec::new(),
             has_snapshot: false,
-            flushed_epoch: None,
         }
     }
 

@@ -717,12 +717,10 @@ impl Command {
         self.command_ext().get_ctx().get_priority()
     }
 
-    pub fn resource_control_ctx(&self) -> &ResourceControlContext {
-        self.command_ext().get_ctx().get_resource_control_context()
-    }
-
     pub fn group_name(&self) -> String {
-        self.resource_control_ctx()
+        self.command_ext()
+            .get_ctx()
+            .get_resource_control_context()
             .get_resource_group_name()
             .to_owned()
     }

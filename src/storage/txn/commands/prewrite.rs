@@ -951,7 +951,7 @@ fn handle_1pc_locks(txn: &mut MvccTxn, commit_ts: TimeStamp) -> ReleasedLocks {
             txn.start_ts,
             lock.short_value,
         )
-        .set_last_change(lock.last_change)
+        .set_last_change(lock.last_change_ts, lock.versions_to_last_change)
         .set_txn_source(lock.txn_source);
         // Transactions committed with 1PC should be impossible to overwrite rollback
         // records.
@@ -978,7 +978,7 @@ mod tests {
     use engine_rocks::ReadPerfInstant;
     use engine_traits::CF_WRITE;
     use kvproto::kvrpcpb::{Assertion, Context, ExtraOp};
-    use txn_types::{Key, LastChange, Mutation, TimeStamp};
+    use txn_types::{Key, Mutation, TimeStamp};
 
     use super::*;
     use crate::storage::{
@@ -2682,7 +2682,8 @@ mod tests {
         .unwrap();
         must_unlocked(&mut engine, key);
         let write = must_written(&mut engine, key, 30, res.one_pc_commit_ts, WriteType::Lock);
-        assert_eq!(write.last_change, LastChange::make_exist(20.into(), 1));
+        assert_eq!(write.last_change_ts, 20.into());
+        assert_eq!(write.versions_to_last_change, 1);
 
         // 1PC write another LOCK
         let res = prewrite_with_cm(
@@ -2697,7 +2698,8 @@ mod tests {
         .unwrap();
         must_unlocked(&mut engine, key);
         let write = must_written(&mut engine, key, 50, res.one_pc_commit_ts, WriteType::Lock);
-        assert_eq!(write.last_change, LastChange::make_exist(20.into(), 2));
+        assert_eq!(write.last_change_ts, 20.into());
+        assert_eq!(write.versions_to_last_change, 2);
 
         // 1PC write a PUT
         let mutations = vec![Mutation::make_put(Key::from_raw(key), b"v2".to_vec())];
@@ -2713,7 +2715,8 @@ mod tests {
         .unwrap();
         must_unlocked(&mut engine, key);
         let write = must_written(&mut engine, key, 70, res.one_pc_commit_ts, WriteType::Put);
-        assert_eq!(write.last_change, LastChange::Unknown);
+        assert_eq!(write.last_change_ts, TimeStamp::zero());
+        assert_eq!(write.versions_to_last_change, 0);
 
         // TiKV 6.4 should not have last_change_ts.
         let feature_gate = FeatureGate::default();
@@ -2732,7 +2735,8 @@ mod tests {
         .unwrap();
         must_unlocked(&mut engine, key);
         let write = must_written(&mut engine, key, 80, res.one_pc_commit_ts, WriteType::Lock);
-        assert_eq!(write.last_change, LastChange::Unknown);
+        assert_eq!(write.last_change_ts, TimeStamp::zero());
+        assert_eq!(write.versions_to_last_change, 0);
     }
 
     #[test]
@@ -2766,7 +2770,8 @@ mod tests {
         .unwrap();
         must_unlocked(&mut engine, key);
         let write = must_written(&mut engine, key, 30, res.one_pc_commit_ts, WriteType::Lock);
-        assert_eq!(write.last_change, LastChange::make_exist(20.into(), 1));
+        assert_eq!(write.last_change_ts, 20.into());
+        assert_eq!(write.versions_to_last_change, 1);
 
         // Pessimistic 1PC write another LOCK
         must_acquire_pessimistic_lock(&mut engine, key, key, 50, 50);
@@ -2783,7 +2788,8 @@ mod tests {
         .unwrap();
         must_unlocked(&mut engine, key);
         let write = must_written(&mut engine, key, 50, res.one_pc_commit_ts, WriteType::Lock);
-        assert_eq!(write.last_change, LastChange::make_exist(20.into(), 2));
+        assert_eq!(write.last_change_ts, 20.into());
+        assert_eq!(write.versions_to_last_change, 2);
 
         // Pessimistic 1PC write a PUT
         must_acquire_pessimistic_lock(&mut engine, key, key, 70, 70);
@@ -2804,7 +2810,8 @@ mod tests {
         .unwrap();
         must_unlocked(&mut engine, key);
         let write = must_written(&mut engine, key, 70, res.one_pc_commit_ts, WriteType::Put);
-        assert_eq!(write.last_change, LastChange::Unknown);
+        assert_eq!(write.last_change_ts, TimeStamp::zero());
+        assert_eq!(write.versions_to_last_change, 0);
 
         // TiKV 6.4 should not have last_change_ts.
         let feature_gate = FeatureGate::default();
@@ -2825,7 +2832,8 @@ mod tests {
         .unwrap();
         must_unlocked(&mut engine, key);
         let write = must_written(&mut engine, key, 80, res.one_pc_commit_ts, WriteType::Lock);
-        assert_eq!(write.last_change, LastChange::Unknown);
+        assert_eq!(write.last_change_ts, TimeStamp::zero());
+        assert_eq!(write.versions_to_last_change, 0);
     }
 
     #[test]

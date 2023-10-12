@@ -1,22 +1,20 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-// Created from https://www.unicode.org/Public/UCA/4.0.0/allkeys-4.0.0.txt
+use super::*;
 
-use super::{super::PADDING_SPACE, UnicodeVersion};
-
-static LONG_RUNE: u64 = 0xFFFD;
-
+/// Collator for `utf8mb4_unicode_ci` collation with padding behavior (trims
+/// right spaces).
 #[derive(Debug)]
-pub struct Unicode0400 {}
+pub struct CollatorUtf8Mb4UnicodeCi;
 
-impl UnicodeVersion for Unicode0400 {
-    #[inline]
-    fn preprocess(s: &str) -> &str {
-        s.trim_end_matches(PADDING_SPACE)
-    }
+impl Collator for CollatorUtf8Mb4UnicodeCi {
+    type Charset = CharsetUtf8mb4;
+    type Weight = u128;
+
+    const IS_CASE_INSENSITIVE: bool = true;
 
     #[inline]
-    fn char_weight(ch: char) -> u128 {
+    fn char_weight(ch: char) -> Self::Weight {
         let r = ch as usize;
         if r > 0xFFFF {
             return 0xFFFD;
@@ -29,7 +27,86 @@ impl UnicodeVersion for Unicode0400 {
 
         u as u128
     }
+
+    #[inline]
+    fn write_sort_key<W: BufferWriter>(writer: &mut W, bstr: &[u8]) -> Result<usize> {
+        let s = str::from_utf8(bstr)?.trim_end_matches(PADDING_SPACE);
+        let mut n = 0;
+        for ch in s.chars() {
+            let mut weight = Self::char_weight(ch);
+            while weight != 0 {
+                writer.write_u16_be((weight & 0xFFFF) as u16)?;
+                n += 1;
+                weight >>= 16
+            }
+        }
+        Ok(n * std::mem::size_of::<u16>())
+    }
+
+    #[inline]
+    fn sort_compare(a: &[u8], b: &[u8]) -> Result<Ordering> {
+        let mut ca = str::from_utf8(a)?.trim_end_matches(PADDING_SPACE).chars();
+        let mut cb = str::from_utf8(b)?.trim_end_matches(PADDING_SPACE).chars();
+        let mut an = 0;
+        let mut bn = 0;
+
+        loop {
+            if an == 0 {
+                for ach in &mut ca {
+                    an = Self::char_weight(ach);
+                    if an != 0 {
+                        break;
+                    }
+                }
+            }
+
+            if bn == 0 {
+                for bch in &mut cb {
+                    bn = Self::char_weight(bch);
+                    if bn != 0 {
+                        break;
+                    }
+                }
+            }
+
+            if an == 0 || bn == 0 {
+                return Ok(an.cmp(&bn));
+            }
+
+            if an == bn {
+                an = 0;
+                bn = 0;
+                continue;
+            }
+
+            while an != 0 && bn != 0 {
+                if (an ^ bn) & 0xFFFF == 0 {
+                    an >>= 16;
+                    bn >>= 16;
+                } else {
+                    return Ok((an & 0xFFFF).cmp(&(bn & 0xFFFF)));
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn sort_hash<H: Hasher>(state: &mut H, bstr: &[u8]) -> Result<()> {
+        let s = str::from_utf8(bstr)?.trim_end_matches(PADDING_SPACE);
+        for ch in s.chars() {
+            let mut weight = Self::char_weight(ch);
+            while weight != 0 {
+                (weight & 0xFFFF).hash(state);
+                weight >>= 16;
+            }
+        }
+        Ok(())
+    }
 }
+
+// Created from https://www.unicode.org/Public/UCA/4.0.0/allkeys-4.0.0.txt
+
+static LONG_RUNE: u64 = 0xFFFD;
 
 #[inline]
 fn map_long_rune(r: usize) -> u128 {

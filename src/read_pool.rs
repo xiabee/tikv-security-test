@@ -16,9 +16,7 @@ use futures::{channel::oneshot, future::TryFutureExt};
 use kvproto::{errorpb, kvrpcpb::CommandPri};
 use online_config::{ConfigChange, ConfigManager, ConfigValue, Result as CfgResult};
 use prometheus::{core::Metric, Histogram, IntCounter, IntGauge};
-use resource_control::{
-    with_resource_limiter, ControlledFuture, ResourceController, ResourceLimiter, TaskMetadata,
-};
+use resource_control::{ControlledFuture, ResourceController};
 use thiserror::Error;
 use tikv_util::{
     sys::{cpu_time::ProcessStat, SysQuota},
@@ -122,8 +120,7 @@ impl ReadPoolHandle {
         f: F,
         priority: CommandPri,
         task_id: u64,
-        metadata: TaskMetadata<'_>,
-        resource_limiter: Option<Arc<ResourceLimiter>>,
+        group_meta: Vec<u8>,
     ) -> Result<(), ReadPoolError>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -164,21 +161,17 @@ impl ReadPoolHandle {
                     CommandPri::Normal => None,
                     CommandPri::Low => Some(2),
                 };
-                let group_name = metadata.group_name().to_owned();
                 let mut extras = Extras::new_multilevel(task_id, fixed_level);
-                extras.set_metadata(metadata.to_vec());
+                extras.set_metadata(group_meta.clone());
                 let task_cell = if let Some(resource_ctl) = resource_ctl {
                     TaskCell::new(
-                        TrackedFuture::new(with_resource_limiter(
-                            ControlledFuture::new(
-                                async move {
-                                    f.await;
-                                    running_tasks.dec();
-                                },
-                                resource_ctl.clone(),
-                                group_name,
-                            ),
-                            resource_limiter,
+                        TrackedFuture::new(ControlledFuture::new(
+                            async move {
+                                f.await;
+                                running_tasks.dec();
+                            },
+                            resource_ctl.clone(),
+                            group_meta,
                         )),
                         extras,
                     )
@@ -202,8 +195,7 @@ impl ReadPoolHandle {
         f: F,
         priority: CommandPri,
         task_id: u64,
-        metadata: TaskMetadata<'_>,
-        resource_limiter: Option<Arc<ResourceLimiter>>,
+        group_meta: Vec<u8>,
     ) -> impl Future<Output = Result<T, ReadPoolError>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -217,8 +209,7 @@ impl ReadPoolHandle {
             },
             priority,
             task_id,
-            metadata,
-            resource_limiter,
+            group_meta,
         );
         async move {
             res?;
@@ -813,24 +804,18 @@ mod tests {
         let (task3, _tx3) = gen_task();
         let (task4, _tx4) = gen_task();
 
-        handle
-            .spawn(task1, CommandPri::Normal, 1, TaskMetadata::default(), None)
-            .unwrap();
-        handle
-            .spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task1, CommandPri::Normal, 1, vec![]).unwrap();
+        handle.spawn(task2, CommandPri::Normal, 2, vec![]).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None) {
+        match handle.spawn(task3, CommandPri::Normal, 3, vec![]) {
             Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
         tx1.send(()).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        handle
-            .spawn(task4, CommandPri::Normal, 4, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task4, CommandPri::Normal, 4, vec![]).unwrap();
     }
 
     #[test]
@@ -862,15 +847,11 @@ mod tests {
         let (task4, _tx4) = gen_task();
         let (task5, _tx5) = gen_task();
 
-        handle
-            .spawn(task1, CommandPri::Normal, 1, TaskMetadata::default(), None)
-            .unwrap();
-        handle
-            .spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task1, CommandPri::Normal, 1, vec![]).unwrap();
+        handle.spawn(task2, CommandPri::Normal, 2, vec![]).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None) {
+        match handle.spawn(task3, CommandPri::Normal, 3, vec![]) {
             Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
@@ -878,12 +859,10 @@ mod tests {
         handle.scale_pool_size(3);
         assert_eq!(handle.get_normal_pool_size(), 3);
 
-        handle
-            .spawn(task4, CommandPri::Normal, 4, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task4, CommandPri::Normal, 4, vec![]).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task5, CommandPri::Normal, 5, TaskMetadata::default(), None) {
+        match handle.spawn(task5, CommandPri::Normal, 5, vec![]) {
             Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
@@ -918,15 +897,11 @@ mod tests {
         let (task4, _tx4) = gen_task();
         let (task5, _tx5) = gen_task();
 
-        handle
-            .spawn(task1, CommandPri::Normal, 1, TaskMetadata::default(), None)
-            .unwrap();
-        handle
-            .spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task1, CommandPri::Normal, 1, vec![]).unwrap();
+        handle.spawn(task2, CommandPri::Normal, 2, vec![]).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None) {
+        match handle.spawn(task3, CommandPri::Normal, 3, vec![]) {
             Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
@@ -938,12 +913,10 @@ mod tests {
         handle.scale_pool_size(1);
         assert_eq!(handle.get_normal_pool_size(), 1);
 
-        handle
-            .spawn(task4, CommandPri::Normal, 4, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task4, CommandPri::Normal, 4, vec![]).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task5, CommandPri::Normal, 5, TaskMetadata::default(), None) {
+        match handle.spawn(task5, CommandPri::Normal, 5, vec![]) {
             Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
@@ -1043,12 +1016,8 @@ mod tests {
             let (task1, tx1) = gen_task();
             let (task2, tx2) = gen_task();
 
-            handle
-                .spawn(task1, CommandPri::Normal, 1, TaskMetadata::default(), None)
-                .unwrap();
-            handle
-                .spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None)
-                .unwrap();
+            handle.spawn(task1, CommandPri::Normal, 1, vec![]).unwrap();
+            handle.spawn(task2, CommandPri::Normal, 2, vec![]).unwrap();
 
             tx1.send(()).unwrap();
             tx2.send(()).unwrap();

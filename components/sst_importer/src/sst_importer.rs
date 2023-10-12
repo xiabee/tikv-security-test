@@ -4,7 +4,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fs::File,
-    io::{self, BufReader, ErrorKind, Read},
+    io::{self, BufReader, Read},
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 
-use collections::HashSet;
 use dashmap::{mapref::entry::Entry, DashMap};
 use encryption::{to_engine_encryption_method, DataKeyManager};
 use engine_rocks::{get_env, RocksSstReader};
@@ -29,19 +28,17 @@ use external_storage_export::{
 use file_system::{get_io_rate_limiter, IoType, OpenOptions};
 use kvproto::{
     brpb::{CipherInfo, StorageBackend},
-    import_sstpb::{Range, *},
+    import_sstpb::*,
     kvrpcpb::ApiVersion,
-    metapb::Region,
 };
 use tikv_util::{
     codec::{
         bytes::{decode_bytes_in_place, encode_bytes},
         stream_event::{EventEncoder, EventIterator, Iterator as EIterator},
     },
-    future::RescheduleChecker,
     sys::{thread::ThreadBuildWrapper, SysQuota},
     time::{Instant, Limiter},
-    Either, HandyRwLock,
+    HandyRwLock,
 };
 use tokio::{
     runtime::{Handle, Runtime},
@@ -53,7 +50,6 @@ use crate::{
     caching::cache_map::{CacheMap, ShareOwned},
     import_file::{ImportDir, ImportFile},
     import_mode::{ImportModeSwitcher, RocksDbMetricsFn},
-    import_mode2::{HashRange, ImportModeSwitcherV2},
     metrics::*,
     sst_writer::{RawSstWriter, TxnSstWriter},
     util, Config, ConfigManager as ImportConfigManager, Error, Result,
@@ -156,7 +152,7 @@ impl CacheKvFile {
 pub struct SstImporter {
     dir: ImportDir,
     key_manager: Option<Arc<DataKeyManager>>,
-    switcher: Either<ImportModeSwitcher, ImportModeSwitcherV2>,
+    switcher: ImportModeSwitcher,
     // TODO: lift api_version as a type parameter.
     api_version: ApiVersion,
     compression_types: HashMap<CfName, SstCompressionType>,
@@ -175,13 +171,8 @@ impl SstImporter {
         root: P,
         key_manager: Option<Arc<DataKeyManager>>,
         api_version: ApiVersion,
-        raft_kv_v2: bool,
     ) -> Result<SstImporter> {
-        let switcher = if raft_kv_v2 {
-            Either::Right(ImportModeSwitcherV2::new(cfg))
-        } else {
-            Either::Left(ImportModeSwitcher::new(cfg))
-        };
+        let switcher = ImportModeSwitcher::new(cfg);
         let cached_storage = CacheMap::default();
         // We are going to run some background tasks here, (hyper needs to maintain the
         // connection, the cache map needs gc intervally.) so we must create a
@@ -190,12 +181,13 @@ impl SstImporter {
         let download_rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("sst_import_misc")
-            .with_sys_and_custom_hooks(
-                || {
-                    file_system::set_io_type(IoType::Import);
-                },
-                || {},
-            )
+            .after_start_wrapper(|| {
+                tikv_alloc::add_thread_memory_accessor();
+                file_system::set_io_type(IoType::Import);
+            })
+            .before_stop_wrapper(|| {
+                tikv_alloc::remove_thread_memory_accessor();
+            })
             .enable_all()
             .build()?;
         download_rt.spawn(cached_storage.gc_loop());
@@ -223,48 +215,6 @@ impl SstImporter {
         })
     }
 
-    pub fn ranges_enter_import_mode(&self, ranges: Vec<Range>) {
-        if let Either::Right(ref switcher) = self.switcher {
-            switcher.ranges_enter_import_mode(ranges)
-        } else {
-            unreachable!();
-        }
-    }
-
-    pub fn clear_import_mode_regions(&self, ranges: Vec<Range>) {
-        if let Either::Right(ref switcher) = self.switcher {
-            switcher.clear_import_mode_range(ranges);
-        } else {
-            unreachable!();
-        }
-    }
-
-    // it always returns false for v1
-    pub fn region_in_import_mode(&self, region: &Region) -> bool {
-        if let Either::Right(ref switcher) = self.switcher {
-            switcher.region_in_import_mode(region)
-        } else {
-            false
-        }
-    }
-
-    // it always returns false for v1
-    pub fn range_in_import_mode(&self, range: &Range) -> bool {
-        if let Either::Right(ref switcher) = self.switcher {
-            switcher.range_in_import_mode(range)
-        } else {
-            false
-        }
-    }
-
-    pub fn ranges_in_import(&self) -> HashSet<HashRange> {
-        if let Either::Right(ref switcher) = self.switcher {
-            switcher.ranges_in_import()
-        } else {
-            unreachable!()
-        }
-    }
-
     fn calcualte_usage_mem(mem_ratio: f64) -> u64 {
         ((SysQuota::memory_limit_in_bytes() as f64) * mem_ratio) as u64
     }
@@ -281,33 +231,13 @@ impl SstImporter {
         }
     }
 
-    pub fn start_switch_mode_check<E: KvEngine>(&self, executor: &Handle, db: Option<E>) {
-        match &self.switcher {
-            Either::Left(switcher) => switcher.start(executor, db.unwrap()),
-            Either::Right(switcher) => switcher.start(executor),
-        }
+    pub fn start_switch_mode_check<E: KvEngine>(&self, executor: &Handle, db: E) {
+        self.switcher.start(executor, db);
     }
 
     pub fn get_path(&self, meta: &SstMeta) -> PathBuf {
         let path = self.dir.join(meta).unwrap();
         path.save
-    }
-
-    pub fn get_total_size(&self) -> Result<u64> {
-        let mut total_size = 0;
-        for entry in file_system::read_dir(self.dir.get_root_dir())? {
-            match entry.and_then(|e| e.metadata().map(|m| (e, m))) {
-                Ok((_, m)) => {
-                    if !m.is_file() {
-                        continue;
-                    }
-                    total_size += m.len();
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) => return Err(Error::from(e)),
-            };
-        }
-        Ok(total_size)
     }
 
     pub fn create(&self, meta: &SstMeta) -> Result<ImportFile> {
@@ -436,29 +366,15 @@ impl SstImporter {
     }
 
     pub fn enter_normal_mode<E: KvEngine>(&self, db: E, mf: RocksDbMetricsFn) -> Result<bool> {
-        if let Either::Left(ref switcher) = self.switcher {
-            switcher.enter_normal_mode(&db, mf)
-        } else {
-            unreachable!();
-        }
+        self.switcher.enter_normal_mode(&db, mf)
     }
 
     pub fn enter_import_mode<E: KvEngine>(&self, db: E, mf: RocksDbMetricsFn) -> Result<bool> {
-        if let Either::Left(ref switcher) = self.switcher {
-            switcher.enter_import_mode(&db, mf)
-        } else {
-            unreachable!();
-        }
+        self.switcher.enter_import_mode(&db, mf)
     }
 
     pub fn get_mode(&self) -> SwitchMode {
-        if let Either::Left(ref switcher) = self.switcher {
-            switcher.get_mode()
-        } else {
-            // v2 should use region_in_import_mode/range_in_import_mode to check regional
-            // mode
-            SwitchMode::Normal
-        }
+        self.switcher.get_mode()
     }
 
     #[cfg(test)]
@@ -569,7 +485,7 @@ impl SstImporter {
         if self.mem_limit.load(Ordering::SeqCst) != memory_limit {
             self.mem_limit.store(memory_limit, Ordering::SeqCst);
             info!("update importer config";
-                "memory_use_ratio" => mem_ratio,
+                "memory-use-ratio" => mem_ratio,
                 "size" => memory_limit,
             )
         }
@@ -615,7 +531,7 @@ impl SstImporter {
         if self.import_support_download() {
             let shrink_file_count = shrink_files.len();
             if shrink_file_count > 0 || retain_file_count > 0 {
-                info!("shrink space by tick"; "shrink_files_count" => shrink_file_count, "retain_files_count" => retain_file_count);
+                info!("shrink space by tick"; "shrink files count" => shrink_file_count, "retain files count" => retain_file_count);
             }
 
             for f in shrink_files {
@@ -626,7 +542,7 @@ impl SstImporter {
             shrink_file_count
         } else {
             if shrink_buff_size > 0 || retain_buff_size > 0 {
-                info!("shrink cache by tick"; "shrink_size" => shrink_buff_size, "retain_size" => retain_buff_size);
+                info!("shrink cache by tick"; "shrink size" => shrink_buff_size, "retain size" => retain_buff_size);
             }
             shrink_buff_size
         }
@@ -659,6 +575,7 @@ impl SstImporter {
     async fn exec_download(
         &self,
         meta: &KvMeta,
+        rewrite_rule: &RewriteRule,
         ext_storage: Arc<dyn external_storage_export::ExternalStorage>,
         speed_limiter: &Limiter,
     ) -> Result<LoadedFile> {
@@ -706,8 +623,9 @@ impl SstImporter {
             .with_label_values(&["exec_download"])
             .observe(start.saturating_elapsed().as_secs_f64());
 
+        let rewrite_buff = self.rewrite_kv_file(buff, rewrite_rule)?;
         Ok(LoadedFile {
-            content: Arc::from(buff.into_boxed_slice()),
+            content: Arc::from(rewrite_buff.into_boxed_slice()),
             permit,
         })
     }
@@ -715,6 +633,7 @@ impl SstImporter {
     pub async fn do_read_kv_file(
         &self,
         meta: &KvMeta,
+        rewrite_rule: &RewriteRule,
         ext_storage: Arc<dyn external_storage_export::ExternalStorage>,
         speed_limiter: &Limiter,
     ) -> Result<CacheKvFile> {
@@ -755,7 +674,7 @@ impl SstImporter {
         }
 
         cache
-            .get_or_try_init(|| self.exec_download(meta, ext_storage, speed_limiter))
+            .get_or_try_init(|| self.exec_download(meta, rewrite_rule, ext_storage, speed_limiter))
             .await?;
         Ok(CacheKvFile::Mem(cache))
     }
@@ -828,6 +747,7 @@ impl SstImporter {
     pub async fn read_from_kv_file(
         &self,
         meta: &KvMeta,
+        rewrite_rule: &RewriteRule,
         ext_storage: Arc<dyn external_storage_export::ExternalStorage>,
         backend: &StorageBackend,
         speed_limiter: &Limiter,
@@ -836,7 +756,7 @@ impl SstImporter {
             self.do_download_kv_file(meta, backend, speed_limiter)
                 .await?
         } else {
-            self.do_read_kv_file(meta, ext_storage, speed_limiter)
+            self.do_read_kv_file(meta, rewrite_rule, ext_storage, speed_limiter)
                 .await?
         };
         match c {
@@ -854,7 +774,8 @@ impl SstImporter {
                 let mut buffer = Vec::new();
                 reader.read_to_end(&mut buffer)?;
 
-                Ok(Arc::from(buffer.into_boxed_slice()))
+                let rewrite_buff = self.rewrite_kv_file(buffer, rewrite_rule)?;
+                Ok(Arc::from(rewrite_buff.into_boxed_slice()))
             }
         }
     }
@@ -952,11 +873,7 @@ impl SstImporter {
 
         // perform iteration and key rewrite.
         let mut new_buff = Vec::with_capacity(file_buff.len());
-        let mut event_iter = EventIterator::with_rewriting(
-            file_buff.as_slice(),
-            rewrite_rule.get_old_key_prefix(),
-            rewrite_rule.get_new_key_prefix(),
-        );
+        let mut event_iter = EventIterator::new(file_buff.as_slice());
         let mut key = new_prefix.to_vec();
         let new_prefix_data_key_len = key.len();
 
@@ -999,14 +916,9 @@ impl SstImporter {
         start_ts: u64,
         restore_ts: u64,
         file_buff: Arc<[u8]>,
-        rewrite_rule: &RewriteRule,
         mut build_fn: impl FnMut(Vec<u8>, Vec<u8>),
     ) -> Result<Option<Range>> {
-        let mut event_iter = EventIterator::with_rewriting(
-            file_buff.as_ref(),
-            rewrite_rule.get_old_key_prefix(),
-            rewrite_rule.get_new_key_prefix(),
-        );
+        let mut event_iter = EventIterator::new(file_buff.as_ref());
         let mut smallest_key = None;
         let mut largest_key = None;
         let mut total_key = 0;
@@ -1022,16 +934,6 @@ impl SstImporter {
             event_iter.next()?;
             INPORTER_APPLY_COUNT.with_label_values(&["key_meet"]).inc();
 
-            if !event_iter
-                .key()
-                .starts_with(rewrite_rule.get_new_key_prefix())
-            {
-                return Err(Error::WrongKeyPrefix {
-                    what: "do_apply_kv_file",
-                    key: event_iter.key().to_vec(),
-                    prefix: rewrite_rule.get_old_key_prefix().to_vec(),
-                });
-            }
             let key = event_iter.key().to_vec();
             let value = event_iter.value().to_vec();
             let ts = Key::decode_ts_from(&key)?;
@@ -1059,11 +961,10 @@ impl SstImporter {
             largest_key = largest_key
                 .map_or_else(|| Some(key.clone()), |v: Vec<u8>| Some(v.max(key.clone())));
         }
-        if not_in_range != 0 || ts_not_expected != 0 {
-            info!("build download request file done";
-                "total_keys" => %total_key,
-                "ts_filtered_keys" => %ts_not_expected,
-                "range_filtered_keys" => %not_in_range);
+        if total_key != not_in_range {
+            info!("build download request file done"; "total keys" => %total_key,
+            "ts filtered keys" => %ts_not_expected,
+            "range filtered keys" => %not_in_range);
         }
 
         IMPORTER_APPLY_DURATION
@@ -1248,7 +1149,7 @@ impl SstImporter {
                 key_manager.link_file(temp_str, save_str)?;
                 let r = file_system::rename(&path.temp, &path.save);
                 let del_file = if r.is_ok() { temp_str } else { save_str };
-                if let Err(e) = key_manager.delete_file(del_file, None) {
+                if let Err(e) = key_manager.delete_file(del_file) {
                     warn!("fail to remove encryption metadata during 'do_download'"; "err" => ?e);
                 }
                 r?;
@@ -1284,9 +1185,6 @@ impl SstImporter {
             .build(path.save.to_str().unwrap())
             .unwrap();
 
-        let mut yield_check =
-            RescheduleChecker::new(tokio::task::yield_now, Duration::from_millis(10));
-        let mut count = 0;
         while iter.valid()? {
             let mut old_key = Cow::Borrowed(keys::origin_key(iter.key()));
             let mut ts = None;
@@ -1350,11 +1248,6 @@ impl SstImporter {
             }
 
             sst_writer.put(&data_key, &value)?;
-            count += 1;
-            if count >= 1024 {
-                count = 0;
-                yield_check.check().await;
-            }
             iter.next()?;
             if first_key.is_none() {
                 first_key = Some(keys::origin_key(&data_key).to_vec());
@@ -2017,7 +1910,7 @@ mod tests {
             ..Default::default()
         };
         let import_dir = tempfile::tempdir().unwrap();
-        let importer = SstImporter::new(&cfg, import_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, import_dir, None, ApiVersion::V1).unwrap();
         let mem_limit_old = importer.mem_limit.load(Ordering::SeqCst);
 
         // create new config and get the diff config.
@@ -2069,7 +1962,6 @@ mod tests {
             import_dir,
             Some(key_manager),
             ApiVersion::V1,
-            false,
         )
         .unwrap();
         let ext_storage = {
@@ -2081,8 +1973,10 @@ mod tests {
         };
 
         // test do_read_kv_file()
+        let rewrite_rule = &new_rewrite_rule(b"", b"", 12345);
         let output = block_on_external_io(importer.do_read_kv_file(
             &kv_meta,
+            rewrite_rule,
             ext_storage,
             &Limiter::new(f64::INFINITY),
         ))
@@ -2127,7 +2021,6 @@ mod tests {
             import_dir,
             Some(key_manager),
             ApiVersion::V1,
-            false,
         )
         .unwrap();
         let ext_storage = {
@@ -2191,7 +2084,8 @@ mod tests {
             ..Default::default()
         };
         let importer =
-            SstImporter::new(&cfg, import_dir, Some(key_manager), ApiVersion::V1, false).unwrap();
+            SstImporter::new(&cfg, import_dir, Some(key_manager), ApiVersion::V1).unwrap();
+        let rewrite_rule = &new_rewrite_rule(b"", b"", 12345);
         let ext_storage = {
             importer.wrap_kms(
                 importer.external_storage_or_cache(&backend, "").unwrap(),
@@ -2209,6 +2103,7 @@ mod tests {
         assert!(importer.import_support_download());
         let output = block_on_external_io(importer.read_from_kv_file(
             &kv_meta,
+            rewrite_rule,
             ext_storage,
             &backend,
             &Limiter::new(f64::INFINITY),
@@ -2243,7 +2138,6 @@ mod tests {
             import_dir,
             Some(key_manager.clone()),
             ApiVersion::V1,
-            false,
         )
         .unwrap();
 
@@ -2280,7 +2174,6 @@ mod tests {
             import_dir,
             Some(key_manager),
             ApiVersion::V1,
-            false,
         )
         .unwrap();
 
@@ -2315,7 +2208,7 @@ mod tests {
         // performs the download.
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         let db = create_sst_test_engine().unwrap();
 
         let range = importer
@@ -2370,7 +2263,6 @@ mod tests {
             &importer_dir,
             Some(key_manager.clone()),
             ApiVersion::V1,
-            false,
         )
         .unwrap();
 
@@ -2424,7 +2316,7 @@ mod tests {
         // performs the download.
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         let db = create_sst_test_engine().unwrap();
 
         let range = importer
@@ -2469,7 +2361,7 @@ mod tests {
         // performs the download.
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
 
         // creates a sample SST file.
         let (_ext_sst_dir, backend, meta) = create_sample_external_sst_file_txn_default().unwrap();
@@ -2513,7 +2405,7 @@ mod tests {
         // performs the download.
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
 
         // creates a sample SST file.
         let (_ext_sst_dir, backend, meta) = create_sample_external_sst_file_txn_write().unwrap();
@@ -2579,8 +2471,7 @@ mod tests {
             // performs the download.
             let importer_dir = tempfile::tempdir().unwrap();
             let cfg = Config::default();
-            let importer =
-                SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+            let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
             let db = create_sst_test_engine().unwrap();
 
             let range = importer
@@ -2652,7 +2543,7 @@ mod tests {
         let (_ext_sst_dir, backend, mut meta) = create_sample_external_sst_file().unwrap();
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         let db = create_sst_test_engine().unwrap();
         // note: the range doesn't contain the DATA_PREFIX 'z'.
         meta.mut_range().set_start(b"t123_r02".to_vec());
@@ -2698,7 +2589,7 @@ mod tests {
         let (_ext_sst_dir, backend, mut meta) = create_sample_external_sst_file().unwrap();
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         let db = create_sst_test_engine().unwrap();
         meta.mut_range().set_start(b"t5_r02".to_vec());
         meta.mut_range().set_end(b"t5_r12".to_vec());
@@ -2745,7 +2636,7 @@ mod tests {
         meta.set_uuid(vec![0u8; 16]);
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         let db = create_sst_test_engine().unwrap();
         let backend = external_storage_export::make_local_backend(ext_sst_dir.path());
 
@@ -2770,7 +2661,7 @@ mod tests {
         let (_ext_sst_dir, backend, mut meta) = create_sample_external_sst_file().unwrap();
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         let db = create_sst_test_engine().unwrap();
         meta.mut_range().set_start(vec![b'x']);
         meta.mut_range().set_end(vec![b'y']);
@@ -2796,7 +2687,7 @@ mod tests {
         let (_ext_sst_dir, backend, meta) = create_sample_external_sst_file().unwrap();
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         let db = create_sst_test_engine().unwrap();
 
         let result = importer.download::<TestEngine>(
@@ -2833,7 +2724,7 @@ mod tests {
         // performs the download.
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, api_version, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, api_version).unwrap();
         let db = create_sst_test_engine().unwrap();
 
         let range = importer
@@ -2892,7 +2783,7 @@ mod tests {
         // performs the download.
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, api_version, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, api_version).unwrap();
         let db = create_sst_test_engine().unwrap();
 
         let range = importer
@@ -2947,7 +2838,7 @@ mod tests {
         // performs the download.
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let importer = SstImporter::new(&cfg, &importer_dir, None, api_version, false).unwrap();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, api_version).unwrap();
         let db = create_sst_test_engine().unwrap();
 
         let range = importer
@@ -2994,8 +2885,7 @@ mod tests {
         // performs the download.
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let mut importer =
-            SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let mut importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         importer.set_compression_type(CF_DEFAULT, Some(SstCompressionType::Snappy));
         let db = create_sst_test_engine().unwrap();
 
@@ -3027,8 +2917,7 @@ mod tests {
 
         let importer_dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let mut importer =
-            SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+        let mut importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
         importer.set_compression_type(CF_DEFAULT, Some(SstCompressionType::Zstd));
         let db_path = importer_dir.path().join("db");
         let db = new_test_engine(db_path.to_str().unwrap(), DATA_CFS);
@@ -3077,7 +2966,7 @@ mod tests {
     fn test_import_support_download() {
         let import_dir = tempfile::tempdir().unwrap();
         let importer =
-            SstImporter::new(&Config::default(), import_dir, None, ApiVersion::V1, false).unwrap();
+            SstImporter::new(&Config::default(), import_dir, None, ApiVersion::V1).unwrap();
         assert_eq!(importer.import_support_download(), false);
 
         let import_dir = tempfile::tempdir().unwrap();
@@ -3089,7 +2978,6 @@ mod tests {
             import_dir,
             None,
             ApiVersion::V1,
-            false,
         )
         .unwrap();
         assert_eq!(importer.import_support_download(), true);
@@ -3100,7 +2988,7 @@ mod tests {
         // create importer object.
         let import_dir = tempfile::tempdir().unwrap();
         let importer =
-            SstImporter::new(&Config::default(), import_dir, None, ApiVersion::V1, false).unwrap();
+            SstImporter::new(&Config::default(), import_dir, None, ApiVersion::V1).unwrap();
         assert_eq!(importer.mem_use.load(Ordering::SeqCst), 0);
 
         // test inc_mem_and_check() and dec_mem() successfully.
@@ -3128,7 +3016,7 @@ mod tests {
     fn test_dashmap_lock() {
         let import_dir = tempfile::tempdir().unwrap();
         let importer =
-            SstImporter::new(&Config::default(), import_dir, None, ApiVersion::V1, false).unwrap();
+            SstImporter::new(&Config::default(), import_dir, None, ApiVersion::V1).unwrap();
 
         let key = "file1";
         let r = Arc::new(OnceCell::new());

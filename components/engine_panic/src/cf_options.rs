@@ -65,7 +65,4 @@ impl CfOptions for PanicCfOptions {
     fn set_sst_partitioner_factory<F: SstPartitionerFactory>(&mut self, factory: F) {
         panic!()
     }
-    fn set_max_compactions(&self, n: u32) -> Result<()> {
-        panic!()
-    }
 }

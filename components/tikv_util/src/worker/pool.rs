@@ -16,7 +16,7 @@ use futures::{
     channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
     compat::{Future01CompatExt, Stream01CompatExt},
     executor::block_on,
-    future::FutureExt,
+    future::{self, FutureExt},
     stream::StreamExt,
 };
 use prometheus::IntGauge;
@@ -24,7 +24,7 @@ use yatp::{Remote, ThreadPool};
 
 use super::metrics::*;
 use crate::{
-    future::{block_on_timeout, poll_future_notify},
+    future::poll_future_notify,
     timer::GLOBAL_TIMER_HANDLE,
     yatp_pool::{DefaultTicker, YatpPoolBuilder},
 };
@@ -243,12 +243,18 @@ impl<T: Display + Send> ReceiverWrapper<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<T>, std::sync::mpsc::RecvTimeoutError> {
-        let msg = block_on_timeout(self.inner.next(), timeout)
-            .map_err(|_| std::sync::mpsc::RecvTimeoutError::Timeout)?;
-        if let Some(Msg::Task(t)) = msg {
-            return Ok(Some(t));
+        let deadline = Instant::now() + timeout;
+        let delay = GLOBAL_TIMER_HANDLE.delay(deadline).compat();
+        let ret = future::select(self.inner.next(), delay);
+        match block_on(ret) {
+            future::Either::Left((msg, _)) => {
+                if let Some(Msg::Task(t)) = msg {
+                    return Ok(Some(t));
+                }
+                Ok(None)
+            }
+            future::Either::Right(_) => Err(std::sync::mpsc::RecvTimeoutError::Timeout),
         }
-        Ok(None)
     }
 }
 

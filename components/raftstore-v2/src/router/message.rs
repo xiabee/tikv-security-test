@@ -1,22 +1,17 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::sync::{mpsc::SyncSender, Arc};
 
-use collections::HashSet;
 use kvproto::{
     import_sstpb::SstMeta,
     metapb,
     metapb::RegionEpoch,
-    pdpb,
     raft_cmdpb::{RaftCmdRequest, RaftRequestHeader},
     raft_serverpb::RaftMessage,
 };
 use raftstore::store::{
     fsm::ChangeObserver, metrics::RaftEventDurationType, simple_write::SimpleWriteBinary,
-    util::LatencyInspector, FetchedLogs, GenSnapRes, TabletSnapKey,
-    UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryFillOutReportSyncer,
-    UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer,
+    FetchedLogs, GenSnapRes,
 };
 use resource_control::ResourceMetered;
 use tikv_util::time::Instant;
@@ -26,7 +21,7 @@ use super::response_channel::{
     QueryResSubscriber,
 };
 use crate::{
-    operation::{CatchUpLogs, ReplayWatch, RequestHalfSplit, RequestSplit, SplitInit},
+    operation::{CatchUpLogs, RequestHalfSplit, RequestSplit, SplitInit},
     router::ApplyRes,
 };
 
@@ -146,7 +141,7 @@ pub struct UnsafeWrite {
 pub struct CaptureChange {
     pub observer: ChangeObserver,
     pub region_epoch: RegionEpoch,
-    // A callback accepts a snapshot.
+    // A callback accpets a snapshot.
     pub snap_cb: AnyResChannel,
 }
 
@@ -174,7 +169,7 @@ pub enum PeerMsg {
     LogsFetched(FetchedLogs),
     SnapshotGenerated(GenSnapRes),
     /// Start the FSM.
-    Start(Option<Arc<ReplayWatch>>),
+    Start,
     /// Messages from peer to peer in the same store
     SplitInit(Box<SplitInit>),
     SplitInitFinish(u64),
@@ -245,34 +240,6 @@ pub enum PeerMsg {
     /// A message that used to check if a flush is happened.
     #[cfg(feature = "testexport")]
     WaitFlush(super::FlushChannel),
-    FlushBeforeClose {
-        tx: SyncSender<()>,
-    },
-    /// A message that used to check if a snapshot gc is happened.
-    SnapGc(Box<[TabletSnapKey]>),
-
-    /// Let a peer enters force leader state during unsafe recovery.
-    EnterForceLeaderState {
-        syncer: UnsafeRecoveryForceLeaderSyncer,
-        failed_stores: HashSet<u64>,
-    },
-    /// Let a peer exits force leader state.
-    ExitForceLeaderState,
-    /// Let a peer campaign directly after exit force leader.
-    ExitForceLeaderStateCampaign,
-    /// Wait for a peer to apply to the latest commit index.
-    UnsafeRecoveryWaitApply(UnsafeRecoveryWaitApplySyncer),
-    /// Wait for a peer to fill its status to the report.
-    UnsafeRecoveryFillOutReport(UnsafeRecoveryFillOutReportSyncer),
-    /// Wait for a peer to be initialized.
-    UnsafeRecoveryWaitInitialized(UnsafeRecoveryExecutePlanSyncer),
-    /// Destroy a peer.
-    UnsafeRecoveryDestroy(UnsafeRecoveryExecutePlanSyncer),
-    // Demote failed voter peers.
-    UnsafeRecoveryDemoteFailedVoters {
-        failed_voters: Vec<metapb::Peer>,
-        syncer: UnsafeRecoveryExecutePlanSyncer,
-    },
 }
 
 impl ResourceMetered for PeerMsg {}
@@ -331,28 +298,6 @@ impl PeerMsg {
             sub,
         )
     }
-
-    #[cfg(feature = "testexport")]
-    pub fn request_split_with_callback(
-        epoch: metapb::RegionEpoch,
-        split_keys: Vec<Vec<u8>>,
-        source: String,
-        f: Box<dyn FnOnce(&mut kvproto::raft_cmdpb::RaftCmdResponse) + Send>,
-    ) -> (Self, CmdResSubscriber) {
-        let (ch, sub) = CmdResChannel::with_callback(f);
-        (
-            PeerMsg::RequestSplit {
-                request: RequestSplit {
-                    epoch,
-                    split_keys,
-                    source: source.into(),
-                    share_source_region_size: false,
-                },
-                ch,
-            },
-            sub,
-        )
-    }
 }
 
 #[derive(Debug)]
@@ -370,18 +315,6 @@ pub enum StoreMsg {
     WaitFlush {
         region_id: u64,
         ch: super::FlushChannel,
-    },
-    /// Inspect the latency of raftstore.
-    LatencyInspect {
-        send_time: Instant,
-        inspector: LatencyInspector,
-    },
-    /// Send a store report for unsafe recovery.
-    UnsafeRecoveryReport(pdpb::StoreReport),
-    /// Create a peer for unsafe recovery.
-    UnsafeRecoveryCreatePeer {
-        region: metapb::Region,
-        syncer: UnsafeRecoveryExecutePlanSyncer,
     },
 }
 

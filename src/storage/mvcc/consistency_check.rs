@@ -532,7 +532,6 @@ mod tests {
                 TimeStamp::zero(),
                 0,
                 TimeStamp::zero(),
-                false,
             );
             let value = lock.to_bytes();
             engine

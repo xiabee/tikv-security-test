@@ -160,9 +160,6 @@ impl BatchExecutorsRunner<()> {
                 ExecType::TypeExpand => {
                     other_err!("Expand executor not implemented");
                 }
-                ExecType::TypeExpand2 => {
-                    other_err!("Expand2 executor not implemented");
-                }
             }
         }
 
