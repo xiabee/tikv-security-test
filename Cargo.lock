@@ -2754,7 +2754,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.2"
-source = "git+https://github.com/pingcap/kvproto.git?branch=release-7.1#18d3a81835621d80f78a600da8334d7d0d7b51f2"
+source = "git+https://github.com/pingcap/kvproto.git?branch=release-7.1#f4a2db6417b657c65ea5d65374c954e3afa5acf0"
 dependencies = [
  "futures 0.3.15",
  "grpcio",
@@ -2819,7 +2819,7 @@ dependencies = [
 [[package]]
 name = "librocksdb_sys"
 version = "0.1.0"
-source = "git+https://github.com/tikv/rust-rocksdb.git#3282f221d2c84968d05b79dc13b73fc5539e27ad"
+source = "git+https://github.com/tikv/rust-rocksdb.git?branch=tikv-7.1#dd213275abc5613f22815323d7b77ee046bf6a86"
 dependencies = [
  "bindgen 0.57.0",
  "bzip2-sys",
@@ -2838,7 +2838,7 @@ dependencies = [
 [[package]]
 name = "libtitan_sys"
 version = "0.0.1"
-source = "git+https://github.com/tikv/rust-rocksdb.git#3282f221d2c84968d05b79dc13b73fc5539e27ad"
+source = "git+https://github.com/tikv/rust-rocksdb.git?branch=tikv-7.1#dd213275abc5613f22815323d7b77ee046bf6a86"
 dependencies = [
  "bzip2-sys",
  "cc",
@@ -4700,7 +4700,7 @@ dependencies = [
 [[package]]
 name = "rocksdb"
 version = "0.3.0"
-source = "git+https://github.com/tikv/rust-rocksdb.git#3282f221d2c84968d05b79dc13b73fc5539e27ad"
+source = "git+https://github.com/tikv/rust-rocksdb.git?branch=tikv-7.1#dd213275abc5613f22815323d7b77ee046bf6a86"
 dependencies = [
  "libc 0.2.139",
  "librocksdb_sys",
@@ -5362,10 +5362,14 @@ dependencies = [
  "engine_traits",
  "futures 0.3.15",
  "grpcio",
+ "itertools",
  "keys",
  "kvproto",
+ "lazy_static",
  "log",
  "pd_client",
+ "prometheus",
+ "prometheus-static-metric",
  "protobuf",
  "raft_log_engine",
  "raftstore",
@@ -5377,6 +5381,7 @@ dependencies = [
  "tikv",
  "tikv_alloc",
  "tikv_util",
+ "tokio",
  "toml",
  "txn_types",
 ]
@@ -5622,9 +5627,8 @@ checksum = "20518fe4a4c9acf048008599e464deb21beeae3d3578418951a189c235a7a9a8"
 
 [[package]]
 name = "sysinfo"
-version = "0.26.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ade661fa5e048ada64ad7901713301c21d2dbc5b65ee7967de8826c111452960"
+version = "0.26.9"
+source = "git+https://github.com/tikv/sysinfo?branch=0.26-fix-cpu#5a1bcf08816979624ef2ad79cfb896de432a9501"
 dependencies = [
  "cfg-if 1.0.0",
  "core-foundation-sys",
@@ -6266,7 +6270,7 @@ dependencies = [
 
 [[package]]
 name = "tikv"
-version = "7.1.1"
+version = "7.1.2"
 dependencies = [
  "anyhow",
  "api_version",
