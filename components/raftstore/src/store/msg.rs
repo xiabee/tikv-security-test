@@ -22,10 +22,9 @@ use kvproto::{
 #[cfg(any(test, feature = "testexport"))]
 use pd_client::BucketMeta;
 use raft::SnapshotStatus;
-use resource_control::ResourceMetered;
 use smallvec::{smallvec, SmallVec};
 use tikv_util::{deadline::Deadline, escape, memory::HeapSize, time::Instant};
-use tracker::{get_tls_tracker_token, TrackerToken};
+use tracker::{get_tls_tracker_token, TrackerToken, GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN};
 
 use super::{local_metrics::TimeTracker, region_meta::RegionMeta, FetchedLogs, RegionSnapshot};
 use crate::store::{
@@ -138,7 +137,16 @@ where
         proposed_cb: Option<ExtCallback>,
         committed_cb: Option<ExtCallback>,
     ) -> Self {
-        let tracker = TimeTracker::default();
+        let tracker_token = get_tls_tracker_token();
+        let now = std::time::Instant::now();
+        let tracker = if tracker_token == INVALID_TRACKER_TOKEN {
+            TimeTracker::Instant(now)
+        } else {
+            GLOBAL_TRACKERS.with_tracker(tracker_token, |tracker| {
+                tracker.metrics.write_instant = Some(now);
+            });
+            TimeTracker::Tracker(tracker_token)
+        };
 
         Callback::Write {
             cb,
@@ -209,7 +217,7 @@ pub trait ReadCallback: ErrorCallback {
     type Response;
 
     fn set_result(self, result: Self::Response);
-    fn read_tracker(&self) -> Option<TrackerToken>;
+    fn read_tracker(&self) -> Option<&TrackerToken>;
 }
 
 pub trait WriteCallback: ErrorCallback {
@@ -217,16 +225,8 @@ pub trait WriteCallback: ErrorCallback {
 
     fn notify_proposed(&mut self);
     fn notify_committed(&mut self);
-
-    type TimeTrackerListRef<'a>: IntoIterator<Item = &'a TimeTracker>
-    where
-        Self: 'a;
-    fn write_trackers(&self) -> Self::TimeTrackerListRef<'_>;
-
-    type TimeTrackerListMut<'a>: IntoIterator<Item = &'a mut TimeTracker>
-    where
-        Self: 'a;
-    fn write_trackers_mut(&mut self) -> Self::TimeTrackerListMut<'_>;
+    fn write_trackers(&self) -> Option<&SmallVec<[TimeTracker; 4]>>;
+    fn write_trackers_mut(&mut self) -> Option<&mut SmallVec<[TimeTracker; 4]>>;
     fn set_result(self, result: Self::Response);
 }
 
@@ -257,9 +257,9 @@ impl<S: Snapshot> ReadCallback for Callback<S> {
         self.invoke_read(result);
     }
 
-    fn read_tracker(&self) -> Option<TrackerToken> {
+    fn read_tracker(&self) -> Option<&TrackerToken> {
         let Callback::Read { tracker, .. } = self else { return None; };
-        Some(*tracker)
+        Some(tracker)
     }
 }
 
@@ -276,24 +276,16 @@ impl<S: Snapshot> WriteCallback for Callback<S> {
         self.invoke_committed();
     }
 
-    type TimeTrackerListRef<'a> = impl IntoIterator<Item = &'a TimeTracker>;
     #[inline]
-    fn write_trackers(&self) -> Self::TimeTrackerListRef<'_> {
-        let trackers = match self {
-            Callback::Write { trackers, .. } => Some(trackers),
-            _ => None,
-        };
-        trackers.into_iter().flatten()
+    fn write_trackers(&self) -> Option<&SmallVec<[TimeTracker; 4]>> {
+        let Callback::Write { trackers, .. } = self else { return None; };
+        Some(trackers)
     }
 
-    type TimeTrackerListMut<'a> = impl IntoIterator<Item = &'a mut TimeTracker>;
     #[inline]
-    fn write_trackers_mut(&mut self) -> Self::TimeTrackerListMut<'_> {
-        let trackers = match self {
-            Callback::Write { trackers, .. } => Some(trackers),
-            _ => None,
-        };
-        trackers.into_iter().flatten()
+    fn write_trackers_mut(&mut self) -> Option<&mut SmallVec<[TimeTracker; 4]>> {
+        let Callback::Write { trackers, .. } = self else { return None; };
+        Some(trackers)
     }
 
     #[inline]
@@ -304,7 +296,7 @@ impl<S: Snapshot> WriteCallback for Callback<S> {
 
 impl<C> WriteCallback for Vec<C>
 where
-    C: WriteCallback + 'static,
+    C: WriteCallback,
     C::Response: Clone,
 {
     type Response = C::Response;
@@ -323,16 +315,14 @@ where
         }
     }
 
-    type TimeTrackerListRef<'a> = impl Iterator<Item = &'a TimeTracker> + 'a;
     #[inline]
-    fn write_trackers(&self) -> Self::TimeTrackerListRef<'_> {
-        self.iter().flat_map(|c| c.write_trackers())
+    fn write_trackers(&self) -> Option<&SmallVec<[TimeTracker; 4]>> {
+        None
     }
 
-    type TimeTrackerListMut<'a> = impl Iterator<Item = &'a mut TimeTracker> + 'a;
     #[inline]
-    fn write_trackers_mut(&mut self) -> Self::TimeTrackerListMut<'_> {
-        self.iter_mut().flat_map(|c| c.write_trackers_mut())
+    fn write_trackers_mut(&mut self) -> Option<&mut SmallVec<[TimeTracker; 4]>> {
+        None
     }
 
     #[inline]
@@ -385,8 +375,6 @@ pub enum PeerTick {
     ReportBuckets = 9,
     CheckLongUncommitted = 10,
     CheckPeersAvailability = 11,
-    RequestSnapshot = 12,
-    RequestVoterReplicatedIndex = 13,
 }
 
 impl PeerTick {
@@ -407,8 +395,6 @@ impl PeerTick {
             PeerTick::ReportBuckets => "report_buckets",
             PeerTick::CheckLongUncommitted => "check_long_uncommitted",
             PeerTick::CheckPeersAvailability => "check_peers_availability",
-            PeerTick::RequestSnapshot => "request_snapshot",
-            PeerTick::RequestVoterReplicatedIndex => "request_voter_replicated_index",
         }
     }
 
@@ -426,8 +412,6 @@ impl PeerTick {
             PeerTick::ReportBuckets,
             PeerTick::CheckLongUncommitted,
             PeerTick::CheckPeersAvailability,
-            PeerTick::RequestSnapshot,
-            PeerTick::RequestVoterReplicatedIndex,
         ];
         TICKS
     }
@@ -507,7 +491,7 @@ where
         store_id: u64,
         group_id: u64,
     },
-    /// Capture changes of a region.
+    /// Capture the changes of the region.
     CaptureChange {
         cmd: ChangeObserver,
         region_epoch: RegionEpoch,
@@ -774,8 +758,6 @@ pub enum PeerMsg<EK: KvEngine> {
     Destroy(u64),
 }
 
-impl<EK: KvEngine> ResourceMetered for PeerMsg<EK> {}
-
 impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -870,8 +852,6 @@ where
         abnormal_stores: Vec<u64>,
     },
 }
-
-impl<EK: KvEngine> ResourceMetered for StoreMsg<EK> {}
 
 impl<EK> fmt::Debug for StoreMsg<EK>
 where

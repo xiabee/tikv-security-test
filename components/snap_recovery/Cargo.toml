@@ -5,6 +5,13 @@ edition = "2021"
 publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["test-engine-kv-rocksdb", "test-engine-raft-raft-engine"]
+test-engine-kv-rocksdb = ["tikv/test-engine-kv-rocksdb"]
+test-engine-raft-raft-engine = ["tikv/test-engine-raft-raft-engine"]
+test-engines-rocksdb = ["tikv/test-engines-rocksdb"]
+test-engines-panic = ["tikv/test-engines-panic"]
+
 [dependencies]
 chrono = "0.4"
 encryption = { workspace = true }
@@ -24,8 +31,8 @@ prometheus-static-metric = "0.5"
 protobuf = { version = "2.8", features = ["bytes"] }
 raft_log_engine = { workspace = true }
 raftstore = { workspace = true }
-slog = { workspace = true }
-slog-global = { workspace = true }
+slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debug"] }
+slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
 structopt = "0.3"
 tempfile = "3.0"
 thiserror = "1.0"

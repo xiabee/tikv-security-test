@@ -2,9 +2,8 @@
 
 mod storage_impl;
 
-use std::{marker::PhantomData, sync::Arc};
+use std::sync::Arc;
 
-use api_version::KvFormat;
 use async_trait::async_trait;
 use kvproto::coprocessor::{KeyRange, Response};
 use protobuf::Message;
@@ -19,7 +18,7 @@ use crate::{
     tikv_util::quota_limiter::QuotaLimiter,
 };
 
-pub struct DagHandlerBuilder<S: Store + 'static, F: KvFormat> {
+pub struct DagHandlerBuilder<S: Store + 'static> {
     req: DagRequest,
     ranges: Vec<KeyRange>,
     store: S,
@@ -30,10 +29,9 @@ pub struct DagHandlerBuilder<S: Store + 'static, F: KvFormat> {
     is_cache_enabled: bool,
     paging_size: Option<u64>,
     quota_limiter: Arc<QuotaLimiter>,
-    _phantom: PhantomData<F>,
 }
 
-impl<S: Store + 'static, F: KvFormat> DagHandlerBuilder<S, F> {
+impl<S: Store + 'static> DagHandlerBuilder<S> {
     pub fn new(
         req: DagRequest,
         ranges: Vec<KeyRange>,
@@ -56,7 +54,6 @@ impl<S: Store + 'static, F: KvFormat> DagHandlerBuilder<S, F> {
             is_cache_enabled,
             paging_size,
             quota_limiter,
-            _phantom: PhantomData,
         }
     }
 
@@ -68,7 +65,7 @@ impl<S: Store + 'static, F: KvFormat> DagHandlerBuilder<S, F> {
 
     pub fn build(self) -> Result<Box<dyn RequestHandler>> {
         COPR_DAG_REQ_COUNT.with_label_values(&["batch"]).inc();
-        Ok(BatchDagHandler::new::<_, F>(
+        Ok(BatchDagHandler::new(
             self.req,
             self.ranges,
             self.store,
@@ -90,7 +87,7 @@ pub struct BatchDagHandler {
 }
 
 impl BatchDagHandler {
-    pub fn new<S: Store + 'static, F: KvFormat>(
+    pub fn new<S: Store + 'static>(
         req: DagRequest,
         ranges: Vec<KeyRange>,
         store: S,
@@ -103,7 +100,7 @@ impl BatchDagHandler {
         quota_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self> {
         Ok(Self {
-            runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request::<_, F>(
+            runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request(
                 req,
                 ranges,
                 TikvStorage::new(store, is_cache_enabled),

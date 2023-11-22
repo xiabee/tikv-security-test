@@ -785,10 +785,6 @@ impl<S: EngineSnapshot> MvccReader<S> {
         self.hint_min_ts = ts_bound;
     }
 
-    pub fn snapshot_ext(&self) -> S::Ext<'_> {
-        self.snapshot.ext()
-    }
-
     pub fn snapshot(&self) -> &S {
         &self.snapshot
     }
@@ -924,7 +920,6 @@ pub mod tests {
                 m,
                 &None,
                 SkipPessimisticCheck,
-                None,
             )
             .unwrap();
             self.write(txn.into_modifies());
@@ -949,7 +944,6 @@ pub mod tests {
                 m,
                 &None,
                 DoPessimisticCheck,
-                None,
             )
             .unwrap();
             self.write(txn.into_modifies());
@@ -1059,7 +1053,6 @@ pub mod tests {
                             wb.delete_range_cf(cf, &k1, &k2).unwrap();
                         }
                     }
-                    Modify::Ingest(_) => unimplemented!(),
                 }
             }
             wb.write().unwrap();
@@ -1073,7 +1066,7 @@ pub mod tests {
 
         pub fn compact(&mut self) {
             for cf in ALL_CFS {
-                self.db.compact_range_cf(cf, None, None, false, 1).unwrap();
+                self.db.compact_range(cf, None, None, false, 1).unwrap();
             }
         }
     }
@@ -1266,7 +1259,7 @@ pub mod tests {
         let overlapped_write = reader
             .get_txn_commit_record(&key, 55.into())
             .unwrap()
-            .unwrap_none(0);
+            .unwrap_none();
         assert!(overlapped_write.is_none());
 
         // When no such record is found but a record of another txn has a write record
@@ -1274,7 +1267,7 @@ pub mod tests {
         let overlapped_write = reader
             .get_txn_commit_record(&key, 50.into())
             .unwrap()
-            .unwrap_none(0)
+            .unwrap_none()
             .unwrap();
         assert_eq!(overlapped_write.write.start_ts, 45.into());
         assert_eq!(overlapped_write.write.write_type, WriteType::Put);

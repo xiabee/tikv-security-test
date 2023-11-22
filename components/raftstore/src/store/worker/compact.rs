@@ -109,7 +109,7 @@ where
             .start_coarse_timer();
         box_try!(
             self.engine
-                .compact_range_cf(cf_name, start_key, end_key, false, 1 /* threads */,)
+                .compact_range(cf_name, start_key, end_key, false, 1 /* threads */,)
         );
         compact_range_timer.observe_duration();
         info!(
@@ -207,11 +207,12 @@ fn collect_ranges_need_compact(
     for range in ranges.windows(2) {
         // Get total entries and total versions in this range and checks if it needs to
         // be compacted.
-        if let Some(range_stats) = box_try!(engine.get_range_stats(CF_WRITE, &range[0], &range[1]))
+        if let Some((num_ent, num_ver)) =
+            box_try!(engine.get_range_entries_and_versions(CF_WRITE, &range[0], &range[1]))
         {
             if need_compact(
-                range_stats.num_entries,
-                range_stats.num_versions,
+                num_ent,
+                num_ver,
                 tombstones_num_threshold,
                 tombstones_percent_threshold,
             ) {
@@ -357,12 +358,12 @@ mod tests {
         engine.flush_cf(CF_WRITE, true).unwrap();
 
         let (start, end) = (data_key(b"k0"), data_key(b"k5"));
-        let range_stats = engine
-            .get_range_stats(CF_WRITE, &start, &end)
+        let (entries, version) = engine
+            .get_range_entries_and_versions(CF_WRITE, &start, &end)
             .unwrap()
             .unwrap();
-        assert_eq!(range_stats.num_entries, 10);
-        assert_eq!(range_stats.num_versions, 5);
+        assert_eq!(entries, 10);
+        assert_eq!(version, 5);
 
         // mvcc_put 5..10
         for i in 5..10 {
@@ -372,9 +373,12 @@ mod tests {
         engine.flush_cf(CF_WRITE, true).unwrap();
 
         let (s, e) = (data_key(b"k5"), data_key(b"k9"));
-        let range_stats = engine.get_range_stats(CF_WRITE, &s, &e).unwrap().unwrap();
-        assert_eq!(range_stats.num_entries, 5);
-        assert_eq!(range_stats.num_versions, 5);
+        let (entries, version) = engine
+            .get_range_entries_and_versions(CF_WRITE, &s, &e)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entries, 5);
+        assert_eq!(version, 5);
 
         let ranges_need_to_compact = collect_ranges_need_compact(
             &engine,
@@ -396,9 +400,12 @@ mod tests {
         engine.flush_cf(CF_WRITE, true).unwrap();
 
         let (s, e) = (data_key(b"k5"), data_key(b"k9"));
-        let range_stats = engine.get_range_stats(CF_WRITE, &s, &e).unwrap().unwrap();
-        assert_eq!(range_stats.num_entries, 10);
-        assert_eq!(range_stats.num_versions, 5);
+        let (entries, version) = engine
+            .get_range_entries_and_versions(CF_WRITE, &s, &e)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entries, 10);
+        assert_eq!(version, 5);
 
         let ranges_need_to_compact = collect_ranges_need_compact(
             &engine,

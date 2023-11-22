@@ -1,7 +1,7 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]: TiKV gRPC APIs implementation
-use std::{mem, sync::Arc, time::Duration};
+use std::{mem, sync::Arc};
 
 use api_version::KvFormat;
 use fail::fail_point;
@@ -26,14 +26,13 @@ use raftstore::{
     },
     Error as RaftStoreError, Result as RaftStoreResult,
 };
-use resource_control::ResourceGroupManager;
 use tikv_alloc::trace::MemoryTraceGuard;
-use tikv_kv::{RaftExtension, StageLatencyStats};
+use tikv_kv::RaftExtension;
 use tikv_util::{
     future::{paired_future_callback, poll_future_notify},
     mpsc::future::{unbounded, BatchReceiver, Sender, WakePolicy},
     sys::memory_usage_reaches_high_water,
-    time::Instant,
+    time::{duration_to_ms, duration_to_sec, Instant},
     worker::Scheduler,
 };
 use tracker::{set_tls_tracker_token, RequestInfo, RequestType, Tracker, GLOBAL_TRACKERS};
@@ -66,7 +65,6 @@ const GRPC_MSG_NOTIFY_SIZE: usize = 8;
 pub struct Service<E: Engine, L: LockManager, F: KvFormat> {
     store_id: u64,
     /// Used to handle requests related to GC.
-    // TODO: make it Some after GC is supported for v2.
     gc_worker: GcWorker<E>,
     // For handling KV requests.
     storage: Storage<E, L, F>,
@@ -87,14 +85,6 @@ pub struct Service<E: Engine, L: LockManager, F: KvFormat> {
 
     // Go `server::Config` to get more details.
     reject_messages_on_memory_ratio: f64,
-
-    resource_manager: Option<Arc<ResourceGroupManager>>,
-}
-
-impl<E: Engine, L: LockManager, F: KvFormat> Drop for Service<E, L, F> {
-    fn drop(&mut self) {
-        self.check_leader_scheduler.stop();
-    }
 }
 
 impl<E: Engine + Clone, L: LockManager + Clone, F: KvFormat> Clone for Service<E, L, F> {
@@ -111,7 +101,6 @@ impl<E: Engine + Clone, L: LockManager + Clone, F: KvFormat> Clone for Service<E
             grpc_thread_load: self.grpc_thread_load.clone(),
             proxy: self.proxy.clone(),
             reject_messages_on_memory_ratio: self.reject_messages_on_memory_ratio,
-            resource_manager: self.resource_manager.clone(),
         }
     }
 }
@@ -130,7 +119,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
         enable_req_batch: bool,
         proxy: Proxy,
         reject_messages_on_memory_ratio: f64,
-        resource_manager: Option<Arc<ResourceGroupManager>>,
     ) -> Self {
         Service {
             store_id,
@@ -144,7 +132,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
             grpc_thread_load,
             proxy,
             reject_messages_on_memory_ratio,
-            resource_manager,
         }
     }
 
@@ -197,13 +184,6 @@ macro_rules! handle_request {
             let begin_instant = Instant::now();
 
             let source = req.mut_context().take_request_source();
-            let resource_control_ctx = req.get_context().get_resource_control_context();
-            if let Some(resource_manager) = &self.resource_manager {
-                resource_manager.consume_penalty(resource_control_ctx);
-            }
-            GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
             let resp = $future_name(&self.storage, req);
             let task = async move {
                 let resp = resp.await?;
@@ -236,10 +216,6 @@ macro_rules! set_total_time {
         $resp
             .mut_exec_details_v2()
             .mut_time_detail()
-            .set_total_rpc_wall_time_ns($duration.as_nanos() as u64);
-        $resp
-            .mut_exec_details_v2()
-            .mut_time_detail_v2()
             .set_total_rpc_wall_time_ns($duration.as_nanos() as u64);
     };
 }
@@ -423,7 +399,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let begin_instant = Instant::now();
 
         let source = req.mut_context().take_request_source();
-        let resp = future_prepare_flashback_to_version(&self.storage, req);
+        let resp = future_prepare_flashback_to_version(self.storage.clone(), req);
         let task = async move {
             let resp = resp.await?;
             let elapsed = begin_instant.saturating_elapsed();
@@ -454,7 +430,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let begin_instant = Instant::now();
 
         let source = req.mut_context().take_request_source();
-        let resp = future_flashback_to_version(&self.storage, req);
+        let resp = future_flashback_to_version(self.storage.clone(), req);
         let task = async move {
             let resp = resp.await?;
             let elapsed = begin_instant.saturating_elapsed();
@@ -479,14 +455,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     fn coprocessor(&mut self, ctx: RpcContext<'_>, mut req: Request, sink: UnarySink<Response>) {
         forward_unary!(self.proxy, coprocessor, ctx, req, sink);
         let source = req.mut_context().take_request_source();
-        let resource_control_ctx = req.get_context().get_resource_control_context();
-        if let Some(resource_manager) = &self.resource_manager {
-            resource_manager.consume_penalty(resource_control_ctx);
-        }
-        GRPC_RESOURCE_GROUP_COUNTER_VEC
-            .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-            .inc();
-
         let begin_instant = Instant::now();
         let future = future_copr(&self.copr, Some(ctx.peer()), req);
         let task = async move {
@@ -517,14 +485,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         sink: UnarySink<RawCoprocessorResponse>,
     ) {
         let source = req.mut_context().take_request_source();
-        let resource_control_ctx = req.get_context().get_resource_control_context();
-        if let Some(resource_manager) = &self.resource_manager {
-            resource_manager.consume_penalty(resource_control_ctx);
-        }
-        GRPC_RESOURCE_GROUP_COUNTER_VEC
-            .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-            .inc();
-
         let begin_instant = Instant::now();
         let future = future_raw_coprocessor(&self.copr_v2, &self.storage, req);
         let task = async move {
@@ -606,13 +566,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         mut sink: ServerStreamingSink<Response>,
     ) {
         let begin_instant = Instant::now();
-        let resource_control_ctx = req.get_context().get_resource_control_context();
-        if let Some(resource_manager) = &self.resource_manager {
-            resource_manager.consume_penalty(resource_control_ctx);
-        }
-        GRPC_RESOURCE_GROUP_COUNTER_VEC
-            .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-            .inc();
 
         let mut stream = self
             .copr
@@ -628,7 +581,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                 Ok(_) => {
                     GRPC_MSG_HISTOGRAM_STATIC
                         .coprocessor_stream
-                        .observe(begin_instant.saturating_elapsed().as_secs_f64());
+                        .observe(duration_to_sec(begin_instant.saturating_elapsed()));
                     let _ = sink.close().await;
                 }
                 Err(e) => {
@@ -659,7 +612,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         );
 
         let store_id = self.store_id;
-        let ch = self.storage.get_engine().raft_extension();
+        let ch = self.storage.get_engine().raft_extension().clone();
         let reject_messages_on_memory_ratio = self.reject_messages_on_memory_ratio;
 
         let res = async move {
@@ -712,7 +665,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         );
 
         let store_id = self.store_id;
-        let ch = self.storage.get_engine().raft_extension();
+        let ch = self.storage.get_engine().raft_extension().clone();
         let reject_messages_on_memory_ratio = self.reject_messages_on_memory_ratio;
 
         let res = async move {
@@ -762,24 +715,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         sink: ClientStreamingSink<Done>,
     ) {
         let task = SnapTask::Recv { stream, sink };
-        if let Err(e) = self.snap_scheduler.schedule(task) {
-            let err_msg = format!("{}", e);
-            let sink = match e.into_inner() {
-                SnapTask::Recv { sink, .. } => sink,
-                _ => unreachable!(),
-            };
-            let status = RpcStatus::with_message(RpcStatusCode::RESOURCE_EXHAUSTED, err_msg);
-            ctx.spawn(sink.fail(status).map(|_| ()));
-        }
-    }
-
-    fn tablet_snapshot(
-        &mut self,
-        ctx: RpcContext<'_>,
-        stream: RequestStream<TabletSnapshotRequest>,
-        sink: DuplexSink<TabletSnapshotResponse>,
-    ) {
-        let task = SnapTask::RecvTablet { stream, sink };
         if let Err(e) = self.snap_scheduler.schedule(task) {
             let err_msg = format!("{}", e);
             let sink = match e.into_inner() {
@@ -866,7 +801,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             sink.success(resp).await?;
             GRPC_MSG_HISTOGRAM_STATIC
                 .split_region
-                .observe(begin_instant.saturating_elapsed().as_secs_f64());
+                .observe(duration_to_sec(begin_instant.saturating_elapsed()));
             ServerResult::Ok(())
         }
         .map_err(|e| {
@@ -887,8 +822,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         mut sink: DuplexSink<BatchCommandsResponse>,
     ) {
         forward_duplex!(self.proxy, batch_commands, ctx, stream, sink);
-
         let (tx, rx) = unbounded(WakePolicy::TillReach(GRPC_MSG_NOTIFY_SIZE));
+
         let ctx = Arc::new(ctx);
         let peer = ctx.peer();
         let storage = self.storage.clone();
@@ -896,7 +831,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let copr_v2 = self.copr_v2.clone();
         let pool_size = storage.get_normal_pool_size();
         let batch_builder = BatcherBuilder::new(self.enable_req_batch, pool_size);
-        let resource_manager = self.resource_manager.clone();
         let request_handler = stream.try_for_each(move |mut req| {
             let request_ids = req.take_request_ids();
             let requests: Vec<_> = req.take_requests().into();
@@ -913,7 +847,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                     id,
                     req,
                     &tx,
-                    &resource_manager,
                 );
                 if let Some(batch) = batcher.as_mut() {
                     batch.maybe_commit(&storage, &tx);
@@ -1123,7 +1056,6 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
     id: u64,
     req: batch_commands_request::Request,
     tx: &Sender<MeasuredSingleResponse>,
-    resource_manager: &Option<Arc<ResourceGroupManager>>,
 ) {
     // To simplify code and make the logic more clear.
     macro_rules! oneof {
@@ -1145,13 +1077,6 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
                     response_batch_commands_request(id, resp, tx.clone(), begin_instant, GrpcTypeKind::invalid, String::default());
                 },
                 Some(batch_commands_request::request::Cmd::Get(mut req)) => {
-                    let resource_control_ctx = req.get_context().get_resource_control_context();
-                    if let Some(resource_manager) = resource_manager {
-                        resource_manager.consume_penalty(resource_control_ctx);
-                    }
-                    GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
                     if batcher.as_mut().map_or(false, |req_batch| {
                         req_batch.can_batch_get(&req)
                     }) {
@@ -1166,13 +1091,6 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
                     }
                 },
                 Some(batch_commands_request::request::Cmd::RawGet(mut req)) => {
-                    let resource_control_ctx = req.get_context().get_resource_control_context();
-                    if let Some(resource_manager) = resource_manager {
-                        resource_manager.consume_penalty(resource_control_ctx);
-                    }
-                    GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
                     if batcher.as_mut().map_or(false, |req_batch| {
                         req_batch.can_batch_raw_get(&req)
                     }) {
@@ -1187,13 +1105,6 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
                     }
                 },
                 Some(batch_commands_request::request::Cmd::Coprocessor(mut req)) => {
-                    let resource_control_ctx = req.get_context().get_resource_control_context();
-                    if let Some(resource_manager) = resource_manager {
-                        resource_manager.consume_penalty(resource_control_ctx);
-                    }
-                    GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
                     let begin_instant = Instant::now();
                     let source = req.mut_context().take_request_source();
                     let resp = future_copr(copr, Some(peer.to_string()), req)
@@ -1221,13 +1132,6 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
                     );
                 }
                 $(Some(batch_commands_request::request::Cmd::$cmd(mut req)) => {
-                    let resource_control_ctx = req.get_context().get_resource_control_context();
-                    if let Some(resource_manager) = resource_manager {
-                        resource_manager.consume_penalty(resource_control_ctx);
-                    }
-                    GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
                     let begin_instant = Instant::now();
                     let source = req.mut_context().take_request_source();
                     let resp = $future_fn($($arg,)* req)
@@ -1254,8 +1158,8 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
         ResolveLock, future_resolve_lock(storage), kv_resolve_lock;
         Gc, future_gc(), kv_gc;
         DeleteRange, future_delete_range(storage), kv_delete_range;
-        PrepareFlashbackToVersion, future_prepare_flashback_to_version(storage), kv_prepare_flashback_to_version;
-        FlashbackToVersion, future_flashback_to_version(storage), kv_flashback_to_version;
+        PrepareFlashbackToVersion, future_prepare_flashback_to_version(storage.clone()), kv_prepare_flashback_to_version;
+        FlashbackToVersion, future_flashback_to_version(storage.clone()), kv_flashback_to_version;
         RawBatchGet, future_raw_batch_get(storage), raw_batch_get;
         RawPut, future_raw_put(storage), raw_put;
         RawBatchPut, future_raw_batch_put(storage), raw_batch_put;
@@ -1306,9 +1210,6 @@ fn handle_measures_for_batch_commands(measures: &mut MeasuredBatchResponse) {
             exec_details
                 .mut_time_detail()
                 .set_total_rpc_wall_time_ns(elapsed.as_nanos() as u64);
-            exec_details
-                .mut_time_detail_v2()
-                .set_total_rpc_wall_time_ns(elapsed.as_nanos() as u64);
         }
     }
 }
@@ -1351,7 +1252,7 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
 
     async move {
         let v = v.await;
-        let duration = start.saturating_elapsed();
+        let duration_ms = duration_to_ms(start.saturating_elapsed());
         let mut resp = GetResponse::default();
         if let Some(err) = extract_region_error(&v) {
             resp.set_region_error(err);
@@ -1364,7 +1265,10 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
                     GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
                         tracker.write_scan_detail(scan_detail_v2);
                     });
-                    set_time_detail(exec_detail_v2, duration, &stats.latency_stats);
+                    let time_detail = exec_detail_v2.mut_time_detail();
+                    time_detail.set_kv_read_wall_time_ms(duration_ms);
+                    time_detail.set_wait_wall_time_ms(stats.latency_stats.wait_wall_time_ms);
+                    time_detail.set_process_wall_time_ms(stats.latency_stats.process_wall_time_ms);
                     match val {
                         Some(val) => resp.set_value(val),
                         None => resp.set_not_found(true),
@@ -1376,29 +1280,6 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
         GLOBAL_TRACKERS.remove(tracker);
         Ok(resp)
     }
-}
-
-fn set_time_detail(
-    exec_detail_v2: &mut ExecDetailsV2,
-    total_dur: Duration,
-    stats: &StageLatencyStats,
-) {
-    let duration_ns = total_dur.as_nanos() as u64;
-    // deprecated. we will remove the `time_detail` field in future version.
-    {
-        let time_detail = exec_detail_v2.mut_time_detail();
-        time_detail.set_kv_read_wall_time_ms(duration_ns / 1_000_000);
-        time_detail.set_wait_wall_time_ms(stats.wait_wall_time_ns / 1_000_000);
-        time_detail.set_process_wall_time_ms(stats.process_wall_time_ns / 1_000_000);
-    }
-
-    let time_detail_v2 = exec_detail_v2.mut_time_detail_v2();
-    time_detail_v2.set_kv_read_wall_time_ns(duration_ns);
-    time_detail_v2.set_wait_wall_time_ns(stats.wait_wall_time_ns);
-    time_detail_v2.set_process_wall_time_ns(stats.process_wall_time_ns);
-    // currently, the schedule suspend_wall_time is always 0 for get and
-    // batch_get. TODO: once we support aync-io, we may also count the
-    // schedule suspend duration here.
 }
 
 fn future_scan<E: Engine, L: LockManager, F: KvFormat>(
@@ -1465,7 +1346,7 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
 
     async move {
         let v = v.await;
-        let duration = start.saturating_elapsed();
+        let duration_ms = duration_to_ms(start.saturating_elapsed());
         let mut resp = BatchGetResponse::default();
         if let Some(err) = extract_region_error(&v) {
             resp.set_region_error(err);
@@ -1479,7 +1360,10 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
                     GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
                         tracker.write_scan_detail(scan_detail_v2);
                     });
-                    set_time_detail(exec_detail_v2, duration, &stats.latency_stats);
+                    let time_detail = exec_detail_v2.mut_time_detail();
+                    time_detail.set_kv_read_wall_time_ms(duration_ms);
+                    time_detail.set_wait_wall_time_ms(stats.latency_stats.wait_wall_time_ms);
+                    time_detail.set_process_wall_time_ms(stats.latency_stats.process_wall_time_ms);
                     resp.set_pairs(pairs.into());
                 }
                 Err(e) => {
@@ -1573,65 +1457,60 @@ fn future_delete_range<E: Engine, L: LockManager, F: KvFormat>(
 // the actual flashback operation.
 // NOTICE: the caller needs to make sure the version we want to flashback won't
 // be between any transactions that have not been fully committed.
-fn future_prepare_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
+pub async fn future_prepare_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
     // Keep this param to hint the type of E for the compiler.
-    storage: &Storage<E, L, F>,
+    storage: Storage<E, L, F>,
     req: PrepareFlashbackToVersionRequest,
-) -> impl Future<Output = ServerResult<PrepareFlashbackToVersionResponse>> {
-    let storage = storage.clone();
-    async move {
-        let f = storage
-            .get_engine()
-            .start_flashback(req.get_context(), req.get_start_ts());
-        let mut res = f.await.map_err(storage::Error::from);
+) -> ServerResult<PrepareFlashbackToVersionResponse> {
+    let f = storage.get_engine().start_flashback(req.get_context());
+    let mut res = f.await.map_err(storage::Error::from);
+    if matches!(res, Ok(())) {
+        // After the region is put into the flashback state, we need to do a special
+        // prewrite to prevent `resolved_ts` from advancing.
+        let (cb, f) = paired_future_callback();
+        res = storage.sched_txn_command(req.clone().into(), cb);
         if matches!(res, Ok(())) {
-            // After the region is put into the flashback state, we need to do a special
-            // prewrite to prevent `resolved_ts` from advancing.
-            let (cb, f) = paired_future_callback();
-            res = storage.sched_txn_command(req.clone().into(), cb);
-            if matches!(res, Ok(())) {
-                res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
-            }
+            res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
         }
-        let mut resp = PrepareFlashbackToVersionResponse::default();
-        if let Some(e) = extract_region_error(&res) {
-            resp.set_region_error(e);
-        } else if let Err(e) = res {
-            resp.set_error(format!("{}", e));
-        }
-        Ok(resp)
     }
+    let mut resp = PrepareFlashbackToVersionResponse::default();
+    if let Some(e) = extract_region_error(&res) {
+        resp.set_region_error(e);
+    } else if let Err(e) = res {
+        resp.set_error(format!("{}", e));
+    }
+    Ok(resp)
 }
 
 // Flashback the region to a specific point with the given `version`, please
 // make sure the region is "locked" by `PrepareFlashbackToVersion` first,
 // otherwise this request will fail.
-fn future_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+pub async fn future_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
+    storage: Storage<E, L, F>,
     req: FlashbackToVersionRequest,
-) -> impl Future<Output = ServerResult<FlashbackToVersionResponse>> {
-    let storage = storage.clone();
-    async move {
-        // Perform the data flashback transaction command. We will check if the region
-        // is in the flashback state when proposing the flashback modification.
-        let (cb, f) = paired_future_callback();
-        let mut res = storage.sched_txn_command(req.clone().into(), cb);
-        if matches!(res, Ok(())) {
-            res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
-        }
-        if matches!(res, Ok(())) {
-            // Only finish when flashback executed successfully.
-            let f = storage.get_engine().end_flashback(req.get_context());
-            res = f.await.map_err(storage::Error::from);
-        }
-        let mut resp = FlashbackToVersionResponse::default();
-        if let Some(err) = extract_region_error(&res) {
-            resp.set_region_error(err);
-        } else if let Err(e) = res {
-            resp.set_error(format!("{}", e));
-        }
-        Ok(resp)
+) -> ServerResult<FlashbackToVersionResponse> {
+    // Perform the data flashback transaction command. We will check if the region
+    // is in the flashback state when proposing the flashback modification.
+    let (cb, f) = paired_future_callback();
+    let mut res = storage.sched_txn_command(req.clone().into(), cb);
+    if matches!(res, Ok(())) {
+        res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
     }
+    if matches!(res, Ok(())) {
+        // Only finish when flashback executed successfully.
+        fail_point!("skip_finish_flashback_to_version", |_| {
+            Ok(FlashbackToVersionResponse::default())
+        });
+        let f = storage.get_engine().end_flashback(req.get_context());
+        res = f.await.map_err(storage::Error::from);
+    }
+    let mut resp = FlashbackToVersionResponse::default();
+    if let Some(err) = extract_region_error(&res) {
+        resp.set_region_error(err);
+    } else if let Err(e) = res {
+        resp.set_error(format!("{}", e));
+    }
+    Ok(resp)
 }
 
 fn future_raw_get<E: Engine, L: LockManager, F: KvFormat>(

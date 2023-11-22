@@ -247,6 +247,7 @@ where
 
         // TODO: slow score
 
+        let router = self.router.clone();
         let resp = self.pd_client.store_heartbeat(stats, None, None);
         let logger = self.logger.clone();
         let f = async move {
@@ -257,25 +258,14 @@ where
         self.remote.spawn(f);
     }
 
-    pub fn handle_update_store_infos(
-        &mut self,
-        cpu_usages: RecordPairVec,
-        read_io_rates: RecordPairVec,
-        write_io_rates: RecordPairVec,
-    ) {
-        self.store_stat.store_cpu_usages = cpu_usages;
-        self.store_stat.store_read_io_rates = read_io_rates;
-        self.store_stat.store_write_io_rates = write_io_rates;
-    }
-
     /// Returns (capacity, used, available).
     fn collect_engine_size(&self) -> Option<(u64, u64, u64)> {
-        let disk_stats = match fs2::statvfs(self.tablet_registry.tablet_root()) {
+        let disk_stats = match fs2::statvfs(self.tablet_factory.tablets_path()) {
             Err(e) => {
                 error!(
                     self.logger,
                     "get disk stat for rocksdb failed";
-                    "engine_path" => self.tablet_registry.tablet_root().display(),
+                    "engine_path" => self.tablet_factory.tablets_path().display(),
                     "err" => ?e
                 );
                 return None;
@@ -283,19 +273,11 @@ where
             Ok(stats) => stats,
         };
         let disk_cap = disk_stats.total_space();
-        let capacity = if self.cfg.value().capacity.0 == 0 {
-            disk_cap
-        } else {
-            std::cmp::min(disk_cap, self.cfg.value().capacity.0)
-        };
-        let mut kv_size = 0;
-        self.tablet_registry.for_each_opened_tablet(|_, cached| {
-            if let Some(tablet) = cached.latest() {
-                kv_size += tablet.get_engine_used_size().unwrap_or(0);
-            }
-            true
-        });
-        let snap_size = self.snap_mgr.total_snap_size().unwrap();
+        // TODO: custom capacity.
+        let capacity = disk_cap;
+        // TODO: accurate snapshot size and kv engines size.
+        let snap_size = 0;
+        let kv_size = 0;
         let used_size = snap_size
             + kv_size
             + self

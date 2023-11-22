@@ -17,10 +17,10 @@ use kvproto::{
 };
 use raftstore::{
     coprocessor::ObserveId,
-    router::CdcHandle,
+    router::RaftStoreRouter,
     store::{
         fsm::ChangeObserver,
-        msg::{Callback, ReadResponse},
+        msg::{Callback, ReadResponse, SignificantMsg},
     },
 };
 use resolved_ts::{Resolver, TsSource};
@@ -35,7 +35,7 @@ use tikv_kv::Iterator;
 use tikv_util::{
     box_err,
     codec::number,
-    debug, error, info,
+    debug, defer, error, info,
     sys::inspector::{self_thread_inspector, ThreadInspector},
     time::{Instant, Limiter},
     warn,
@@ -47,7 +47,7 @@ use txn_types::{Key, KvPair, Lock, LockType, OldValue, TimeStamp};
 
 use crate::{
     channel::CdcEvent,
-    delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState, ObservedRange},
+    delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState},
     endpoint::Deregister,
     metrics::*,
     old_value::{near_seek_old_value, new_old_value_cursor, OldValueCursors},
@@ -75,11 +75,10 @@ pub(crate) enum Scanner<S: Snapshot> {
 }
 
 pub(crate) struct Initializer<E> {
-    pub(crate) tablet: Option<E>,
+    pub(crate) engine: E,
     pub(crate) sched: Scheduler<Task>,
     pub(crate) sink: crate::channel::Sink,
 
-    pub(crate) observed_range: ObservedRange,
     pub(crate) region_id: u64,
     pub(crate) region_epoch: RegionEpoch,
     pub(crate) observe_id: ObserveId,
@@ -89,7 +88,9 @@ pub(crate) struct Initializer<E> {
     pub(crate) request_id: u64,
     pub(crate) checkpoint_ts: TimeStamp,
 
-    pub(crate) speed_limiter: Limiter,
+    pub(crate) scan_speed_limiter: Limiter,
+    pub(crate) fetch_speed_limiter: Limiter,
+
     pub(crate) max_scan_batch_bytes: usize,
     pub(crate) max_scan_batch_size: usize,
 
@@ -102,33 +103,14 @@ pub(crate) struct Initializer<E> {
 }
 
 impl<E: KvEngine> Initializer<E> {
-    pub(crate) async fn initialize<T: 'static + CdcHandle<E>>(
+    pub(crate) async fn initialize<T: 'static + RaftStoreRouter<E>>(
         &mut self,
-        change_observer: ChangeObserver,
-        cdc_handle: T,
+        change_cmd: ChangeObserver,
+        raft_router: T,
         concurrency_semaphore: Arc<Semaphore>,
     ) -> Result<()> {
         fail_point!("cdc_before_initialize");
         let _permit = concurrency_semaphore.acquire().await;
-
-        // When downstream_state is Stopped, it means the corresponding delegate
-        // is stopped. The initialization can be safely canceled.
-        //
-        // Acquiring a permit may take some time, it is possible that
-        // initialization can be canceled.
-        if self.downstream_state.load() == DownstreamState::Stopped {
-            info!("cdc async incremental scan canceled";
-                "region_id" => self.region_id,
-                "downstream_id" => ?self.downstream_id,
-                "observe_id" => ?self.observe_id,
-                "conn_id" => ?self.conn_id);
-            return Err(box_err!("scan canceled"));
-        }
-
-        CDC_SCAN_TASKS.with_label_values(&["ongoing"]).inc();
-        tikv_util::defer!({
-            CDC_SCAN_TASKS.with_label_values(&["ongoing"]).dec();
-        });
 
         // To avoid holding too many snapshots and holding them too long,
         // we need to acquire scan concurrency permit before taking snapshot.
@@ -142,22 +124,24 @@ impl<E: KvEngine> Initializer<E> {
         let (incremental_scan_barrier_cb, incremental_scan_barrier_fut) =
             tikv_util::future::paired_future_callback();
         let barrier = CdcEvent::Barrier(Some(incremental_scan_barrier_cb));
-        if let Err(e) = cdc_handle.capture_change(
+        if let Err(e) = raft_router.significant_send(
             self.region_id,
-            region_epoch,
-            change_observer,
-            Callback::read(Box::new(move |resp| {
-                if let Err(e) = sched.schedule(Task::InitDownstream {
-                    region_id,
-                    downstream_id,
-                    downstream_state,
-                    sink,
-                    incremental_scan_barrier: barrier,
-                    cb: Box::new(move || cb(resp)),
-                }) {
-                    error!("cdc schedule cdc task failed"; "error" => ?e);
-                }
-            })),
+            SignificantMsg::CaptureChange {
+                cmd: change_cmd,
+                region_epoch,
+                callback: Callback::read(Box::new(move |resp| {
+                    if let Err(e) = sched.schedule(Task::InitDownstream {
+                        region_id,
+                        downstream_id,
+                        downstream_state,
+                        sink,
+                        incremental_scan_barrier: barrier,
+                        cb: Box::new(move || cb(resp)),
+                    }) {
+                        error!("cdc schedule cdc task failed"; "error" => ?e);
+                    }
+                })),
+            },
         ) {
             warn!("cdc send capture change cmd failed";
             "region_id" => self.region_id, "error" => ?e);
@@ -182,8 +166,8 @@ impl<E: KvEngine> Initializer<E> {
         mut resp: ReadResponse<impl EngineSnapshot>,
     ) -> Result<()> {
         if let Some(region_snapshot) = resp.snapshot {
-            assert_eq!(self.region_id, region_snapshot.get_region().get_id());
             let region = region_snapshot.get_region().clone();
+            assert_eq!(self.region_id, region.get_id());
             self.async_incremental_scan(region_snapshot, region).await
         } else {
             assert!(
@@ -201,16 +185,31 @@ impl<E: KvEngine> Initializer<E> {
         snap: S,
         region: Region,
     ) -> Result<()> {
-        let downstream_id = self.downstream_id;
+        CDC_SCAN_TASKS.with_label_values(&["ongoing"]).inc();
+        defer!(CDC_SCAN_TASKS.with_label_values(&["ongoing"]).dec());
+
         let region_id = region.get_id();
+        let downstream_id = self.downstream_id;
         let observe_id = self.observe_id;
+        let conn_id = self.conn_id;
         let kv_api = self.kv_api;
-        self.observed_range.update_region_key_range(&region);
+        let on_cancel = || -> Result<()> {
+            info!("cdc async incremental scan canceled";
+                "region_id" => region_id,
+                "downstream_id" => ?downstream_id,
+                "observe_id" => ?observe_id,
+                "conn_id" => ?conn_id);
+            Err(box_err!("scan canceled"))
+        };
+
+        if self.downstream_state.load() == DownstreamState::Stopped {
+            return on_cancel();
+        }
+
         debug!("cdc async incremental scan";
             "region_id" => region_id,
             "downstream_id" => ?downstream_id,
             "observe_id" => ?self.observe_id,
-            "all_key_covered" => ?self.observed_range.all_key_covered,
             "start_key" => log_wrappers::Value::key(snap.lower_bound().unwrap_or_default()),
             "end_key" => log_wrappers::Value::key(snap.upper_bound().unwrap_or_default()));
 
@@ -253,7 +252,6 @@ impl<E: KvEngine> Initializer<E> {
         };
 
         fail_point!("cdc_incremental_scan_start");
-        let conn_id = self.conn_id;
         let mut done = false;
         let start = Instant::now_coarse();
 
@@ -262,15 +260,6 @@ impl<E: KvEngine> Initializer<E> {
             curr_state,
             DownstreamState::Initializing | DownstreamState::Stopped
         ));
-
-        let on_cancel = || -> Result<()> {
-            info!("cdc async incremental scan canceled";
-                "region_id" => region_id,
-                "downstream_id" => ?downstream_id,
-                "observe_id" => ?observe_id,
-                "conn_id" => ?conn_id);
-            Err(box_err!("scan canceled"))
-        };
 
         while !done {
             // When downstream_state is Stopped, it means the corresponding
@@ -398,16 +387,14 @@ impl<E: KvEngine> Initializer<E> {
             perf_delta,
         } = self.do_scan(scanner, old_value_cursors, &mut entries)?;
 
-        CDC_SCAN_BYTES.inc_by(emit as _);
         TLS_CDC_PERF_STATS.with(|x| *x.borrow_mut() += perf_delta);
         tls_flush_perf_stats();
-        let require = if let Some(bytes) = disk_read {
+        if let Some(bytes) = disk_read {
             CDC_SCAN_DISK_READ_BYTES.inc_by(bytes as _);
-            bytes
-        } else {
-            perf_delta.block_read_byte as usize
-        };
-        self.speed_limiter.consume(require).await;
+            self.scan_speed_limiter.consume(bytes).await;
+        }
+        CDC_SCAN_BYTES.inc_by(emit as _);
+        self.fetch_speed_limiter.consume(emit as _).await;
 
         if let Some(resolver) = resolver {
             // Track the locks.
@@ -433,7 +420,6 @@ impl<E: KvEngine> Initializer<E> {
             self.request_id,
             entries,
             self.filter_loop,
-            &self.observed_range,
         )?;
         if done {
             let (cb, fut) = tikv_util::future::paired_future_callback();
@@ -513,11 +499,7 @@ impl<E: KvEngine> Initializer<E> {
         let start_key = data_key(snap.lower_bound().unwrap_or_default());
         let end_key = data_end_key(snap.upper_bound().unwrap_or_default());
         let range = Range::new(&start_key, &end_key);
-        let tablet = match self.tablet.as_ref() {
-            Some(t) => t,
-            None => return false,
-        };
-        let collection = match tablet.table_properties_collection(CF_WRITE, &[range]) {
+        let collection = match self.engine.table_properties_collection(CF_WRITE, &[range]) {
             Ok(collection) => collection,
             Err(_) => return false,
         };
@@ -574,7 +556,7 @@ mod tests {
         cdcpb::{EventLogType, Event_oneof_event},
         errorpb::Error as ErrorHeader,
     };
-    use raftstore::{coprocessor::ObserveHandle, router::CdcRaftRouter, store::RegionSnapshot};
+    use raftstore::{coprocessor::ObserveHandle, store::RegionSnapshot};
     use test_raftstore::MockRaftStoreRouter;
     use tikv::storage::{
         kv::Engine,
@@ -591,7 +573,7 @@ mod tests {
     use tokio::runtime::{Builder, Runtime};
 
     use super::*;
-    use crate::txn_source::TxnSource;
+    use crate::txn_souce::TxnSource;
 
     struct ReceiverRunnable<T: Display + Send> {
         tx: Sender<T>,
@@ -614,7 +596,8 @@ mod tests {
     }
 
     fn mock_initializer(
-        speed_limit: usize,
+        scan_limit: usize,
+        fetch_limit: usize,
         buffer: usize,
         engine: Option<RocksEngine>,
         kv_api: ChangeDataRequestKvApi,
@@ -639,15 +622,16 @@ mod tests {
             .unwrap();
         let downstream_state = Arc::new(AtomicCell::new(DownstreamState::Initializing));
         let initializer = Initializer {
-            tablet: engine.or_else(|| {
+            engine: engine.unwrap_or_else(|| {
                 TestEngineBuilder::new()
                     .build_without_cache()
                     .unwrap()
                     .kv_engine()
+                    .unwrap()
             }),
             sched: receiver_worker.scheduler(),
             sink,
-            observed_range: ObservedRange::default(),
+
             region_id: 1,
             region_epoch: RegionEpoch::default(),
             observe_id: ObserveId::new(),
@@ -656,7 +640,8 @@ mod tests {
             conn_id: ConnId::new(),
             request_id: 0,
             checkpoint_ts: 1.into(),
-            speed_limiter: Limiter::new(speed_limit as _),
+            scan_speed_limiter: Limiter::new(scan_limit as _),
+            fetch_speed_limiter: Limiter::new(fetch_limit as _),
             max_scan_batch_bytes: 1024 * 1024,
             max_scan_batch_size: 1024,
             build_resolver: true,
@@ -674,12 +659,6 @@ mod tests {
 
         let mut expected_locks = BTreeMap::<TimeStamp, HashSet<Arc<[u8]>>>::new();
 
-        // Only observe ["", "b\0x90"]
-        let observed_range = ObservedRange::new(
-            Key::from_raw(&[]).into_encoded(),
-            Key::from_raw(&[b'k', 90]).into_encoded(),
-        )
-        .unwrap();
         let mut total_bytes = 0;
         // Pessimistic locks should not be tracked
         for i in 0..10 {
@@ -707,12 +686,12 @@ mod tests {
         let buffer = 1000;
         let (mut worker, pool, mut initializer, rx, mut drain) = mock_initializer(
             total_bytes,
+            total_bytes,
             buffer,
             engine.kv_engine(),
             ChangeDataRequestKvApi::TiDb,
             false,
         );
-        initializer.observed_range = observed_range.clone();
         let check_result = || loop {
             let task = rx.recv().unwrap();
             match task {
@@ -726,14 +705,7 @@ mod tests {
         // To not block test by barrier.
         pool.spawn(async move {
             let mut d = drain.drain();
-            while let Some((e, _)) = d.next().await {
-                if let CdcEvent::Event(e) = e {
-                    for e in e.get_entries().get_entries() {
-                        let key = Key::from_raw(&e.key).into_encoded();
-                        assert!(observed_range.contains_encoded_key(&key), "{:?}", e);
-                    }
-                }
-            }
+            while d.next().await.is_some() {}
         });
 
         block_on(initializer.async_incremental_scan(snap.clone(), region.clone())).unwrap();
@@ -791,6 +763,7 @@ mod tests {
         let mut engine = TestEngineBuilder::new().build_without_cache().unwrap();
 
         let mut total_bytes = 0;
+
         for i in 10..100 {
             let (k, v) = (&[b'k', i], &[b'v', i]);
             total_bytes += k.len();
@@ -803,6 +776,7 @@ mod tests {
         // Buffer must be large enough to unblock async incremental scan.
         let buffer = 1000;
         let (mut worker, pool, mut initializer, _rx, mut drain) = mock_initializer(
+            total_bytes,
             total_bytes,
             buffer,
             engine.kv_engine(),
@@ -885,6 +859,7 @@ mod tests {
             for checkpoint_ts in [200, 100, 150] {
                 let (mut worker, pool, mut initializer, _rx, mut drain) = mock_initializer(
                     usize::MAX,
+                    usize::MAX,
                     1000,
                     engine.kv_engine(),
                     ChangeDataRequestKvApi::TiDb,
@@ -949,6 +924,7 @@ mod tests {
         let buffer = 1;
         let (mut worker, _pool, mut initializer, rx, _drain) = mock_initializer(
             total_bytes,
+            total_bytes,
             buffer,
             None,
             ChangeDataRequestKvApi::TiDb,
@@ -1003,10 +979,10 @@ mod tests {
         let total_bytes = 1;
         let buffer = 1;
         let (mut worker, pool, mut initializer, _rx, _drain) =
-            mock_initializer(total_bytes, buffer, None, kv_api, false);
+            mock_initializer(total_bytes, total_bytes, buffer, None, kv_api, false);
 
         let change_cmd = ChangeObserver::from_cdc(1, ObserveHandle::new());
-        let raft_router = CdcRaftRouter(MockRaftStoreRouter::new());
+        let raft_router = MockRaftStoreRouter::new();
         let concurrency_semaphore = Arc::new(Semaphore::new(1));
 
         initializer.downstream_state.store(DownstreamState::Stopped);
@@ -1030,6 +1006,14 @@ mod tests {
         let (tx1, rx1) = sync_channel(1);
         let change_cmd = ChangeObserver::from_cdc(1, ObserveHandle::new());
         pool.spawn(async move {
+            // Migrated to 2021 migration. This let statement is probably not needed, see
+            //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+            let _ = (
+                &initializer,
+                &change_cmd,
+                &raft_router,
+                &concurrency_semaphore,
+            );
             let res = initializer
                 .initialize(change_cmd, raft_router, concurrency_semaphore)
                 .await;

@@ -75,7 +75,6 @@ impl<Owner: Fsm> BasicMailbox<Owner> {
         msg: Owner::Message,
         scheduler: &S,
     ) -> Result<(), SendError<Owner::Message>> {
-        scheduler.consume_msg_resource(&msg);
         self.sender.force_send(msg)?;
         self.state.notify(scheduler, Cow::Borrowed(self));
         Ok(())
@@ -90,7 +89,6 @@ impl<Owner: Fsm> BasicMailbox<Owner> {
         msg: Owner::Message,
         scheduler: &S,
     ) -> Result<(), TrySendError<Owner::Message>> {
-        scheduler.consume_msg_resource(&msg);
         self.sender.try_send(msg)?;
         self.state.notify(scheduler, Cow::Borrowed(self));
         Ok(())

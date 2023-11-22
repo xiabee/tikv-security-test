@@ -20,9 +20,9 @@ use online_config::{self, ConfigChange, ConfigManager, OnlineConfig};
 use pd_client::PdClient;
 use raftstore::{
     coprocessor::{CmdBatch, ObserveHandle, ObserveId},
-    router::CdcHandle,
+    router::RaftStoreRouter,
     store::{
-        fsm::store::StoreRegionMeta,
+        fsm::StoreMeta,
         util::{
             self, ReadState, RegionReadProgress, RegionReadProgressCore, RegionReadProgressRegistry,
         },
@@ -273,11 +273,11 @@ impl ObserveRegion {
     }
 }
 
-pub struct Endpoint<T, E: KvEngine, S> {
+pub struct Endpoint<T, E: KvEngine> {
     store_id: Option<u64>,
     cfg: ResolvedTsConfig,
     advance_notify: Arc<Notify>,
-    store_meta: Arc<Mutex<S>>,
+    store_meta: Arc<Mutex<StoreMeta>>,
     region_read_progress: RegionReadProgressRegistry,
     regions: HashMap<u64, ObserveRegion>,
     scanner_pool: ScannerPool<T, E>,
@@ -287,11 +287,10 @@ pub struct Endpoint<T, E: KvEngine, S> {
 }
 
 // methods that are used for metrics and logging
-impl<T, E, S> Endpoint<T, E, S>
+impl<T, E> Endpoint<T, E>
 where
-    T: 'static + CdcHandle<E>,
+    T: 'static + RaftStoreRouter<E>,
     E: KvEngine,
-    S: StoreRegionMeta,
 {
     fn is_leader(&self, store_id: Option<u64>, leader_store_id: Option<u64>) -> bool {
         store_id.is_some() && store_id == leader_store_id
@@ -545,17 +544,16 @@ where
     }
 }
 
-impl<T, E, S> Endpoint<T, E, S>
+impl<T, E> Endpoint<T, E>
 where
-    T: 'static + CdcHandle<E>,
+    T: 'static + RaftStoreRouter<E>,
     E: KvEngine,
-    S: StoreRegionMeta,
 {
     pub fn new(
         cfg: &ResolvedTsConfig,
         scheduler: Scheduler<Task>,
-        cdc_handle: T,
-        store_meta: Arc<Mutex<S>>,
+        raft_router: T,
+        store_meta: Arc<Mutex<StoreMeta>>,
         pd_client: Arc<dyn PdClient>,
         concurrency_manager: ConcurrencyManager,
         env: Arc<Environment>,
@@ -563,7 +561,7 @@ where
     ) -> Self {
         let (region_read_progress, store_id) = {
             let meta = store_meta.lock().unwrap();
-            (meta.region_read_progress().clone(), meta.store_id())
+            (meta.region_read_progress.clone(), meta.store_id)
         };
         let advance_worker = AdvanceTsWorker::new(
             cfg.advance_ts_interval.0,
@@ -571,10 +569,10 @@ where
             scheduler.clone(),
             concurrency_manager,
         );
-        let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, cdc_handle);
+        let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, raft_router);
         let store_resolver_gc_interval = Duration::from_secs(60);
         let leader_resolver = LeadershipResolver::new(
-            store_id,
+            store_id.unwrap(),
             pd_client.clone(),
             env,
             security_mgr,
@@ -582,7 +580,7 @@ where
             store_resolver_gc_interval,
         );
         let ep = Self {
-            store_id: Some(store_id),
+            store_id,
             cfg: cfg.clone(),
             advance_notify: Arc::new(Notify::new()),
             scheduler,
@@ -759,8 +757,8 @@ where
             let region;
             {
                 let meta = self.store_meta.lock().unwrap();
-                match meta.reader(region_id) {
-                    Some(r) => region = r.region.as_ref().clone(),
+                match meta.regions.get(&region_id) {
+                    Some(r) => region = r.clone(),
                     None => return,
                 }
             }
@@ -867,8 +865,8 @@ where
     fn get_or_init_store_id(&mut self) -> Option<u64> {
         self.store_id.or_else(|| {
             let meta = self.store_meta.lock().unwrap();
-            self.store_id = Some(meta.store_id());
-            self.store_id
+            self.store_id = meta.store_id;
+            meta.store_id
         })
     }
 
@@ -1010,11 +1008,10 @@ impl fmt::Display for Task {
     }
 }
 
-impl<T, E, S> Runnable for Endpoint<T, E, S>
+impl<T, E> Runnable for Endpoint<T, E>
 where
-    T: 'static + CdcHandle<E>,
+    T: 'static + RaftStoreRouter<E>,
     E: KvEngine,
-    S: StoreRegionMeta,
 {
     type Task = Task;
 
@@ -1207,11 +1204,10 @@ struct ResolverStats {
 
 const METRICS_FLUSH_INTERVAL: u64 = 10_000; // 10s
 
-impl<T, E, S> RunnableWithTimer for Endpoint<T, E, S>
+impl<T, E> RunnableWithTimer for Endpoint<T, E>
 where
-    T: 'static + CdcHandle<E>,
+    T: 'static + RaftStoreRouter<E>,
     E: KvEngine,
-    S: StoreRegionMeta,
 {
     fn on_timeout(&mut self) {
         let stats = self.collect_stats();

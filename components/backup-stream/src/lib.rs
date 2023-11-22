@@ -21,7 +21,5 @@ mod subscription_track;
 pub mod utils;
 
 pub use checkpoint_manager::GetCheckpointResult;
-pub use endpoint::{
-    BackupStreamResolver, Endpoint, ObserveOp, RegionCheckpointOperation, RegionSet, Task,
-};
+pub use endpoint::{Endpoint, ObserveOp, RegionCheckpointOperation, RegionSet, Task};
 pub use service::Service;

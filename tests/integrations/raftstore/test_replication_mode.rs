@@ -1,12 +1,16 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    sync::{mpsc, Arc},
+    thread,
+    time::Duration,
+};
 
 use kvproto::replication_modepb::*;
 use pd_client::PdClient;
 use raft::eraftpb::ConfChangeType;
 use test_raftstore::*;
-use tikv_util::{config::*, mpsc::future, HandyRwLock};
+use tikv_util::{config::*, HandyRwLock};
 
 fn prepare_cluster() -> Cluster<ServerCluster> {
     let mut cluster = new_server_cluster(0, 3);
@@ -34,6 +38,18 @@ fn run_cluster(cluster: &mut Cluster<ServerCluster>) {
     cluster.must_put(b"k1", b"v0");
 }
 
+fn prepare_labels(cluster: &mut Cluster<ServerCluster>) {
+    cluster.add_label(1, "dc", "dc1");
+    cluster.add_label(2, "dc", "dc1");
+    cluster.add_label(3, "dc", "dc2");
+    cluster.add_label(1, "zone", "z1");
+    cluster.add_label(2, "zone", "z2");
+    cluster.add_label(3, "zone", "z3");
+    cluster.add_label(1, "host", "h1");
+    cluster.add_label(2, "host", "h2");
+    cluster.add_label(3, "host", "h3");
+}
+
 /// When using DrAutoSync replication mode, data should be replicated to
 /// different labels before committed.
 #[test]
@@ -49,7 +65,7 @@ fn test_dr_auto_sync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&request);
+    let (cb, rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -71,7 +87,7 @@ fn test_dr_auto_sync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&request);
+    let (cb, rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -79,7 +95,7 @@ fn test_dr_auto_sync() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(future::RecvTimeoutError::Timeout)
+        Err(mpsc::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -101,7 +117,7 @@ fn test_sync_recover_after_apply_snapshot() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&request);
+    let (cb, rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -109,7 +125,7 @@ fn test_sync_recover_after_apply_snapshot() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(future::RecvTimeoutError::Timeout)
+        Err(mpsc::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -119,7 +135,7 @@ fn test_sync_recover_after_apply_snapshot() {
     // swith to async
     cluster
         .pd_client
-        .switch_replication_mode(DrAutoSyncState::Async, vec![]);
+        .switch_replication_mode(Some(DrAutoSyncState::Async), vec![]);
     rx.recv_timeout(Duration::from_millis(100)).unwrap();
     must_get_equal(&cluster.get_engine(1), b"k2", b"v2");
     thread::sleep(Duration::from_millis(100));
@@ -136,7 +152,7 @@ fn test_sync_recover_after_apply_snapshot() {
 
     cluster
         .pd_client
-        .switch_replication_mode(DrAutoSyncState::SyncRecover, vec![]);
+        .switch_replication_mode(Some(DrAutoSyncState::SyncRecover), vec![]);
     thread::sleep(Duration::from_millis(100));
     // Add node 3 back, snapshot will apply
     cluster.clear_send_filters();
@@ -248,7 +264,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&request);
+    let (cb, rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -256,7 +272,7 @@ fn test_switching_replication_mode() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(future::RecvTimeoutError::Timeout)
+        Err(mpsc::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -265,7 +281,7 @@ fn test_switching_replication_mode() {
 
     cluster
         .pd_client
-        .switch_replication_mode(DrAutoSyncState::Async, vec![]);
+        .switch_replication_mode(Some(DrAutoSyncState::Async), vec![]);
     rx.recv_timeout(Duration::from_millis(100)).unwrap();
     must_get_equal(&cluster.get_engine(1), b"k2", b"v2");
     thread::sleep(Duration::from_millis(100));
@@ -275,7 +291,7 @@ fn test_switching_replication_mode() {
 
     cluster
         .pd_client
-        .switch_replication_mode(DrAutoSyncState::SyncRecover, vec![]);
+        .switch_replication_mode(Some(DrAutoSyncState::SyncRecover), vec![]);
     thread::sleep(Duration::from_millis(100));
     let mut request = new_request(
         region.get_id(),
@@ -284,7 +300,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&request);
+    let (cb, rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -312,7 +328,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&request);
+    let (cb, rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -321,7 +337,7 @@ fn test_switching_replication_mode() {
     // already enable group commit.
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(future::RecvTimeoutError::Timeout)
+        Err(mpsc::RecvTimeoutError::Timeout)
     );
 }
 
@@ -331,7 +347,7 @@ fn test_replication_mode_allowlist() {
     run_cluster(&mut cluster);
     cluster
         .pd_client
-        .switch_replication_mode(DrAutoSyncState::Async, vec![1]);
+        .switch_replication_mode(Some(DrAutoSyncState::Async), vec![1]);
     thread::sleep(Duration::from_millis(100));
 
     // 2,3 are paused, so it should not be able to write.
@@ -343,7 +359,7 @@ fn test_replication_mode_allowlist() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&request);
+    let (cb, rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -351,13 +367,13 @@ fn test_replication_mode_allowlist() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(future::RecvTimeoutError::Timeout)
+        Err(mpsc::RecvTimeoutError::Timeout)
     );
 
     // clear allowlist.
     cluster
         .pd_client
-        .switch_replication_mode(DrAutoSyncState::Async, vec![]);
+        .switch_replication_mode(Some(DrAutoSyncState::Async), vec![]);
     rx.recv_timeout(Duration::from_millis(100)).unwrap();
     must_get_equal(&cluster.get_engine(1), b"k2", b"v2");
 }
@@ -431,7 +447,7 @@ fn test_migrate_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&request);
+    let (cb, rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -439,7 +455,7 @@ fn test_migrate_replication_mode() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(future::RecvTimeoutError::Timeout)
+        Err(mpsc::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -454,6 +470,68 @@ fn test_migrate_replication_mode() {
     let state = cluster.pd_client.region_replication_status(region.get_id());
     assert_eq!(state.state_id, 2);
     assert_eq!(state.state, RegionReplicationState::IntegrityOverLabel);
+}
+
+#[test]
+fn test_migrate_majority_to_drautosync() {
+    // 1. start cluster, enable dr-auto-sync and set labels.
+    let mut cluster = new_server_cluster(0, 3);
+    cluster.pd_client.disable_default_operator();
+    cluster.cfg.raft_store.pd_store_heartbeat_tick_interval = ReadableDuration::millis(50);
+    cluster.cfg.raft_store.raft_log_gc_threshold = 10;
+    prepare_labels(&mut cluster);
+    cluster.run();
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+    cluster.must_put(b"k1", b"v0");
+    cluster.pd_client.configure_dr_auto_sync("dc");
+    thread::sleep(Duration::from_millis(100));
+    let region = cluster.get_region(b"k1");
+    let mut request = new_request(
+        region.get_id(),
+        region.get_region_epoch().clone(),
+        vec![new_put_cf_cmd("default", b"k2", b"v2")],
+        false,
+    );
+    request.mut_header().set_peer(new_peer(1, 1));
+    let (cb, rx) = make_cb(&request);
+    cluster
+        .sim
+        .rl()
+        .async_command_on_node(1, request, cb)
+        .unwrap();
+    assert_eq!(rx.recv_timeout(Duration::from_millis(100)).is_ok(), true);
+    must_get_equal(&cluster.get_engine(1), b"k2", b"v2");
+    let state = cluster.pd_client.region_replication_status(region.get_id());
+    assert_eq!(state.state_id, 1);
+    assert_eq!(state.state, RegionReplicationState::IntegrityOverLabel);
+
+    // 2. swith to marjority mode.
+    cluster.pd_client.switch_replication_mode(None, vec![]);
+    thread::sleep(Duration::from_millis(150));
+
+    // 3. spilt the region and make a new region, the regions status must be
+    // SimpleMajority.
+    cluster.must_split(&region, b"m1");
+    thread::sleep(Duration::from_millis(150));
+    cluster.must_put(b"n4", b"v4");
+    must_get_equal(&cluster.get_engine(1), b"n4", b"v4");
+    let region_m = cluster.get_region(b"n4");
+    let region_k = cluster.get_region(b"k1");
+
+    // 4. switch to dy-auto-sync mode, the new region generated at marjority mode
+    // becomes IntegrityOverLabel again.
+    cluster.pd_client.switch_to_drautosync_mode();
+    thread::sleep(Duration::from_millis(100));
+    let state_m = cluster
+        .pd_client
+        .region_replication_status(region_m.get_id());
+    let state_k = cluster
+        .pd_client
+        .region_replication_status(region_k.get_id());
+    assert_eq!(state_m.state_id, 3);
+    assert_eq!(state_m.state, RegionReplicationState::IntegrityOverLabel);
+    assert_eq!(state_k.state_id, 3);
+    assert_eq!(state_k.state, RegionReplicationState::IntegrityOverLabel);
 }
 
 /// Tests if labels are loaded correctly after rolling start.
