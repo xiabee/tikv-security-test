@@ -910,7 +910,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "serde",
- "time",
+ "time 0.1.42",
 ]
 
 [[package]]
@@ -1338,6 +1338,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deranged"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f32d04922c60427da6f9fef14d042d9edddef64cb9d4ce0d64d0685fbeb1fd3"
+
+[[package]]
 name = "derivative"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1524,7 +1530,7 @@ dependencies = [
  "tempfile",
  "tikv_alloc",
  "tikv_util",
- "time",
+ "time 0.3.26",
  "toml",
  "tracker",
  "txn_types",
@@ -4173,7 +4179,7 @@ dependencies = [
  "slog-global",
  "tempfile",
  "tikv_util",
- "time",
+ "time 0.3.26",
  "tracker",
 ]
 
@@ -4240,7 +4246,7 @@ dependencies = [
  "tidb_query_datatype",
  "tikv_alloc",
  "tikv_util",
- "time",
+ "time 0.3.26",
  "tokio",
  "tracker",
  "txn_types",
@@ -4289,7 +4295,7 @@ dependencies = [
  "test_util",
  "thiserror",
  "tikv_util",
- "time",
+ "time 0.3.26",
  "tracker",
  "txn_types",
  "yatp",
@@ -5030,9 +5036,9 @@ dependencies = [
 
 [[package]]
 name = "serde"
-version = "1.0.106"
+version = "1.0.147"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36df6ac6412072f67cf767ebbde4133a5b2e88e76dc6187fa7104cd16f783399"
+checksum = "d193d69bae983fc11a79df82342761dfbf28a99fc8d203dca4c3c1b590948965"
 dependencies = [
  "serde_derive",
 ]
@@ -5061,9 +5067,9 @@ dependencies = [
 
 [[package]]
 name = "serde_derive"
-version = "1.0.106"
+version = "1.0.147"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e549e3abf4fb8621bd1609f11dfc9f5e50320802273b12f3811a67e6716ea6c"
+checksum = "4f1d362ca8fc9c3e3a7484440752472d68a6caa98f1ab81d99b5dfe517cec852"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5979,7 +5985,7 @@ dependencies = [
  "slog-global",
  "tempfile",
  "tikv_util",
- "time",
+ "time 0.3.26",
 ]
 
 [[package]]
@@ -6058,7 +6064,7 @@ dependencies = [
  "tikv",
  "tikv_kv",
  "tikv_util",
- "time",
+ "time 0.1.42",
  "tipb",
  "tipb_helper",
  "tokio",
@@ -6156,7 +6162,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tikv_util",
- "time",
+ "time 0.3.26",
  "yatp",
 ]
 
@@ -6261,7 +6267,7 @@ dependencies = [
  "tidb_query_common",
  "tidb_query_datatype",
  "tikv_util",
- "time",
+ "time 0.3.26",
  "tipb",
  "tipb_helper",
  "twoway",
@@ -6383,7 +6389,7 @@ dependencies = [
  "tikv_alloc",
  "tikv_kv",
  "tikv_util",
- "time",
+ "time 0.1.42",
  "tipb",
  "tokio",
  "tokio-openssl",
@@ -6444,7 +6450,7 @@ dependencies = [
  "tikv",
  "tikv_alloc",
  "tikv_util",
- "time",
+ "time 0.3.26",
  "tokio",
  "toml",
  "txn_types",
@@ -6492,7 +6498,7 @@ dependencies = [
  "server",
  "tikv",
  "tikv_util",
- "time",
+ "time 0.3.26",
  "toml",
 ]
 
@@ -6603,7 +6609,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tikv_alloc",
- "time",
+ "time 0.3.26",
  "tokio",
  "tokio-executor",
  "tokio-timer",
@@ -6624,6 +6630,23 @@ dependencies = [
  "redox_syscall 0.1.56",
  "winapi 0.3.9",
 ]
+
+[[package]]
+name = "time"
+version = "0.3.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a79d09ac6b08c1ab3906a2f7cc2e81a0e27c7ae89c63812df75e52bef0751e07"
+dependencies = [
+ "deranged",
+ "serde",
+ "time-core",
+]
+
+[[package]]
+name = "time-core"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7300fbefb4dadc1af235a9cef3737cea692a9d97e1b9cbcd4ebdae6f8868e6fb"
 
 [[package]]
 name = "tinytemplate"

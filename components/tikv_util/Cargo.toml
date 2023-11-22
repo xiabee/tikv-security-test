@@ -55,7 +55,7 @@ slog-term = "2.4"
 sysinfo = "0.26"
 thiserror = "1.0"
 tikv_alloc = { workspace = true }
-time = "0.1"
+time = "0.3"
 tokio = { version = "1.5", features = ["rt-multi-thread"] }
 tokio-executor = { workspace = true }
 tokio-timer = { workspace = true }

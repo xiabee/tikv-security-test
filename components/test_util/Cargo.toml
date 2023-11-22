@@ -24,4 +24,4 @@ slog = { workspace = true }
 slog-global = { workspace = true }
 tempfile = "3.0"
 tikv_util = { workspace = true }
-time = "0.1"
+time = "0.3"
