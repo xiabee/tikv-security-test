@@ -126,6 +126,7 @@ pub enum StaleState {
     Valid,
     ToValidate,
     LeaderMissing,
+    MaybeLeaderMissing,
 }
 
 #[derive(Debug)]
@@ -656,7 +657,7 @@ impl UnsafeRecoveryForceLeaderSyncer {
     pub fn new(report_id: u64, router: RaftRouter<impl KvEngine, impl RaftEngine>) -> Self {
         let thread_safe_router = Mutex::new(router);
         let inner = InvokeClosureOnDrop(Box::new(move || {
-            info!("Unsafe recovery, force leader finished.");
+            info!("Unsafe recovery, force leader finished."; "report_id" => report_id);
             let router_ptr = thread_safe_router.lock().unwrap();
             start_unsafe_recovery_report(&*router_ptr, report_id, false);
         }));
@@ -677,11 +678,11 @@ impl UnsafeRecoveryExecutePlanSyncer {
         let abort = Arc::new(Mutex::new(false));
         let abort_clone = abort.clone();
         let closure = InvokeClosureOnDrop(Box::new(move || {
-            info!("Unsafe recovery, plan execution finished");
             if *abort_clone.lock().unwrap() {
-                warn!("Unsafe recovery, plan execution aborted");
+                warn!("Unsafe recovery, plan execution aborted"; "report_id" => report_id);
                 return;
             }
+            info!("Unsafe recovery, plan execution finished"; "report_id" => report_id);
             let router_ptr = thread_safe_router.lock().unwrap();
             start_unsafe_recovery_report(&*router_ptr, report_id, true);
         }));
@@ -748,11 +749,11 @@ impl UnsafeRecoveryWaitApplySyncer {
         let abort = Arc::new(Mutex::new(false));
         let abort_clone = abort.clone();
         let closure = InvokeClosureOnDrop(Box::new(move || {
-            info!("Unsafe recovery, wait apply finished");
             if *abort_clone.lock().unwrap() {
-                warn!("Unsafe recovery, wait apply aborted");
+                warn!("Unsafe recovery, wait apply aborted"; "report_id" => report_id);
                 return;
             }
+            info!("Unsafe recovery, wait apply finished"; "report_id" => report_id);
             let router_ptr = thread_safe_router.lock().unwrap();
             if exit_force_leader {
                 (*router_ptr).broadcast_normal(|| {
@@ -791,7 +792,7 @@ impl UnsafeRecoveryFillOutReportSyncer {
         let reports = Arc::new(Mutex::new(vec![]));
         let reports_clone = reports.clone();
         let closure = InvokeClosureOnDrop(Box::new(move || {
-            info!("Unsafe recovery, peer reports collected");
+            info!("Unsafe recovery, peer reports collected"; "report_id" => report_id);
             let mut store_report = pdpb::StoreReport::default();
             {
                 let mut reports_ptr = reports_clone.lock().unwrap();
@@ -801,7 +802,7 @@ impl UnsafeRecoveryFillOutReportSyncer {
             let router_ptr = thread_safe_router.lock().unwrap();
             if let Err(e) = (*router_ptr).send_control(StoreMsg::UnsafeRecoveryReport(store_report))
             {
-                error!("Unsafe recovery, fail to schedule reporting"; "err" => ?e);
+                error!("Unsafe recovery, fail to schedule reporting"; "err" => ?e, "report_id" => report_id);
             }
         }));
         UnsafeRecoveryFillOutReportSyncer {
@@ -849,6 +850,9 @@ pub enum UnsafeRecoveryState {
         demote_after_exit: bool,
     },
     Destroy(UnsafeRecoveryExecutePlanSyncer),
+    // DemoteFailedVoter may fail due to some reasons. It's just a marker to avoid exiting force
+    // leader state
+    Failed,
 }
 
 impl UnsafeRecoveryState {
@@ -857,6 +861,7 @@ impl UnsafeRecoveryState {
             UnsafeRecoveryState::WaitApply { syncer, .. } => syncer.time,
             UnsafeRecoveryState::DemoteFailedVoters { syncer, .. }
             | UnsafeRecoveryState::Destroy(syncer) => syncer.time,
+            UnsafeRecoveryState::Failed => return false,
         };
         time.saturating_elapsed() >= timeout
     }
@@ -866,6 +871,7 @@ impl UnsafeRecoveryState {
             UnsafeRecoveryState::WaitApply { syncer, .. } => &syncer.abort,
             UnsafeRecoveryState::DemoteFailedVoters { syncer, .. }
             | UnsafeRecoveryState::Destroy(syncer) => &syncer.abort,
+            UnsafeRecoveryState::Failed => return true,
         };
         *abort.lock().unwrap()
     }
@@ -875,6 +881,7 @@ impl UnsafeRecoveryState {
             UnsafeRecoveryState::WaitApply { syncer, .. } => syncer.abort(),
             UnsafeRecoveryState::DemoteFailedVoters { syncer, .. }
             | UnsafeRecoveryState::Destroy(syncer) => syncer.abort(),
+            UnsafeRecoveryState::Failed => (),
         }
     }
 }
@@ -1238,7 +1245,10 @@ where
             return;
         }
         self.replication_mode_version = state.status().get_dr_auto_sync().state_id;
-        let enable = state.status().get_dr_auto_sync().get_state() != DrAutoSyncState::Async;
+        let enable = !matches!(
+            state.status().get_dr_auto_sync().get_state(),
+            DrAutoSyncState::Async | DrAutoSyncState::SyncRecover
+        );
         self.raft_group.raft.enable_group_commit(enable);
         self.dr_auto_sync_state = state.status().get_dr_auto_sync().get_state();
     }
@@ -2258,7 +2268,6 @@ where
             self.leader_missing_time = None;
             return StaleState::Valid;
         }
-        let naive_peer = !self.is_initialized() || !self.raft_group.raft.promotable();
         // Updates the `leader_missing_time` according to the current state.
         //
         // If we are checking this it means we suspect the leader might be missing.
@@ -2278,13 +2287,18 @@ where
                 StaleState::ToValidate
             }
             Some(instant)
-                if instant.saturating_elapsed() >= ctx.cfg.abnormal_leader_missing_duration.0
-                    && !naive_peer =>
+                if instant.saturating_elapsed() >= ctx.cfg.abnormal_leader_missing_duration.0 =>
             {
                 // A peer is considered as in the leader missing state
                 // if it's initialized but is isolated from its leader or
                 // something bad happens that the raft group can not elect a leader.
-                StaleState::LeaderMissing
+                if self.is_initialized() && self.raft_group.raft.promotable() {
+                    StaleState::LeaderMissing
+                } else {
+                    // Uninitialized peer and learner may not have leader info,
+                    // even if there is a valid leader.
+                    StaleState::MaybeLeaderMissing
+                }
             }
             _ => StaleState::Valid,
         }
@@ -5501,6 +5515,7 @@ where
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
     ) {
+        ctx.raft_metrics.check_stale_peer.inc();
         if self.check_stale_conf_ver < self.region().get_region_epoch().get_conf_ver()
             || self.region().get_region_epoch().get_conf_ver() == 0
         {
