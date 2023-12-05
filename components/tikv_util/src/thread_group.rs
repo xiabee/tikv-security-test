@@ -2,13 +2,9 @@
 
 //! Provides util functions to manage share properties across threads.
 
-use std::{
-    cell::RefCell,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Default)]
 struct GroupPropertiesInner {

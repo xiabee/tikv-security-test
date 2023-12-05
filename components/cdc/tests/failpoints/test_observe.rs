@@ -1,31 +1,27 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
-
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
-    },
-    time::Duration,
-};
-
-use api_version::{test_kv_format_impl, KvFormat};
-use futures::{executor::block_on, sink::SinkExt};
+use crate::{new_event_feed, TestSuite, TestSuiteBuilder};
+use futures::executor::block_on;
+use futures::sink::SinkExt;
 use grpcio::WriteFlags;
-use kvproto::{cdcpb::*, kvrpcpb::*, raft_serverpb::RaftMessage};
+#[cfg(feature = "prost-codec")]
+use kvproto::cdcpb::event::{Event as Event_oneof_event, LogType as EventLogType};
+#[cfg(not(feature = "prost-codec"))]
+use kvproto::cdcpb::*;
+use kvproto::kvrpcpb::*;
+use kvproto::raft_serverpb::RaftMessage;
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::Duration;
 use test_raftstore::*;
-use tikv_util::{config::ReadableDuration, HandyRwLock};
-
-use crate::{new_event_feed, TestSuite, TestSuiteBuilder};
+use tikv_util::config::ReadableDuration;
+use tikv_util::HandyRwLock;
 
 #[test]
 fn test_observe_duplicate_cmd() {
-    test_kv_format_impl!(test_observe_duplicate_cmd_impl<ApiV1 ApiV2>);
-}
-
-fn test_observe_duplicate_cmd_impl<F: KvFormat>() {
-    let mut suite = TestSuite::new(3, F::TAG);
+    let mut suite = TestSuite::new(3);
 
     let region = suite.cluster.get_region(&[]);
     let req = suite.new_changedata_request(region.get_id());
@@ -44,8 +40,7 @@ fn test_observe_duplicate_cmd_impl<F: KvFormat>() {
         other => panic!("unknown event {:?}", other),
     }
 
-    // If tikv enable ApiV2, txn key needs to start with 'x';
-    let (k, v) = ("xkey1".to_owned(), "value".to_owned());
+    let (k, v) = ("key1".to_owned(), "value".to_owned());
     // Prewrite
     let start_ts = block_on(suite.cluster.pd_client.get_tso()).unwrap();
     let mut mutation = Mutation::default();

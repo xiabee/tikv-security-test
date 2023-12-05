@@ -4,18 +4,16 @@ mod point_getter;
 mod reader;
 mod scanner;
 
-use txn_types::{TimeStamp, Write, WriteType};
-
+pub use self::point_getter::{PointGetter, PointGetterBuilder};
 #[cfg(test)]
 pub use self::reader::tests as reader_tests;
-pub use self::{
-    point_getter::{PointGetter, PointGetterBuilder},
-    reader::{MvccReader, SnapshotReader},
-    scanner::{
-        has_data_in_range, near_load_data_by_write, seek_for_valid_write, test_util, DeltaScanner,
-        EntryScanner, Scanner, ScannerBuilder,
-    },
+pub use self::reader::{MvccReader, SnapshotReader};
+pub use self::scanner::test_util;
+pub use self::scanner::{
+    has_data_in_range, seek_for_valid_write, DeltaScanner, EntryScanner, Scanner, ScannerBuilder,
 };
+
+use txn_types::{TimeStamp, Write, WriteType};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum NewerTsCheckState {
@@ -24,25 +22,23 @@ pub enum NewerTsCheckState {
     NotMetYet,
 }
 
-/// The result of `get_txn_commit_record`, which is used to get the status of a
-/// specified transaction from write cf.
+/// The result of `get_txn_commit_record`, which is used to get the status of a specified
+/// transaction from write cf.
 #[derive(Debug)]
 pub enum TxnCommitRecord {
-    /// The commit record of the given transaction is not found. But it's
-    /// possible that there's another transaction's commit record, whose
-    /// `commit_ts` equals to the current transaction's `start_ts`. That
-    /// kind of record will be returned via the `overlapped_write` field.
-    /// In this case, if the current transaction is to be rolled back, the
-    /// `overlapped_write` must not be overwritten.
+    /// The commit record of the given transaction is not found. But it's possible that there's
+    /// another transaction's commit record, whose `commit_ts` equals to the current transaction's
+    /// `start_ts`. That kind of record will be returned via the `overlapped_write` field.
+    /// In this case, if the current transaction is to be rolled back, the `overlapped_write` must not
+    /// be overwritten.
     None {
         overlapped_write: Option<OverlappedWrite>,
     },
     /// Found the transaction's write record.
     SingleRecord { commit_ts: TimeStamp, write: Write },
-    /// The transaction's status is found in another transaction's record's
-    /// `overlapped_rollback` field. This may happen when the current
-    /// transaction's `start_ts` is the same as the `commit_ts` of another
-    /// transaction on this key.
+    /// The transaction's status is found in another transaction's record's `overlapped_rollback`
+    /// field. This may happen when the current transaction's `start_ts` is the same as the
+    /// `commit_ts` of another transaction on this key.
     OverlappedRollback { commit_ts: TimeStamp },
 }
 

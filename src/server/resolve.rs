@@ -1,21 +1,20 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    fmt::{self, Display, Formatter},
-    sync::{Arc, Mutex},
-};
+use std::fmt::{self, Display, Formatter};
+use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 
 use collections::HashMap;
+use engine_traits::KvEngine;
 use kvproto::replication_modepb::ReplicationMode;
 use pd_client::{take_peer_address, PdClient};
+use raftstore::router::RaftStoreRouter;
 use raftstore::store::GlobalReplicationState;
-use tikv_kv::RaftExtension;
-use tikv_util::{
-    time::Instant,
-    worker::{Runnable, Scheduler, Worker},
-};
+use tikv_util::time::Instant;
+use tikv_util::worker::{Runnable, Scheduler, Worker};
 
-use super::{metrics::*, Result};
+use super::metrics::*;
+use super::Result;
 
 const STORE_ADDRESS_REFRESH_SECONDS: u64 = 60;
 
@@ -51,21 +50,24 @@ struct StoreAddr {
 }
 
 /// A runner for resolving store addresses.
-struct Runner<T, R>
+struct Runner<T, RR, E>
 where
     T: PdClient,
-    R: RaftExtension,
+    RR: RaftStoreRouter<E>,
+    E: KvEngine,
 {
     pd_client: Arc<T>,
     store_addrs: HashMap<u64, StoreAddr>,
     state: Arc<Mutex<GlobalReplicationState>>,
-    router: R,
+    router: RR,
+    engine: PhantomData<E>,
 }
 
-impl<T, R> Runner<T, R>
+impl<T, RR, E> Runner<T, RR, E>
 where
     T: PdClient,
-    R: RaftExtension,
+    RR: RaftStoreRouter<E>,
+    E: KvEngine,
 {
     fn resolve(&mut self, store_id: u64) -> Result<String> {
         if let Some(s) = self.store_addrs.get(&store_id) {
@@ -124,18 +126,17 @@ where
     }
 }
 
-impl<T, R> Runnable for Runner<T, R>
+impl<T, RR, E> Runnable for Runner<T, RR, E>
 where
     T: PdClient,
-    R: RaftExtension,
+    RR: RaftStoreRouter<E>,
+    E: KvEngine,
 {
     type Task = Task;
     fn run(&mut self, task: Task) {
-        let start = Instant::now();
         let store_id = task.store_id;
         let resp = self.resolve(store_id);
-        (task.cb)(resp);
-        ADDRESS_RESOLVE_HISTOGRAM.observe(start.saturating_elapsed_secs());
+        (task.cb)(resp)
     }
 }
 
@@ -152,14 +153,15 @@ impl PdStoreAddrResolver {
 }
 
 /// Creates a new `PdStoreAddrResolver`.
-pub fn new_resolver<T, R>(
+pub fn new_resolver<T, RR: 'static, E>(
     pd_client: Arc<T>,
     worker: &Worker,
-    router: R,
+    router: RR,
 ) -> (PdStoreAddrResolver, Arc<Mutex<GlobalReplicationState>>)
 where
     T: PdClient + 'static,
-    R: RaftExtension + 'static,
+    RR: RaftStoreRouter<E>,
+    E: KvEngine,
 {
     let state = Arc::new(Mutex::new(GlobalReplicationState::default()));
     let runner = Runner {
@@ -167,6 +169,7 @@ where
         store_addrs: HashMap::default(),
         state: state.clone(),
         router,
+        engine: PhantomData,
     };
     let scheduler = worker.start("addr-resolver", runner);
     let resolver = PdStoreAddrResolver::new(scheduler);
@@ -183,14 +186,20 @@ impl StoreAddrResolver for PdStoreAddrResolver {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, ops::Sub, str::FromStr, sync::Arc, thread, time::Duration};
+    use super::*;
+    use std::marker::PhantomData;
+    use std::net::SocketAddr;
+    use std::ops::Sub;
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     use collections::HashMap;
+    use engine_test::kv::KvTestEngine;
     use kvproto::metapb;
     use pd_client::{PdClient, Result};
-    use tikv_kv::FakeExtension;
-
-    use super::*;
+    use raftstore::router::RaftStoreBlackHole;
 
     const STORE_ADDRESS_REFRESH_SECONDS: u64 = 60;
 
@@ -225,7 +234,7 @@ mod tests {
         store
     }
 
-    fn new_runner(store: metapb::Store) -> Runner<MockPdClient, FakeExtension> {
+    fn new_runner(store: metapb::Store) -> Runner<MockPdClient, RaftStoreBlackHole, KvTestEngine> {
         let client = MockPdClient {
             start: Instant::now(),
             store,
@@ -234,7 +243,8 @@ mod tests {
             pd_client: Arc::new(client),
             store_addrs: HashMap::default(),
             state: Default::default(),
-            router: FakeExtension,
+            router: RaftStoreBlackHole,
+            engine: PhantomData,
         }
     }
 
@@ -244,21 +254,21 @@ mod tests {
     fn test_resolve_store_state_up() {
         let store = new_store(STORE_ADDR, metapb::StoreState::Up);
         let runner = new_runner(store);
-        runner.get_address(0).unwrap();
+        assert!(runner.get_address(0).is_ok());
     }
 
     #[test]
     fn test_resolve_store_state_offline() {
         let store = new_store(STORE_ADDR, metapb::StoreState::Offline);
         let runner = new_runner(store);
-        runner.get_address(0).unwrap();
+        assert!(runner.get_address(0).is_ok());
     }
 
     #[test]
     fn test_resolve_store_state_tombstone() {
         let store = new_store(STORE_ADDR, metapb::StoreState::Tombstone);
         let runner = new_runner(store);
-        runner.get_address(0).unwrap_err();
+        assert!(runner.get_address(0).is_err());
     }
 
     #[test]

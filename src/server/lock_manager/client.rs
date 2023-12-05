@@ -1,18 +1,15 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::Arc, time::Duration};
-
-use futures::{
-    channel::mpsc::{self, UnboundedSender},
-    future::{self, BoxFuture},
-    sink::SinkExt,
-    stream::{StreamExt, TryStreamExt},
-};
+use super::{Error, Result};
+use futures::channel::mpsc::{self, UnboundedSender};
+use futures::future::{self, BoxFuture};
+use futures::sink::SinkExt;
+use futures::stream::{StreamExt, TryStreamExt};
 use grpcio::{ChannelBuilder, EnvBuilder, Environment, WriteFlags};
 use kvproto::deadlock::*;
 use security::SecurityManager;
-
-use super::{Error, Result};
+use std::sync::Arc;
+use std::time::Duration;
 
 type DeadlockFuture<T> = BoxFuture<'static, Result<T>>;
 
@@ -21,8 +18,7 @@ pub type Callback = Box<dyn Fn(DeadlockResponse) + Send>;
 const CQ_COUNT: usize = 1;
 const CLIENT_PREFIX: &str = "deadlock";
 
-/// Builds the `Environment` of deadlock clients. All clients should use the
-/// same instance.
+/// Builds the `Environment` of deadlock clients. All clients should use the same instance.
 pub fn env() -> Arc<Environment> {
     Arc::new(
         EnvBuilder::new()
@@ -34,6 +30,7 @@ pub fn env() -> Arc<Environment> {
 
 #[derive(Clone)]
 pub struct Client {
+    addr: String,
     client: DeadlockClient,
     sender: Option<UnboundedSender<DeadlockRequest>>,
 }
@@ -46,6 +43,7 @@ impl Client {
         let channel = security_mgr.connect(cb, addr);
         let client = DeadlockClient::new(channel);
         Self {
+            addr: addr.to_owned(),
             client,
             sender: None,
         }
@@ -59,13 +57,14 @@ impl Client {
         let (sink, receiver) = self.client.detect().unwrap();
         let send_task = Box::pin(async move {
             let mut sink = sink.sink_map_err(Error::Grpc);
-
-            sink.send_all(&mut rx.map(|r| Ok((r, WriteFlags::default()))))
+            let res = sink
+                .send_all(&mut rx.map(|r| Ok((r, WriteFlags::default()))))
                 .await
                 .map(|_| {
                     info!("cancel detect sender");
                     sink.get_mut().cancel();
-                })
+                });
+            res
         });
         self.sender = Some(tx);
 

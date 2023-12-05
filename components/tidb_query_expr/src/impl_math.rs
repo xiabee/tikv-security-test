@@ -4,16 +4,12 @@ use std::cell::RefCell;
 
 use num::traits::Pow;
 use tidb_query_codegen::rpn_fn;
+
 use tidb_query_common::Result;
-use tidb_query_datatype::{
-    codec::{
-        self,
-        data_type::*,
-        mysql::{RoundMode, DEFAULT_FSP},
-        Error,
-    },
-    expr::EvalContext,
-};
+use tidb_query_datatype::codec::data_type::*;
+use tidb_query_datatype::codec::mysql::{RoundMode, DEFAULT_FSP};
+use tidb_query_datatype::codec::{self, Error};
+use tidb_query_datatype::expr::EvalContext;
 
 const MAX_I64_DIGIT_LENGTH: i64 = 19;
 const MAX_U64_DIGIT_LENGTH: i64 = 20;
@@ -22,13 +18,13 @@ const MAX_RAND_VALUE: u32 = 0x3FFFFFFF;
 #[rpn_fn]
 #[inline]
 pub fn pi() -> Result<Option<Real>> {
-    Ok(Some(Real::new(std::f64::consts::PI).unwrap()))
+    Ok(Some(Real::from(std::f64::consts::PI)))
 }
 
 #[rpn_fn]
 #[inline]
 pub fn crc32(arg: BytesRef) -> Result<Option<Int>> {
-    Ok(Some(i64::from(file_system::calc_crc32_bytes(arg))))
+    Ok(Some(i64::from(file_system::calc_crc32_bytes(&arg))))
 }
 
 #[inline]
@@ -65,7 +61,7 @@ pub fn log10(arg: &Real) -> Result<Option<Real>> {
 // If the given f64 is finite, returns `Some(Real)`. Otherwise returns None.
 fn f64_to_real(n: f64) -> Option<Real> {
     if n.is_finite() {
-        Some(Real::new(n).unwrap())
+        Some(Real::from(n))
     } else {
         None
     }
@@ -92,7 +88,7 @@ impl Ceil for CeilReal {
 
     #[inline]
     fn ceil(_ctx: &mut EvalContext, arg: &Self::Input) -> Result<Option<Self::Output>> {
-        Ok(Some(Real::new(arg.ceil()).unwrap()))
+        Ok(Some(Real::from(arg.ceil())))
     }
 }
 
@@ -167,7 +163,7 @@ impl Floor for FloorReal {
 
     #[inline]
     fn floor(_ctx: &mut EvalContext, arg: &Self::Input) -> Result<Option<Self::Output>> {
-        Ok(Some(Real::new(arg.floor()).unwrap()))
+        Ok(Some(Real::from(arg.floor())))
     }
 }
 
@@ -226,7 +222,7 @@ impl Floor for FloorIntToInt {
 #[inline]
 fn abs_int(arg: &Int) -> Result<Option<Int>> {
     match arg.checked_abs() {
-        None => Err(Error::overflow("BIGINT", format!("abs({})", *arg)).into()),
+        None => Err(Error::overflow("BIGINT", &format!("abs({})", *arg)).into()),
         Some(arg_abs) => Ok(Some(arg_abs)),
     }
 }
@@ -272,7 +268,11 @@ fn sqrt(arg: &Real) -> Result<Option<Real>> {
             None
         } else {
             let res = arg.sqrt();
-            Real::new(res).ok()
+            if res.is_nan() {
+                None
+            } else {
+                Some(Real::from(res))
+            }
         }
     })
 }
@@ -288,7 +288,7 @@ fn radians(arg: &Real) -> Result<Option<Real>> {
 pub fn exp(arg: &Real) -> Result<Option<Real>> {
     let ret = arg.exp();
     if ret.is_infinite() {
-        Err(Error::overflow("DOUBLE", format!("exp({})", arg)).into())
+        Err(Error::overflow("DOUBLE", &format!("exp({})", arg)).into())
     } else {
         Ok(Real::new(ret).ok())
     }
@@ -345,7 +345,7 @@ fn rand() -> Result<Option<Real>> {
 #[inline]
 #[rpn_fn(nullable)]
 fn rand_with_seed_first_gen(seed: Option<&i64>) -> Result<Option<Real>> {
-    let mut rng = MySqlRng::new_with_seed(seed.cloned().unwrap_or(0));
+    let mut rng = MySQLRng::new_with_seed(seed.cloned().unwrap_or(0));
     let res = rng.gen();
     Ok(Real::new(res).ok())
 }
@@ -481,11 +481,11 @@ fn truncate_real(x: Real, d: i32) -> Real {
     let shift = 10_f64.powi(d);
     let tmp = x * shift;
     if *tmp == 0_f64 {
-        Real::new(0_f64).unwrap()
+        Real::from(0_f64)
     } else if tmp.is_infinite() {
         x
     } else {
-        Real::new(tmp.trunc() / shift).unwrap()
+        Real::from(tmp.trunc() / shift)
     }
 }
 
@@ -544,11 +544,11 @@ pub fn round_with_frac_real(arg0: &Real, arg1: &Int) -> Result<Option<Real>> {
     let digits = arg1;
     let power = 10.0_f64.powi(-digits as i32);
     let frac = *number / power;
-    Ok(Some(Real::new(frac.round() * power).unwrap()))
+    Ok(Some(Real::from(frac.round() * power)))
 }
 
 thread_local! {
-   static MYSQL_RNG: RefCell<MySqlRng> = RefCell::new(MySqlRng::new())
+   static MYSQL_RNG: RefCell<MySQLRng> = RefCell::new(MySQLRng::new())
 }
 
 #[derive(Copy, Clone)]
@@ -639,22 +639,15 @@ fn extract_num(num_s: &str, is_neg: bool, from_base: IntWithSign) -> IntWithSign
     }
 }
 
-// Returns (isize, is_positive): convert an i64 to usize, and whether the input
-// is positive
+// Returns (isize, is_positive): convert an i64 to usize, and whether the input is positive
 //
 // # Examples
 // ```
 // assert_eq!(i64_to_usize(1_i64, false), (1_usize, true));
 // assert_eq!(i64_to_usize(1_i64, false), (1_usize, true));
 // assert_eq!(i64_to_usize(-1_i64, false), (1_usize, false));
-// assert_eq!(
-//     i64_to_usize(u64::max_value() as i64, true),
-//     (u64::max_value() as usize, true)
-// );
-// assert_eq!(
-//     i64_to_usize(u64::max_value() as i64, false),
-//     (1_usize, false)
-// );
+// assert_eq!(i64_to_usize(u64::max_value() as i64, true), (u64::max_value() as usize, true));
+// assert_eq!(i64_to_usize(u64::max_value() as i64, false), (1_usize, false));
 // ```
 #[inline]
 pub fn i64_to_usize(i: i64, is_unsigned: bool) -> (usize, bool) {
@@ -672,12 +665,12 @@ pub fn i64_to_usize(i: i64, is_unsigned: bool) -> (usize, bool) {
     }
 }
 
-pub struct MySqlRng {
+pub struct MySQLRng {
     seed1: u32,
     seed2: u32,
 }
 
-impl MySqlRng {
+impl MySQLRng {
     fn new() -> Self {
         let current_time = time::get_time();
         let nsec = i64::from(current_time.nsec);
@@ -687,7 +680,7 @@ impl MySqlRng {
     fn new_with_seed(seed: i64) -> Self {
         let seed1 = (seed.wrapping_mul(0x10001).wrapping_add(55555555)) as u32 % MAX_RAND_VALUE;
         let seed2 = (seed.wrapping_mul(0x10000001)) as u32 % MAX_RAND_VALUE;
-        MySqlRng { seed1, seed2 }
+        MySQLRng { seed1, seed2 }
     }
 
     fn gen(&mut self) -> f64 {
@@ -697,7 +690,7 @@ impl MySqlRng {
     }
 }
 
-impl Default for MySqlRng {
+impl Default for MySQLRng {
     fn default() -> Self {
         Self::new()
     }
@@ -705,9 +698,10 @@ impl Default for MySqlRng {
 
 #[cfg(test)]
 mod tests {
-    use std::{f64, i64, str::FromStr};
-
-    use tidb_query_datatype::{builder::FieldTypeBuilder, FieldTypeFlag, FieldTypeTp};
+    use std::str::FromStr;
+    use std::{f64, i64};
+    use tidb_query_datatype::builder::FieldTypeBuilder;
+    use tidb_query_datatype::{FieldTypeFlag, FieldTypeTp};
     use tipb::ScalarFuncSig;
 
     use super::*;
@@ -718,7 +712,7 @@ mod tests {
         let output = RpnFnScalarEvaluator::new()
             .evaluate(ScalarFuncSig::Pi)
             .unwrap();
-        assert_eq!(output, Some(Real::new(std::f64::consts::PI).unwrap()));
+        assert_eq!(output, Some(Real::from(std::f64::consts::PI)));
     }
 
     #[test]
@@ -746,8 +740,8 @@ mod tests {
     #[test]
     fn test_log_1_arg() {
         let test_cases = vec![
-            (Some(std::f64::consts::E), Some(Real::new(1.0_f64).unwrap())),
-            (Some(100.0), Some(Real::new(4.605170185988092_f64).unwrap())),
+            (Some(std::f64::consts::E), Some(Real::from(1.0_f64))),
+            (Some(100.0), Some(Real::from(4.605170185988092_f64))),
             (Some(-1.0), None),
             (Some(0.0), None),
             (None, None),
@@ -764,21 +758,9 @@ mod tests {
     #[test]
     fn test_log_2_arg() {
         let test_cases = vec![
-            (
-                Some(10.0_f64),
-                Some(100.0_f64),
-                Some(Real::new(2.0_f64).unwrap()),
-            ),
-            (
-                Some(2.0_f64),
-                Some(1.0_f64),
-                Some(Real::new(0.0_f64).unwrap()),
-            ),
-            (
-                Some(0.5_f64),
-                Some(0.25_f64),
-                Some(Real::new(2.0_f64).unwrap()),
-            ),
+            (Some(10.0_f64), Some(100.0_f64), Some(Real::from(2.0_f64))),
+            (Some(2.0_f64), Some(1.0_f64), Some(Real::from(0.0_f64))),
+            (Some(0.5_f64), Some(0.25_f64), Some(Real::from(2.0_f64))),
             (Some(-0.23323_f64), Some(2.0_f64), None),
             (Some(0_f64), Some(123_f64), None),
             (Some(1_f64), Some(123_f64), None),
@@ -800,8 +782,8 @@ mod tests {
     #[test]
     fn test_log2() {
         let test_cases = vec![
-            (Some(16_f64), Some(Real::new(4_f64).unwrap())),
-            (Some(5_f64), Some(Real::new(2.321928094887362_f64).unwrap())),
+            (Some(16_f64), Some(Real::from(4_f64))),
+            (Some(5_f64), Some(Real::from(2.321928094887362_f64))),
             (Some(-1.234_f64), None),
             (Some(0_f64), None),
             (None, None),
@@ -818,11 +800,8 @@ mod tests {
     #[test]
     fn test_log10() {
         let test_cases = vec![
-            (Some(100_f64), Some(Real::new(2_f64).unwrap())),
-            (
-                Some(101_f64),
-                Some(Real::new(2.0043213737826426_f64).unwrap()),
-            ),
+            (Some(100_f64), Some(Real::from(2_f64))),
+            (Some(101_f64), Some(Real::from(2.0043213737826426_f64))),
             (Some(-1.234_f64), None),
             (Some(0_f64), None),
             (None, None),
@@ -840,14 +819,19 @@ mod tests {
     fn test_abs_int() {
         let test_cases = vec![
             (ScalarFuncSig::AbsInt, -3, Some(3), false),
-            (ScalarFuncSig::AbsInt, i64::MAX, Some(i64::MAX), false),
             (
-                ScalarFuncSig::AbsUInt,
-                u64::MAX as i64,
-                Some(u64::MAX as i64),
+                ScalarFuncSig::AbsInt,
+                std::i64::MAX,
+                Some(std::i64::MAX),
                 false,
             ),
-            (ScalarFuncSig::AbsInt, i64::MIN, Some(0), true),
+            (
+                ScalarFuncSig::AbsUInt,
+                std::u64::MAX as i64,
+                Some(std::u64::MAX as i64),
+                false,
+            ),
+            (ScalarFuncSig::AbsInt, std::i64::MIN, Some(0), true),
         ];
 
         for (sig, arg, expect_output, is_err) in test_cases {
@@ -901,11 +885,11 @@ mod tests {
             (4.0, 3.1),
             (-3.0, -3.45),
             (0.0, -0.1),
-            (f64::MAX, f64::MAX),
-            (f64::MIN, f64::MIN),
+            (std::f64::MAX, std::f64::MAX),
+            (std::f64::MIN, std::f64::MIN),
         ];
         for (expected, input) in cases {
-            let arg = Real::new(input).unwrap();
+            let arg = Real::from(input);
             let expected = Real::new(expected).ok();
             let output = RpnFnScalarEvaluator::new()
                 .push_param(arg)
@@ -937,8 +921,8 @@ mod tests {
     #[test]
     fn test_ceil_int_to_dec() {
         let cases = vec![
-            ("-9223372036854775808", i64::MIN),
-            ("9223372036854775807", i64::MAX),
+            ("-9223372036854775808", std::i64::MIN),
+            ("9223372036854775807", std::i64::MAX),
             ("123", 123),
             ("-123", -123),
         ];
@@ -958,7 +942,7 @@ mod tests {
             (124, "123.456"),
             (2, "1.23"),
             (-1, "-1.23"),
-            (i64::MIN, "-9223372036854775808"),
+            (std::i64::MIN, "-9223372036854775808"),
         ];
         for (expected, input) in cases {
             let arg = input.parse::<Decimal>().ok();
@@ -979,8 +963,8 @@ mod tests {
             (666, 666),
             (-3, -3),
             (-233, -233),
-            (i64::MAX, i64::MAX),
-            (i64::MIN, i64::MIN),
+            (std::i64::MAX, std::i64::MAX),
+            (std::i64::MIN, std::i64::MIN),
         ];
 
         for (expected, input) in cases {
@@ -1018,11 +1002,11 @@ mod tests {
             (-3.45, -4.0),
             (-0.1, -1.0),
             (16140901064495871255.0, 16140901064495871255.0),
-            (f64::MAX, f64::MAX),
-            (f64::MIN, f64::MIN),
+            (std::f64::MAX, std::f64::MAX),
+            (std::f64::MIN, std::f64::MIN),
         ];
         for (input, expected) in cases {
-            let arg = Real::new(input).unwrap();
+            let arg = Real::from(input);
             let expected = Real::new(expected).ok();
             let output = RpnFnScalarEvaluator::new()
                 .push_param(arg)
@@ -1037,8 +1021,8 @@ mod tests {
     #[test]
     fn test_floor_int_to_dec() {
         let tests_cases = vec![
-            (i64::MIN, "-9223372036854775808"),
-            (i64::MAX, "9223372036854775807"),
+            (std::i64::MIN, "-9223372036854775808"),
+            (std::i64::MAX, "9223372036854775807"),
             (123, "123"),
             (-123, "-123"),
         ];
@@ -1082,7 +1066,7 @@ mod tests {
             ("123.456", 123),
             ("1.23", 1),
             ("-1.23", -2),
-            ("-9223372036854775808", i64::MIN),
+            ("-9223372036854775808", std::i64::MIN),
         ];
         for (input, expected) in cases {
             let arg = input.parse::<Decimal>().ok();
@@ -1103,8 +1087,8 @@ mod tests {
             (1, 1),
             (2, 2),
             (-3, -3),
-            (i64::MAX, i64::MAX),
-            (i64::MIN, i64::MIN),
+            (std::i64::MAX, std::i64::MAX),
+            (std::i64::MIN, std::i64::MIN),
         ];
 
         for (expected, input) in cases {
@@ -1140,13 +1124,10 @@ mod tests {
     fn test_sqrt() {
         let test_cases = vec![
             (None, None),
-            (Some(64f64), Some(Real::new(8f64).unwrap())),
-            (
-                Some(2f64),
-                Some(Real::new(std::f64::consts::SQRT_2).unwrap()),
-            ),
+            (Some(64f64), Some(Real::from(8f64))),
+            (Some(2f64), Some(Real::from(std::f64::consts::SQRT_2))),
             (Some(-16f64), None),
-            (Some(f64::NAN), None),
+            (Some(std::f64::NAN), None),
         ];
         for (input, expect) in test_cases {
             let output = RpnFnScalarEvaluator::new()
@@ -1161,17 +1142,17 @@ mod tests {
     fn test_radians() {
         let test_cases = vec![
             (None, None),
-            (Some(0_f64), Some(Real::new(0_f64).unwrap())),
-            (
-                Some(180_f64),
-                Some(Real::new(std::f64::consts::PI).unwrap()),
-            ),
+            (Some(0_f64), Some(Real::from(0_f64))),
+            (Some(180_f64), Some(Real::from(std::f64::consts::PI))),
             (
                 Some(-360_f64),
-                Some(Real::new(-2_f64 * std::f64::consts::PI).unwrap()),
+                Some(Real::from(-2_f64 * std::f64::consts::PI)),
             ),
-            (Some(f64::NAN), None),
-            (Some(f64::INFINITY), Some(Real::new(f64::INFINITY).unwrap())),
+            (Some(std::f64::NAN), None),
+            (
+                Some(std::f64::INFINITY),
+                Some(Real::from(std::f64::INFINITY)),
+            ),
         ];
         for (input, expect) in test_cases {
             let output = RpnFnScalarEvaluator::new()
@@ -1192,19 +1173,19 @@ mod tests {
         ];
         for (x, expected) in tests {
             let output = RpnFnScalarEvaluator::new()
-                .push_param(Some(Real::new(x).unwrap()))
+                .push_param(Some(Real::from(x)))
                 .evaluate(ScalarFuncSig::Exp)
                 .unwrap();
-            assert_eq!(output, Some(Real::new(expected).unwrap()));
+            assert_eq!(output, Some(Real::from(expected)));
         }
         test_unary_func_ok_none::<Real, Real>(ScalarFuncSig::Exp);
 
         let overflow_tests = vec![100000_f64];
         for x in overflow_tests {
             let output: Result<Option<Real>> = RpnFnScalarEvaluator::new()
-                .push_param(Some(Real::new(x).unwrap()))
+                .push_param(Some(Real::from(x)))
                 .evaluate(ScalarFuncSig::Exp);
-            output.unwrap_err();
+            assert!(output.is_err());
         }
     }
 
@@ -1212,16 +1193,13 @@ mod tests {
     fn test_degrees() {
         let tests_cases = vec![
             (None, None),
-            (Some(f64::NAN), None),
-            (Some(0f64), Some(Real::new(0f64).unwrap())),
-            (Some(1f64), Some(Real::new(57.29577951308232_f64).unwrap())),
-            (
-                Some(std::f64::consts::PI),
-                Some(Real::new(180.0_f64).unwrap()),
-            ),
+            (Some(std::f64::NAN), None),
+            (Some(0f64), Some(Real::from(0f64))),
+            (Some(1f64), Some(Real::from(57.29577951308232_f64))),
+            (Some(std::f64::consts::PI), Some(Real::from(180.0_f64))),
             (
                 Some(-std::f64::consts::PI / 2.0_f64),
-                Some(Real::new(-90.0_f64).unwrap()),
+                Some(Real::from(-90.0_f64)),
             ),
         ];
         for (input, expect) in tests_cases {
@@ -1246,10 +1224,10 @@ mod tests {
         ];
         for (input, expect) in valid_test_cases {
             let output: Option<Real> = RpnFnScalarEvaluator::new()
-                .push_param(Some(Real::new(input).unwrap()))
+                .push_param(Some(Real::from(input)))
                 .evaluate(ScalarFuncSig::Sin)
                 .unwrap();
-            assert!((output.unwrap().into_inner() - expect).abs() < f64::EPSILON);
+            assert!((output.unwrap().into_inner() - expect).abs() < std::f64::EPSILON);
         }
     }
 
@@ -1263,10 +1241,10 @@ mod tests {
         ];
         for (input, expect) in test_cases {
             let output: Option<Real> = RpnFnScalarEvaluator::new()
-                .push_param(Some(Real::new(input).unwrap()))
+                .push_param(Some(Real::from(input)))
                 .evaluate(ScalarFuncSig::Cos)
                 .unwrap();
-            assert!((output.unwrap().into_inner() - expect).abs() < f64::EPSILON);
+            assert!((output.unwrap().into_inner() - expect).abs() < std::f64::EPSILON);
         }
     }
 
@@ -1279,16 +1257,15 @@ mod tests {
             (std::f64::consts::PI, 0.0_f64),
             (
                 (std::f64::consts::PI * 3.0) / 4.0,
-                f64::tan((std::f64::consts::PI * 3.0) / 4.0), /* in mysql and rust, it equals
-                                                               * -1.0000000000000002, not -1 */
+                f64::tan((std::f64::consts::PI * 3.0) / 4.0), //in mysql and rust, it equals -1.0000000000000002, not -1
             ),
         ];
         for (input, expect) in test_cases {
             let output: Option<Real> = RpnFnScalarEvaluator::new()
-                .push_param(Some(Real::new(input).unwrap()))
+                .push_param(Some(Real::from(input)))
                 .evaluate(ScalarFuncSig::Tan)
                 .unwrap();
-            assert!((output.unwrap().into_inner() - expect).abs() < f64::EPSILON);
+            assert!((output.unwrap().into_inner() - expect).abs() < std::f64::EPSILON);
         }
     }
 
@@ -1312,42 +1289,44 @@ mod tests {
         ];
         for (input, expect) in test_cases {
             let output: Option<Real> = RpnFnScalarEvaluator::new()
-                .push_param(Some(Real::new(input).unwrap()))
+                .push_param(Some(Real::from(input)))
                 .evaluate(ScalarFuncSig::Cot)
                 .unwrap();
-            assert!((output.unwrap().into_inner() - expect).abs() < f64::EPSILON);
+            assert!((output.unwrap().into_inner() - expect).abs() < std::f64::EPSILON);
         }
-        RpnFnScalarEvaluator::new()
-            .push_param(Some(Real::new(0.0_f64).unwrap()))
-            .evaluate::<Real>(ScalarFuncSig::Cot)
-            .unwrap_err();
+        assert!(
+            RpnFnScalarEvaluator::new()
+                .push_param(Some(Real::from(0.0_f64)))
+                .evaluate::<Real>(ScalarFuncSig::Cot)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_pow() {
         let cases = vec![
             (
-                Some(Real::new(1.0f64).unwrap()),
-                Some(Real::new(3.0f64).unwrap()),
-                Some(Real::new(1.0f64).unwrap()),
+                Some(Real::from(1.0f64)),
+                Some(Real::from(3.0f64)),
+                Some(Real::from(1.0f64)),
             ),
             (
-                Some(Real::new(3.0f64).unwrap()),
-                Some(Real::new(0.0f64).unwrap()),
-                Some(Real::new(1.0f64).unwrap()),
+                Some(Real::from(3.0f64)),
+                Some(Real::from(0.0f64)),
+                Some(Real::from(1.0f64)),
             ),
             (
-                Some(Real::new(2.0f64).unwrap()),
-                Some(Real::new(4.0f64).unwrap()),
-                Some(Real::new(16.0f64).unwrap()),
+                Some(Real::from(2.0f64)),
+                Some(Real::from(4.0f64)),
+                Some(Real::from(16.0f64)),
             ),
             (
-                Some(Real::new(f64::INFINITY).unwrap()),
-                Some(Real::new(0.0f64).unwrap()),
-                Some(Real::new(1.0f64).unwrap()),
+                Some(Real::from(std::f64::INFINITY)),
+                Some(Real::from(0.0f64)),
+                Some(Real::from(1.0f64)),
             ),
-            (Some(Real::new(4.0f64).unwrap()), None, None),
-            (None, Some(Real::new(4.0f64).unwrap()), None),
+            (Some(Real::from(4.0f64)), None, None),
+            (None, Some(Real::from(4.0f64)), None),
             (None, None, None),
         ];
 
@@ -1362,21 +1341,20 @@ mod tests {
 
         let invalid_cases = vec![
             (
-                Some(Real::new(f64::INFINITY).unwrap()),
-                Some(Real::new(f64::INFINITY).unwrap()),
+                Some(Real::from(std::f64::INFINITY)),
+                Some(Real::from(std::f64::INFINITY)),
             ),
-            (
-                Some(Real::new(0.0f64).unwrap()),
-                Some(Real::new(-9999999.0f64).unwrap()),
-            ),
+            (Some(Real::from(0.0f64)), Some(Real::from(-9999999.0f64))),
         ];
 
         for (lhs, rhs) in invalid_cases {
-            RpnFnScalarEvaluator::new()
-                .push_param(lhs)
-                .push_param(rhs)
-                .evaluate::<Real>(ScalarFuncSig::Pow)
-                .unwrap_err();
+            assert!(
+                RpnFnScalarEvaluator::new()
+                    .push_param(lhs)
+                    .push_param(rhs)
+                    .evaluate::<Real>(ScalarFuncSig::Pow)
+                    .is_err()
+            );
         }
     }
 
@@ -1391,10 +1369,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(got1 < Real::new(1.0).unwrap());
-        assert!(got1 >= Real::new(0.0).unwrap());
-        assert!(got2 < Real::new(1.0).unwrap());
-        assert!(got2 >= Real::new(0.0).unwrap());
+        assert!(got1 < Real::from(1.0));
+        assert!(got1 >= Real::from(0.0));
+        assert!(got2 < Real::from(1.0));
+        assert!(got2 >= Real::from(0.0));
         assert_ne!(got1, got2);
     }
 
@@ -1419,7 +1397,7 @@ mod tests {
                 .evaluate::<Real>(ScalarFuncSig::RandWithSeedFirstGen)
                 .unwrap()
                 .unwrap();
-            assert_eq!(got, Real::new(exp).unwrap());
+            assert_eq!(got, Real::from(exp));
         }
 
         let none_case_got = RpnFnScalarEvaluator::new()
@@ -1427,27 +1405,24 @@ mod tests {
             .evaluate::<Real>(ScalarFuncSig::RandWithSeedFirstGen)
             .unwrap()
             .unwrap();
-        assert_eq!(none_case_got, Real::new(0.15522042769493574).unwrap());
+        assert_eq!(none_case_got, Real::from(0.15522042769493574));
     }
 
     #[test]
     fn test_asin() {
         let test_cases = vec![
+            (Some(Real::from(0.0_f64)), Some(Real::from(0.0_f64))),
             (
-                Some(Real::new(0.0_f64).unwrap()),
-                Some(Real::new(0.0_f64).unwrap()),
+                Some(Real::from(1.0_f64)),
+                Some(Real::from(std::f64::consts::PI / 2.0_f64)),
             ),
             (
-                Some(Real::new(1.0_f64).unwrap()),
-                Some(Real::new(std::f64::consts::PI / 2.0_f64).unwrap()),
+                Some(Real::from(-1.0_f64)),
+                Some(Real::from(-std::f64::consts::PI / 2.0_f64)),
             ),
             (
-                Some(Real::new(-1.0_f64).unwrap()),
-                Some(Real::new(-std::f64::consts::PI / 2.0_f64).unwrap()),
-            ),
-            (
-                Some(Real::new(std::f64::consts::SQRT_2 / 2.0_f64).unwrap()),
-                Some(Real::new(std::f64::consts::PI / 4.0_f64).unwrap()),
+                Some(Real::from(std::f64::consts::SQRT_2 / 2.0_f64)),
+                Some(Real::from(std::f64::consts::PI / 4.0_f64)),
             ),
         ];
         for (input, expect) in test_cases {
@@ -1455,12 +1430,12 @@ mod tests {
                 .push_param(input)
                 .evaluate(ScalarFuncSig::Asin)
                 .unwrap();
-            assert!((output.unwrap() - expect.unwrap()).abs() < f64::EPSILON);
+            assert!((output.unwrap() - expect.unwrap()).abs() < std::f64::EPSILON);
         }
         let invalid_test_cases = vec![
-            (Some(Real::new(f64::INFINITY).unwrap()), None),
-            (Some(Real::new(2.0_f64).unwrap()), None),
-            (Some(Real::new(-2.0_f64).unwrap()), None),
+            (Some(Real::from(std::f64::INFINITY)), None),
+            (Some(Real::from(2.0_f64)), None),
+            (Some(Real::from(-2.0_f64)), None),
         ];
         for (input, expect) in invalid_test_cases {
             let output: Option<Real> = RpnFnScalarEvaluator::new()
@@ -1475,20 +1450,17 @@ mod tests {
     fn test_acos() {
         let test_cases = vec![
             (
-                Some(Real::new(0.0_f64).unwrap()),
-                Some(Real::new(std::f64::consts::PI / 2.0_f64).unwrap()),
+                Some(Real::from(0.0_f64)),
+                Some(Real::from(std::f64::consts::PI / 2.0_f64)),
+            ),
+            (Some(Real::from(1.0_f64)), Some(Real::from(0.0_f64))),
+            (
+                Some(Real::from(-1.0_f64)),
+                Some(Real::from(std::f64::consts::PI)),
             ),
             (
-                Some(Real::new(1.0_f64).unwrap()),
-                Some(Real::new(0.0_f64).unwrap()),
-            ),
-            (
-                Some(Real::new(-1.0_f64).unwrap()),
-                Some(Real::new(std::f64::consts::PI).unwrap()),
-            ),
-            (
-                Some(Real::new(std::f64::consts::SQRT_2 / 2.0_f64).unwrap()),
-                Some(Real::new(std::f64::consts::PI / 4.0_f64).unwrap()),
+                Some(Real::from(std::f64::consts::SQRT_2 / 2.0_f64)),
+                Some(Real::from(std::f64::consts::PI / 4.0_f64)),
             ),
         ];
         for (input, expect) in test_cases {
@@ -1496,12 +1468,12 @@ mod tests {
                 .push_param(input)
                 .evaluate(ScalarFuncSig::Acos)
                 .unwrap();
-            assert!((output.unwrap() - expect.unwrap()).abs() < f64::EPSILON);
+            assert!((output.unwrap() - expect.unwrap()).abs() < std::f64::EPSILON);
         }
         let invalid_test_cases = vec![
-            (Some(Real::new(f64::INFINITY).unwrap()), None),
-            (Some(Real::new(2.0_f64).unwrap()), None),
-            (Some(Real::new(-2.0_f64).unwrap()), None),
+            (Some(Real::from(std::f64::INFINITY)), None),
+            (Some(Real::from(2.0_f64)), None),
+            (Some(Real::from(-2.0_f64)), None),
         ];
         for (input, expect) in invalid_test_cases {
             let output: Option<Real> = RpnFnScalarEvaluator::new()
@@ -1516,32 +1488,29 @@ mod tests {
     fn test_atan_1_arg() {
         let test_cases = vec![
             (
-                Some(Real::new(1.0_f64).unwrap()),
-                Some(Real::new(std::f64::consts::PI / 4.0_f64).unwrap()),
+                Some(Real::from(1.0_f64)),
+                Some(Real::from(std::f64::consts::PI / 4.0_f64)),
             ),
             (
-                Some(Real::new(-1.0_f64).unwrap()),
-                Some(Real::new(-std::f64::consts::PI / 4.0_f64).unwrap()),
+                Some(Real::from(-1.0_f64)),
+                Some(Real::from(-std::f64::consts::PI / 4.0_f64)),
             ),
             (
-                Some(Real::new(f64::MAX).unwrap()),
-                Some(Real::new(std::f64::consts::PI / 2.0_f64).unwrap()),
+                Some(Real::from(std::f64::MAX)),
+                Some(Real::from(std::f64::consts::PI / 2.0_f64)),
             ),
             (
-                Some(Real::new(f64::MIN).unwrap()),
-                Some(Real::new(-std::f64::consts::PI / 2.0_f64).unwrap()),
+                Some(Real::from(std::f64::MIN)),
+                Some(Real::from(-std::f64::consts::PI / 2.0_f64)),
             ),
-            (
-                Some(Real::new(0.0_f64).unwrap()),
-                Some(Real::new(0.0_f64).unwrap()),
-            ),
+            (Some(Real::from(0.0_f64)), Some(Real::from(0.0_f64))),
         ];
         for (input, expect) in test_cases {
             let output: Option<Real> = RpnFnScalarEvaluator::new()
                 .push_param(input)
                 .evaluate(ScalarFuncSig::Atan1Arg)
                 .unwrap();
-            assert!((output.unwrap() - expect.unwrap()).abs() < f64::EPSILON);
+            assert!((output.unwrap() - expect.unwrap()).abs() < std::f64::EPSILON);
         }
     }
 
@@ -1549,29 +1518,29 @@ mod tests {
     fn test_atan_2_args() {
         let test_cases = vec![
             (
-                Some(Real::new(0.0_f64).unwrap()),
-                Some(Real::new(0.0_f64).unwrap()),
-                Some(Real::new(0.0_f64).unwrap()),
+                Some(Real::from(0.0_f64)),
+                Some(Real::from(0.0_f64)),
+                Some(Real::from(0.0_f64)),
             ),
             (
-                Some(Real::new(0.0_f64).unwrap()),
-                Some(Real::new(-1.0_f64).unwrap()),
-                Some(Real::new(std::f64::consts::PI).unwrap()),
+                Some(Real::from(0.0_f64)),
+                Some(Real::from(-1.0_f64)),
+                Some(Real::from(std::f64::consts::PI)),
             ),
             (
-                Some(Real::new(1.0_f64).unwrap()),
-                Some(Real::new(-1.0_f64).unwrap()),
-                Some(Real::new(3.0_f64 * std::f64::consts::PI / 4.0_f64).unwrap()),
+                Some(Real::from(1.0_f64)),
+                Some(Real::from(-1.0_f64)),
+                Some(Real::from(3.0_f64 * std::f64::consts::PI / 4.0_f64)),
             ),
             (
-                Some(Real::new(-1.0_f64).unwrap()),
-                Some(Real::new(1.0_f64).unwrap()),
-                Some(Real::new(-std::f64::consts::PI / 4.0_f64).unwrap()),
+                Some(Real::from(-1.0_f64)),
+                Some(Real::from(1.0_f64)),
+                Some(Real::from(-std::f64::consts::PI / 4.0_f64)),
             ),
             (
-                Some(Real::new(1.0_f64).unwrap()),
-                Some(Real::new(0.0_f64).unwrap()),
-                Some(Real::new(std::f64::consts::PI / 2.0_f64).unwrap()),
+                Some(Real::from(1.0_f64)),
+                Some(Real::from(0.0_f64)),
+                Some(Real::from(std::f64::consts::PI / 2.0_f64)),
             ),
         ];
         for (arg0, arg1, expect) in test_cases {
@@ -1580,7 +1549,7 @@ mod tests {
                 .push_param(arg1)
                 .evaluate(ScalarFuncSig::Atan2Args)
                 .unwrap();
-            assert!((output.unwrap() - expect.unwrap()).abs() < f64::EPSILON);
+            assert!((output.unwrap() - expect.unwrap()).abs() < std::f64::EPSILON);
         }
     }
 
@@ -1638,18 +1607,9 @@ mod tests {
     #[test]
     fn test_round_real() {
         let test_cases = vec![
-            (
-                Some(Real::new(-3.12_f64).unwrap()),
-                Some(Real::new(-3f64).unwrap()),
-            ),
-            (
-                Some(Real::new(f64::MAX).unwrap()),
-                Some(Real::new(f64::MAX).unwrap()),
-            ),
-            (
-                Some(Real::new(f64::MIN).unwrap()),
-                Some(Real::new(f64::MIN).unwrap()),
-            ),
+            (Some(Real::from(-3.12_f64)), Some(Real::from(-3f64))),
+            (Some(Real::from(f64::MAX)), Some(Real::from(f64::MAX))),
+            (Some(Real::from(f64::MIN)), Some(Real::from(f64::MIN))),
             (None, None),
         ];
 
@@ -1803,12 +1763,12 @@ mod tests {
                 .build();
 
             let output = RpnFnScalarEvaluator::new()
-                .push_param(Some(Real::new(lhs).unwrap()))
+                .push_param(Some(Real::from(lhs)))
                 .push_param_with_field_type(Some(rhs), rhs_field_type)
                 .evaluate::<Real>(ScalarFuncSig::TruncateReal)
                 .unwrap();
 
-            assert_eq!(output, Some(Real::new(expected).unwrap()));
+            assert_eq!(output, Some(Real::from(expected)));
         }
     }
 
@@ -1993,26 +1953,26 @@ mod tests {
 
         let real_cases = vec![
             (
-                Some(Real::new(-1.298_f64).unwrap()),
+                Some(Real::from(-1.298_f64)),
                 Some(1),
-                Some(Real::new(-1.3_f64).unwrap()),
+                Some(Real::from(-1.3_f64)),
             ),
             (
-                Some(Real::new(-1.298_f64).unwrap()),
+                Some(Real::from(-1.298_f64)),
                 Some(0),
-                Some(Real::new(-1.0_f64).unwrap()),
+                Some(Real::from(-1.0_f64)),
             ),
             (
-                Some(Real::new(23.298_f64).unwrap()),
+                Some(Real::from(23.298_f64)),
                 Some(2),
-                Some(Real::new(23.30_f64).unwrap()),
+                Some(Real::from(23.30_f64)),
             ),
             (
-                Some(Real::new(23.298_f64).unwrap()),
+                Some(Real::from(23.298_f64)),
                 Some(-1),
-                Some(Real::new(20.0_f64).unwrap()),
+                Some(Real::from(20.0_f64)),
             ),
-            (Some(Real::new(23.298_f64).unwrap()), None, None),
+            (Some(Real::from(23.298_f64)), None, None),
             (None, Some(2), None),
             (None, None, None),
         ];
@@ -2030,9 +1990,9 @@ mod tests {
     #[test]
     #[allow(clippy::float_cmp)]
     fn test_rand_new() {
-        let mut rng1 = MySqlRng::new();
+        let mut rng1 = MySQLRng::new();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let mut rng2 = MySqlRng::new();
+        let mut rng2 = MySQLRng::new();
         let got1 = rng1.gen();
         let got2 = rng2.gen();
         assert!(got1 < 1.0);
@@ -2054,7 +2014,7 @@ mod tests {
             (9223372036854775807, 0.9050373219931845, 0.37014932126752037),
         ];
         for (seed, exp1, exp2) in tests {
-            let mut rand = MySqlRng::new_with_seed(seed);
+            let mut rand = MySQLRng::new_with_seed(seed);
             let res1 = rand.gen();
             assert_eq!(res1, exp1);
             let res2 = rand.gen();

@@ -9,7 +9,6 @@ bitflags::bitflags! {
 }
 
 impl WeekMode {
-    #[must_use]
     pub fn to_normalized(self) -> WeekMode {
         let mut mode = self;
         if !mode.contains(WeekMode::BEHAVIOR_MONDAY_FIRST) {

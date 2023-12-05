@@ -4,23 +4,25 @@ mod fixture;
 mod util;
 
 use criterion::measurement::Measurement;
-use test_coprocessor::*;
+
 use tidb_query_datatype::FieldTypeTp;
-use tikv::storage::RocksEngine;
 use tipb::{ExprType, ScalarFuncSig};
 use tipb_helper::ExprDefBuilder;
 
-use crate::util::{executor_descriptor::*, store::*, BenchCase};
+use crate::util::executor_descriptor::*;
+use crate::util::store::*;
+use crate::util::BenchCase;
+use test_coprocessor::*;
+use tikv::storage::RocksEngine;
 
 /// SELECT COUNT(1) FROM Table, or SELECT COUNT(PrimaryKey) FROM Table
-fn bench_select_count_1<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_count_1<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
     let (table, store) = crate::table_scan::fixture::table_with_2_columns(input.rows);
 
-    // TODO: Change to use `DagSelect` helper when it no longer place unnecessary
-    // columns.
+    // TODO: Change to use `DAGSelect` helper when it no longer place unnecessary columns.
     let executors = &[
         table_scan(&[table["id"].as_column_info()]),
         simple_aggregate(&[
@@ -36,7 +38,7 @@ where
 }
 
 /// SELECT COUNT(column) FROM Table
-fn bench_select_count_col<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_count_col<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -57,7 +59,7 @@ where
 }
 
 /// SELECT column FROM Table WHERE column
-fn bench_select_where_col<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_where_col<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -75,7 +77,7 @@ where
 
 fn bench_select_col_where_fn_impl<M>(
     selectivity: f64,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -100,7 +102,7 @@ fn bench_select_col_where_fn_impl<M>(
 }
 
 /// SELECT column FROM Table WHERE column > X (selectivity = 5%)
-fn bench_select_col_where_fn_sel_l<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_col_where_fn_sel_l<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -108,7 +110,7 @@ where
 }
 
 /// SELECT column FROM Table WHERE column > X (selectivity = 50%)
-fn bench_select_col_where_fn_sel_m<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_col_where_fn_sel_m<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -116,7 +118,7 @@ where
 }
 
 /// SELECT column FROM Table WHERE column > X (selectivity = 95%)
-fn bench_select_col_where_fn_sel_h<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_col_where_fn_sel_h<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -125,7 +127,7 @@ where
 
 fn bench_select_count_1_where_fn_impl<M>(
     selectivity: f64,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -155,7 +157,7 @@ fn bench_select_count_1_where_fn_impl<M>(
 }
 
 /// SELECT COUNT(1) FROM Table WHERE column > X (selectivity = 5%)
-fn bench_select_count_1_where_fn_sel_l<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_count_1_where_fn_sel_l<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -163,7 +165,7 @@ where
 }
 
 /// SELECT COUNT(1) FROM Table WHERE column > X (selectivity = 50%)
-fn bench_select_count_1_where_fn_sel_m<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_count_1_where_fn_sel_m<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -171,7 +173,7 @@ where
 }
 
 /// SELECT COUNT(1) FROM Table WHERE column > X (selectivity = 95%)
-fn bench_select_count_1_where_fn_sel_h<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_select_count_1_where_fn_sel_h<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -181,7 +183,7 @@ where
 fn bench_select_count_1_group_by_int_col_impl<M>(
     table: Table,
     store: Store<RocksEngine>,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -205,7 +207,7 @@ fn bench_select_count_1_group_by_int_col_impl<M>(
 
 /// SELECT COUNT(1) FROM Table GROUP BY int_col (2 groups)
 fn bench_select_count_1_group_by_int_col_group_few<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -216,7 +218,7 @@ fn bench_select_count_1_group_by_int_col_group_few<M>(
 
 /// SELECT COUNT(1) FROM Table GROUP BY int_col (n groups, n = row_count)
 fn bench_select_count_1_group_by_int_col_group_many<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -228,7 +230,7 @@ fn bench_select_count_1_group_by_int_col_group_many<M>(
 fn bench_select_count_1_group_by_int_col_stream_impl<M>(
     table: Table,
     store: Store<RocksEngine>,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -252,7 +254,7 @@ fn bench_select_count_1_group_by_int_col_stream_impl<M>(
 
 /// SELECT COUNT(1) FROM Table GROUP BY int_col (2 groups, stream aggregation)
 fn bench_select_count_1_group_by_int_col_group_few_stream<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -261,10 +263,9 @@ fn bench_select_count_1_group_by_int_col_group_few_stream<M>(
     bench_select_count_1_group_by_int_col_stream_impl(table, store, b, input);
 }
 
-/// SELECT COUNT(1) FROM Table GROUP BY int_col (n groups, n = row_count, stream
-/// aggregation)
+/// SELECT COUNT(1) FROM Table GROUP BY int_col (n groups, n = row_count, stream aggregation)
 fn bench_select_count_1_group_by_int_col_group_many_stream<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -276,7 +277,7 @@ fn bench_select_count_1_group_by_int_col_group_many_stream<M>(
 fn bench_select_count_1_group_by_fn_impl<M>(
     table: Table,
     store: Store<RocksEngine>,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -304,10 +305,8 @@ fn bench_select_count_1_group_by_fn_impl<M>(
 }
 
 /// SELECT COUNT(1) FROM Table GROUP BY int_col + 1 (2 groups)
-fn bench_select_count_1_group_by_fn_group_few<M>(
-    b: &mut criterion::Bencher<'_, M>,
-    input: &Input<M>,
-) where
+fn bench_select_count_1_group_by_fn_group_few<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
+where
     M: Measurement,
 {
     let (table, store) = self::fixture::table_with_int_column_two_groups(input.rows);
@@ -315,10 +314,8 @@ fn bench_select_count_1_group_by_fn_group_few<M>(
 }
 
 /// SELECT COUNT(1) FROM Table GROUP BY int_col + 1 (n groups, n = row_count)
-fn bench_select_count_1_group_by_fn_group_many<M>(
-    b: &mut criterion::Bencher<'_, M>,
-    input: &Input<M>,
-) where
+fn bench_select_count_1_group_by_fn_group_many<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
+where
     M: Measurement,
 {
     let (table, store) = self::fixture::table_with_int_column_n_groups(input.rows);
@@ -328,7 +325,7 @@ fn bench_select_count_1_group_by_fn_group_many<M>(
 fn bench_select_count_1_group_by_2_col_impl<M>(
     table: Table,
     store: Store<RocksEngine>,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -357,20 +354,17 @@ fn bench_select_count_1_group_by_2_col_impl<M>(
 }
 
 /// SELECT COUNT(1) FROM Table GROUP BY int_col, int_col + 1 (2 groups)
-fn bench_select_count_1_group_by_2_col_group_few<M>(
-    b: &mut criterion::Bencher<'_, M>,
-    input: &Input<M>,
-) where
+fn bench_select_count_1_group_by_2_col_group_few<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
+where
     M: Measurement,
 {
     let (table, store) = self::fixture::table_with_int_column_two_groups(input.rows);
     bench_select_count_1_group_by_2_col_impl(table, store, b, input);
 }
 
-/// SELECT COUNT(1) FROM Table GROUP BY int_col, int_col + 1 (n groups, n =
-/// row_count)
+/// SELECT COUNT(1) FROM Table GROUP BY int_col, int_col + 1 (n groups, n = row_count)
 fn bench_select_count_1_group_by_2_col_group_many<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -382,7 +376,7 @@ fn bench_select_count_1_group_by_2_col_group_many<M>(
 fn bench_select_count_1_group_by_2_col_stream_impl<M>(
     table: Table,
     store: Store<RocksEngine>,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -410,10 +404,9 @@ fn bench_select_count_1_group_by_2_col_stream_impl<M>(
         .bench(b, executors, &[table.get_record_range_all()], &store);
 }
 
-/// SELECT COUNT(1) FROM Table GROUP BY int_col, int_col + 1 (2 groups, stream
-/// aggregation)
+/// SELECT COUNT(1) FROM Table GROUP BY int_col, int_col + 1 (2 groups, stream aggregation)
 fn bench_select_count_1_group_by_2_col_group_few_stream<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -422,10 +415,9 @@ fn bench_select_count_1_group_by_2_col_group_few_stream<M>(
     bench_select_count_1_group_by_2_col_stream_impl(table, store, b, input);
 }
 
-/// SELECT COUNT(1) FROM Table GROUP BY int_col, int_col + 1 (n groups, n =
-/// row_count, stream aggregation)
+/// SELECT COUNT(1) FROM Table GROUP BY int_col, int_col + 1 (n groups, n = row_count, stream aggregation)
 fn bench_select_count_1_group_by_2_col_group_many_stream<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -434,10 +426,9 @@ fn bench_select_count_1_group_by_2_col_group_many_stream<M>(
     bench_select_count_1_group_by_2_col_stream_impl(table, store, b, input);
 }
 
-/// SELECT COUNT(1) FROM Table WHERE id > X GROUP BY int_col (2 groups,
-/// selectivity = 5%)
+/// SELECT COUNT(1) FROM Table WHERE id > X GROUP BY int_col (2 groups, selectivity = 5%)
 fn bench_select_count_1_where_fn_group_by_int_col_group_few_sel_l<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -472,7 +463,7 @@ fn bench_select_count_1_where_fn_group_by_int_col_group_few_sel_l<M>(
 /// SELECT COUNT(1) FROM Table WHERE id > X GROUP BY int_col
 /// (2 groups, selectivity = 5%, stream aggregation)
 fn bench_select_count_1_where_fn_group_by_int_col_group_few_sel_l_stream<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -506,7 +497,7 @@ fn bench_select_count_1_where_fn_group_by_int_col_group_few_sel_l_stream<M>(
 
 fn bench_select_order_by_3_col_impl<M>(
     limit: usize,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -537,18 +528,16 @@ fn bench_select_order_by_3_col_impl<M>(
         .bench(b, executors, &[table.get_record_range_all()], &store);
 }
 
-/// SELECT id, col1, col2 FROM Table ORDER BY isnull(col1), col1, col2 DESC
-/// LIMIT 10
-fn bench_select_order_by_3_col_limit_small<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+/// SELECT id, col1, col2 FROM Table ORDER BY isnull(col1), col1, col2 DESC LIMIT 10
+fn bench_select_order_by_3_col_limit_small<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
     bench_select_order_by_3_col_impl(10, b, input);
 }
 
-/// SELECT id, col1, col2 FROM Table ORDER BY isnull(col1), col1, col2 DESC
-/// LIMIT 4000
-fn bench_select_order_by_3_col_limit_large<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+/// SELECT id, col1, col2 FROM Table ORDER BY isnull(col1), col1, col2 DESC LIMIT 4000
+fn bench_select_order_by_3_col_limit_large<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -562,7 +551,7 @@ where
 
 fn bench_select_where_fn_order_by_3_col_impl<M>(
     limit: usize,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -599,10 +588,10 @@ fn bench_select_where_fn_order_by_3_col_impl<M>(
         .bench(b, executors, &[table.get_record_range_all()], &store);
 }
 
-/// SELECT id, col1, col2 FROM Table WHERE id > X ORDER BY isnull(col1), col1,
-/// col2 DESC LIMIT 10 (selectivity = 0%)
+/// SELECT id, col1, col2 FROM Table WHERE id > X ORDER BY isnull(col1), col1, col2 DESC LIMIT 10
+/// (selectivity = 0%)
 fn bench_select_where_fn_order_by_3_col_limit_small<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -610,10 +599,10 @@ fn bench_select_where_fn_order_by_3_col_limit_small<M>(
     bench_select_where_fn_order_by_3_col_impl(10, b, input);
 }
 
-/// SELECT id, col1, col2 FROM Table WHERE id > X ORDER BY isnull(col1), col1,
-/// col2 DESC LIMIT 4000 (selectivity = 0%)
+/// SELECT id, col1, col2 FROM Table WHERE id > X ORDER BY isnull(col1), col1, col2 DESC LIMIT 4000
+/// (selectivity = 0%)
 fn bench_select_where_fn_order_by_3_col_limit_large<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -628,7 +617,7 @@ fn bench_select_where_fn_order_by_3_col_limit_large<M>(
 
 fn bench_select_50_col_order_by_1_col_impl<M>(
     limit: usize,
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -651,7 +640,7 @@ fn bench_select_50_col_order_by_1_col_impl<M>(
 
 /// SELECT * FROM Table ORDER BY col0 LIMIT 10, there are 50 columns.
 fn bench_select_50_col_order_by_1_col_limit_small<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -661,7 +650,7 @@ fn bench_select_50_col_order_by_1_col_limit_small<M>(
 
 /// SELECT * FROM Table ORDER BY col0 LIMIT 4000, there are 50 columns.
 fn bench_select_50_col_order_by_1_col_limit_large<M>(
-    b: &mut criterion::Bencher<'_, M>,
+    b: &mut criterion::Bencher<M>,
     input: &Input<M>,
 ) where
     M: Measurement,
@@ -706,15 +695,15 @@ where
         rows_options.push(1);
     }
     let mut bencher_options: Vec<Box<dyn util::IntegratedBencher<M>>> = vec![
-        Box::new(util::DagBencher::<RocksStore>::new(false)),
-        Box::new(util::DagBencher::<RocksStore>::new(true)),
+        Box::new(util::DAGBencher::<RocksStore>::new(false)),
+        Box::new(util::DAGBencher::<RocksStore>::new(true)),
     ];
     if crate::util::bench_level() >= 2 {
         let mut additional_inputs: Vec<Box<dyn util::IntegratedBencher<M>>> = vec![
             Box::new(util::BatchBencher::<MemStore>::new()),
             Box::new(util::BatchBencher::<RocksStore>::new()),
-            Box::new(util::DagBencher::<MemStore>::new(false)),
-            Box::new(util::DagBencher::<MemStore>::new(true)),
+            Box::new(util::DAGBencher::<MemStore>::new(false)),
+            Box::new(util::DAGBencher::<MemStore>::new(true)),
         ];
         bencher_options.append(&mut additional_inputs);
     }

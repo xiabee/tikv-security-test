@@ -1,40 +1,33 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! Types for storage related errors and associated helper methods.
-use std::{
-    convert::TryFrom,
-    error::Error as StdError,
-    fmt::{self, Debug, Display, Formatter},
-    io::Error as IoError,
-    sync::Arc,
-};
+use std::error::Error as StdError;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::io::Error as IoError;
+
+use kvproto::{errorpb, kvrpcpb};
+use thiserror::Error;
 
 use error_code::{self, ErrorCode, ErrorCodeExt};
-use kvproto::{errorpb, kvrpcpb, kvrpcpb::ApiVersion};
-use thiserror::Error;
 use tikv_util::deadline::DeadlineError;
 use txn_types::{KvPair, TimeStamp};
 
 use crate::storage::{
-    kv::{self, Error as KvError, ErrorInner as KvErrorInner},
+    kv::{self, Error as EngineError, ErrorInner as EngineErrorInner},
     mvcc::{Error as MvccError, ErrorInner as MvccErrorInner},
     txn::{self, Error as TxnError, ErrorInner as TxnErrorInner},
-    CommandKind, Result,
+    Result,
 };
 
 #[derive(Debug, Error)]
-/// Detailed errors for storage operations. This enum also unifies code for
-/// basic error handling functionality in a single place instead of being spread
-/// out.
+/// Detailed errors for storage operations. This enum also unifies code for basic error
+/// handling functionality in a single place instead of being spread out.
 pub enum ErrorInner {
     #[error("{0}")]
-    Kv(#[from] kv::Error),
+    Engine(#[from] kv::Error),
 
     #[error("{0}")]
     Txn(#[from] txn::Error),
-
-    #[error("{0}")]
-    Engine(#[from] engine_traits::Error),
 
     #[error("storage is closed.")]
     Closed,
@@ -57,63 +50,11 @@ pub enum ErrorInner {
     #[error("invalid cf name: {0}")]
     InvalidCf(String),
 
-    #[error("cf is deprecated in API V2, cf name: {0}")]
-    CfDeprecated(String),
-
     #[error("ttl is not enabled, but get put request with ttl")]
-    TtlNotEnabled,
+    TTLNotEnabled,
 
     #[error("Deadline is exceeded")]
     DeadlineExceeded,
-
-    #[error("The length of ttls does not equal to the length of pairs")]
-    TtlLenNotEqualsToPairs,
-
-    #[error("Api version in request does not match with TiKV storage, cmd: {:?}, storage: {:?}, request: {:?}", .cmd, .storage_api_version, .req_api_version)]
-    ApiVersionNotMatched {
-        cmd: CommandKind,
-        storage_api_version: ApiVersion,
-        req_api_version: ApiVersion,
-    },
-
-    #[error("Key mode mismatched with the request mode, cmd: {:?}, storage: {:?}, key: {}", .cmd, .storage_api_version, .key)]
-    InvalidKeyMode {
-        cmd: CommandKind,
-        storage_api_version: ApiVersion,
-        key: String,
-    },
-
-    #[error("Key mode mismatched with the request mode, cmd: {:?}, storage: {:?}, range: {:?}", .cmd, .storage_api_version, .range)]
-    InvalidKeyRangeMode {
-        cmd: CommandKind,
-        storage_api_version: ApiVersion,
-        range: (Option<String>, Option<String>),
-    },
-}
-
-impl ErrorInner {
-    pub fn invalid_key_mode(cmd: CommandKind, storage_api_version: ApiVersion, key: &[u8]) -> Self {
-        ErrorInner::InvalidKeyMode {
-            cmd,
-            storage_api_version,
-            key: log_wrappers::hex_encode_upper(key),
-        }
-    }
-
-    pub fn invalid_key_range_mode(
-        cmd: CommandKind,
-        storage_api_version: ApiVersion,
-        range: (Option<&[u8]>, Option<&[u8]>),
-    ) -> Self {
-        ErrorInner::InvalidKeyRangeMode {
-            cmd,
-            storage_api_version,
-            range: (
-                range.0.map(log_wrappers::hex_encode_upper),
-                range.1.map(log_wrappers::hex_encode_upper),
-            ),
-        }
-    }
 }
 
 impl From<DeadlineError> for ErrorInner {
@@ -145,9 +86,8 @@ impl<T: Into<ErrorInner>> From<T> for Error {
 impl ErrorCodeExt for Error {
     fn error_code(&self) -> ErrorCode {
         match self.0.as_ref() {
-            ErrorInner::Kv(e) => e.error_code(),
-            ErrorInner::Txn(e) => e.error_code(),
             ErrorInner::Engine(e) => e.error_code(),
+            ErrorInner::Txn(e) => e.error_code(),
             ErrorInner::Closed => error_code::storage::CLOSED,
             ErrorInner::Other(_) => error_code::storage::UNKNOWN,
             ErrorInner::Io(_) => error_code::storage::IO,
@@ -155,13 +95,8 @@ impl ErrorCodeExt for Error {
             ErrorInner::GcWorkerTooBusy => error_code::storage::GC_WORKER_TOO_BUSY,
             ErrorInner::KeyTooLarge { .. } => error_code::storage::KEY_TOO_LARGE,
             ErrorInner::InvalidCf(_) => error_code::storage::INVALID_CF,
-            ErrorInner::CfDeprecated(_) => error_code::storage::CF_DEPRECATED,
-            ErrorInner::TtlNotEnabled => error_code::storage::TTL_NOT_ENABLED,
+            ErrorInner::TTLNotEnabled => error_code::storage::TTL_NOT_ENABLED,
             ErrorInner::DeadlineExceeded => error_code::storage::DEADLINE_EXCEEDED,
-            ErrorInner::TtlLenNotEqualsToPairs => error_code::storage::TTL_LEN_NOT_EQUALS_TO_PAIRS,
-            ErrorInner::ApiVersionNotMatched { .. } => error_code::storage::API_VERSION_NOT_MATCHED,
-            ErrorInner::InvalidKeyMode { .. } => error_code::storage::INVALID_KEY_MODE,
-            ErrorInner::InvalidKeyRangeMode { .. } => error_code::storage::INVALID_KEY_MODE,
         }
     }
 }
@@ -180,9 +115,8 @@ pub enum ErrorHeaderKind {
 }
 
 impl ErrorHeaderKind {
-    /// TODO: This function is only used for bridging existing & legacy metric
-    /// tags. It should be removed once Coprocessor starts using new static
-    /// metrics.
+    /// TODO: This function is only used for bridging existing & legacy metric tags.
+    /// It should be removed once Coprocessor starts using new static metrics.
     pub fn get_str(&self) -> &'static str {
         match *self {
             ErrorHeaderKind::NotLeader => "not_leader",
@@ -206,10 +140,9 @@ impl Display for ErrorHeaderKind {
 
 const SCHEDULER_IS_BUSY: &str = "scheduler is busy";
 const GC_WORKER_IS_BUSY: &str = "gc worker is busy";
-const DEADLINE_EXCEEDED: &str = "deadline is exceeded";
 
-/// Get the `ErrorHeaderKind` enum that corresponds to the error in the protobuf
-/// message. Returns `ErrorHeaderKind::Other` if no match found.
+/// Get the `ErrorHeaderKind` enum that corresponds to the error in the protobuf message.
+/// Returns `ErrorHeaderKind::Other` if no match found.
 pub fn get_error_kind_from_header(header: &errorpb::Error) -> ErrorHeaderKind {
     if header.has_not_leader() {
         ErrorHeaderKind::NotLeader
@@ -238,68 +171,50 @@ pub fn get_tag_from_header(header: &errorpb::Error) -> &'static str {
     get_error_kind_from_header(header).get_str()
 }
 
-pub fn extract_region_error_from_error(e: &Error) -> Option<errorpb::Error> {
-    match e {
+pub fn extract_region_error<T>(res: &Result<T>) -> Option<errorpb::Error> {
+    match *res {
         // TODO: use `Error::cause` instead.
-        Error(box ErrorInner::Kv(KvError(box KvErrorInner::Request(ref e))))
-        | Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Engine(KvError(
-            box KvErrorInner::Request(ref e),
-        )))))
-        | Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(MvccError(
-            box MvccErrorInner::Kv(KvError(box KvErrorInner::Request(ref e))),
-        ))))) => Some(e.to_owned()),
-        Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::MaxTimestampNotSynced {
+        Err(Error(box ErrorInner::Engine(EngineError(box EngineErrorInner::Request(ref e)))))
+        | Err(Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Engine(EngineError(
+            box EngineErrorInner::Request(ref e),
+        ))))))
+        | Err(Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(MvccError(
+            box MvccErrorInner::Engine(EngineError(box EngineErrorInner::Request(ref e))),
+        )))))) => Some(e.to_owned()),
+        Err(Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::MaxTimestampNotSynced {
             ..
-        }))) => {
+        })))) => {
             let mut err = errorpb::Error::default();
             err.set_max_timestamp_not_synced(Default::default());
             Some(err)
         }
-        Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::FlashbackNotPrepared(
-            region_id,
-        )))) => {
-            let mut err = errorpb::Error::default();
-            let mut flashback_not_prepared_err = errorpb::FlashbackNotPrepared::default();
-            flashback_not_prepared_err.set_region_id(*region_id);
-            err.set_flashback_not_prepared(flashback_not_prepared_err);
-            Some(err)
-        }
-        Error(box ErrorInner::SchedTooBusy) => {
+        Err(Error(box ErrorInner::SchedTooBusy)) => {
             let mut err = errorpb::Error::default();
             let mut server_is_busy_err = errorpb::ServerIsBusy::default();
             server_is_busy_err.set_reason(SCHEDULER_IS_BUSY.to_owned());
             err.set_server_is_busy(server_is_busy_err);
             Some(err)
         }
-        Error(box ErrorInner::GcWorkerTooBusy) => {
+        Err(Error(box ErrorInner::GcWorkerTooBusy)) => {
             let mut err = errorpb::Error::default();
             let mut server_is_busy_err = errorpb::ServerIsBusy::default();
             server_is_busy_err.set_reason(GC_WORKER_IS_BUSY.to_owned());
             err.set_server_is_busy(server_is_busy_err);
             Some(err)
         }
-        Error(box ErrorInner::Closed) => {
-            // TiKV is closing, return an RegionError to tell the client that this region is
-            // unavailable temporarily, the client should retry the request in other TiKVs.
+        Err(Error(box ErrorInner::Closed)) => {
+            // TiKV is closing, return an RegionError to tell the client that this region is unavailable
+            // temporarily, the client should retry the request in other TiKVs.
             let mut err = errorpb::Error::default();
             err.set_message("TiKV is Closing".to_string());
             Some(err)
         }
-        Error(box ErrorInner::DeadlineExceeded) => {
+        Err(Error(box ErrorInner::DeadlineExceeded)) => {
             let mut err = errorpb::Error::default();
-            let mut server_is_busy_err = errorpb::ServerIsBusy::default();
-            server_is_busy_err.set_reason(DEADLINE_EXCEEDED.to_owned());
-            err.set_server_is_busy(server_is_busy_err);
+            err.set_message("Deadline is exceeded".to_string());
             Some(err)
         }
         _ => None,
-    }
-}
-
-pub fn extract_region_error<T>(res: &Result<T>) -> Option<errorpb::Error> {
-    match res {
-        Ok(_) => None,
-        Err(e) => extract_region_error_from_error(e),
     }
 }
 
@@ -318,10 +233,10 @@ pub fn extract_key_error(err: &Error) -> kvrpcpb::KeyError {
         Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(MvccError(
             box MvccErrorInner::KeyIsLocked(info),
         )))))
-        | Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Engine(KvError(
-            box KvErrorInner::KeyIsLocked(info),
+        | Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Engine(EngineError(
+            box EngineErrorInner::KeyIsLocked(info),
         )))))
-        | Error(box ErrorInner::Kv(KvError(box KvErrorInner::KeyIsLocked(info)))) => {
+        | Error(box ErrorInner::Engine(EngineError(box EngineErrorInner::KeyIsLocked(info)))) => {
             key_error.set_locked(info.clone());
         }
         // failed in prewrite or pessimistic lock
@@ -332,7 +247,7 @@ pub fn extract_key_error(err: &Error) -> kvrpcpb::KeyError {
                 conflict_commit_ts,
                 key,
                 primary,
-                reason,
+                ..
             },
         ))))) => {
             let mut write_conflict = kvrpcpb::WriteConflict::default();
@@ -341,7 +256,6 @@ pub fn extract_key_error(err: &Error) -> kvrpcpb::KeyError {
             write_conflict.set_conflict_commit_ts(conflict_commit_ts.into_inner());
             write_conflict.set_key(key.to_owned());
             write_conflict.set_primary(primary.to_owned());
-            write_conflict.set_reason(reason.to_owned());
             key_error.set_conflict(write_conflict);
             // for compatibility with older versions.
             key_error.set_retryable(format!("{:?}", err));
@@ -407,30 +321,6 @@ pub fn extract_key_error(err: &Error) -> kvrpcpb::KeyError {
             commit_ts_too_large.set_commit_ts(min_commit_ts.into_inner());
             key_error.set_commit_ts_too_large(commit_ts_too_large);
         }
-        Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(MvccError(
-            box MvccErrorInner::AssertionFailed {
-                start_ts,
-                key,
-                assertion,
-                existing_start_ts,
-                existing_commit_ts,
-            },
-        ))))) => {
-            let mut assertion_failed = kvrpcpb::AssertionFailed::default();
-            assertion_failed.set_start_ts(start_ts.into_inner());
-            assertion_failed.set_key(key.to_owned());
-            assertion_failed.set_assertion(*assertion);
-            assertion_failed.set_existing_start_ts(existing_start_ts.into_inner());
-            assertion_failed.set_existing_commit_ts(existing_commit_ts.into_inner());
-            key_error.set_assertion_failed(assertion_failed);
-        }
-        Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(MvccError(
-            box MvccErrorInner::PrimaryMismatch(lock_info),
-        ))))) => {
-            let mut primary_mismatch = kvrpcpb::PrimaryMismatch::default();
-            primary_mismatch.set_lock_info(lock_info.clone());
-            key_error.set_primary_mismatch(primary_mismatch);
-        }
         _ => {
             error!(?*err; "txn aborts");
             key_error.set_abort(format!("{:?}", err));
@@ -481,45 +371,8 @@ pub fn extract_key_errors(res: Result<Vec<Result<()>>>) -> Vec<kvrpcpb::KeyError
     }
 }
 
-/// The shared version of [`Error`]. In some cases, it's necessary to pass a
-/// single error to more than one requests, since the inner error doesn't
-/// support cloning.
-#[derive(Debug, Clone, Error)]
-#[error(transparent)]
-pub struct SharedError(pub Arc<Error>);
-
-impl SharedError {
-    pub fn inner(&self) -> &ErrorInner {
-        &self.0.0
-    }
-}
-
-impl From<ErrorInner> for SharedError {
-    fn from(e: ErrorInner) -> Self {
-        Self(Arc::new(Error::from(e)))
-    }
-}
-
-impl From<Error> for SharedError {
-    fn from(e: Error) -> Self {
-        Self(Arc::new(e))
-    }
-}
-
-/// Tries to convert the shared error to owned one. It can success only when
-/// it's the only reference to the error.
-impl TryFrom<SharedError> for Error {
-    type Error = ();
-
-    fn try_from(e: SharedError) -> std::result::Result<Self, Self::Error> {
-        Arc::try_unwrap(e.0).map_err(|_| ())
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use kvproto::kvrpcpb::WriteConflictReason;
-
     use super::*;
 
     #[test]
@@ -536,7 +389,6 @@ mod test {
                 conflict_commit_ts,
                 key: key.clone(),
                 primary: primary.clone(),
-                reason: WriteConflictReason::LazyUniquenessCheck,
             },
         )));
         let mut expect = kvrpcpb::KeyError::default();
@@ -546,7 +398,6 @@ mod test {
         write_conflict.set_conflict_commit_ts(conflict_commit_ts.into_inner());
         write_conflict.set_key(key);
         write_conflict.set_primary(primary);
-        write_conflict.set_reason(WriteConflictReason::LazyUniquenessCheck);
         expect.set_conflict(write_conflict);
         expect.set_retryable(format!("{:?}", case));
 

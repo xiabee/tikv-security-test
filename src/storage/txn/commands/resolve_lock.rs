@@ -1,26 +1,18 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath]
+use crate::storage::kv::WriteData;
+use crate::storage::lock_manager::LockManager;
+use crate::storage::mvcc::{
+    Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader, MAX_TXN_WRITE_SIZE,
+};
+use crate::storage::txn::commands::{
+    Command, CommandExt, ReleasedLocks, ResolveLockReadPhase, ResponsePolicy, TypedCommand,
+    WriteCommand, WriteContext, WriteResult,
+};
+use crate::storage::txn::{cleanup, commit, Error, ErrorInner, Result};
+use crate::storage::{ProcessResult, Snapshot};
 use collections::HashMap;
 use txn_types::{Key, Lock, TimeStamp};
-
-use crate::storage::{
-    kv::WriteData,
-    lock_manager::LockManager,
-    mvcc::{
-        Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader,
-        MAX_TXN_WRITE_SIZE,
-    },
-    txn::{
-        cleanup,
-        commands::{
-            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResolveLockReadPhase,
-            ResponsePolicy, TypedCommand, WriteCommand, WriteContext, WriteResult,
-        },
-        commit, Error, ErrorInner, Result,
-    },
-    ProcessResult, Snapshot,
-};
 
 command! {
     /// Resolve locks according to `txn_status`.
@@ -30,7 +22,7 @@ command! {
     /// This should follow after a `ResolveLockReadPhase`.
     ResolveLock:
         cmd_ty => (),
-        display => "kv::resolve_lock {:?} scan_key({:?}) key_locks({:?})", (txn_status, scan_key, key_locks),
+        display => "kv::resolve_lock", (),
         content => {
             /// Maps lock_ts to commit_ts. If a transaction was rolled back, it is mapped to 0.
             ///
@@ -57,8 +49,9 @@ command! {
 impl CommandExt for ResolveLock {
     ctx!();
     tag!(resolve_lock);
-    request_type!(KvResolveLock);
-    property!(is_sys_cmd);
+
+    command_method!(readonly, bool, false);
+    command_method!(is_sys_cmd, bool, true);
 
     fn write_bytes(&self) -> usize {
         self.key_locks
@@ -75,14 +68,13 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
         let (ctx, txn_status, key_locks) = (self.ctx, self.txn_status, self.key_locks);
 
         let mut txn = MvccTxn::new(TimeStamp::zero(), context.concurrency_manager);
-        let mut reader = ReaderWithStats::new(
-            SnapshotReader::new_with_ctx(TimeStamp::zero(), snapshot, &ctx),
-            context.statistics,
-        );
+        let mut reader =
+            SnapshotReader::new(TimeStamp::zero(), snapshot, !ctx.get_not_fill_cache());
 
         let mut scan_key = self.scan_key.take();
         let rows = key_locks.len();
-        let mut released_locks = ReleasedLocks::new();
+        // Map txn's start_ts to ReleasedLocks
+        let mut released_locks = HashMap::default();
         for (current_key, current_lock) in key_locks {
             txn.start_ts = current_lock.ts;
             reader.start_ts = current_lock.ts;
@@ -99,9 +91,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
                     false,
                 )?
             } else if commit_ts > current_lock.ts {
-                // Continue to resolve locks if the not found committed locks are pessimistic
-                // type. They could be left if the transaction is finally committed and
-                // pessimistic conflict retry happens during execution.
+                // Continue to resolve locks if the not found committed locks are pessimistic type.
+                // They could be left if the transaction is finally committed and pessimistic conflict
+                // retry happens during execution.
                 match commit(&mut txn, &mut reader, current_key.clone(), commit_ts) {
                     Ok(res) => res,
                     Err(MvccError(box MvccErrorInner::TxnLockNotFound { .. }))
@@ -117,43 +109,42 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
                     commit_ts,
                 }));
             };
-            released_locks.push(released);
+            released_locks
+                .entry(current_lock.ts)
+                .or_insert_with(|| ReleasedLocks::new(current_lock.ts, commit_ts))
+                .push(released);
 
             if txn.write_size() >= MAX_TXN_WRITE_SIZE {
                 scan_key = Some(current_key);
                 break;
             }
         }
+        let lock_mgr = context.lock_mgr;
+        released_locks
+            .into_iter()
+            .for_each(|(_, released_locks)| released_locks.wake_up(lock_mgr));
 
+        context.statistics.add(&reader.take_statistics());
         let pr = if scan_key.is_none() {
             ProcessResult::Res
         } else {
-            let next_cmd = ResolveLockReadPhase {
-                ctx: ctx.clone(),
-                deadline: self.deadline,
-                txn_status,
-                scan_key,
-            };
             ProcessResult::NextCommand {
-                cmd: Command::ResolveLockReadPhase(next_cmd),
+                cmd: ResolveLockReadPhase::new(txn_status, scan_key.take(), ctx.clone()).into(),
             }
         };
-        let mut write_data = WriteData::from_modifies(txn.into_modifies());
-        write_data.set_allowed_on_disk_almost_full();
+        let write_data = WriteData::from_modifies(txn.into_modifies());
         Ok(WriteResult {
             ctx,
             to_be_write: write_data,
             rows,
             pr,
-            lock_info: vec![],
-            released_locks,
+            lock_info: None,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
         })
     }
 }
 
-// To resolve a key, the write size is about 100~150 bytes, depending on key and
-// value length. The write batch will be around 32KB if we scan 256 keys each
-// time.
+// To resolve a key, the write size is about 100~150 bytes, depending on key and value length.
+// The write batch will be around 32KB if we scan 256 keys each time.
 pub const RESOLVE_LOCK_BATCH_SIZE: usize = 256;

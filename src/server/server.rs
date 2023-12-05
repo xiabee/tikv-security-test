@@ -1,48 +1,44 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    i32,
-    net::{IpAddr, SocketAddr},
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::i32;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use api_version::KvFormat;
-use futures::{compat::Stream01CompatExt, stream::StreamExt};
+use futures::compat::Stream01CompatExt;
+use futures::stream::StreamExt;
 use grpcio::{ChannelBuilder, Environment, ResourceQuota, Server as GrpcServer, ServerBuilder};
 use grpcio_health::{create_health, HealthService, ServingStatus};
 use kvproto::tikvpb::*;
-use raftstore::store::{CheckLeaderTask, SnapManager};
-use security::SecurityManager;
-use tikv_util::{
-    config::VersionTrack,
-    sys::{get_global_memory_usage, record_global_memory_usage},
-    timer::GLOBAL_TIMER_HANDLE,
-    worker::{LazyWorker, Scheduler, Worker},
-    Either,
-};
 use tokio::runtime::{Builder as RuntimeBuilder, Handle as RuntimeHandle, Runtime};
 use tokio_timer::timer::Handle;
 
-use super::{
-    load_statistics::*,
-    metrics::{MEMORY_USAGE_GAUGE, SERVER_INFO_GAUGE_VEC},
-    raft_client::{ConnectionBuilder, RaftClient},
-    resolve::StoreAddrResolver,
-    service::*,
-    snap::{Runner as SnapHandler, Task as SnapTask},
-    transport::ServerTransport,
-    Config, Error, Result,
-};
-use crate::{
-    coprocessor::Endpoint,
-    coprocessor_v2,
-    read_pool::ReadPool,
-    server::{gc_worker::GcWorker, Proxy},
-    storage::{lock_manager::LockManager, Engine, Storage},
-    tikv_util::sys::thread::ThreadBuildWrapper,
-};
+use crate::coprocessor::Endpoint;
+use crate::coprocessor_v2;
+use crate::server::gc_worker::GcWorker;
+use crate::server::Proxy;
+use crate::storage::lock_manager::LockManager;
+use crate::storage::{Engine, Storage};
+use engine_rocks::RocksEngine;
+use raftstore::router::RaftStoreRouter;
+use raftstore::store::{CheckLeaderTask, SnapManager};
+use security::SecurityManager;
+use tikv_util::config::VersionTrack;
+use tikv_util::sys::{get_global_memory_usage, record_global_memory_usage};
+use tikv_util::timer::GLOBAL_TIMER_HANDLE;
+use tikv_util::worker::{LazyWorker, Scheduler, Worker};
+use tikv_util::Either;
+
+use super::load_statistics::*;
+use super::metrics::{MEMORY_USAGE_GAUGE, SERVER_INFO_GAUGE_VEC};
+use super::raft_client::{ConnectionBuilder, RaftClient};
+use super::resolve::StoreAddrResolver;
+use super::service::*;
+use super::snap::{Runner as SnapHandler, Task as SnapTask};
+use super::transport::ServerTransport;
+use super::{Config, Error, Result};
+use crate::read_pool::ReadPool;
 
 const LOAD_STATISTICS_SLOTS: usize = 4;
 const LOAD_STATISTICS_INTERVAL: Duration = Duration::from_millis(100);
@@ -51,137 +47,69 @@ pub const GRPC_THREAD_PREFIX: &str = "grpc-server";
 pub const READPOOL_NORMAL_THREAD_PREFIX: &str = "store-read-norm";
 pub const STATS_THREAD_PREFIX: &str = "transport-stats";
 
-pub trait GrpcBuilderFactory {
-    fn create_builder(&self, env: Arc<Environment>) -> Result<ServerBuilder>;
-}
-
-struct BuilderFactory<S: Tikv + Send + Clone + 'static> {
-    kv_service: S,
-    cfg: Arc<VersionTrack<Config>>,
-    security_mgr: Arc<SecurityManager>,
-    health_service: HealthService,
-}
-
-impl<S> BuilderFactory<S>
-where
-    S: Tikv + Send + Clone + 'static,
-{
-    pub fn new(
-        kv_service: S,
-        cfg: Arc<VersionTrack<Config>>,
-        security_mgr: Arc<SecurityManager>,
-        health_service: HealthService,
-    ) -> BuilderFactory<S> {
-        BuilderFactory {
-            kv_service,
-            cfg,
-            security_mgr,
-            health_service,
-        }
-    }
-}
-
-impl<S> GrpcBuilderFactory for BuilderFactory<S>
-where
-    S: Tikv + Send + Clone + 'static,
-{
-    fn create_builder(&self, env: Arc<Environment>) -> Result<ServerBuilder> {
-        let addr = SocketAddr::from_str(&self.cfg.value().addr)?;
-        let ip: String = format!("{}", addr.ip());
-        let mem_quota = ResourceQuota::new(Some("ServerMemQuota"))
-            .resize_memory(self.cfg.value().grpc_memory_pool_quota.0 as usize);
-        let channel_args = ChannelBuilder::new(Arc::clone(&env))
-            .stream_initial_window_size(self.cfg.value().grpc_stream_initial_window_size.0 as i32)
-            .max_concurrent_stream(self.cfg.value().grpc_concurrent_stream)
-            .max_receive_message_len(-1)
-            .set_resource_quota(mem_quota)
-            .max_send_message_len(-1)
-            .http2_max_ping_strikes(i32::MAX) // For pings without data from clients.
-            .keepalive_time(self.cfg.value().grpc_keepalive_time.into())
-            .keepalive_timeout(self.cfg.value().grpc_keepalive_timeout.into())
-            .build_args();
-
-        let sb = ServerBuilder::new(Arc::clone(&env))
-            .channel_args(channel_args)
-            .register_service(create_tikv(self.kv_service.clone()))
-            .register_service(create_health(self.health_service.clone()));
-        Ok(self.security_mgr.bind(sb, &ip, addr.port()))
-    }
-}
-
 /// The TiKV server
 ///
 /// It hosts various internal components, including gRPC, the raftstore router
 /// and a snapshot worker.
-pub struct Server<S: StoreAddrResolver + 'static, E: Engine> {
+pub struct Server<T: RaftStoreRouter<RocksEngine> + 'static, S: StoreAddrResolver + 'static> {
     env: Arc<Environment>,
     /// A GrpcServer builder or a GrpcServer.
     ///
     /// If the listening port is configured, the server will be started lazily.
     builder_or_server: Option<Either<ServerBuilder, GrpcServer>>,
-    grpc_mem_quota: ResourceQuota,
     local_addr: SocketAddr,
     // Transport.
-    trans: ServerTransport<E::RaftExtension, S>,
-    raft_router: E::RaftExtension,
+    trans: ServerTransport<T, S, RocksEngine>,
+    raft_router: T,
     // For sending/receiving snapshots.
     snap_mgr: SnapManager,
     snap_worker: LazyWorker<SnapTask>,
 
     // Currently load statistics is done in the thread.
     stats_pool: Option<Runtime>,
-    grpc_thread_load: Arc<ThreadLoadPool>,
+    grpc_thread_load: Arc<ThreadLoad>,
     yatp_read_pool: Option<ReadPool>,
     debug_thread_pool: Arc<Runtime>,
     health_service: HealthService,
     timer: Handle,
-    builder_factory: Box<dyn GrpcBuilderFactory>,
 }
 
-impl<S, E> Server<S, E>
-where
-    S: StoreAddrResolver + 'static,
-    E: Engine,
-    E::RaftExtension: Unpin,
-{
+impl<T: RaftStoreRouter<RocksEngine> + Unpin, S: StoreAddrResolver + 'static> Server<T, S> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<L: LockManager, F: KvFormat>(
+    pub fn new<E: Engine, L: LockManager>(
         store_id: u64,
         cfg: &Arc<VersionTrack<Config>>,
         security_mgr: &Arc<SecurityManager>,
-        storage: Storage<E, L, F>,
+        storage: Storage<E, L>,
         copr: Endpoint<E>,
         copr_v2: coprocessor_v2::Endpoint,
+        raft_router: T,
         resolver: S,
         snap_mgr: SnapManager,
-        gc_worker: GcWorker<E>,
+        gc_worker: GcWorker<E, T>,
         check_leader_scheduler: Scheduler<CheckLeaderTask>,
         env: Arc<Environment>,
         yatp_read_pool: Option<ReadPool>,
         debug_thread_pool: Arc<Runtime>,
-        health_service: HealthService,
     ) -> Result<Self> {
         // A helper thread (or pool) for transport layer.
         let stats_pool = if cfg.value().stats_concurrency > 0 {
             Some(
-                RuntimeBuilder::new_multi_thread()
+                RuntimeBuilder::new()
+                    .threaded_scheduler()
                     .thread_name(STATS_THREAD_PREFIX)
-                    .worker_threads(cfg.value().stats_concurrency)
-                    .after_start_wrapper(|| {})
-                    .before_stop_wrapper(|| {})
+                    .core_threads(cfg.value().stats_concurrency)
                     .build()
                     .unwrap(),
             )
         } else {
             None
         };
-        let grpc_thread_load = Arc::new(ThreadLoadPool::with_threshold(
-            cfg.value().heavy_load_threshold,
-        ));
+        let grpc_thread_load =
+            Arc::new(ThreadLoad::with_threshold(cfg.value().heavy_load_threshold));
 
         let snap_worker = Worker::new("snap-handler");
         let lazy_worker = snap_worker.lazy_build("snap-handler");
-        let raft_ext = storage.get_engine().raft_extension().clone();
 
         let proxy = Proxy::new(security_mgr.clone(), &env, Arc::new(cfg.value().clone()));
         let kv_service = KvService::new(
@@ -190,35 +118,47 @@ where
             gc_worker,
             copr,
             copr_v2,
+            raft_router.clone(),
             lazy_worker.scheduler(),
             check_leader_scheduler,
             Arc::clone(&grpc_thread_load),
             cfg.value().enable_request_batch,
             proxy,
-            cfg.value().reject_messages_on_memory_ratio,
         );
-        let builder_factory = Box::new(BuilderFactory::new(
-            kv_service,
-            cfg.clone(),
-            security_mgr.clone(),
-            health_service.clone(),
-        ));
 
         let addr = SocketAddr::from_str(&cfg.value().addr)?;
+        let ip = format!("{}", addr.ip());
         let mem_quota = ResourceQuota::new(Some("ServerMemQuota"))
             .resize_memory(cfg.value().grpc_memory_pool_quota.0 as usize);
-        let builder = Either::Left(builder_factory.create_builder(env.clone())?);
+        let channel_args = ChannelBuilder::new(Arc::clone(&env))
+            .stream_initial_window_size(cfg.value().grpc_stream_initial_window_size.0 as i32)
+            .max_concurrent_stream(cfg.value().grpc_concurrent_stream)
+            .max_receive_message_len(-1)
+            .set_resource_quota(mem_quota)
+            .max_send_message_len(-1)
+            .http2_max_ping_strikes(i32::MAX) // For pings without data from clients.
+            .keepalive_time(cfg.value().grpc_keepalive_time.into())
+            .keepalive_timeout(cfg.value().grpc_keepalive_timeout.into())
+            .build_args();
+        let health_service = HealthService::default();
+        let builder = {
+            let mut sb = ServerBuilder::new(Arc::clone(&env))
+                .channel_args(channel_args)
+                .register_service(create_tikv(kv_service))
+                .register_service(create_health(health_service.clone()));
+            sb = security_mgr.bind(sb, &ip, addr.port());
+            Either::Left(sb)
+        };
 
         let conn_builder = ConnectionBuilder::new(
             env.clone(),
-            Arc::clone(cfg),
+            Arc::new(cfg.value().clone()),
             security_mgr.clone(),
             resolver,
-            raft_ext.clone(),
+            raft_router.clone(),
             lazy_worker.scheduler(),
-            grpc_thread_load.clone(),
         );
-        let raft_client = RaftClient::new(store_id, conn_builder);
+        let raft_client = RaftClient::new(conn_builder);
 
         let trans = ServerTransport::new(raft_client);
         health_service.set_serving_status("", ServingStatus::NotServing);
@@ -226,10 +166,9 @@ where
         let svr = Server {
             env: Arc::clone(&env),
             builder_or_server: Some(builder),
-            grpc_mem_quota: mem_quota,
             local_addr: addr,
             trans,
-            raft_router: raft_ext,
+            raft_router,
             snap_mgr,
             snap_worker: lazy_worker,
             stats_pool,
@@ -238,7 +177,6 @@ where
             debug_thread_pool,
             health_service,
             timer: GLOBAL_TIMER_HANDLE.clone(),
-            builder_factory,
         };
 
         Ok(svr)
@@ -252,16 +190,12 @@ where
         self.snap_worker.scheduler()
     }
 
-    pub fn transport(&self) -> ServerTransport<E::RaftExtension, S> {
+    pub fn transport(&self) -> ServerTransport<T, S, RocksEngine> {
         self.trans.clone()
     }
 
     pub fn env(&self) -> Arc<Environment> {
         self.env.clone()
-    }
-
-    pub fn get_grpc_mem_quota(&self) -> &ResourceQuota {
-        &self.grpc_mem_quota
     }
 
     /// Register a gRPC service.
@@ -292,15 +226,6 @@ where
         Ok(addr)
     }
 
-    fn start_grpc(&mut self) {
-        info!("listening on addr"; "addr" => &self.local_addr);
-        let mut grpc_server = self.builder_or_server.take().unwrap().right().unwrap();
-        grpc_server.start();
-        self.builder_or_server = Some(Either::Right(grpc_server));
-        self.health_service
-            .set_serving_status("", ServingStatus::Serving);
-    }
-
     /// Starts the TiKV server.
     /// Notice: Make sure call `build_and_bind` first.
     pub fn start(
@@ -317,9 +242,11 @@ where
         );
         self.snap_worker.start(snap_runner);
 
-        self.start_grpc();
+        let mut grpc_server = self.builder_or_server.take().unwrap().right().unwrap();
+        info!("listening on addr"; "addr" => &self.local_addr);
+        grpc_server.start();
+        self.builder_or_server = Some(Either::Right(grpc_server));
 
-        // Note this should be called only after grpc server is started.
         let mut grpc_load_stats = {
             let tl = Arc::clone(&self.grpc_thread_load);
             ThreadLoadStatistics::new(LOAD_STATISTICS_SLOTS, GRPC_THREAD_PREFIX, tl)
@@ -357,6 +284,8 @@ where
                 option_env!("TIKV_BUILD_GIT_HASH").unwrap_or("None"),
             ])
             .set(startup_ts as i64);
+        self.health_service
+            .set_serving_status("", ServingStatus::Serving);
 
         info!("TiKV is ready to serve");
         Ok(())
@@ -369,38 +298,12 @@ where
             server.shutdown();
         }
         if let Some(pool) = self.stats_pool.take() {
-            pool.shutdown_background();
+            let _ = pool.shutdown_background();
         }
         let _ = self.yatp_read_pool.take();
-        self.health_service.shutdown();
-        Ok(())
-    }
-
-    pub fn pause(&mut self) -> Result<()> {
-        let start = Instant::now();
-        // Prepare the builder for resume grpc server. And if the builder cannot be
-        // created, then pause will be skipped.
-        let builder = Either::Left(self.builder_factory.create_builder(self.env.clone())?);
-        if let Some(Either::Right(server)) = self.builder_or_server.take() {
-            drop(server);
-        }
         self.health_service
             .set_serving_status("", ServingStatus::NotServing);
-        self.builder_or_server = Some(builder);
-        info!("paused the grpc server"; "takes" => ?start.elapsed(),);
         Ok(())
-    }
-
-    pub fn resume(&mut self) -> Result<()> {
-        if let Some(builder) = self.builder_or_server.as_ref() {
-            let start = Instant::now();
-            assert!(builder.is_left());
-            self.build_and_bind()?;
-            self.start_grpc();
-            info!("resumed the grpc server"; "takes" => ?start.elapsed(),);
-            return Ok(());
-        }
-        Err(Error::Other(box_err!("resume the grpc server is skipped.")))
     }
 
     // Return listening address, this may only be used for outer test
@@ -415,21 +318,24 @@ where
 pub mod test_router {
     use std::sync::mpsc::*;
 
-    use engine_rocks::{RocksEngine, RocksSnapshot};
-    use kvproto::raft_serverpb::RaftMessage;
-    use raftstore::{router::RaftStoreRouter, store::*, Result as RaftStoreResult};
-
     use super::*;
+
+    use raftstore::store::*;
+    use raftstore::Result as RaftStoreResult;
+
+    use engine_rocks::RocksSnapshot;
+    use engine_traits::{KvEngine, Snapshot};
+    use kvproto::raft_serverpb::RaftMessage;
 
     #[derive(Clone)]
     pub struct TestRaftStoreRouter {
-        tx: Sender<Either<PeerMsg<RocksEngine>, StoreMsg<RocksEngine>>>,
+        tx: Sender<usize>,
         significant_msg_sender: Sender<SignificantMsg<RocksSnapshot>>,
     }
 
     impl TestRaftStoreRouter {
         pub fn new(
-            tx: Sender<Either<PeerMsg<RocksEngine>, StoreMsg<RocksEngine>>>,
+            tx: Sender<usize>,
             significant_msg_sender: Sender<SignificantMsg<RocksSnapshot>>,
         ) -> TestRaftStoreRouter {
             TestRaftStoreRouter {
@@ -440,31 +346,35 @@ pub mod test_router {
     }
 
     impl StoreRouter<RocksEngine> for TestRaftStoreRouter {
-        fn send(&self, msg: StoreMsg<RocksEngine>) -> RaftStoreResult<()> {
-            let _ = self.tx.send(Either::Right(msg));
+        fn send(&self, _: StoreMsg<RocksEngine>) -> RaftStoreResult<()> {
+            let _ = self.tx.send(1);
             Ok(())
         }
     }
 
-    impl ProposalRouter<RocksSnapshot> for TestRaftStoreRouter {
+    impl<S: Snapshot> ProposalRouter<S> for TestRaftStoreRouter {
         fn send(
             &self,
-            cmd: RaftCommand<RocksSnapshot>,
-        ) -> std::result::Result<(), crossbeam::channel::TrySendError<RaftCommand<RocksSnapshot>>>
-        {
-            let _ = self.tx.send(Either::Left(PeerMsg::RaftCommand(cmd)));
+            _: RaftCommand<S>,
+        ) -> std::result::Result<(), crossbeam::channel::TrySendError<RaftCommand<S>>> {
+            let _ = self.tx.send(1);
             Ok(())
         }
     }
 
-    impl CasualRouter<RocksEngine> for TestRaftStoreRouter {
-        fn send(&self, _: u64, msg: CasualMessage<RocksEngine>) -> RaftStoreResult<()> {
-            let _ = self.tx.send(Either::Left(PeerMsg::CasualMessage(msg)));
+    impl<EK: KvEngine> CasualRouter<EK> for TestRaftStoreRouter {
+        fn send(&self, _: u64, _: CasualMessage<EK>) -> RaftStoreResult<()> {
+            let _ = self.tx.send(1);
             Ok(())
         }
     }
 
-    impl SignificantRouter<RocksEngine> for TestRaftStoreRouter {
+    impl RaftStoreRouter<RocksEngine> for TestRaftStoreRouter {
+        fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
+            let _ = self.tx.send(1);
+            Ok(())
+        }
+
         fn significant_send(
             &self,
             _: u64,
@@ -473,58 +383,36 @@ pub mod test_router {
             let _ = self.significant_msg_sender.send(msg);
             Ok(())
         }
-    }
 
-    impl RaftStoreRouter<RocksEngine> for TestRaftStoreRouter {
-        fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()> {
-            let _ = self
-                .tx
-                .send(Either::Left(PeerMsg::RaftMessage(InspectedRaftMessage {
-                    heap_size: 0,
-                    msg,
-                })));
-            Ok(())
-        }
-
-        fn broadcast_normal(&self, mut f: impl FnMut() -> PeerMsg<RocksEngine>) {
-            let _ = self.tx.send(Either::Left(f()));
+        fn broadcast_normal(&self, _: impl FnMut() -> PeerMsg<RocksEngine>) {
+            let _ = self.tx.send(1);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{atomic::*, *},
-        time::Duration,
-    };
+    use std::sync::atomic::*;
+    use std::sync::*;
+    use std::time::Duration;
 
-    use engine_rocks::RocksSnapshot;
+    use super::*;
+
+    use super::super::resolve::{Callback as ResolveCallback, StoreAddrResolver};
+    use super::super::{Config, Result};
+    use crate::config::CoprReadPoolConfig;
+    use crate::coprocessor::{self, readpool_impl};
+    use crate::server::TestRaftStoreRouter;
+    use crate::storage::TestStorageBuilder;
     use grpcio::EnvBuilder;
-    use kvproto::raft_serverpb::RaftMessage;
-    use raftstore::{
-        coprocessor::region_info_accessor::MockRegionInfoProvider,
-        router::RaftStoreRouter,
-        store::{transport::Transport, *},
-    };
-    use resource_metering::ResourceTagFactory;
-    use security::SecurityConfig;
-    use tikv_util::{config::ReadableDuration, quota_limiter::QuotaLimiter};
-    use tokio::runtime::Builder as TokioBuilder;
+    use raftstore::store::transport::Transport;
+    use raftstore::store::*;
 
-    use super::{
-        super::{
-            resolve::{Callback as ResolveCallback, StoreAddrResolver},
-            Config, Result,
-        },
-        *,
-    };
-    use crate::{
-        config::CoprReadPoolConfig,
-        coprocessor::{self, readpool_impl},
-        server::{raftkv::RaftRouterWrap, TestRaftStoreRouter},
-        storage::{lock_manager::MockLockManager, TestEngineBuilder, TestStorageBuilderApiV1},
-    };
+    use crate::storage::lock_manager::DummyLockManager;
+    use engine_rocks::{PerfLevel, RocksSnapshot};
+    use kvproto::raft_serverpb::RaftMessage;
+    use security::SecurityConfig;
+    use tokio::runtime::Builder as TokioBuilder;
 
     #[derive(Clone)]
     struct MockResolver {
@@ -562,31 +450,21 @@ mod tests {
         }
     }
 
-    // if this failed, unset the environmental variables 'http_proxy' and
-    // 'https_proxy', and retry.
+    // if this failed, unset the environmental variables 'http_proxy' and 'https_proxy', and retry.
     #[test]
     fn test_peer_resolve() {
-        let mock_store_id = 5;
         let cfg = Config {
             addr: "127.0.0.1:0".to_owned(),
-            raft_client_max_backoff: ReadableDuration::millis(100),
-            raft_client_initial_reconnect_backoff: ReadableDuration::millis(100),
             ..Default::default()
         };
+
+        let storage = TestStorageBuilder::new(DummyLockManager {}, false)
+            .build()
+            .unwrap();
 
         let (tx, rx) = mpsc::channel();
         let (significant_msg_sender, significant_msg_receiver) = mpsc::channel();
         let router = TestRaftStoreRouter::new(tx, significant_msg_sender);
-        let engine = TestEngineBuilder::new()
-            .build()
-            .unwrap()
-            .with_raft_extension(RaftRouterWrap::new(router.clone()));
-
-        let storage =
-            TestStorageBuilderApiV1::from_engine_and_lock_mgr(engine, MockLockManager::new())
-                .build()
-                .unwrap();
-
         let env = Arc::new(
             EnvBuilder::new()
                 .cq_count(1)
@@ -594,15 +472,13 @@ mod tests {
                 .build(),
         );
 
-        let (tx, _rx) = mpsc::channel();
         let mut gc_worker = GcWorker::new(
             storage.get_engine(),
-            tx,
+            router.clone(),
             Default::default(),
             Default::default(),
-            Arc::new(MockRegionInfoProvider::new(Vec::new())),
         );
-        gc_worker.start(mock_store_id).unwrap();
+        gc_worker.start().unwrap();
 
         let quick_fail = Arc::new(AtomicBool::new(false));
         let cfg = Arc::new(VersionTrack::new(cfg));
@@ -616,19 +492,18 @@ mod tests {
             &cfg.value().clone(),
             cop_read_pool.handle(),
             storage.get_concurrency_manager(),
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
+            PerfLevel::EnableCount,
         );
         let copr_v2 = coprocessor_v2::Endpoint::new(&coprocessor_v2::Config::default());
         let debug_thread_pool = Arc::new(
-            TokioBuilder::new_multi_thread()
+            TokioBuilder::new()
+                .threaded_scheduler()
                 .thread_name(thd_name!("debugger"))
-                .worker_threads(1)
-                .after_start_wrapper(|| {})
-                .before_stop_wrapper(|| {})
+                .core_threads(1)
                 .build()
                 .unwrap(),
         );
+        let mock_store_id = 5;
         let addr = Arc::new(Mutex::new(None));
         let (check_leader_scheduler, _) = tikv_util::worker::dummy_scheduler();
         let mut server = Server::new(
@@ -638,6 +513,7 @@ mod tests {
             storage,
             copr,
             copr_v2,
+            router.clone(),
             MockResolver {
                 quick_fail: Arc::clone(&quick_fail),
                 addr: Arc::clone(&addr),
@@ -648,7 +524,6 @@ mod tests {
             env,
             None,
             debug_thread_pool,
-            HealthService::default(),
         )
         .unwrap();
 
@@ -673,7 +548,7 @@ mod tests {
 
         trans.send(msg.clone()).unwrap();
         trans.flush();
-        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
 
         msg.mut_to_peer().set_store_id(2);
         msg.set_region_id(2);

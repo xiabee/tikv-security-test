@@ -1,9 +1,7 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use kvproto::pdpb::*;
 
@@ -46,12 +44,6 @@ impl LeaderChange {
     }
 }
 
-impl Default for LeaderChange {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 const DEAD_ID: u64 = 1000;
 const DEAD_NAME: &str = "walking_dead";
 const DEAD_URL: &str = "127.0.0.1:65534";
@@ -88,7 +80,7 @@ impl PdMocker for LeaderChange {
 
     fn set_endpoints(&self, eps: Vec<String>) {
         let mut members = Vec::with_capacity(eps.len());
-        for (i, ep) in eps.iter().enumerate() {
+        for (i, ep) in (&eps).iter().enumerate() {
             let mut m = Member::default();
             m.set_name(format!("pd{}", i));
             m.set_member_id(100 + i as u64);
@@ -109,7 +101,7 @@ impl PdMocker for LeaderChange {
         header.set_cluster_id(1);
 
         let mut resps = Vec::with_capacity(eps.len());
-        for (i, _) in eps.iter().enumerate() {
+        for (i, _) in (&eps).iter().enumerate() {
             let mut resp = GetMembersResponse::default();
             resp.set_header(header.clone());
             resp.set_members(members.clone().into());

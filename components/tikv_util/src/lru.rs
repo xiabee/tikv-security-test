@@ -1,12 +1,9 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    hash::Hash,
-    mem::MaybeUninit,
-    ptr::{self, NonNull},
-};
-
 use collections::{HashMap, HashMapEntry};
+use std::hash::Hash;
+use std::mem::MaybeUninit;
+use std::ptr::{self, NonNull};
 
 struct Record<K> {
     prev: NonNull<Record<K>>,
@@ -20,39 +17,37 @@ struct ValueEntry<K, V> {
 }
 
 struct Trace<K> {
-    head: NonNull<Record<K>>,
-    tail: NonNull<Record<K>>,
+    head: Box<Record<K>>,
+    tail: Box<Record<K>>,
     tick: usize,
     sample_mask: usize,
 }
 
 #[inline]
-unsafe fn suture<K>(mut leading: NonNull<Record<K>>, mut following: NonNull<Record<K>>) {
-    leading.as_mut().next = following;
-    following.as_mut().prev = leading;
+unsafe fn suture<K>(leading: &mut Record<K>, following: &mut Record<K>) {
+    leading.next = NonNull::new_unchecked(following);
+    following.prev = NonNull::new_unchecked(leading);
 }
 
 #[inline]
-unsafe fn cut_out<K>(record: NonNull<Record<K>>) {
-    suture(record.as_ref().prev, record.as_ref().next)
+unsafe fn cut_out<K>(record: &mut Record<K>) {
+    suture(record.prev.as_mut(), record.next.as_mut())
 }
 
 impl<K> Trace<K> {
     fn new(sample_mask: usize) -> Trace<K> {
         unsafe {
-            let head = Box::leak(Box::new(Record {
-                prev: NonNull::dangling(),
-                next: NonNull::dangling(),
+            let mut head = Box::new(Record {
+                prev: NonNull::new_unchecked(1usize as _),
+                next: NonNull::new_unchecked(1usize as _),
                 key: MaybeUninit::uninit(),
-            }))
-            .into();
-            let tail = Box::leak(Box::new(Record {
-                prev: NonNull::dangling(),
-                next: NonNull::dangling(),
+            });
+            let mut tail = Box::new(Record {
+                prev: NonNull::new_unchecked(1usize as _),
+                next: NonNull::new_unchecked(1usize as _),
                 key: MaybeUninit::uninit(),
-            }))
-            .into();
-            suture(head, tail);
+            });
+            suture(&mut head, &mut tail);
 
             Trace {
                 head,
@@ -71,17 +66,17 @@ impl<K> Trace<K> {
         }
     }
 
-    fn promote(&mut self, record: NonNull<Record<K>>) {
+    fn promote(&mut self, mut record: NonNull<Record<K>>) {
         unsafe {
-            cut_out(record);
-            suture(record, self.head.as_ref().next);
-            suture(self.head, record);
+            cut_out(record.as_mut());
+            suture(record.as_mut(), &mut self.head.next.as_mut());
+            suture(&mut self.head, record.as_mut());
         }
     }
 
-    fn delete(&mut self, record: NonNull<Record<K>>) {
+    fn delete(&mut self, mut record: NonNull<Record<K>>) {
         unsafe {
-            cut_out(record);
+            cut_out(record.as_mut());
 
             ptr::drop_in_place(Box::from_raw(record.as_ptr()).key.as_mut_ptr());
         }
@@ -89,24 +84,24 @@ impl<K> Trace<K> {
 
     fn create(&mut self, key: K) -> NonNull<Record<K>> {
         let record = Box::leak(Box::new(Record {
-            prev: self.head,
-            next: unsafe { self.head.as_ref().next },
+            prev: unsafe { NonNull::new_unchecked(&mut *self.head) },
+            next: self.head.next,
             key: MaybeUninit::new(key),
         }))
         .into();
         unsafe {
-            self.head.as_mut().next.as_mut().prev = record;
-            self.head.as_mut().next = record;
+            self.head.next.as_mut().prev = record;
+            self.head.next = record;
         }
         record
     }
 
     fn reuse_tail(&mut self, key: K) -> (K, NonNull<Record<K>>) {
         unsafe {
-            let mut record = self.tail.as_ref().prev;
-            cut_out(record);
-            suture(record, self.head.as_ref().next);
-            suture(self.head, record);
+            let mut record = self.tail.prev;
+            cut_out(record.as_mut());
+            suture(record.as_mut(), self.head.next.as_mut());
+            suture(&mut self.head, record.as_mut());
 
             let old_key = record.as_mut().key.as_ptr().read();
             record.as_mut().key = MaybeUninit::new(key);
@@ -115,33 +110,24 @@ impl<K> Trace<K> {
     }
 
     fn clear(&mut self) {
+        let mut cur = self.head.next;
         unsafe {
-            let mut cur = self.head.as_ref().next;
-            while cur != self.tail {
-                let tmp = cur.as_ref().next;
+            while cur.as_ptr() != &mut *self.tail {
+                let tmp = cur.as_mut().next;
                 ptr::drop_in_place(Box::from_raw(cur.as_ptr()).key.as_mut_ptr());
                 cur = tmp;
             }
-            suture(self.head, self.tail);
+            suture(&mut self.head, &mut self.tail);
         }
     }
 
     fn remove_tail(&mut self) -> K {
         unsafe {
-            let record = self.tail.as_ref().prev;
-            cut_out(record);
+            let mut record = self.tail.prev;
+            cut_out(record.as_mut());
 
             let r = Box::from_raw(record.as_ptr());
             r.key.as_ptr().read()
-        }
-    }
-}
-
-impl<K> Drop for Trace<K> {
-    fn drop(&mut self) {
-        unsafe {
-            drop(Box::from_raw(self.head.as_ptr()));
-            drop(Box::from_raw(self.tail.as_ptr()));
         }
     }
 }
@@ -153,7 +139,6 @@ pub trait SizePolicy<K, V> {
     fn on_reset(&mut self, val: usize);
 }
 
-#[derive(Default)]
 pub struct CountTracker(usize);
 
 impl<K, V> SizePolicy<K, V> for CountTracker {
@@ -171,6 +156,12 @@ impl<K, V> SizePolicy<K, V> for CountTracker {
 
     fn on_reset(&mut self, val: usize) {
         self.0 = val;
+    }
+}
+
+impl Default for CountTracker {
+    fn default() -> Self {
+        Self(0)
     }
 }
 
@@ -245,6 +236,7 @@ where
         let current_size = SizePolicy::<K, V>::current(&self.size_policy);
         match self.map.entry(key) {
             HashMapEntry::Occupied(mut e) => {
+                // TODO: evict entries if size exceeds capacity.
                 self.size_policy.on_remove(e.key(), &e.get().value);
                 self.size_policy.on_insert(e.key(), &value);
                 let mut entry = e.get_mut();
@@ -253,6 +245,7 @@ where
             }
             HashMapEntry::Vacant(v) => {
                 let record = if self.capacity <= current_size {
+                    // TODO: evict not only one entry to fit capacity.
                     let res = self.trace.reuse_tail(v.key().clone());
                     old_key = Some(res.0);
                     res.1
@@ -267,28 +260,6 @@ where
         if let Some(o) = old_key {
             let entry = self.map.remove(&o).unwrap();
             self.size_policy.on_remove(&o, &entry.value);
-        }
-
-        // NOTE: now when inserting a value larger than the capacity, actually this
-        // implementation will clean the whole cache.
-        // Perhaps we can reject entries larger than capacity goes in the LRU cache, but
-        // that is impossible for now: the `SizePolicy` trait doesn't provide the
-        // interface of querying the actual size of an item.
-        self.evict_until_fit()
-    }
-
-    fn evict_until_fit(&mut self) {
-        let cap = self.capacity;
-        loop {
-            let current_size = self.size_policy.current();
-            // Should we keep at least one entry? So our users won't lose their fresh record
-            // once it exceeds the capacity.
-            if current_size <= cap || self.map.is_empty() {
-                break;
-            }
-            let key = self.trace.remove_tail();
-            let val = self.map.remove(&key).unwrap();
-            self.size_policy.on_remove(&key, &val.value);
         }
     }
 
@@ -324,7 +295,7 @@ where
         }
     }
 
-    pub fn iter(&self) -> Iter<'_, K, V> {
+    pub fn iter(&self) -> Iter<K, V> {
         Iter {
             base: self.map.iter(),
         }
@@ -372,7 +343,7 @@ where
     }
 }
 
-pub struct Iter<'a, K, V> {
+pub struct Iter<'a, K: 'a, V: 'a> {
     base: std::collections::hash_map::Iter<'a, K, ValueEntry<K, V>>,
 }
 
@@ -601,29 +572,6 @@ mod tests {
         }
         for i in 10..20 {
             assert_eq!(map.get(&i), Some(&vec![b' ']));
-        }
-    }
-
-    #[test]
-    fn test_oversized() {
-        let mut cache = LruCache::with_capacity_sample_and_trace(42, 0, TestTracker(0));
-        cache.insert(
-            42,
-            b"this is the answer... but will it being inserted?".to_vec(),
-        );
-        assert!(cache.size() <= 42);
-        cache.insert(42, b"Aha, perhaps an shorter answer.".to_vec());
-        assert!(cache.size() <= 42);
-        cache.insert(43, b"Yet a new challenger.".to_vec());
-        assert!(cache.size() <= 42);
-
-        for i in 0..100 {
-            cache.insert(i, vec![i as _]);
-            assert!(cache.size() <= 42);
-        }
-        for i in 90..200 {
-            cache.insert(i, vec![i as _; 8]);
-            assert!(cache.size() <= 42);
         }
     }
 }

@@ -1,34 +1,25 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    borrow::Cow,
-    cmp::Ordering,
-    fmt::{self, Debug, Display, Formatter},
-    i64, str,
-};
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::{i64, str};
 
-use codec::{
-    byte::{CompactByteCodec, MemComparableByteCodec},
-    number::{self, NumberCodec},
-    prelude::*,
-};
-use tikv_util::{codec::BytesSlice, escape};
+use crate::FieldTypeTp;
+use tikv_util::codec::BytesSlice;
+use tikv_util::escape;
 
-use super::{
-    mysql::{
-        self, parse_json_path_expr, Decimal, DecimalDecoder, DecimalEncoder, Duration, Enum, Json,
-        JsonDecoder, JsonEncoder, PathExpression, Set, Time, DEFAULT_FSP, MAX_FSP,
-    },
-    Result,
+use super::mysql::{
+    self, parse_json_path_expr, Decimal, DecimalDecoder, DecimalEncoder, Duration, Enum, Json,
+    JsonDecoder, JsonEncoder, PathExpression, Set, Time, DEFAULT_FSP, MAX_FSP,
 };
-use crate::{
-    codec::{
-        convert::{ConvertTo, ToInt},
-        data_type::AsMySqlBool,
-    },
-    expr::EvalContext,
-    FieldTypeTp,
-};
+use super::Result;
+use crate::codec::convert::{ConvertTo, ToInt};
+use crate::codec::data_type::AsMySQLBool;
+use crate::expr::EvalContext;
+use codec::byte::{CompactByteCodec, MemComparableByteCodec};
+use codec::number::{self, NumberCodec};
+use codec::prelude::*;
 
 pub const NIL_FLAG: u8 = 0;
 pub const BYTES_FLAG: u8 = 1;
@@ -140,9 +131,9 @@ impl Display for Datum {
             Datum::Bytes(ref bs) => write!(f, "Bytes(\"{}\")", escape(bs)),
             Datum::Dec(ref d) => write!(f, "Dec({})", d),
             Datum::Time(t) => write!(f, "Time({})", t),
-            Datum::Json(ref j) => write!(f, "Json({})", j),
-            Datum::Enum(ref e) => write!(f, "Enum({})", e),
-            Datum::Set(ref s) => write!(f, "Set({})", s),
+            Datum::Json(ref j) => write!(f, "Json({})", j.to_string()),
+            Datum::Enum(ref e) => write!(f, "Enum({})", e.to_string()),
+            Datum::Set(ref s) => write!(f, "Set({})", s.to_string()),
             Datum::Min => write!(f, "MIN"),
             Datum::Max => write!(f, "MAX"),
         }
@@ -162,8 +153,7 @@ pub fn cmp_f64(l: f64, r: f64) -> Result<Ordering> {
         .ok_or_else(|| invalid_type!("{} and {} can't be compared", l, r))
 }
 
-/// `checked_add_i64`  checks and adds `r` to the `l`. Return None if the sum is
-/// negative.
+/// `checked_add_i64`  checks and adds `r` to the `l`. Return None if the sum is negative.
 #[inline]
 fn checked_add_i64(l: u64, r: i64) -> Option<u64> {
     if r >= 0 {
@@ -909,8 +899,8 @@ pub trait DatumDecoder:
             NIL_FLAG => Datum::Null,
             FLOAT_FLAG => self.read_f64().map(Datum::F64)?,
             DURATION_FLAG => {
-                // Decode the i64 into `Duration` with `MAX_FSP`, then unflatten it with
-                // concrete `FieldType` information
+                // Decode the i64 into `Duration` with `MAX_FSP`, then unflatten it with concrete
+                // `FieldType` information
                 let nanos = self.read_i64()?;
                 let dur = Duration::from_nanos(nanos, MAX_FSP)?;
                 Datum::Dur(dur)
@@ -1011,7 +1001,7 @@ pub trait DatumEncoder:
                     self.write_u8(JSON_FLAG)?;
                     self.write_json(j.as_ref())?;
                 }
-                // TODO: implement datum write here.
+                //TODO: implement datum write here.
                 Datum::Enum(_) => unimplemented!(),
                 Datum::Set(_) => unimplemented!(),
             }
@@ -1074,8 +1064,7 @@ pub fn encode(ctx: &mut EvalContext, values: &[Datum], comparable: bool) -> Resu
     Ok(buf)
 }
 
-/// `encode_key` encodes a datum slice into a memory comparable buffer as the
-/// key.
+/// `encode_key` encodes a datum slice into a memory comparable buffer as the key.
 pub fn encode_key(ctx: &mut EvalContext, values: &[Datum]) -> Result<Vec<u8>> {
     encode(ctx, values, true)
 }
@@ -1136,8 +1125,7 @@ pub fn split_datum(buf: &[u8], desc: bool) -> Result<(&[u8], &[u8])> {
 
 /// `skip_n_datum_slices` skip `n` datum slices within `buf`
 /// and advances the buffer pointer.
-/// If the datum buffer contains less than `n` slices, an error will be
-/// returned.
+/// If the datum buffer contains less than `n` slices, an error will be returned.
 pub fn skip_n(buf: &mut &[u8], n: usize) -> Result<()> {
     let origin = *buf;
     for i in 0..n {
@@ -1156,16 +1144,15 @@ pub fn skip_n(buf: &mut &[u8], n: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cmp::Ordering, i16, i32, i64, i8, slice::from_ref, str::FromStr, sync::Arc, u16, u32, u64,
-        u8,
-    };
-
     use super::*;
-    use crate::{
-        codec::mysql::{Decimal, Duration, Time, MAX_FSP},
-        expr::{EvalConfig, EvalContext},
-    };
+    use crate::codec::mysql::{Decimal, Duration, Time, MAX_FSP};
+    use crate::expr::{EvalConfig, EvalContext};
+
+    use std::cmp::Ordering;
+    use std::slice::from_ref;
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::{i16, i32, i64, i8, u16, u32, u64, u8};
 
     fn same_type(l: &Datum, r: &Datum) -> bool {
         match (l, r) {
@@ -1960,7 +1947,7 @@ mod tests {
             ),
             (Datum::Bytes(b"[1, 2, 3]".to_vec()), "[1, 2, 3]"),
             (Datum::Bytes(b"{}".to_vec()), "{}"),
-            (Datum::I64(1), "1"),
+            (Datum::I64(1), "true"),
         ];
 
         for (d, json) in tests {
@@ -1975,7 +1962,7 @@ mod tests {
         ];
 
         for d in illegal_cases {
-            d.cast_as_json().unwrap_err();
+            assert!(d.cast_as_json().is_err());
         }
     }
 
@@ -1996,7 +1983,7 @@ mod tests {
         let illegal_cases = vec![Datum::Max, Datum::Min];
 
         for d in illegal_cases {
-            d.into_json().unwrap_err();
+            assert!(d.into_json().is_err());
         }
     }
 

@@ -2,11 +2,11 @@
 
 use num_traits::identities::Zero;
 use tidb_query_codegen::rpn_fn;
+
 use tidb_query_common::Result;
-use tidb_query_datatype::{
-    codec::{self, data_type::*, div_i64, div_i64_with_u64, div_u64_with_i64, Error},
-    expr::EvalContext,
-};
+use tidb_query_datatype::codec::data_type::*;
+use tidb_query_datatype::codec::{self, div_i64, div_i64_with_u64, div_u64_with_i64, Error};
+use tidb_query_datatype::expr::EvalContext;
 
 #[rpn_fn]
 #[inline]
@@ -44,7 +44,7 @@ impl ArithmeticOp for IntIntPlus {
 
     fn calc(lhs: &Int, rhs: &Int) -> Result<Option<Int>> {
         lhs.checked_add(*rhs)
-            .ok_or_else(|| Error::overflow("BIGINT", format!("({} + {})", lhs, rhs)).into())
+            .ok_or_else(|| Error::overflow("BIGINT", &format!("({} + {})", lhs, rhs)).into())
             .map(Some)
     }
 }
@@ -61,8 +61,10 @@ impl ArithmeticOp for IntUintPlus {
         } else {
             (*rhs as u64).checked_sub(lhs.overflowing_neg().0 as u64)
         };
-        res.ok_or_else(|| Error::overflow("BIGINT UNSIGNED", format!("({} + {})", lhs, rhs)).into())
-            .map(|v| Some(v as i64))
+        res.ok_or_else(|| {
+            Error::overflow("BIGINT UNSIGNED", &format!("({} + {})", lhs, rhs)).into()
+        })
+        .map(|v| Some(v as i64))
     }
 }
 
@@ -87,7 +89,7 @@ impl ArithmeticOp for UintUintPlus {
         (*lhs as u64)
             .checked_add(*rhs as u64)
             .ok_or_else(|| {
-                Error::overflow("BIGINT UNSIGNED", format!("({} + {})", lhs, rhs)).into()
+                Error::overflow("BIGINT UNSIGNED", &format!("({} + {})", lhs, rhs)).into()
             })
             .map(|v| Some(v as i64))
     }
@@ -102,7 +104,7 @@ impl ArithmeticOp for RealPlus {
     fn calc(lhs: &Real, rhs: &Real) -> Result<Option<Real>> {
         let res = *lhs + *rhs;
         if !res.is_finite() {
-            return Err(Error::overflow("DOUBLE", format!("({} + {})", lhs, rhs)).into());
+            return Err(Error::overflow("DOUBLE", &format!("({} + {})", lhs, rhs)).into());
         }
         Ok(Some(res))
     }
@@ -128,7 +130,7 @@ impl ArithmeticOp for IntIntMinus {
 
     fn calc(lhs: &Int, rhs: &Int) -> Result<Option<Int>> {
         lhs.checked_sub(*rhs)
-            .ok_or_else(|| Error::overflow("BIGINT", format!("({} - {})", lhs, rhs)).into())
+            .ok_or_else(|| Error::overflow("BIGINT", &format!("({} - {})", lhs, rhs)).into())
             .map(Some)
     }
 }
@@ -143,10 +145,10 @@ impl ArithmeticOp for IntUintMinus {
         if *lhs >= 0 {
             (*lhs as u64)
                 .checked_sub(*rhs as u64)
-                .ok_or_else(|| Error::overflow("BIGINT", format!("({} - {})", lhs, rhs)).into())
+                .ok_or_else(|| Error::overflow("BIGINT", &format!("({} - {})", lhs, rhs)).into())
                 .map(|v| Some(v as i64))
         } else {
-            Err(Error::overflow("BIGINT", format!("({} - {})", lhs, rhs)).into())
+            Err(Error::overflow("BIGINT", &format!("({} - {})", lhs, rhs)).into())
         }
     }
 }
@@ -163,7 +165,7 @@ impl ArithmeticOp for UintIntMinus {
         } else {
             (*lhs as u64).checked_add(rhs.overflowing_neg().0 as u64)
         };
-        res.ok_or_else(|| Error::overflow("BIGINT", format!("({} - {})", lhs, rhs)).into())
+        res.ok_or_else(|| Error::overflow("BIGINT", &format!("({} - {})", lhs, rhs)).into())
             .map(|v| Some(v as i64))
     }
 }
@@ -178,7 +180,7 @@ impl ArithmeticOp for UintUintMinus {
         (*lhs as u64)
             .checked_sub(*rhs as u64)
             .ok_or_else(|| {
-                Error::overflow("BIGINT UNSIGNED", format!("({} - {})", lhs, rhs)).into()
+                Error::overflow("BIGINT UNSIGNED", &format!("({} - {})", lhs, rhs)).into()
             })
             .map(|v| Some(v as i64))
     }
@@ -193,7 +195,7 @@ impl ArithmeticOp for RealMinus {
     fn calc(lhs: &Real, rhs: &Real) -> Result<Option<Real>> {
         let res = *lhs - *rhs;
         if !res.is_finite() {
-            return Err(Error::overflow("DOUBLE", format!("({} - {})", lhs, rhs)).into());
+            return Err(Error::overflow("DOUBLE", &format!("({} - {})", lhs, rhs)).into());
         }
         Ok(Some(res))
     }
@@ -235,15 +237,9 @@ impl ArithmeticOp for IntUintMod {
         if *rhs == 0i64 {
             return Ok(None);
         }
-
-        if *lhs > 0 {
-            Ok(Some(((*lhs as u64) % (*rhs as u64)) as i64))
-        } else {
-            Ok(Some(
-                0i64.overflowing_sub(((lhs.overflowing_abs().0 as u64) % (*rhs as u64)) as i64)
-                    .0,
-            ))
-        }
+        Ok(Some(
+            ((lhs.overflowing_abs().0 as u64) % (*rhs as u64)) as i64,
+        ))
     }
 }
 
@@ -330,7 +326,7 @@ impl ArithmeticOp for RealMultiply {
     fn calc(lhs: &Real, rhs: &Real) -> Result<Option<Real>> {
         let res = *lhs * *rhs;
         if res.is_infinite() {
-            Err(Error::overflow("REAL", format!("({} * {})", lhs, rhs)).into())
+            Err(Error::overflow("REAL", &format!("({} * {})", lhs, rhs)).into())
         } else {
             Ok(Some(res))
         }
@@ -344,7 +340,7 @@ impl ArithmeticOp for IntIntMultiply {
     type T = Int;
     fn calc(lhs: &Int, rhs: &Int) -> Result<Option<Int>> {
         lhs.checked_mul(*rhs)
-            .ok_or_else(|| Error::overflow("BIGINT", format!("({} * {})", lhs, rhs)).into())
+            .ok_or_else(|| Error::overflow("BIGINT", &format!("({} * {})", lhs, rhs)).into())
             .map(Some)
     }
 }
@@ -360,7 +356,7 @@ impl ArithmeticOp for IntUintMultiply {
         } else {
             None
         }
-        .ok_or_else(|| Error::overflow("BIGINT UNSIGNED", format!("({} * {})", lhs, rhs)).into())
+        .ok_or_else(|| Error::overflow("BIGINT UNSIGNED", &format!("({} * {})", lhs, rhs)).into())
         .map(Some)
     }
 }
@@ -384,7 +380,7 @@ impl ArithmeticOp for UintUintMultiply {
         (*lhs as u64)
             .checked_mul(*rhs as u64)
             .ok_or_else(|| {
-                Error::overflow("BIGINT UNSIGNED", format!("({} * {})", lhs, rhs)).into()
+                Error::overflow("BIGINT UNSIGNED", &format!("({} * {})", lhs, rhs)).into()
             })
             .map(|v| Some(v as i64))
     }
@@ -498,7 +494,7 @@ impl ArithmeticOpWithCtx for RealDivide {
         } else {
             let result = *lhs / *rhs;
             if result.is_infinite() {
-                ctx.handle_overflow_err(Error::overflow("DOUBLE", format!("{} / {}", lhs, rhs)))
+                ctx.handle_overflow_err(Error::overflow("DOUBLE", &format!("{} / {}", lhs, rhs)))
                     .map(|_| None)?
             } else {
                 Some(result)
@@ -509,18 +505,17 @@ impl ArithmeticOpWithCtx for RealDivide {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use std::str::FromStr;
 
-    use tidb_query_datatype::{
-        builder::FieldTypeBuilder,
-        codec::error::ERR_DIVISION_BY_ZERO,
-        expr::{EvalConfig, Flag, SqlMode},
-        FieldTypeFlag, FieldTypeTp,
-    };
+    use tidb_query_datatype::builder::FieldTypeBuilder;
+    use tidb_query_datatype::{FieldTypeFlag, FieldTypeTp};
     use tipb::ScalarFuncSig;
 
-    use super::*;
     use crate::test_util::RpnFnScalarEvaluator;
+    use tidb_query_datatype::codec::error::ERR_DIVISION_BY_ZERO;
+    use tidb_query_datatype::expr::{EvalConfig, Flag, SqlMode};
 
     #[test]
     fn test_plus_int() {
@@ -529,9 +524,9 @@ mod tests {
             (Some(1), false, None, false, None),
             (Some(17), false, Some(25), false, Some(42)),
             (
-                Some(i64::MIN),
+                Some(std::i64::MIN),
                 false,
-                Some((i64::MAX as u64 + 1) as i64),
+                Some((std::i64::MAX as u64 + 1) as i64),
                 true,
                 Some(0),
             ),
@@ -573,9 +568,9 @@ mod tests {
             ),
             (Real::new(1e308).ok(), Real::new(1e308).ok(), None, true),
             (
-                Real::new(f64::MAX - 1f64).ok(),
+                Real::new(std::f64::MAX - 1f64).ok(),
                 Real::new(2f64).ok(),
-                Real::new(f64::MAX).ok(),
+                Real::new(std::f64::MAX).ok(),
                 false,
             ),
         ];
@@ -616,13 +611,27 @@ mod tests {
             (
                 Some(0),
                 true,
-                Some(i64::MIN),
+                Some(std::i64::MIN),
                 false,
-                Some((i64::MAX as u64 + 1) as i64),
+                Some((std::i64::MAX as u64 + 1) as i64),
                 false,
             ),
-            (Some(i64::MIN), false, Some(i64::MAX), false, None, true),
-            (Some(i64::MAX), false, Some(i64::MIN), false, None, true),
+            (
+                Some(std::i64::MIN),
+                false,
+                Some(std::i64::MAX),
+                false,
+                None,
+                true,
+            ),
+            (
+                Some(std::i64::MAX),
+                false,
+                Some(std::i64::MIN),
+                false,
+                None,
+                true,
+            ),
             (Some(-1), false, Some(2), true, None, true),
             (Some(1), true, Some(2), false, None, true),
         ];
@@ -666,8 +675,8 @@ mod tests {
                 false,
             ),
             (
-                Real::new(f64::MIN).ok(),
-                Real::new(f64::MAX).ok(),
+                Real::new(std::f64::MIN).ok(),
+                Real::new(std::f64::MAX).ok(),
                 None,
                 true,
             ),
@@ -720,8 +729,12 @@ mod tests {
             (None, Some(-11), None),
             (Some(11), Some(0), None),
             (Some(-11), Some(0), None),
-            (Some(i64::MAX), Some(i64::MIN), Some(i64::MAX)),
-            (Some(i64::MIN), Some(i64::MAX), Some(-1)),
+            (
+                Some(std::i64::MAX),
+                Some(std::i64::MIN),
+                Some(std::i64::MAX),
+            ),
+            (Some(std::i64::MIN), Some(std::i64::MAX), Some(-1)),
         ];
 
         for (lhs, rhs, expected) in tests {
@@ -738,18 +751,18 @@ mod tests {
     fn test_mod_int_unsigned() {
         let tests = vec![
             (
-                Some(u64::MAX as i64),
+                Some(std::u64::MAX as i64),
                 true,
-                Some(i64::MIN),
+                Some(std::i64::MIN),
                 false,
-                Some(i64::MAX),
+                Some(std::i64::MAX),
             ),
             (
-                Some(i64::MIN),
+                Some(std::i64::MIN),
                 false,
-                Some(u64::MAX as i64),
+                Some(std::u64::MAX as i64),
                 true,
-                Some(i64::MIN),
+                Some(std::i64::MIN),
             ),
         ];
 
@@ -881,10 +894,16 @@ mod tests {
             (-11, false, 0, false, None),
             (-3, false, 5, true, Some(0)),
             (3, false, -5, false, Some(0)),
-            (i64::MIN + 1, false, -1, false, Some(i64::MAX)),
-            (i64::MIN, false, 1, false, Some(i64::MIN)),
-            (i64::MAX, false, 1, false, Some(i64::MAX)),
-            (u64::MAX as i64, true, 1, false, Some(u64::MAX as i64)),
+            (std::i64::MIN + 1, false, -1, false, Some(std::i64::MAX)),
+            (std::i64::MIN, false, 1, false, Some(std::i64::MIN)),
+            (std::i64::MAX, false, 1, false, Some(std::i64::MAX)),
+            (
+                std::u64::MAX as i64,
+                true,
+                1,
+                false,
+                Some(std::u64::MAX as i64),
+            ),
         ];
 
         for (lhs, lhs_is_unsigned, rhs, rhs_is_unsigned, expected) in test_cases {
@@ -918,7 +937,7 @@ mod tests {
     #[test]
     fn test_int_divide_int_overflow() {
         let test_cases = vec![
-            (i64::MIN, false, -1, false),
+            (std::i64::MIN, false, -1, false),
             (-1, false, 1, true),
             (-2, false, 1, true),
             (1, true, -1, false),
@@ -978,9 +997,9 @@ mod tests {
     #[test]
     fn test_int_divide_decimal_overflow() {
         let test_cases = vec![
-            (Decimal::from(i64::MIN), Decimal::from(-1)),
+            (Decimal::from(std::i64::MIN), Decimal::from(-1)),
             (
-                Decimal::from(i64::MAX),
+                Decimal::from(std::i64::MAX),
                 Decimal::from_bytes(b"0.1").unwrap().unwrap(),
             ),
         ];
@@ -1010,7 +1029,10 @@ mod tests {
             );
         }
 
-        let should_fail = vec![(f64::MAX, f64::MAX), (f64::MAX, f64::MIN)];
+        let should_fail = vec![
+            (std::f64::MAX, std::f64::MAX),
+            (std::f64::MAX, std::f64::MIN),
+        ];
 
         for (lhs, rhs) in should_fail {
             assert!(
@@ -1031,7 +1053,7 @@ mod tests {
         let should_pass = vec![
             (11, 17, Some(187)),
             (-1, -3, Some(3)),
-            (1, i64::MIN, Some(i64::MIN)),
+            (1, std::i64::MIN, Some(std::i64::MIN)),
         ];
         for (lhs, rhs, expected) in should_pass {
             assert_eq!(
@@ -1044,7 +1066,7 @@ mod tests {
             );
         }
 
-        let should_fail = vec![(i64::MAX, 2), (i64::MIN, -1)];
+        let should_fail = vec![(std::i64::MAX, 2), (std::i64::MIN, -1)];
         for (lhs, rhs) in should_fail {
             assert!(
                 RpnFnScalarEvaluator::new()
@@ -1061,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_int_uint_multiply() {
-        let should_pass = vec![(i64::MAX, 1, Some(i64::MAX)), (3, 7, Some(21))];
+        let should_pass = vec![(std::i64::MAX, 1, Some(std::i64::MAX)), (3, 7, Some(21))];
 
         for (lhs, rhs, expected) in should_pass {
             assert_eq!(
@@ -1079,7 +1101,7 @@ mod tests {
             );
         }
 
-        let should_fail = vec![(-2, 1), (i64::MIN, 2)];
+        let should_fail = vec![(-2, 1), (std::i64::MIN, 2)];
         for (lhs, rhs) in should_fail {
             assert!(
                 RpnFnScalarEvaluator::new()
@@ -1104,7 +1126,7 @@ mod tests {
         let should_pass = vec![
             (7, 11, Some(77)),
             (1, 2, Some(2)),
-            (u64::MAX as i64, 1, Some(u64::MAX as i64)),
+            (std::u64::MAX as i64, 1, Some(std::u64::MAX as i64)),
         ];
 
         for (lhs, rhs, expected) in should_pass {
@@ -1128,7 +1150,7 @@ mod tests {
             );
         }
 
-        let should_fail = vec![(u64::MAX as i64, 2)];
+        let should_fail = vec![(std::u64::MAX as i64, 2)];
         for (lhs, rhs) in should_fail {
             assert!(
                 RpnFnScalarEvaluator::new()
@@ -1196,13 +1218,15 @@ mod tests {
             assert_eq!(actual, expected, "lhs={:?}, rhs={:?}", lhs, rhs);
         }
 
-        let overflow = vec![(f64::MAX, 0.0001)];
+        let overflow = vec![(std::f64::MAX, 0.0001)];
         for (lhs, rhs) in overflow {
-            RpnFnScalarEvaluator::new()
-                .push_param(lhs)
-                .push_param(rhs)
-                .evaluate::<Real>(ScalarFuncSig::DivideReal)
-                .unwrap_err();
+            assert!(
+                RpnFnScalarEvaluator::new()
+                    .push_param(lhs)
+                    .push_param(rhs)
+                    .evaluate::<Real>(ScalarFuncSig::DivideReal)
+                    .is_err()
+            )
         }
     }
 
@@ -1271,7 +1295,7 @@ mod tests {
                 if is_ok {
                     assert!(result.unwrap().is_none());
                 } else {
-                    result.unwrap_err();
+                    assert!(result.is_err());
                 }
 
                 if has_warning {

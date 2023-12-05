@@ -1,6 +1,8 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use tipb::{ByItem, ColumnInfo, ExecType, Executor as PbExecutor, Expr, TopN};
+use tipb::ColumnInfo;
+use tipb::{ByItem, Expr};
+use tipb::{ExecType, Executor as PbExecutor, TopN};
 
 /// Builds a table scan executor descriptor.
 pub fn table_scan(columns_info: &[ColumnInfo]) -> PbExecutor {

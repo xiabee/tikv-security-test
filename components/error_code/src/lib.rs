@@ -28,8 +28,6 @@ pub const UNKNOWN: ErrorCode = ErrorCode {
     workaround: "",
 };
 
-pub mod backup_stream;
-pub mod causal_ts;
 pub mod cloud;
 pub mod codec;
 pub mod coprocessor;
@@ -43,7 +41,7 @@ pub mod storage;
 
 use std::fmt::{self, Display, Formatter};
 
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct ErrorCode {
     pub code: &'static str,
     pub description: &'static str,

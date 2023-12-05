@@ -9,14 +9,17 @@ publish = false
 doctest = false
 
 [features]
-default = ["test-engine-kv-rocksdb", "test-engine-raft-raft-engine"]
+default = ["protobuf-codec", "test-engines-rocksdb"]
 
-test-engine-kv-rocksdb = [
-  "engine_test/test-engine-kv-rocksdb"
+protobuf-codec = [
+  "engine_test/protobuf-codec",
+  "engine_traits/protobuf-codec",
 ]
-test-engine-raft-raft-engine = [
-  "engine_test/test-engine-raft-raft-engine"
+prost-codec = [
+  "engine_test/prost-codec",
+  "engine_traits/prost-codec",
 ]
+
 test-engines-rocksdb = [
   "engine_test/test-engines-rocksdb",
 ]
@@ -25,8 +28,8 @@ test-engines-panic = [
 ]
 
 [dependencies]
-engine_test = { workspace = true }
-engine_traits = { workspace = true }
-panic_hook = { workspace = true }
+engine_test = { path = "../engine_test", default-features = false }
+engine_traits = { path = "../engine_traits", default-features = false }
+panic_hook = { path = "../panic_hook" }
 tempfile = "3.0"
-tikv_alloc = { workspace = true }
+tikv_alloc = { path = "../tikv_alloc" }

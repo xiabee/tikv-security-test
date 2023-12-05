@@ -5,44 +5,46 @@ edition = "2018"
 publish = false
 
 [features]
+default = ["protobuf-codec"]
 failpoints = ["fail/failpoints"]
-test-cgroup = []
+protobuf-codec = [
+  "error_code/protobuf-codec",
+  "grpcio/protobuf-codec",
+  "kvproto/protobuf-codec",
+]
+prost-codec = [
+  "error_code/prost-codec",
+  "grpcio/prost-codec",
+  "kvproto/prost-codec",
+]
 
 [dependencies]
-async-speed-limit = "0.4.0"
+async-speed-limit = "0.3"
 backtrace = "0.3.9"
 byteorder = "1.2"
-bytes = "1.0"
+bytes = "0.5.3"
+codec = { path = "../codec", default-features = false }
+configuration = { path = "../configuration" }
 chrono = "0.4"
-codec = { workspace = true }
-collections = { workspace = true }
-cpu-time = "1.0.0"
 crc32fast = "1.2"
 crossbeam = "0.8"
+error_code = { path = "../error_code", default-features = false }
 derive_more = "0.99.3"
-error_code = { workspace = true }
-fail = "0.5"
-futures = { version = "0.3", features = ["compat", "thread-pool"] }
+fail = "0.4"
+fs2 = "0.4"
+futures = { version = "0.3", features = ["compat"] }
 futures-util = { version = "0.3", default-features = false, features = ["io"] }
-grpcio = { workspace = true }
+grpcio = { version = "0.9",  default-features = false, features = ["openssl-vendored"] }
 http = "0.2.0"
-kvproto = { workspace = true }
 lazy_static = "1.3"
 libc = "0.2"
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
-log_wrappers = { workspace = true }
-mnt = "0.3.1"
-nix = "0.24"
-num-traits = "0.2"
+log_wrappers = { path = "../log_wrappers" }
 num_cpus = "1"
-online_config = { workspace = true }
 openssl = "0.10"
-pin-project = "1.0"
-prometheus = { version = "0.13", features = ["nightly"] }
-prometheus-static-metric = "0.5"
-protobuf = "2"
-rand = "0.8"
-rusoto_core = "0.46.0"
+prometheus = { version = "0.10", features = ["nightly"] }
+rand = "0.7"
+rusoto_core = "0.45.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debug"] }
@@ -52,30 +54,30 @@ slog-json = "2.3"
 slog-term = "2.4"
 sysinfo = "0.16"
 thiserror = "1.0"
-tikv_alloc = { workspace = true }
+tikv_alloc = { path = "../tikv_alloc" }
+collections = { path = "../collections" }
 time = "0.1"
-tokio = { version = "1.5", features = ["rt-multi-thread"] }
-tokio-executor = { workspace = true }
-tokio-timer = { workspace = true }
-tracker = { workspace = true }
+tokio = { version = "0.2", features = ["rt-util", "rt-threaded"] }
+tokio-executor = "0.1"
+tokio-timer = { git = "https://github.com/tikv/tokio", branch = "tokio-timer-hotfix" }
 url = "2"
-yatp = { workspace = true }
+kvproto = { git = "https://github.com/pingcap/kvproto.git", branch = "release-5.1", default-features = false }
+protobuf = "2"
+yatp = { git = "https://github.com/tikv/yatp.git", branch = "master" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-procinfo = { git = "https://github.com/tikv/procinfo-rs", rev = "6599eb9dca74229b2c1fcc44118bef7eff127128" }
+procinfo = { git = "https://github.com/tikv/procinfo-rs", rev = "5125fc1a69496b73b26b3c08b6e8afc3c665a56e" }
 page_size = "0.4"
 procfs = { version = "0.12", default-features = false }
 
 [dev-dependencies]
-gag = "1.0"
-panic_hook = { workspace = true }
+panic_hook = { path = "../panic_hook" }
 protobuf = "2"
 regex = "1.0"
 tempfile = "3.0"
 toml = "0.5"
 utime = "0.2"
 
-[[bench]]
-name = "channel"
-path = "benches/channel/mod.rs"
-test = true
+[target.'cfg(unix)'.dev-dependencies]
+gag = "0.1.10"
+nix = "0.11"

@@ -1,13 +1,12 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::{mpsc, Mutex},
-    time::Duration,
-};
-
-use engine_rocks::{raw::Range, util::get_cf_handle};
+use engine_rocks::raw::Range;
+use engine_rocks::util::get_cf_handle;
 use engine_traits::{MiscExt, CF_WRITE};
 use keys::{data_key, DATA_MAX_KEY};
+use std::sync::mpsc;
+use std::sync::Mutex;
+use std::time::Duration;
 use test_raftstore::*;
 use tikv::storage::mvcc::{TimeStamp, Write, WriteType};
 use tikv_util::config::*;
@@ -36,7 +35,6 @@ fn test_compact_after_delete<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.cfg.raft_store.region_compact_min_tombstones = 500;
     cluster.cfg.raft_store.region_compact_tombstones_percent = 50;
     cluster.cfg.raft_store.region_compact_check_step = 1;
-    cluster.cfg.rocksdb.titan.enabled = true;
     cluster.run();
 
     for i in 0..1000 {
@@ -63,14 +61,15 @@ fn test_compact_after_delete<T: Simulator>(cluster: &mut Cluster<T>) {
         cluster.must_delete_cf(CF_WRITE, &k);
     }
     for engines in cluster.engines.values() {
-        engines.kv.flush_cf(CF_WRITE, true).unwrap();
+        let cf = get_cf_handle(&engines.kv.as_inner(), CF_WRITE).unwrap();
+        engines.kv.as_inner().flush_cf(cf, true).unwrap();
     }
 
     // wait for compaction.
     receiver.recv_timeout(Duration::from_millis(5000)).unwrap();
 
     for engines in cluster.engines.values() {
-        let cf_handle = get_cf_handle(engines.kv.as_inner(), CF_WRITE).unwrap();
+        let cf_handle = get_cf_handle(&engines.kv.as_inner(), CF_WRITE).unwrap();
         let approximate_size = engines
             .kv
             .as_inner()

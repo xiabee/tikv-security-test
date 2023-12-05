@@ -4,7 +4,9 @@ use std::marker::PhantomData;
 
 use tidb_query_codegen::AggrFunction;
 use tidb_query_common::Result;
-use tidb_query_datatype::{codec::data_type::*, expr::EvalContext, EvalType};
+use tidb_query_datatype::codec::data_type::*;
+use tidb_query_datatype::expr::EvalContext;
+use tidb_query_datatype::EvalType;
 use tidb_query_expr::RpnExpression;
 use tipb::{Expr, ExprType, FieldType};
 
@@ -30,7 +32,6 @@ impl super::AggrDefinitionParser for AggrFnDefinitionParserFirst {
         out_exp: &mut Vec<RpnExpression>,
     ) -> Result<Box<dyn AggrFunction>> {
         use std::convert::TryFrom;
-
         use tidb_query_datatype::FieldTypeAccessor;
 
         assert_eq!(root_expr.get_tp(), ExprType::First);
@@ -155,22 +156,19 @@ where
     }
 }
 
-// Here we manually implement `AggrFunctionStateUpdatePartial` instead of
-// implementing `ConcreteAggrFunctionState` so that `update_repeat` and
-// `update_vector` can be faster.
+// Here we manually implement `AggrFunctionStateUpdatePartial` instead of implementing
+// `ConcreteAggrFunctionState` so that `update_repeat` and `update_vector` can be faster.
 impl<T> super::AggrFunctionStateUpdatePartial<T> for AggrFnStateFirst<T>
 where
     T: EvaluableRef<'static> + 'static,
     VectorValue: VectorValueExt<T::EvaluableType>,
 {
-    // ChunkedType has been implemented in AggrFunctionStateUpdatePartial<T1> for
-    // AggrFnStateFirst<T2>
+    // ChunkedType has been implemented in AggrFunctionStateUpdatePartial<T1> for AggrFnStateFirst<T2>
     impl_state_update_partial! { T }
 }
 
-// In order to make `AggrFnStateFirst` satisfy the `AggrFunctionState` trait, we
-// default impl all `AggrFunctionStateUpdatePartial` of `Evaluable` for all
-// `AggrFnStateFirst`.
+// In order to make `AggrFnStateFirst` satisfy the `AggrFunctionState` trait, we default impl all
+// `AggrFunctionStateUpdatePartial` of `Evaluable` for all `AggrFnStateFirst`.
 impl_unmatched_function_state! { AggrFnStateFirst<T> }
 
 impl<T> super::AggrFunctionState for AggrFnStateFirst<T>
@@ -198,8 +196,10 @@ mod tests {
     use tikv_util::buffer_vec::BufferVec;
     use tipb_helper::ExprDefBuilder;
 
-    use super::{super::AggrFunction, *};
     use crate::AggrDefinitionParser;
+
+    use super::super::AggrFunction;
+    use super::*;
 
     #[test]
     fn test_update() {
@@ -282,11 +282,11 @@ mod tests {
 
         let mut result = [VectorValue::with_capacity(0, EvalType::Bytes)];
 
-        update_repeat!(state, &mut ctx, Some(&[1u8] as BytesRef<'_>), 2).unwrap();
+        update_repeat!(state, &mut ctx, Some(&[1u8] as BytesRef), 2).unwrap();
         state.push_result(&mut ctx, &mut result[..]).unwrap();
         assert_eq!(result[0].to_bytes_vec(), &[Some(vec![1])]);
 
-        update_repeat!(state, &mut ctx, Some(&[2u8] as BytesRef<'_>), 3).unwrap();
+        update_repeat!(state, &mut ctx, Some(&[2u8] as BytesRef), 3).unwrap();
         state.push_result(&mut ctx, &mut result[..]).unwrap();
         assert_eq!(result[0].to_bytes_vec(), &[Some(vec![1]), Some(vec![1])]);
     }
@@ -301,7 +301,7 @@ mod tests {
         update_vector!(
             state,
             &mut ctx,
-            ChunkedVecSized::from_slice(&[Some(0); 0]),
+            &ChunkedVecSized::from_slice(&[Some(0); 0]),
             &[]
         )
         .unwrap();
@@ -312,7 +312,7 @@ mod tests {
         update_vector!(
             state,
             &mut ctx,
-            ChunkedVecSized::from_slice(&[Some(1)]),
+            &ChunkedVecSized::from_slice(&[Some(1)]),
             &[]
         )
         .unwrap();
@@ -323,7 +323,7 @@ mod tests {
         update_vector!(
             state,
             &mut ctx,
-            ChunkedVecSized::from_slice(&[None, Some(2)]),
+            &ChunkedVecSized::from_slice(&[None, Some(2)]),
             &[0, 1]
         )
         .unwrap();
@@ -334,7 +334,7 @@ mod tests {
         update_vector!(
             state,
             &mut ctx,
-            ChunkedVecSized::from_slice(&[Some(1)]),
+            &ChunkedVecSized::from_slice(&[Some(1)]),
             &[0]
         )
         .unwrap();
@@ -348,7 +348,7 @@ mod tests {
         update_vector!(
             state,
             &mut ctx,
-            ChunkedVecSized::from_slice(&[None, Some(2)]),
+            &ChunkedVecSized::from_slice(&[None, Some(2)]),
             &[1, 0]
         )
         .unwrap();

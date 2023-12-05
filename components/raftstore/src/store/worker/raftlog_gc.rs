@@ -1,25 +1,18 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    error::Error as StdError,
-    fmt::{self, Display, Formatter},
-    sync::mpsc::Sender,
-};
+use std::error::Error as StdError;
+use std::fmt::{self, Display, Formatter};
+use std::sync::mpsc::Sender;
 
-use engine_traits::{Engines, KvEngine, RaftEngine, RaftLogGcTask};
-use file_system::{IoType, WithIoType};
 use thiserror::Error;
-use tikv_util::{
-    box_try, debug, error,
-    time::{Duration, Instant},
-    warn,
-    worker::{Runnable, RunnableWithTimer},
-};
 
-use crate::store::worker::metrics::*;
+use engine_traits::{Engines, KvEngine, RaftEngine};
+use file_system::{IOType, WithIOType};
+use tikv_util::time::Duration;
+use tikv_util::worker::{Runnable, RunnableWithTimer};
+use tikv_util::{box_try, debug, error};
 
-const MAX_GC_REGION_BATCH: usize = 512;
-const MAX_REGION_NORMAL_GC_LOG_NUMBER: u64 = 10240;
+const MAX_GC_REGION_BATCH: usize = 128;
 
 pub struct Task {
     region_id: u64,
@@ -88,12 +81,20 @@ impl<EK: KvEngine, ER: RaftEngine> Runner<EK, ER> {
     }
 
     /// Does the GC job and returns the count of logs collected.
-    fn gc_raft_log(&mut self, regions: Vec<RaftLogGcTask>) -> Result<usize, Error> {
+    fn gc_raft_log(
+        &mut self,
+        region_id: u64,
+        start_idx: u64,
+        end_idx: u64,
+    ) -> Result<usize, Error> {
+        if start_idx == end_idx {
+            // Flush only.
+            return Ok(0);
+        }
         fail::fail_point!("worker_gc_raft_log", |s| {
             Ok(s.and_then(|s| s.parse().ok()).unwrap_or(0))
         });
-        let deleted = box_try!(self.engines.raft.batch_gc(regions));
-        fail::fail_point!("worker_gc_raft_log_finished", |_| { Ok(deleted) });
+        let deleted = box_try!(self.engines.raft.gc(region_id, start_idx, end_idx));
         Ok(deleted)
     }
 
@@ -104,61 +105,27 @@ impl<EK: KvEngine, ER: RaftEngine> Runner<EK, ER> {
     }
 
     fn flush(&mut self) {
-        if self.tasks.is_empty() {
-            return;
-        }
-        fail::fail_point!("worker_gc_raft_log_flush");
-        // Sync wal of kv_db to make sure the data before apply_index has been persisted
-        // to disk.
-        let start = Instant::now();
+        // Sync wal of kv_db to make sure the data before apply_index has been persisted to disk.
         self.engines.kv.sync().unwrap_or_else(|e| {
             panic!("failed to sync kv_engine in raft_log_gc: {:?}", e);
         });
-        RAFT_LOG_GC_KV_SYNC_DURATION_HISTOGRAM.observe(start.saturating_elapsed_secs());
+        fail::fail_point!("worker_gc_raft_log_flush");
         let tasks = std::mem::take(&mut self.tasks);
-        let mut groups = Vec::with_capacity(tasks.len());
-        let mut cbs = Vec::new();
         for t in tasks {
-            debug!("gc raft log"; "region_id" => t.region_id, "start_index" => t.start_idx, "end_index" => t.end_idx);
+            debug!("gc raft log"; "region_id" => t.region_id, "end_index" => t.end_idx);
+            match self.gc_raft_log(t.region_id, t.start_idx, t.end_idx) {
+                Err(e) => {
+                    error!("failed to gc"; "region_id" => t.region_id, "err" => %e);
+                    self.report_collected(0);
+                }
+                Ok(n) => {
+                    debug!("gc log entries"; "region_id" => t.region_id, "entry_count" => n);
+                    self.report_collected(n);
+                }
+            }
             if let Some(cb) = t.cb {
-                cbs.push(cb);
+                cb();
             }
-            if t.start_idx == t.end_idx {
-                // It's only for flush.
-                continue;
-            }
-            if t.start_idx == 0 {
-                RAFT_LOG_GC_SEEK_OPERATIONS.inc();
-            } else if t.end_idx > t.start_idx + MAX_REGION_NORMAL_GC_LOG_NUMBER {
-                warn!(
-                    "gc raft log with a large range";
-                    "region_id" => t.region_id,
-                    "start_index" => t.start_idx,
-                    "end_index" => t.end_idx,
-                );
-            }
-            groups.push(RaftLogGcTask {
-                raft_group_id: t.region_id,
-                from: t.start_idx,
-                to: t.end_idx,
-            });
-        }
-        let start = Instant::now();
-        match self.gc_raft_log(groups) {
-            Err(e) => {
-                error!("failed to gc"; "err" => %e);
-                self.report_collected(0);
-                RAFT_LOG_GC_FAILED.inc();
-            }
-            Ok(n) => {
-                debug!("gc log entries";  "entry_count" => n);
-                self.report_collected(n);
-                RAFT_LOG_GC_DELETED_KEYS_HISTOGRAM.observe(n as f64);
-            }
-        }
-        RAFT_LOG_GC_WRITE_DURATION_HISTOGRAM.observe(start.saturating_elapsed_secs());
-        for cb in cbs {
-            cb()
         }
     }
 }
@@ -171,12 +138,11 @@ where
     type Task = Task;
 
     fn run(&mut self, task: Task) {
-        let _io_type_guard = WithIoType::new(IoType::ForegroundWrite);
+        let _io_type_guard = WithIOType::new(IOType::ForegroundWrite);
         let flush_now = task.flush;
         self.tasks.push(task);
-        // TODO: maybe they should also be batched even `flush_now` is true.
-        if flush_now || self.tasks.len() > MAX_GC_REGION_BATCH {
-            self.flush();
+        if flush_now || self.tasks.len() >= MAX_GC_REGION_BATCH {
+            self.flush()
         }
     }
 
@@ -201,21 +167,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, time::Duration};
-
-    use engine_traits::{RaftEngine, RaftLogBatch, ALL_CFS};
-    use raft::eraftpb::Entry;
-    use tempfile::Builder;
-
     use super::*;
+    use engine_traits::{KvEngine, Mutable, WriteBatch, WriteBatchExt, ALL_CFS, CF_DEFAULT};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tempfile::Builder;
 
     #[test]
     fn test_gc_raft_log() {
         let dir = Builder::new().prefix("gc-raft-log-test").tempdir().unwrap();
         let path_raft = dir.path().join("raft");
         let path_kv = dir.path().join("kv");
-        let raft_db = engine_test::raft::new_engine(path_kv.to_str().unwrap(), None).unwrap();
-        let kv_db = engine_test::kv::new_engine(path_raft.to_str().unwrap(), ALL_CFS).unwrap();
+        let raft_db =
+            engine_test::raft::new_engine(path_kv.to_str().unwrap(), None, CF_DEFAULT, None)
+                .unwrap();
+        let kv_db =
+            engine_test::kv::new_engine(path_raft.to_str().unwrap(), None, ALL_CFS, None).unwrap();
         let engines = Engines::new(kv_db, raft_db.clone());
 
         let (tx, rx) = mpsc::channel();
@@ -228,13 +195,12 @@ mod tests {
 
         // generate raft logs
         let region_id = 1;
-        let mut raft_wb = raft_db.log_batch(0);
+        let mut raft_wb = raft_db.write_batch();
         for i in 0..100 {
-            let mut e = Entry::new();
-            e.set_index(i);
-            raft_wb.append(region_id, vec![e]).unwrap();
+            let k = keys::raft_log_key(region_id, i);
+            raft_wb.put(&k, b"entry").unwrap();
         }
-        raft_db.consume(&mut raft_wb, false /* sync */).unwrap();
+        raft_wb.write().unwrap();
 
         let tbls = vec![
             (Task::gc(region_id, 0, 10), 10, (0, 10), (10, 100)),
@@ -254,24 +220,26 @@ mod tests {
     }
 
     fn raft_log_must_not_exist(
-        raft_engine: &impl RaftEngine,
+        raft_engine: &impl KvEngine,
         region_id: u64,
         start_idx: u64,
         end_idx: u64,
     ) {
         for i in start_idx..end_idx {
-            assert!(raft_engine.get_entry(region_id, i).unwrap().is_none());
+            let k = keys::raft_log_key(region_id, i);
+            assert!(raft_engine.get_value(&k).unwrap().is_none());
         }
     }
 
     fn raft_log_must_exist(
-        raft_engine: &impl RaftEngine,
+        raft_engine: &impl KvEngine,
         region_id: u64,
         start_idx: u64,
         end_idx: u64,
     ) {
         for i in start_idx..end_idx {
-            assert!(raft_engine.get_entry(region_id, i).unwrap().is_some());
+            let k = keys::raft_log_key(region_id, i);
+            assert!(raft_engine.get_value(&k).unwrap().is_some());
         }
     }
 }

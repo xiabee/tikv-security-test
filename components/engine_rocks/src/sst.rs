@@ -1,23 +1,30 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{path::PathBuf, sync::Arc};
-
+use crate::engine::RocksEngine;
+use crate::options::RocksReadOptions;
+use engine_traits::Error;
+use engine_traits::IterOptions;
+use engine_traits::CF_DEFAULT;
 use engine_traits::{
-    EncryptionKeyManager, Error, ExternalSstFileInfo, IterOptions, Iterator, RefIterable, Result,
-    SstCompressionType, SstExt, SstMetaInfo, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT,
+    ExternalSstFileInfo, SSTMetaInfo, SstCompressionType, SstWriter, SstWriterBuilder,
 };
+use engine_traits::{Iterable, Result, SstExt, SstReader};
+use engine_traits::{Iterator, SeekKey};
 use fail::fail_point;
+use rocksdb::rocksdb::supported_compression;
+use rocksdb::DBCompressionType;
+use rocksdb::DBIterator;
+use rocksdb::ExternalSstFileInfo as RawExternalSstFileInfo;
+use rocksdb::DB;
+use rocksdb::{ColumnFamilyOptions, SstFileReader};
+use rocksdb::{Env, EnvOptions, SequentialFile, SstFileWriter};
+use std::rc::Rc;
+use std::sync::Arc;
+// FIXME: Move RocksSeekKey into a common module since
+// it's shared between multiple iterators
+use crate::engine_iterator::RocksSeekKey;
 use kvproto::import_sstpb::SstMeta;
-use rocksdb::{
-    rocksdb::supported_compression, ColumnFamilyOptions, DBCompressionType, DBIterator, Env,
-    EnvOptions, ExternalSstFileInfo as RawExternalSstFileInfo, SequentialFile, SstFileReader,
-    SstFileWriter, DB,
-};
-use tikv_util::box_err;
-
-use crate::{
-    encryption::WrappedEncryptionKeyManager, engine::RocksEngine, options::RocksReadOptions, r2e,
-};
+use std::path::PathBuf;
 
 impl SstExt for RocksEngine {
     type SstReader = RocksSstReader;
@@ -25,13 +32,16 @@ impl SstExt for RocksEngine {
     type SstWriterBuilder = RocksSstWriterBuilder;
 }
 
+// FIXME: like in RocksEngineIterator and elsewhere, here we are using
+// Rc to avoid putting references in an associated type, which
+// requires generic associated types.
 pub struct RocksSstReader {
-    inner: SstFileReader,
+    inner: Rc<SstFileReader>,
 }
 
 impl RocksSstReader {
-    pub fn sst_meta_info(&self, sst: SstMeta) -> SstMetaInfo {
-        let mut meta = SstMetaInfo {
+    pub fn sst_meta_info(&self, sst: SstMeta) -> SSTMetaInfo {
+        let mut meta = SSTMetaInfo {
             total_kvs: 0,
             total_bytes: 0,
             meta: sst,
@@ -49,16 +59,9 @@ impl RocksSstReader {
             cf_options.set_env(env);
         }
         let mut reader = SstFileReader::new(cf_options);
-        reader.open(path).map_err(r2e)?;
-        Ok(RocksSstReader { inner: reader })
-    }
-
-    pub fn compression_name(&self) -> String {
-        let mut result = String::new();
-        self.inner.read_table_properties(|p| {
-            result = p.compression_name().to_owned();
-        });
-        result
+        reader.open(path)?;
+        let inner = Rc::new(reader);
+        Ok(RocksSstReader { inner })
     }
 }
 
@@ -66,72 +69,56 @@ impl SstReader for RocksSstReader {
     fn open(path: &str) -> Result<Self> {
         Self::open_with_env(path, None)
     }
-    fn open_encrypted<E: EncryptionKeyManager>(path: &str, mgr: Arc<E>) -> Result<Self> {
-        let env = Env::new_key_managed_encrypted_env(
-            Arc::default(),
-            WrappedEncryptionKeyManager::new(mgr),
-        )
-        .map_err(|err| Error::Other(box_err!("failed to open encrypted env: {}", err)))?;
-        Self::open_with_env(path, Some(Arc::new(env)))
-    }
     fn verify_checksum(&self) -> Result<()> {
-        self.inner.verify_checksum().map_err(r2e)?;
+        self.inner.verify_checksum()?;
         Ok(())
     }
+    fn iter(&self) -> Self::Iterator {
+        RocksSstIterator(SstFileReader::iter_rc(self.inner.clone()))
+    }
 }
 
-impl RefIterable for RocksSstReader {
-    type Iterator<'a> = RocksSstIterator<'a>;
+impl Iterable for RocksSstReader {
+    type Iterator = RocksSstIterator;
 
-    #[inline]
-    fn iter(&self, opts: IterOptions) -> Result<Self::Iterator<'_>> {
+    fn iterator_opt(&self, opts: IterOptions) -> Result<Self::Iterator> {
         let opt: RocksReadOptions = opts.into();
         let opt = opt.into_raw();
-        Ok(RocksSstIterator(SstFileReader::iter_opt(&self.inner, opt)))
+        Ok(RocksSstIterator(SstFileReader::iter_opt_rc(
+            self.inner.clone(),
+            opt,
+        )))
+    }
+
+    fn iterator_cf_opt(&self, _cf: &str, _opts: IterOptions) -> Result<Self::Iterator> {
+        unimplemented!() // FIXME: What should happen here?
     }
 }
 
-pub struct RocksSstIterator<'a>(DBIterator<&'a SstFileReader>);
+// FIXME: See comment on RocksSstReader for why this contains Rc
+pub struct RocksSstIterator(DBIterator<Rc<SstFileReader>>);
 
-// It's OK to send the iterator around.
-// TODO: remove this when using tirocks.
-unsafe impl Send for RocksSstIterator<'_> {}
+// TODO(5kbpers): Temporarily force to add `Send` here, add a method for creating
+// DBIterator<Arc<SstFileReader>> in rust-rocksdb later.
+unsafe impl Send for RocksSstIterator {}
 
-impl Iterator for RocksSstIterator<'_> {
-    fn seek(&mut self, key: &[u8]) -> Result<bool> {
-        self.0.seek(rocksdb::SeekKey::Key(key)).map_err(r2e)
+impl Iterator for RocksSstIterator {
+    fn seek(&mut self, key: SeekKey) -> Result<bool> {
+        let k: RocksSeekKey = key.into();
+        self.0.seek(k.into_raw()).map_err(Error::Engine)
     }
 
-    fn seek_for_prev(&mut self, key: &[u8]) -> Result<bool> {
-        self.0
-            .seek_for_prev(rocksdb::SeekKey::Key(key))
-            .map_err(r2e)
-    }
-
-    /// Seek to the first key in the database.
-    fn seek_to_first(&mut self) -> Result<bool> {
-        self.0.seek(rocksdb::SeekKey::Start).map_err(r2e)
-    }
-
-    /// Seek to the last key in the database.
-    fn seek_to_last(&mut self) -> Result<bool> {
-        self.0.seek(rocksdb::SeekKey::End).map_err(r2e)
+    fn seek_for_prev(&mut self, key: SeekKey) -> Result<bool> {
+        let k: RocksSeekKey = key.into();
+        self.0.seek_for_prev(k.into_raw()).map_err(Error::Engine)
     }
 
     fn prev(&mut self) -> Result<bool> {
-        #[cfg(not(feature = "nortcheck"))]
-        if !self.valid()? {
-            return Err(r2e("Iterator invalid"));
-        }
-        self.0.prev().map_err(r2e)
+        self.0.prev().map_err(Error::Engine)
     }
 
     fn next(&mut self) -> Result<bool> {
-        #[cfg(not(feature = "nortcheck"))]
-        if !self.valid()? {
-            return Err(r2e("Iterator invalid"));
-        }
-        self.0.next().map_err(r2e)
+        self.0.next().map_err(Error::Engine)
     }
 
     fn key(&self) -> &[u8] {
@@ -143,7 +130,7 @@ impl Iterator for RocksSstIterator<'_> {
     }
 
     fn valid(&self) -> Result<bool> {
-        self.0.valid().map_err(r2e)
+        self.0.valid().map_err(Error::Engine)
     }
 }
 
@@ -197,7 +184,7 @@ impl SstWriterBuilder<RocksEngine> for RocksSstWriterBuilder {
             env = db.env();
             let handle = db
                 .cf_handle(self.cf.as_deref().unwrap_or(CF_DEFAULT))
-                .ok_or_else(|| r2e(format!("CF {:?} is not found", self.cf)))?;
+                .ok_or_else(|| format!("CF {:?} is not found", self.cf))?;
             db.get_options_cf(handle)
         } else {
             ColumnFamilyOptions::new()
@@ -227,15 +214,9 @@ impl SstWriterBuilder<RocksEngine> for RocksSstWriterBuilder {
         };
         // TODO: 0 is a valid value for compression_level
         if self.compression_level != 0 {
-            // other 4 fields are default value.
-            io_options.set_compression_options(
-                -14,
-                self.compression_level,
-                0, // strategy
-                0, // max_dict_bytes
-                0, // zstd_max_train_bytes
-                1, // parallel_threads
-            );
+            // other three fields are default value.
+            // see: https://github.com/facebook/rocksdb/blob/8cb278d11a43773a3ac22e523f4d183b06d37d88/include/rocksdb/advanced_options.h#L146-L153
+            io_options.set_compression_options(-14, self.compression_level, 0, 0, 0);
         }
         io_options.compression(compress_type);
         // in rocksdb 5.5.1, SstFileWriter will try to use bottommost_compression and
@@ -245,7 +226,7 @@ impl SstWriterBuilder<RocksEngine> for RocksSstWriterBuilder {
         io_options.bottommost_compression(DBCompressionType::Disable);
         let mut writer = SstFileWriter::new(EnvOptions::new(), io_options);
         fail_point!("on_open_sst_writer");
-        writer.open(path).map_err(r2e)?;
+        writer.open(path)?;
         Ok(RocksSstWriter { writer, env })
     }
 }
@@ -260,11 +241,11 @@ impl SstWriter for RocksSstWriter {
     type ExternalSstFileReader = SequentialFile;
 
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        self.writer.put(key, val).map_err(r2e)
+        Ok(self.writer.put(key, val)?)
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.writer.delete(key).map_err(r2e)
+        Ok(self.writer.delete(key)?)
     }
 
     fn file_size(&mut self) -> u64 {
@@ -272,25 +253,22 @@ impl SstWriter for RocksSstWriter {
     }
 
     fn finish(mut self) -> Result<Self::ExternalSstFileInfo> {
-        Ok(RocksExternalSstFileInfo(self.writer.finish().map_err(r2e)?))
+        Ok(RocksExternalSstFileInfo(self.writer.finish()?))
     }
 
     fn finish_read(mut self) -> Result<(Self::ExternalSstFileInfo, Self::ExternalSstFileReader)> {
-        let env = self
-            .env
-            .take()
-            .ok_or_else(|| r2e("failed to read sequential file no env provided"))?;
-        let sst_info = self.writer.finish().map_err(r2e)?;
+        let env = self.env.take().ok_or_else(|| {
+            Error::Engine("failed to read sequential file no env provided".to_owned())
+        })?;
+        let sst_info = self.writer.finish()?;
         let p = sst_info.file_path();
         let path = p.as_os_str().to_str().ok_or_else(|| {
-            r2e(format!(
+            Error::Engine(format!(
                 "failed to sequential file bad path {}",
                 p.display()
             ))
         })?;
-        let seq_file = env
-            .new_sequential_file(path, EnvOptions::new())
-            .map_err(r2e)?;
+        let seq_file = env.new_sequential_file(path, EnvOptions::new())?;
         Ok((RocksExternalSstFileInfo(sst_info), seq_file))
     }
 }
@@ -359,23 +337,12 @@ fn to_rocks_compression_type(ct: SstCompressionType) -> DBCompressionType {
     }
 }
 
-pub fn from_rocks_compression_type(ct: DBCompressionType) -> Option<SstCompressionType> {
-    match ct {
-        DBCompressionType::Lz4 => Some(SstCompressionType::Lz4),
-        DBCompressionType::Snappy => Some(SstCompressionType::Snappy),
-        DBCompressionType::Zstd => Some(SstCompressionType::Zstd),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-
-    use tempfile::Builder;
-
     use super::*;
     use crate::util::new_default_engine;
+    use std::io::Read;
+    use tempfile::Builder;
 
     #[test]
     fn test_smoke() {

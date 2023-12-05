@@ -1,9 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    fmt::{self, Debug, Formatter},
-    io::Result,
-};
+use std::fmt::{self, Debug, Formatter};
+use std::io::Result;
 
 pub trait EncryptionKeyManager: Sync + Send {
     fn get_file(&self, fname: &str) -> Result<FileEncryptionInfo>;
@@ -12,7 +10,7 @@ pub trait EncryptionKeyManager: Sync + Send {
     fn link_file(&self, src_fname: &str, dst_fname: &str) -> Result<()>;
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FileEncryptionInfo {
     pub method: EncryptionMethod,
     pub key: Vec<u8>,
@@ -29,7 +27,7 @@ impl Default for FileEncryptionInfo {
 }
 
 impl Debug for FileEncryptionInfo {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "FileEncryptionInfo [method={:?}, key=...<{} bytes>, iv=...<{} bytes>]",
@@ -46,12 +44,11 @@ impl FileEncryptionInfo {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum EncryptionMethod {
     Unknown = 0,
     Plaintext = 1,
     Aes128Ctr = 2,
     Aes192Ctr = 3,
     Aes256Ctr = 4,
-    Sm4Ctr = 5,
 }

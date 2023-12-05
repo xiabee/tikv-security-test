@@ -24,8 +24,7 @@
 //! valgrind --tool=callgrind --instr-atstart=no ../../target/debug/examples/prime
 //! ```
 //!
-//! You must not run example via `valgrind cargo run ...`. The framework won't
-//! detect Callgrind!
+//! You must not run example via `valgrind cargo run ...`. The framework won't detect Callgrind!
 
 #[inline(never)]
 fn is_prime_number(v: usize, prime_numbers: &[usize]) -> bool {

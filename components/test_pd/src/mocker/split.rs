@@ -25,12 +25,6 @@ impl Split {
     }
 }
 
-impl Default for Split {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PdMocker for Split {
     fn get_members(&self, _: &GetMembersRequest) -> Option<Result<GetMembersResponse>> {
         let mut holder = self.inner.lock().unwrap();
@@ -45,7 +39,7 @@ impl PdMocker for Split {
 
     fn set_endpoints(&self, eps: Vec<String>) {
         let mut members = Vec::with_capacity(eps.len());
-        for (i, ep) in eps.iter().enumerate() {
+        for (i, ep) in (&eps).iter().enumerate() {
             let mut m = Member::default();
             m.set_name(format!("pd{}", i));
             m.set_member_id(100 + i as u64);

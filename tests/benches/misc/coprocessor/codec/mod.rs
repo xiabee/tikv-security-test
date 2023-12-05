@@ -1,9 +1,12 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+mod chunk;
 mod mysql;
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use test::{black_box, Bencher};
+use test::black_box;
+use test::Bencher;
+
 use tidb_query_datatype::codec::table::*;
 
 #[bench]

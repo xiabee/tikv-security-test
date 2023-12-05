@@ -1,16 +1,13 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
-
 use pin_project::pin_project;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tikv_util::deadline::{Deadline, DeadlineError};
 
-/// Checks the deadline before every poll of the future. If the deadline is
-/// exceeded, `DeadlineError` is returned.
+/// Checks the deadline before every poll of the future. If the deadline is exceeded,
+/// `DeadlineError` is returned.
 pub fn check_deadline<F: Future>(
     fut: F,
     deadline: Deadline,
@@ -31,7 +28,7 @@ where
 {
     type Output = Result<F::Output, DeadlineError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         self.deadline.check()?;
         let this = self.project();
         this.fut.poll(cx).map(Ok)
@@ -40,13 +37,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
-
-    use tokio::task::yield_now;
-
     use super::*;
 
-    #[tokio::test(flavor = "current_thread")]
+    use std::{thread, time::Duration};
+    use tokio::task::yield_now;
+
+    #[tokio::test(basic_scheduler)]
     async fn test_deadline_checker() {
         async fn work(iter: i32) {
             for i in 0..iter {
@@ -57,12 +53,10 @@ mod tests {
             }
         }
 
-        check_deadline(work(5), Deadline::from_now(Duration::from_millis(500)))
-            .await
-            .unwrap();
+        let res = check_deadline(work(5), Deadline::from_now(Duration::from_millis(500))).await;
+        assert!(res.is_ok());
 
-        check_deadline(work(100), Deadline::from_now(Duration::from_millis(500)))
-            .await
-            .unwrap_err();
+        let res = check_deadline(work(100), Deadline::from_now(Duration::from_millis(500))).await;
+        assert!(res.is_err());
     }
 }

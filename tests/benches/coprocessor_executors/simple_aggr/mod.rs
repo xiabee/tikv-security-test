@@ -3,6 +3,7 @@
 mod util;
 
 use criterion::measurement::Measurement;
+
 use tidb_query_datatype::FieldTypeTp;
 use tipb::ExprType;
 use tipb_helper::ExprDefBuilder;
@@ -10,7 +11,7 @@ use tipb_helper::ExprDefBuilder;
 use crate::util::{BenchCase, FixtureBuilder};
 
 /// COUNT(1)
-fn bench_simple_aggr_count_1<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_simple_aggr_count_1<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -22,7 +23,7 @@ where
 }
 
 /// COUNT(COL) where COL is a int column
-fn bench_simple_aggr_count_int_col<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_simple_aggr_count_int_col<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -34,7 +35,7 @@ where
 }
 
 /// COUNT(COL) where COL is a real column
-fn bench_simple_aggr_count_real_col<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_simple_aggr_count_real_col<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {
@@ -46,7 +47,7 @@ where
 }
 
 /// COUNT(COL) where COL is a bytes column (note: the column is very short)
-fn bench_simple_aggr_count_bytes_col<M>(b: &mut criterion::Bencher<'_, M>, input: &Input<M>)
+fn bench_simple_aggr_count_bytes_col<M>(b: &mut criterion::Bencher<M>, input: &Input<M>)
 where
     M: Measurement,
 {

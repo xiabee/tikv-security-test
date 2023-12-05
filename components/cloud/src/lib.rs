@@ -13,5 +13,3 @@ pub use kms::{Config, DataKeyPair, EncryptedKey, KeyId, KmsProvider, PlainKey};
 
 pub mod blob;
 pub use blob::{none_to_empty, BucketConf, StringNonEmpty};
-
-pub mod metrics;

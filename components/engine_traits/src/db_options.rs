@@ -3,16 +3,16 @@
 use crate::errors::Result;
 
 /// A trait for engines that support setting global options
-pub trait DbOptionsExt {
-    type DbOptions: DbOptions;
+pub trait DBOptionsExt {
+    type DBOptions: DBOptions;
 
-    fn get_db_options(&self) -> Self::DbOptions;
+    fn get_db_options(&self) -> Self::DBOptions;
     fn set_db_options(&self, options: &[(&str, &str)]) -> Result<()>;
 }
 
 /// A handle to a database's options
-pub trait DbOptions {
-    type TitanDbOptions: TitanCfOptions;
+pub trait DBOptions {
+    type TitanDBOptions: TitanDBOptions;
 
     fn new() -> Self;
     fn get_max_background_jobs(&self) -> i32;
@@ -20,11 +20,11 @@ pub trait DbOptions {
     fn set_rate_bytes_per_sec(&mut self, rate_bytes_per_sec: i64) -> Result<()>;
     fn get_rate_limiter_auto_tuned(&self) -> Option<bool>;
     fn set_rate_limiter_auto_tuned(&mut self, rate_limiter_auto_tuned: bool) -> Result<()>;
-    fn set_titandb_options(&mut self, opts: &Self::TitanDbOptions);
+    fn set_titandb_options(&mut self, opts: &Self::TitanDBOptions);
 }
 
 /// Titan-specefic options
-pub trait TitanCfOptions {
+pub trait TitanDBOptions {
     fn new() -> Self;
     fn set_min_blob_size(&mut self, size: u64);
 }

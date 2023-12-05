@@ -1,17 +1,15 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use async_trait::async_trait;
-use tidb_query_common::storage::IntervalRange;
-use tidb_query_datatype::{
-    codec::{batch::LazyBatchColumnVec, data_type::VectorValue},
-    expr::EvalWarnings,
-};
 use tipb::FieldType;
 
 use crate::interface::*;
+use tidb_query_common::storage::IntervalRange;
+use tidb_query_datatype::codec::batch::LazyBatchColumnVec;
+use tidb_query_datatype::codec::data_type::VectorValue;
+use tidb_query_datatype::expr::EvalWarnings;
 
-/// A simple mock executor that will return batch data according to a fixture
-/// without any modification.
+/// A simple mock executor that will return batch data according to a fixture without any
+/// modification.
 ///
 /// Normally this should be only used in tests.
 pub struct MockExecutor {
@@ -29,7 +27,6 @@ impl MockExecutor {
     }
 }
 
-#[async_trait]
 impl BatchExecutor for MockExecutor {
     type StorageStats = ();
 
@@ -37,7 +34,7 @@ impl BatchExecutor for MockExecutor {
         &self.schema
     }
 
-    async fn next_batch(&mut self, _scan_rows: usize) -> BatchExecuteResult {
+    fn next_batch(&mut self, _scan_rows: usize) -> BatchExecuteResult {
         self.results.next().unwrap()
     }
 
@@ -75,7 +72,6 @@ impl MockScanExecutor {
     }
 }
 
-#[async_trait]
 impl BatchExecutor for MockScanExecutor {
     type StorageStats = ();
 
@@ -83,7 +79,7 @@ impl BatchExecutor for MockScanExecutor {
         &self.schema
     }
 
-    async fn next_batch(&mut self, scan_rows: usize) -> BatchExecuteResult {
+    fn next_batch(&mut self, scan_rows: usize) -> BatchExecuteResult {
         let real_scan_rows = std::cmp::min(scan_rows, self.rows.len());
         // just one column
         let mut res_col = Vec::new();
@@ -95,11 +91,7 @@ impl BatchExecutor for MockScanExecutor {
             self.pos += 1;
             cur_row_idx += 1;
         }
-        let is_drained = if self.pos >= self.rows.len() {
-            BatchExecIsDrain::Drain
-        } else {
-            BatchExecIsDrain::Remain
-        };
+        let is_drained = self.pos >= self.rows.len();
         BatchExecuteResult {
             physical_columns: LazyBatchColumnVec::from(vec![VectorValue::Int(res_col.into())]),
             logical_rows: res_logical_rows,

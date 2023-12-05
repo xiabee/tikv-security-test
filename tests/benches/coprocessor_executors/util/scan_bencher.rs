@@ -3,16 +3,17 @@
 use std::marker::PhantomData;
 
 use criterion::measurement::Measurement;
+
 use kvproto::coprocessor::KeyRange;
-use test_coprocessor::*;
-use tidb_query_executors::interface::*;
-use tikv::{
-    coprocessor::RequestHandler,
-    storage::{RocksEngine, Store as TxnStore},
-};
 use tipb::ColumnInfo;
 
-use crate::util::{bencher::Bencher, store::StoreDescriber};
+use test_coprocessor::*;
+use tidb_query_executors::interface::*;
+use tikv::coprocessor::RequestHandler;
+use tikv::storage::{RocksEngine, Store as TxnStore};
+
+use crate::util::bencher::Bencher;
+use crate::util::store::StoreDescriber;
 
 pub trait ScanExecutorBuilder: 'static {
     type T: TxnStore + 'static;
@@ -26,7 +27,7 @@ pub trait ScanExecutorBuilder: 'static {
     ) -> Self::E;
 }
 
-pub trait ScanExecutorDagHandlerBuilder: 'static {
+pub trait ScanExecutorDAGHandlerBuilder: 'static {
     type T: TxnStore + 'static;
     type P: Copy + 'static;
     fn build(
@@ -48,7 +49,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         columns: &[ColumnInfo],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,
@@ -101,7 +102,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         columns: &[ColumnInfo],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,
@@ -118,13 +119,13 @@ where
     }
 }
 
-pub struct ScanDagBencher<B: ScanExecutorDagHandlerBuilder> {
+pub struct ScanDAGBencher<B: ScanExecutorDAGHandlerBuilder> {
     batch: bool,
     display_table_rows: usize,
     _phantom: PhantomData<B>,
 }
 
-impl<B: ScanExecutorDagHandlerBuilder> ScanDagBencher<B> {
+impl<B: ScanExecutorDAGHandlerBuilder> ScanDAGBencher<B> {
     pub fn new(batch: bool, display_table_rows: usize) -> Self {
         Self {
             batch,
@@ -134,9 +135,9 @@ impl<B: ScanExecutorDagHandlerBuilder> ScanDagBencher<B> {
     }
 }
 
-impl<B, M> ScanBencher<B::P, M> for ScanDagBencher<B>
+impl<B, M> ScanBencher<B::P, M> for ScanDAGBencher<B>
 where
-    B: ScanExecutorDagHandlerBuilder,
+    B: ScanExecutorDAGHandlerBuilder,
     M: Measurement,
 {
     fn name(&self) -> String {
@@ -151,13 +152,13 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         columns: &[ColumnInfo],
         ranges: &[KeyRange],
         store: &Store<RocksEngine>,
         parameters: B::P,
     ) {
-        crate::util::bencher::DagHandleBencher::new(|| {
+        crate::util::bencher::DAGHandleBencher::new(|| {
             B::build(self.batch, columns, ranges, store, parameters)
         })
         .bench(b);

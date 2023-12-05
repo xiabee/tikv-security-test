@@ -1,6 +1,9 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::{super::Result, modifier::BinaryModifier, path_expr::PathExpression, Json, JsonRef};
+use super::super::Result;
+use super::modifier::BinaryModifier;
+use super::path_expr::PathExpression;
+use super::{Json, JsonRef};
 
 /// `ModifyType` is for modify a JSON.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,7 +36,7 @@ impl<'a> JsonRef<'a> {
             ));
         }
         for expr in path_expr_list {
-            if expr.contains_any_asterisk() || expr.contains_any_range() {
+            if expr.contains_any_asterisk() {
                 return Err(box_err!(
                     "Invalid path expression: expected no asterisk, found {:?}",
                     expr
@@ -44,9 +47,9 @@ impl<'a> JsonRef<'a> {
         for (expr, value) in path_expr_list.iter().zip(values.into_iter()) {
             let modifier = BinaryModifier::new(res.as_ref());
             res = match mt {
-                ModifyType::Insert => modifier.insert(expr, value)?,
-                ModifyType::Replace => modifier.replace(expr, value)?,
-                ModifyType::Set => modifier.set(expr, value)?,
+                ModifyType::Insert => modifier.insert(&expr, value)?,
+                ModifyType::Replace => modifier.replace(&expr, value)?,
+                ModifyType::Set => modifier.set(&expr, value)?,
             };
         }
         Ok(res)
@@ -55,7 +58,8 @@ impl<'a> JsonRef<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{super::path_expr::parse_json_path_expr, *};
+    use super::super::path_expr::parse_json_path_expr;
+    use super::*;
 
     #[test]
     fn test_json_modify() {
@@ -216,7 +220,7 @@ mod tests {
                     json,
                     "#{} expect modified json {:?} == {:?}",
                     i,
-                    json,
+                    json.to_string(),
                     expected.to_string()
                 );
             } else {

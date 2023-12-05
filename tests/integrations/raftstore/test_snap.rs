@@ -1,18 +1,15 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Sender},
-        Arc, Mutex, RwLock,
-    },
-    time::Duration,
-};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
-use engine_traits::{KvEngine, RaftEngineReadOnly};
-use file_system::{IoOp, IoType};
+use engine_rocks::Compat;
+use engine_traits::{KvEngine, Peekable};
+use file_system::{IOOp, IOType};
 use futures::executor::block_on;
 use grpcio::Environment;
 use kvproto::raft_serverpb::*;
@@ -24,28 +21,25 @@ use test_raftstore::*;
 use tikv::server::snap::send_snap;
 use tikv_util::{config::*, time::Instant, HandyRwLock};
 
-fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>, max_snapshot_file_size: u64) {
-    cluster.cfg.rocksdb.titan.enabled = true;
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(1000);
+fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 1000;
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(10);
     cluster.cfg.raft_store.snap_apply_batch_size = ReadableSize(500);
-    cluster.cfg.raft_store.max_snapshot_file_raw_size = ReadableSize(max_snapshot_file_size);
     let pd_client = Arc::clone(&cluster.pd_client);
     // Disable default max peer count check.
     pd_client.disable_default_operator();
 
     let r1 = cluster.run_conf_change();
 
-    let first_value = vec![0; 10240];
     // at least 4m data
-    for i in 0..400 {
-        let key = format!("{:03}", i);
-        cluster.must_put(key.as_bytes(), &first_value);
+    for i in 0..2 * 1024 {
+        let key = format!("{:01024}", i);
+        let value = format!("{:01024}", i);
+        cluster.must_put(key.as_bytes(), value.as_bytes());
     }
-    let first_key: &[u8] = b"000";
 
     let engine_2 = cluster.get_engine(2);
-    must_get_none(&engine_2, first_key);
+    must_get_none(&engine_2, &format!("{:01024}", 0).into_bytes());
     // add peer (2,2) to region 1.
     pd_client.must_add_peer(r1, new_peer(2, 2));
 
@@ -55,7 +49,9 @@ fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>, max_snapshot_file_
     must_get_equal(&engine_2, key, value);
 
     // now snapshot must be applied on peer 2;
-    must_get_equal(&engine_2, first_key, &first_value);
+    let key = format!("{:01024}", 0);
+    let value = format!("{:01024}", 0);
+    must_get_equal(&engine_2, key.as_bytes(), value.as_bytes());
     let stale = Arc::new(AtomicBool::new(false));
     cluster.sim.wl().add_recv_filter(
         3,
@@ -65,15 +61,16 @@ fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>, max_snapshot_file_
         )),
     );
     pd_client.must_add_peer(r1, new_peer(3, 3));
-    let mut i = 400;
+    let mut i = 2 * 1024;
     loop {
         i += 1;
-        let key = format!("{:03}", i);
-        cluster.must_put(key.as_bytes(), &first_value);
+        let key = format!("{:01024}", i);
+        let value = format!("{:01024}", i);
+        cluster.must_put(key.as_bytes(), value.as_bytes());
         if stale.load(Ordering::Relaxed) {
             break;
         }
-        if i > 1000 {
+        if i > 10 * 1024 {
             panic!("snapshot should be sent twice after {} kvs", i);
         }
     }
@@ -85,25 +82,24 @@ fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>, max_snapshot_file_
 }
 
 #[test]
-fn test_server_huge_snapshot() {
+fn test_node_huge_snapshot() {
     let count = 5;
-    let mut cluster = new_server_cluster(0, count);
-    test_huge_snapshot(&mut cluster, u64::MAX);
+    let mut cluster = new_node_cluster(0, count);
+    test_huge_snapshot(&mut cluster);
 }
 
 #[test]
-fn test_server_huge_snapshot_multi_files() {
+fn test_server_huge_snapshot() {
     let count = 5;
     let mut cluster = new_server_cluster(0, count);
-    test_huge_snapshot(&mut cluster, 1024 * 1024);
+    test_huge_snapshot(&mut cluster);
 }
 
-fn test_server_snap_gc_internal(version: &str) {
+#[test]
+fn test_server_snap_gc() {
     let mut cluster = new_server_cluster(0, 3);
     configure_for_snapshot(&mut cluster);
-    cluster.pd_client.reset_version(version);
     cluster.cfg.raft_store.snap_gc_timeout = ReadableDuration::millis(300);
-    cluster.cfg.raft_store.max_snapshot_file_raw_size = ReadableSize::mb(100);
 
     let pd_client = Arc::clone(&cluster.pd_client);
     // Disable default max peer count check.
@@ -154,26 +150,11 @@ fn test_server_snap_gc_internal(version: &str) {
 
     let snap_dir = cluster.get_snap_dir(3);
     // it must have more than 2 snaps.
-
-    assert!(
-        fs::read_dir(snap_dir)
-            .unwrap()
-            .filter(|p| p.is_ok())
-            .count()
-            >= 2
-    );
-
-    let actual_max_per_file_size = cluster.get_snap_mgr(1).get_actual_max_per_file_size(true);
-
-    // version > 6.0.0 should enable multi_snapshot_file feature, which means actual
-    // max_per_file_size equals the config
-    if version == "6.5.0" {
-        assert!(actual_max_per_file_size == cluster.cfg.raft_store.max_snapshot_file_raw_size.0);
-    } else {
-        // the feature is disabled, and the actual_max_per_file_size should be u64::MAX
-        // (so that only one file is generated)
-        assert!(actual_max_per_file_size == u64::MAX);
-    }
+    let snapfiles: Vec<_> = fs::read_dir(snap_dir)
+        .unwrap()
+        .map(|p| p.unwrap().path())
+        .collect();
+    assert!(snapfiles.len() >= 2);
 
     cluster.sim.wl().clear_recv_filters(3);
     debug!("filters cleared.");
@@ -200,21 +181,10 @@ fn test_server_snap_gc_internal(version: &str) {
     }
 }
 
-#[test]
-fn test_server_snap_gc_with_multi_snapshot_files() {
-    test_server_snap_gc_internal("6.5.0");
-}
-
-#[test]
-fn test_server_snap_gc() {
-    test_server_snap_gc_internal("5.1.0");
-}
-
 /// A helper function for testing the handling of snapshot is correct
 /// when there are multiple snapshots which have overlapped region ranges
 /// arrive at the same raftstore.
 fn test_concurrent_snap<T: Simulator>(cluster: &mut Cluster<T>) {
-    cluster.cfg.rocksdb.titan.enabled = true;
     // Disable raft log gc in this test case.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::secs(60);
 
@@ -245,8 +215,7 @@ fn test_concurrent_snap<T: Simulator>(cluster: &mut Cluster<T>) {
     if let Err(e) = rx.recv_timeout(Duration::from_secs(1)) {
         panic!("the snapshot is not sent before split, e: {:?}", e);
     }
-    // Split the region range and then there should be another snapshot for the
-    // split ranges.
+    // Split the region range and then there should be another snapshot for the split ranges.
     cluster.must_split(&region, b"k2");
     must_get_equal(&cluster.get_engine(3), b"k3", b"v3");
     // Ensure the regions work after split.
@@ -360,7 +329,7 @@ fn test_node_stale_snap() {
     let mut cluster = new_node_cluster(0, 3);
     // disable compact log to make snapshot only be sent when peer is first added.
     cluster.cfg.raft_store.raft_log_gc_threshold = 1000;
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(1000);
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 1000;
 
     let pd_client = Arc::clone(&cluster.pd_client);
     // Disable default max peer count check.
@@ -481,11 +450,47 @@ fn test_server_snapshot_with_append() {
 }
 
 #[test]
+fn test_request_snapshot_apply_repeatedly() {
+    let mut cluster = new_node_cluster(0, 2);
+    configure_for_request_snapshot(&mut cluster);
+
+    let pd_client = Arc::clone(&cluster.pd_client);
+    // Disable default max peer count check.
+    pd_client.disable_default_operator();
+    let region_id = cluster.run_conf_change();
+    pd_client.must_add_peer(region_id, new_peer(2, 2));
+    cluster.must_transfer_leader(region_id, new_peer(2, 2));
+
+    sleep_ms(200);
+    // Install snapshot filter before requesting snapshot.
+    let (tx, rx) = mpsc::channel();
+    let notifier = Mutex::new(Some(tx));
+    cluster.sim.wl().add_recv_filter(
+        1,
+        Box::new(RecvSnapshotFilter {
+            notifier,
+            region_id,
+        }),
+    );
+    cluster.must_request_snapshot(1, region_id);
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    sleep_ms(200);
+    let engine = cluster.get_raft_engine(1);
+    let raft_key = keys::raft_state_key(region_id);
+    let raft_state: RaftLocalState = engine.c().get_msg(&raft_key).unwrap().unwrap();
+    assert!(
+        raft_state.get_last_index() > RAFT_INIT_LOG_INDEX,
+        "{:?}",
+        raft_state
+    );
+}
+
+#[test]
 fn test_inspected_snapshot() {
     let mut cluster = new_server_cluster(1, 3);
-    cluster.cfg.prefer_mem = false;
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(20);
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(8);
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 8;
     cluster.cfg.raft_store.merge_max_log_gap = 3;
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -503,33 +508,31 @@ fn test_inspected_snapshot() {
         .unwrap()
         .statistics()
         .unwrap();
-    assert_eq!(stats.fetch(IoType::Replication, IoOp::Read), 0);
-    assert_eq!(stats.fetch(IoType::Replication, IoOp::Write), 0);
+    assert_eq!(stats.fetch(IOType::Replication, IOOp::Read), 0);
+    assert_eq!(stats.fetch(IOType::Replication, IOOp::Write), 0);
     // Make sure snapshot read hits disk
     cluster.flush_data();
     // Let store 3 inform leader to generate a snapshot.
     cluster.run_node(3).unwrap();
     must_get_equal(&cluster.get_engine(3), b"k2", b"v2");
-    assert_ne!(stats.fetch(IoType::Replication, IoOp::Read), 0);
-    assert_ne!(stats.fetch(IoType::Replication, IoOp::Write), 0);
+    assert_ne!(stats.fetch(IOType::Replication, IOOp::Read), 0);
+    assert_ne!(stats.fetch(IOType::Replication, IOOp::Write), 0);
 
     pd_client.must_remove_peer(1, new_peer(2, 2));
-    must_get_none(&cluster.get_engine(2), b"k2");
-    assert_eq!(stats.fetch(IoType::LoadBalance, IoOp::Read), 0);
-    assert_eq!(stats.fetch(IoType::LoadBalance, IoOp::Write), 0);
+    assert_eq!(stats.fetch(IOType::LoadBalance, IOOp::Read), 0);
+    assert_eq!(stats.fetch(IOType::LoadBalance, IOOp::Write), 0);
     pd_client.must_add_peer(1, new_peer(2, 2));
     must_get_equal(&cluster.get_engine(2), b"k2", b"v2");
-    assert_ne!(stats.fetch(IoType::LoadBalance, IoOp::Read), 0);
-    assert_ne!(stats.fetch(IoType::LoadBalance, IoOp::Write), 0);
+    assert_ne!(stats.fetch(IOType::LoadBalance, IOOp::Read), 0);
+    assert_ne!(stats.fetch(IOType::LoadBalance, IOOp::Write), 0);
 }
 
 // Test snapshot generating and receiving can share one I/O limiter fairly.
 // 1. Bootstrap a 1 Region, 1 replica cluster;
-// 2. Add a peer on store 2 for the Region, so that there is a snapshot received
-// on store 2; 3. Rename the received snapshot on store 2, and then keep sending
-// it back to store 1; 4. Add another peer for the Region, so store 1 will
-// generate a new snapshot; 5. Test the generating can success while the store
-// keeps receiving snapshots from store 2.
+// 2. Add a peer on store 2 for the Region, so that there is a snapshot received on store 2;
+// 3. Rename the received snapshot on store 2, and then keep sending it back to store 1;
+// 4. Add another peer for the Region, so store 1 will generate a new snapshot;
+// 5. Test the generating can success while the store keeps receiving snapshots from store 2.
 #[test]
 fn test_gen_during_heavy_recv() {
     let mut cluster = new_server_cluster(0, 3);
@@ -578,7 +581,6 @@ fn test_gen_during_heavy_recv() {
         snap_term,
         snap_apply_state,
         true,
-        true,
     )
     .unwrap();
 
@@ -613,8 +615,7 @@ fn test_gen_during_heavy_recv() {
         }
     });
 
-    // While store 1 keeps receiving snapshots, it should still can generate a
-    // snapshot on time.
+    // While store 1 keeps receiving snapshots, it should still can generate a snapshot on time.
     pd_client.must_add_peer(r1, new_learner_peer(3, 3));
     sleep_ms(500);
     must_get_equal(&cluster.get_engine(3), b"zzz-0000", b"value");
@@ -659,8 +660,8 @@ fn random_long_vec(length: usize) -> Vec<u8> {
     value
 }
 
-/// Snapshot is generated using apply term from apply thread, which should be
-/// set correctly otherwise lead to inconsistency.
+/// Snapshot is generated using apply term from apply thread, which should be set
+/// correctly otherwise lead to unconsistency.
 #[test]
 fn test_correct_snapshot_term() {
     // Use five replicas so leader can send a snapshot to a new peer without
@@ -703,8 +704,8 @@ fn test_correct_snapshot_term() {
     // Clears send filters so peer 4 can accept snapshot from peer 5. If peer 5
     // didn't set apply index correctly using snapshot in apply worker, the snapshot
     // will be generated as term 0. Raft consider term of missing index as 0, so
-    // peer 4 will accept the snapshot and think it has already applied it, hence
-    // fast forward it then panic.
+    // peer 4 will accept the snapshot and think it has already applied it, hence fast
+    // forward it then panic.
     cluster.clear_send_filters();
     must_get_equal(&cluster.get_engine(4), b"k0", b"v0");
     cluster.clear_send_filters();
@@ -717,7 +718,7 @@ fn test_correct_snapshot_term() {
 #[test]
 fn test_snapshot_clean_up_logs_with_log_gc() {
     let mut cluster = new_node_cluster(0, 4);
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(50);
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 50;
     cluster.cfg.raft_store.raft_log_gc_threshold = 50;
     // Speed up log gc.
     cluster.cfg.raft_store.raft_log_compact_sync_interval = ReadableDuration::millis(1);
@@ -739,9 +740,6 @@ fn test_snapshot_clean_up_logs_with_log_gc() {
     // Peer (4, 4) must become leader at the end and send snapshot to 2.
     must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
 
-    let raft_engine = cluster.engines[&2].raft.clone();
-    let mut dest = vec![];
-    raft_engine.get_all_entries_to(1, &mut dest).unwrap();
     // No new log is proposed, so there should be no log at all.
-    assert!(dest.is_empty(), "{:?}", dest);
+    assert_eq!(cluster.get_first_log(1, 2), None);
 }

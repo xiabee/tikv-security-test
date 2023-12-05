@@ -2,30 +2,27 @@
 
 use std::cmp::Ordering;
 
+use crate::codec::collation::Collator;
+use crate::{match_template_collator, match_template_evaltype};
+use crate::{Collation, EvalType, FieldTypeAccessor};
 use match_template::match_template;
 use tipb::FieldType;
 
 use super::*;
-use crate::{
-    codec::collation::Collator, match_template_collator, match_template_evaltype, Collation,
-    EvalType, FieldTypeAccessor,
-};
 
 /// A scalar value container, a.k.a. datum, for all concrete eval types.
 ///
-/// In many cases, for example, at the framework level, the concrete eval type
-/// is unknown at compile time. So we use this enum container to represent types
-/// dynamically. It is similar to trait object `Box<T>` where `T` is a concrete
-/// eval type but faster.
+/// In many cases, for example, at the framework level, the concrete eval type is unknown at compile
+/// time. So we use this enum container to represent types dynamically. It is similar to trait
+/// object `Box<T>` where `T` is a concrete eval type but faster.
 ///
 /// Like `VectorValue`, the inner concrete value is immutable.
 ///
 /// Compared to `VectorValue`, it only contains a single concrete value.
-/// Compared to `Datum`, it is a newer encapsulation that naturally wraps
-/// `Option<..>`.
+/// Compared to `Datum`, it is a newer encapsulation that naturally wraps `Option<..>`.
 ///
-/// TODO: Once we removed the `Option<..>` wrapper, it will be much like
-/// `Datum`. At that time, we only need to preserve one of them.
+/// TODO: Once we removed the `Option<..>` wrapper, it will be much like `Datum`. At that time,
+/// we only need to preserve one of them.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScalarValue {
     Int(Option<super::Int>),
@@ -83,7 +80,7 @@ impl ScalarValue {
     }
 }
 
-impl AsMySqlBool for ScalarValue {
+impl AsMySQLBool for ScalarValue {
     #[inline]
     fn as_mysql_bool(&self, context: &mut EvalContext) -> Result<bool> {
         match_template_evaltype! {
@@ -172,8 +169,7 @@ impl From<ScalarValue> for Option<f64> {
     }
 }
 
-/// A scalar value reference container. Can be created from `ScalarValue` or
-/// `VectorValue`.
+/// A scalar value reference container. Can be created from `ScalarValue` or `VectorValue`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarValueRef<'a> {
     Int(Option<&'a super::Int>),
@@ -263,7 +259,7 @@ impl<'a> ScalarValueRef<'a> {
                     None => {
                         output.write_evaluable_datum_null()?;
                     }
-                    Some(val) => {
+                    Some(ref val) => {
                         output.write_evaluable_datum_bytes(val)?;
                     }
                 }
@@ -340,14 +336,14 @@ impl<'a> ScalarValueRef<'a> {
     #[inline]
     pub fn cmp_sort_key(
         &self,
-        other: &ScalarValueRef<'_>,
+        other: &ScalarValueRef,
         field_type: &FieldType,
     ) -> crate::codec::Result<Ordering> {
         Ok(match_template! {
             TT = [Real, Decimal, DateTime, Duration, Json, Enum],
             match (self, other) {
                 (ScalarValueRef::TT(v1), ScalarValueRef::TT(v2)) => v1.cmp(v2),
-                (ScalarValueRef::Int(v1), ScalarValueRef::Int(v2)) => compare_int(&v1.cloned(), &v2.cloned(), field_type),
+                (ScalarValueRef::Int(v1), ScalarValueRef::Int(v2)) => compare_int(&v1.cloned(), &v2.cloned(), &field_type),
                 (ScalarValueRef::Bytes(None), ScalarValueRef::Bytes(None)) => Ordering::Equal,
                 (ScalarValueRef::Bytes(Some(_)), ScalarValueRef::Bytes(None)) => Ordering::Greater,
                 (ScalarValueRef::Bytes(None), ScalarValueRef::Bytes(Some(_))) => Ordering::Less,
@@ -403,7 +399,7 @@ impl_as_ref! { Duration, as_duration }
 
 impl ScalarValue {
     #[inline]
-    pub fn as_json(&self) -> Option<JsonRef<'_>> {
+    pub fn as_json(&self) -> Option<JsonRef> {
         EvaluableRef::borrow_scalar_value(self)
     }
 }
@@ -417,7 +413,7 @@ impl<'a> ScalarValueRef<'a> {
 
 impl ScalarValue {
     #[inline]
-    pub fn as_bytes(&self) -> Option<BytesRef<'_>> {
+    pub fn as_bytes(&self) -> Option<BytesRef> {
         EvaluableRef::borrow_scalar_value(self)
     }
 }

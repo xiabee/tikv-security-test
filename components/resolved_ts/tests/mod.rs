@@ -1,24 +1,24 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::*, time::Duration};
+use std::sync::*;
+use std::time::Duration;
 
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
-use futures::{executor::block_on, stream, SinkExt};
-use grpcio::{ChannelBuilder, ClientUnaryReceiver, Environment, Result, WriteFlags};
-use kvproto::{
-    import_sstpb::{IngestRequest, SstMeta, UploadRequest, UploadResponse},
-    import_sstpb_grpc::ImportSstClient,
-    kvrpcpb::{PrewriteRequestPessimisticAction::*, *},
-    tikvpb::TikvClient,
-};
-use online_config::ConfigValue;
+use configuration::ConfigValue;
+use engine_rocks::{RocksEngine, RocksSnapshot};
+use grpcio::ClientUnaryReceiver;
+use grpcio::{ChannelBuilder, Environment};
+use kvproto::kvrpcpb::*;
+use kvproto::tikvpb::TikvClient;
 use raftstore::coprocessor::CoprocessorHost;
-use resolved_ts::{Observer, Task};
 use test_raftstore::*;
 use tikv::config::ResolvedTsConfig;
-use tikv_util::{worker::LazyWorker, HandyRwLock};
+use tikv_util::worker::LazyWorker;
+use tikv_util::HandyRwLock;
 use txn_types::TimeStamp;
+
+use resolved_ts::{Observer, Task};
 static INIT: Once = Once::new();
 
 pub fn init() {
@@ -27,10 +27,9 @@ pub fn init() {
 
 pub struct TestSuite {
     pub cluster: Cluster<ServerCluster>,
-    pub endpoints: HashMap<u64, LazyWorker<Task>>,
-    pub obs: HashMap<u64, Observer>,
+    pub endpoints: HashMap<u64, LazyWorker<Task<RocksSnapshot>>>,
+    pub obs: HashMap<u64, Observer<RocksEngine>>,
     tikv_cli: HashMap<u64, TikvClient>,
-    import_cli: HashMap<u64, ImportSstClient>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
 
     env: Arc<Environment>,
@@ -87,6 +86,7 @@ impl TestSuite {
                 cm.clone(),
                 env,
                 sim.security_mgr.clone(),
+                resolved_ts::DummySinker::new(),
             );
             concurrency_managers.insert(*id, cm);
             worker.start(rts_endpoint);
@@ -99,7 +99,6 @@ impl TestSuite {
             concurrency_managers,
             env: Arc::new(Environment::new(1)),
             tikv_cli: HashMap::default(),
-            import_cli: HashMap::default(),
         }
     }
 
@@ -129,7 +128,6 @@ impl TestSuite {
         muts: Vec<Mutation>,
         pk: Vec<u8>,
         ts: TimeStamp,
-        try_one_pc: bool,
     ) {
         let mut prewrite_req = PrewriteRequest::default();
         prewrite_req.set_context(self.get_context(region_id));
@@ -137,7 +135,6 @@ impl TestSuite {
         prewrite_req.primary_lock = pk;
         prewrite_req.start_version = ts.into_inner();
         prewrite_req.lock_ttl = prewrite_req.start_version + 1;
-        prewrite_req.try_one_pc = try_one_pc;
         let prewrite_resp = self
             .get_tikv_client(region_id)
             .kv_prewrite(&prewrite_req)
@@ -152,9 +149,6 @@ impl TestSuite {
             "{:?}",
             prewrite_resp.get_errors()
         );
-        if try_one_pc {
-            assert_ne!(prewrite_resp.get_one_pc_commit_ts(), 0);
-        }
     }
 
     pub fn must_kv_commit(
@@ -272,9 +266,7 @@ impl TestSuite {
         prewrite_req.start_version = ts.into_inner();
         prewrite_req.lock_ttl = prewrite_req.start_version + 1;
         prewrite_req.for_update_ts = for_update_ts.into_inner();
-        prewrite_req
-            .mut_pessimistic_actions()
-            .push(DoPessimisticCheck);
+        prewrite_req.mut_is_pessimistic_lock().push(true);
         let prewrite_resp = self
             .get_tikv_client(region_id)
             .kv_prewrite(&prewrite_req)
@@ -331,19 +323,6 @@ impl TestSuite {
             })
     }
 
-    pub fn get_import_client(&mut self, region_id: u64) -> &ImportSstClient {
-        let leader = self.cluster.leader_of_region(region_id).unwrap();
-        let store_id = leader.get_store_id();
-        let addr = self.cluster.sim.rl().get_addr(store_id);
-        let env = self.env.clone();
-        self.import_cli
-            .entry(leader.get_store_id())
-            .or_insert_with(|| {
-                let channel = ChannelBuilder::new(env).connect(&addr);
-                ImportSstClient::new(channel)
-            })
-    }
-
     pub fn get_txn_concurrency_manager(&self, store_id: u64) -> Option<ConcurrencyManager> {
         self.concurrency_managers.get(&store_id).cloned()
     }
@@ -357,24 +336,10 @@ impl TestSuite {
         let meta = self.cluster.store_metas[&leader.store_id].lock().unwrap();
         Some(
             meta.region_read_progress
-                .get_resolved_ts(&region_id)
+                .get_safe_ts(&region_id)
                 .unwrap()
                 .into(),
         )
-    }
-
-    pub fn region_tracked_index(&mut self, region_id: u64) -> u64 {
-        for _ in 0..50 {
-            if let Some(leader) = self.cluster.leader_of_region(region_id) {
-                let meta = self.cluster.store_metas[&leader.store_id].lock().unwrap();
-                if let Some(tracked_index) = meta.region_read_progress.get_tracked_index(&region_id)
-                {
-                    return tracked_index;
-                }
-            }
-            sleep_ms(100)
-        }
-        panic!("fail to get region tracked index after 50 trys");
     }
 
     pub fn must_get_rts(&mut self, region_id: u64, rts: TimeStamp) {
@@ -399,46 +364,5 @@ impl TestSuite {
             sleep_ms(100)
         }
         panic!("fail to get greater ts after 50 trys");
-    }
-
-    pub fn upload_sst(
-        &mut self,
-        region_id: u64,
-        meta: &SstMeta,
-        data: &[u8],
-    ) -> Result<UploadResponse> {
-        let import = self.get_import_client(region_id);
-        let mut r1 = UploadRequest::default();
-        r1.set_meta(meta.clone());
-        let mut r2 = UploadRequest::default();
-        r2.set_data(data.to_vec());
-        let reqs: Vec<_> = vec![r1, r2]
-            .into_iter()
-            .map(|r| Result::Ok((r, WriteFlags::default())))
-            .collect();
-        let (mut tx, rx) = import.upload().unwrap();
-        let mut stream = stream::iter(reqs);
-        block_on(async move {
-            tx.send_all(&mut stream).await?;
-            tx.close().await?;
-            rx.await
-        })
-    }
-
-    pub fn must_ingest_sst(&mut self, region_id: u64, meta: SstMeta) {
-        let mut ingest_request = IngestRequest::default();
-        ingest_request.set_context(self.get_context(region_id));
-        ingest_request.set_sst(meta);
-
-        let ingest_sst_resp = self
-            .get_import_client(region_id)
-            .ingest(&ingest_request)
-            .unwrap();
-
-        assert!(
-            !ingest_sst_resp.has_error(),
-            "{:?}",
-            ingest_sst_resp.get_error()
-        );
     }
 }

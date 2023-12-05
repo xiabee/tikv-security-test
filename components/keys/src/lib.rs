@@ -1,7 +1,5 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath] Common key utitlies.
-
 //! TiKV key building
 
 #[allow(unused_extern_crates)]
@@ -33,7 +31,6 @@ pub const DATA_MAX_KEY: &[u8] = &[DATA_PREFIX + 1];
 // Following keys are all local keys, so the first byte must be 0x01.
 pub const STORE_IDENT_KEY: &[u8] = &[LOCAL_PREFIX, 0x01];
 pub const PREPARE_BOOTSTRAP_KEY: &[u8] = &[LOCAL_PREFIX, 0x02];
-pub const RECOVER_STATE_KEY: &[u8] = &[LOCAL_PREFIX, 0x03];
 // We save two types region data in DB, for raft and other meta data.
 // When the store starts, we should iterate all region meta data to
 // construct peer, no need to travel large raft data, so we separate them
@@ -210,12 +207,6 @@ pub fn data_key(key: &[u8]) -> Vec<u8> {
     v
 }
 
-pub fn data_key_with_buffer(key: &[u8], buffer: &mut Vec<u8>) {
-    buffer.clear();
-    buffer.extend_from_slice(DATA_PREFIX_KEY);
-    buffer.extend_from_slice(key);
-}
-
 pub fn origin_key(key: &[u8]) -> &[u8] {
     assert!(
         validate_data_key(key),
@@ -227,26 +218,26 @@ pub fn origin_key(key: &[u8]) -> &[u8] {
 
 /// Get the `start_key` of current region in encoded form.
 pub fn enc_start_key(region: &Region) -> Vec<u8> {
-    // only initialized region's start_key can be encoded, otherwise there must be
-    // bugs somewhere.
+    // only initialized region's start_key can be encoded, otherwise there must be bugs
+    // somewhere.
     assert!(!region.get_peers().is_empty());
     data_key(region.get_start_key())
 }
 
 /// Get the `end_key` of current region in encoded form.
 pub fn enc_end_key(region: &Region) -> Vec<u8> {
-    // only initialized region's end_key can be encoded, otherwise there must be
-    // bugs somewhere.
+    // only initialized region's end_key can be encoded, otherwise there must be bugs
+    // somewhere.
     assert!(!region.get_peers().is_empty());
     data_end_key(region.get_end_key())
 }
 
 #[inline]
-pub fn data_end_key(key: &[u8]) -> Vec<u8> {
-    if key.is_empty() {
+pub fn data_end_key(region_end_key: &[u8]) -> Vec<u8> {
+    if region_end_key.is_empty() {
         DATA_MAX_KEY.to_vec()
     } else {
-        data_key(key)
+        data_key(region_end_key)
     }
 }
 
@@ -304,16 +295,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use std::cmp::Ordering;
-
+    use super::*;
     use byteorder::{BigEndian, WriteBytesExt};
     use kvproto::metapb::{Peer, Region};
-
-    use super::*;
+    use std::cmp::Ordering;
 
     #[test]
     fn test_region_id_key() {
-        let region_ids = vec![0, 1, 1024, u64::MAX];
+        let region_ids = vec![0, 1, 1024, std::u64::MAX];
         for region_id in region_ids {
             let prefix = region_raft_prefix(region_id);
 
@@ -416,34 +405,28 @@ mod tests {
 
         let state_key = raft_state_key(1);
         // invalid length
-        decode_raft_log_key(&state_key).unwrap_err();
+        assert!(decode_raft_log_key(&state_key).is_err());
 
         let mut state_key = state_key.to_vec();
         state_key.write_u64::<BigEndian>(2).unwrap();
         // invalid suffix
-        decode_raft_log_key(&state_key).unwrap_err();
+        assert!(decode_raft_log_key(&state_key).is_err());
 
         let mut region_state_key = region_state_key(1).to_vec();
         region_state_key.write_u64::<BigEndian>(2).unwrap();
         // invalid prefix
-        decode_raft_log_key(&region_state_key).unwrap_err();
+        assert!(decode_raft_log_key(&region_state_key).is_err());
     }
 
     #[test]
     fn test_data_key() {
-        assert!(!validate_data_key(b"abc"));
         assert!(validate_data_key(&data_key(b"abc")));
-        let mut buffer = vec![];
-        data_key_with_buffer(b"abc", &mut buffer);
-        assert_eq!(buffer, data_key(b"abc"));
-        data_key_with_buffer(b"cde", &mut buffer);
-        assert_eq!(buffer, data_key(b"cde"));
+        assert!(!validate_data_key(b"abc"));
 
         let mut region = Region::default();
-        // uninitialised region should not be passed in `enc_start_key` and
-        // `enc_end_key`.
-        ::panic_hook::recover_safe(|| enc_start_key(&region)).unwrap_err();
-        ::panic_hook::recover_safe(|| enc_end_key(&region)).unwrap_err();
+        // uninitialised region should not be passed in `enc_start_key` and `enc_end_key`.
+        assert!(::panic_hook::recover_safe(|| enc_start_key(&region)).is_err());
+        assert!(::panic_hook::recover_safe(|| enc_end_key(&region)).is_err());
 
         region.mut_peers().push(Peer::default());
         assert_eq!(enc_start_key(&region), vec![DATA_PREFIX]);

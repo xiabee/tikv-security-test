@@ -1,14 +1,11 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
-    string::ToString,
-};
+use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
+use std::string::ToString;
 
-use crate::{
-    codec::{error::Error, Result},
-    expr::EvalContext,
-};
+use crate::codec::error::Error;
+use crate::codec::Result;
+use crate::expr::EvalContext;
 
 /// BinaryLiteral is the internal type for storing bit / hex literal type.
 #[derive(Debug)]
@@ -37,17 +34,16 @@ pub fn to_uint(ctx: &mut EvalContext, bytes: &[u8]) -> Result<u64> {
             "BINARY",
             BinaryLiteral(bytes.to_owned()).to_string(),
         ))?;
-        return Ok(u64::MAX);
+        return Ok(std::u64::MAX);
     }
     let val = bytes.iter().fold(0, |acc, x| acc << 8 | (u64::from(*x)));
     Ok(val)
 }
 
 impl BinaryLiteral {
-    /// from_u64 creates a new BinaryLiteral instance by the given uint value in
-    /// BigEndian. byte size will be used as the length of the new
-    /// BinaryLiteral, with leading bytes filled to zero. If byte size is -1,
-    /// the leading zeros in new BinaryLiteral will be trimmed.
+    /// from_u64 creates a new BinaryLiteral instance by the given uint value in BigEndian.
+    /// byte size will be used as the length of the new BinaryLiteral, with leading bytes filled to zero.
+    /// If byte size is -1, the leading zeros in new BinaryLiteral will be trimmed.
     pub fn from_u64(val: u64, byte_size: isize) -> Result<Self> {
         if byte_size != -1 && !(1..=8).contains(&byte_size) {
             return Err(box_err!("invalid byte size: {}", byte_size));
@@ -277,7 +273,7 @@ mod tests {
         }
 
         let lit = BinaryLiteral::from_u64(100, -2);
-        lit.unwrap_err();
+        assert!(lit.is_err());
     }
 
     #[test]
@@ -463,10 +459,12 @@ mod tests {
         let mut ctx = EvalContext::default();
         for (s, expected, err) in cs {
             if err {
-                BinaryLiteral::from_hex_str(s)
-                    .unwrap()
-                    .to_uint(&mut ctx)
-                    .unwrap_err();
+                assert!(
+                    BinaryLiteral::from_hex_str(s)
+                        .unwrap()
+                        .to_uint(&mut ctx)
+                        .is_err()
+                );
             } else {
                 let lit = BinaryLiteral::from_hex_str(s).unwrap();
                 assert_eq!(lit.to_uint(&mut ctx).unwrap(), expected)

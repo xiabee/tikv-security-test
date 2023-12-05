@@ -1,17 +1,19 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::Mutex;
-
+use crate::request::{restore_receiver, write_receiver};
 use anyhow::Context;
-use kvproto::brpb as proto;
-pub use kvproto::brpb::StorageBackend_oneof_backend as Backend;
+use kvproto::backup as proto;
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
 use protobuf::{self};
 use slog_global::{error, info};
+use std::sync::Mutex;
 use tokio::runtime::{Builder, Runtime};
 
-use crate::request::{restore_receiver, write_receiver};
+#[cfg(feature = "prost-codec")]
+pub use kvproto::backup::storage_backend::Backend;
+#[cfg(feature = "protobuf-codec")]
+pub use kvproto::backup::StorageBackend_oneof_backend as Backend;
 
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 lazy_static! {
@@ -107,11 +109,7 @@ fn anyhow_to_extern_err(e: anyhow::Error) -> ffi_support::ExternError {
 }
 
 pub mod staticlib {
-    use std::{
-        io::{self},
-        sync::Arc,
-    };
-
+    use super::*;
     use external_storage::{
         dylib_client::extern_to_io_err,
         request::{
@@ -121,9 +119,9 @@ pub mod staticlib {
     };
     use futures_io::AsyncRead;
     use protobuf::Message;
+    use std::io::{self};
+    use std::sync::Arc;
     use tikv_util::time::Limiter;
-
-    use super::*;
 
     struct ExternalStorageClient {
         backend: Backend,
@@ -188,7 +186,7 @@ pub mod staticlib {
             .map_err(anyhow_to_io_log_error)
         }
 
-        fn read(&self, _name: &str) -> crate::ExternalData<'_> {
+        fn read(&self, _name: &str) -> Box<dyn AsyncRead + Unpin> {
             unimplemented!("use restore instead of read")
         }
 

@@ -1,13 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{io::Read, path::Path};
+use std::io::Read;
+use std::path::Path;
 
 use file_system::File;
 use kvproto::encryptionpb::EncryptedContent;
 use tikv_util::box_err;
 
 use super::{Backend, MemAesGcmBackend};
-use crate::{AesGcmCrypter, Error, Iv, Result};
+use crate::AesGcmCrypter;
+use crate::{Error, Iv, Result};
 
 #[derive(Debug)]
 pub struct FileBackend {
@@ -64,13 +66,14 @@ impl Backend for FileBackend {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::Write, path::PathBuf};
-
     use hex::FromHex;
     use matches::assert_matches;
+    use std::{fs::File, io::Write, path::PathBuf};
     use tempfile::TempDir;
 
-    use super::{super::metadata::MetadataKey, *};
+    use super::super::metadata::MetadataKey;
+
+    use super::*;
     use crate::*;
 
     fn create_key_file(val: &str) -> (PathBuf, TempDir) {

@@ -10,8 +10,7 @@
 //! Because there are so many similarly named types across the TiKV codebase,
 //! and so much "import renaming", this crate consistently explicitly names type
 //! that implement a trait as `RocksTraitname`, to avoid the need for import
-//! renaming and make it obvious what type any particular module is working
-//! with.
+//! renaming and make it obvious what type any particular module is working with.
 //!
 //! Please read the engine_trait crate docs before hacking.
 
@@ -20,9 +19,11 @@
 #[macro_use]
 extern crate tikv_util;
 
-mod engine;
-mod perf_context;
+extern crate slog_global;
 
-pub use engine::{
-    ManagedFileSystem, RaftEngineConfig, RaftLogBatch, RaftLogEngine, ReadableSize, RecoveryMode,
-};
+extern crate serde_derive;
+
+extern crate raft;
+
+mod engine;
+pub use engine::{RaftEngineConfig, RaftLogBatch, RaftLogEngine, RecoveryMode};

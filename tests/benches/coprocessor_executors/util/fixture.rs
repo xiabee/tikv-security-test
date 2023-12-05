@@ -2,24 +2,23 @@
 
 use std::str::FromStr;
 
-use async_trait::async_trait;
-use criterion::measurement::Measurement;
-use rand::{seq::SliceRandom, Rng, SeedableRng};
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use rand_xorshift::XorShiftRng;
+
+use criterion::measurement::Measurement;
+
 use test_coprocessor::*;
+use tidb_query_datatype::FieldTypeTp;
+use tipb::FieldType;
+
 use tidb_query_common::storage::IntervalRange;
-use tidb_query_datatype::{
-    codec::{
-        batch::{LazyBatchColumn, LazyBatchColumnVec},
-        data_type::Decimal,
-        datum::{Datum, DatumEncoder},
-    },
-    expr::{EvalContext, EvalWarnings},
-    FieldTypeTp,
-};
+use tidb_query_datatype::codec::batch::{LazyBatchColumn, LazyBatchColumnVec};
+use tidb_query_datatype::codec::data_type::Decimal;
+use tidb_query_datatype::codec::datum::{Datum, DatumEncoder};
+use tidb_query_datatype::expr::{EvalContext, EvalWarnings};
 use tidb_query_executors::interface::*;
 use tikv::storage::{RocksEngine, Statistics};
-use tipb::FieldType;
 
 use crate::util::bencher::Bencher;
 
@@ -66,8 +65,7 @@ impl FixtureBuilder {
         self
     }
 
-    /// Pushes a i64 column that values are randomly sampled from the giving
-    /// values.
+    /// Pushes a i64 column that values are randomly sampled from the giving values.
     pub fn push_column_i64_sampled(mut self, samples: &[i64]) -> Self {
         let mut rng: XorShiftRng = SeedableRng::seed_from_u64(SEED_1);
         let mut col = Vec::with_capacity(self.rows);
@@ -79,12 +77,10 @@ impl FixtureBuilder {
         self
     }
 
-    /// Pushes a i64 column that values are filled according to the given values
-    /// in order.
+    /// Pushes a i64 column that values are filled according to the given values in order.
     ///
-    /// For example, if 3 values `[a, b, c]` are given, then the first 1/3
-    /// values in the column are `a`, the second 1/3 values are `b` and the
-    /// last 1/3 values are `c`.
+    /// For example, if 3 values `[a, b, c]` are given, then the first 1/3 values in the column are
+    /// `a`, the second 1/3 values are `b` and the last 1/3 values are `c`.
     pub fn push_column_i64_ordered(mut self, samples: &[i64]) -> Self {
         let mut col = Vec::with_capacity(self.rows);
         for i in 0..self.rows {
@@ -114,15 +110,14 @@ impl FixtureBuilder {
         let mut rng: XorShiftRng = SeedableRng::seed_from_u64(SEED_1);
         let mut col = Vec::with_capacity(self.rows);
         for _ in 0..self.rows {
-            col.push(Datum::F64(rng.gen_range(-1e50..1e50)));
+            col.push(Datum::F64(rng.gen_range(-1e50, 1e50)));
         }
         self.columns.push(col);
         self.field_types.push(FieldTypeTp::Double.into());
         self
     }
 
-    /// Pushes a f64 column that values are randomly sampled from the giving
-    /// values.
+    /// Pushes a f64 column that values are randomly sampled from the giving values.
     pub fn push_column_f64_sampled(mut self, samples: &[f64]) -> Self {
         let mut rng: XorShiftRng = SeedableRng::seed_from_u64(SEED_1);
         let mut col = Vec::with_capacity(self.rows);
@@ -134,12 +129,10 @@ impl FixtureBuilder {
         self
     }
 
-    /// Pushes a f64 column that values are filled according to the given values
-    /// in order.
+    /// Pushes a f64 column that values are filled according to the given values in order.
     ///
-    /// For example, if 3 values `[a, b, c]` are given, then the first 1/3
-    /// values in the column are `a`, the second 1/3 values are `b` and the
-    /// last 1/3 values are `c`.
+    /// For example, if 3 values `[a, b, c]` are given, then the first 1/3 values in the column are
+    /// `a`, the second 1/3 values are `b` and the last 1/3 values are `c`.
     pub fn push_column_f64_ordered(mut self, samples: &[f64]) -> Self {
         let mut col = Vec::with_capacity(self.rows);
         for i in 0..self.rows {
@@ -164,22 +157,21 @@ impl FixtureBuilder {
 
     /// Pushes a decimal column that values are randomly generated.
     ///
-    /// Generated decimals have 1 to 30 integer digits and 1 to 20 fractional
-    /// digits.
+    /// Generated decimals have 1 to 30 integer digits and 1 to 20 fractional digits.
     pub fn push_column_decimal_random(mut self) -> Self {
         let mut rng: XorShiftRng = SeedableRng::seed_from_u64(SEED_2);
         let mut col = Vec::with_capacity(self.rows);
         let mut dec_str = String::new();
         for _ in 0..self.rows {
             dec_str.clear();
-            let number_of_int_digits = rng.gen_range(1..30);
-            let number_of_frac_digits = rng.gen_range(1..20);
+            let number_of_int_digits = rng.gen_range(1, 30);
+            let number_of_frac_digits = rng.gen_range(1, 20);
             for _ in 0..number_of_int_digits {
-                dec_str.push(std::char::from_digit(rng.gen_range(0..10), 10).unwrap());
+                dec_str.push(std::char::from_digit(rng.gen_range(0, 10), 10).unwrap());
             }
             dec_str.push('.');
             for _ in 0..number_of_frac_digits {
-                dec_str.push(std::char::from_digit(rng.gen_range(0..10), 10).unwrap());
+                dec_str.push(std::char::from_digit(rng.gen_range(0, 10), 10).unwrap());
             }
             col.push(Datum::Dec(Decimal::from_str(&dec_str).unwrap()));
         }
@@ -188,8 +180,7 @@ impl FixtureBuilder {
         self
     }
 
-    /// Pushes a decimal column that values are randomly sampled from the giving
-    /// values.
+    /// Pushes a decimal column that values are randomly sampled from the giving values.
     pub fn push_column_decimal_sampled(mut self, samples: &[&str]) -> Self {
         let mut rng: XorShiftRng = SeedableRng::seed_from_u64(SEED_2);
         let mut col = Vec::with_capacity(self.rows);
@@ -202,12 +193,10 @@ impl FixtureBuilder {
         self
     }
 
-    /// Pushes a decimal column that values are filled according to the given
-    /// values in order.
+    /// Pushes a decimal column that values are filled according to the given values in order.
     ///
-    /// For example, if 3 values `[a, b, c]` are given, then the first 1/3
-    /// values in the column are `a`, the second 1/3 values are `b` and the
-    /// last 1/3 values are `c`.
+    /// For example, if 3 values `[a, b, c]` are given, then the first 1/3 values in the column are
+    /// `a`, the second 1/3 values are `b` and the last 1/3 values are `c`.
     pub fn push_column_decimal_ordered(mut self, samples: &[&str]) -> Self {
         let mut col = Vec::with_capacity(self.rows);
         for i in 0..self.rows {
@@ -220,17 +209,17 @@ impl FixtureBuilder {
         self
     }
 
-    /// Pushes a bytes column that values are randomly generated and each value
-    /// has the same length as specified.
+    /// Pushes a bytes column that values are randomly generated and each value has the same length
+    /// as specified.
     pub fn push_column_bytes_random_fixed_len(mut self, len: usize) -> Self {
         let mut rng: XorShiftRng = SeedableRng::seed_from_u64(SEED_3);
         let mut col = Vec::with_capacity(self.rows);
         for _ in 0..self.rows {
-            let bytes: Vec<u8> = std::iter::repeat(())
+            let str: String = std::iter::repeat(())
                 .map(|_| rng.sample(rand::distributions::Alphanumeric))
                 .take(len)
                 .collect();
-            col.push(Datum::Bytes(bytes));
+            col.push(Datum::Bytes(str.into_bytes()));
         }
         self.columns.push(col);
         self.field_types.push(FieldTypeTp::VarChar.into());
@@ -243,7 +232,7 @@ impl FixtureBuilder {
         let mut store = Store::new();
         for row_index in 0..self.rows {
             store.begin();
-            let mut si = store.insert_into(table);
+            let mut si = store.insert_into(&table);
             for col_index in 0..columns.len() {
                 si = si.set(
                     &table[columns[col_index]],
@@ -284,7 +273,6 @@ pub struct BatchFixtureExecutor {
     columns: Vec<LazyBatchColumn>,
 }
 
-#[async_trait]
 impl BatchExecutor for BatchFixtureExecutor {
     type StorageStats = Statistics;
 
@@ -294,7 +282,7 @@ impl BatchExecutor for BatchFixtureExecutor {
     }
 
     #[inline]
-    async fn next_batch(&mut self, scan_rows: usize) -> BatchExecuteResult {
+    fn next_batch(&mut self, scan_rows: usize) -> BatchExecuteResult {
         let mut columns = Vec::with_capacity(self.columns.len());
         for col in &mut self.columns {
             let mut column = LazyBatchColumn::raw_with_capacity(scan_rows);
@@ -314,11 +302,7 @@ impl BatchExecutor for BatchFixtureExecutor {
             physical_columns,
             logical_rows,
             warnings: EvalWarnings::default(),
-            is_drained: Ok(if self.columns[0].is_empty() {
-                BatchExecIsDrain::Drain
-            } else {
-                BatchExecIsDrain::Remain
-            }),
+            is_drained: Ok(self.columns[0].is_empty()),
         }
     }
 
@@ -343,9 +327,9 @@ impl BatchExecutor for BatchFixtureExecutor {
     }
 }
 
-/// Benches the performance of the batch fixture executor itself. When using it
-/// as the source executor in other benchmarks, we need to take out these costs.
-fn bench_util_batch_fixture_executor_next_1024<M>(b: &mut criterion::Bencher<'_, M>)
+/// Benches the performance of the batch fixture executor itself. When using it as the source
+/// executor in other benchmarks, we need to take out these costs.
+fn bench_util_batch_fixture_executor_next_1024<M>(b: &mut criterion::Bencher<M>)
 where
     M: Measurement,
 {

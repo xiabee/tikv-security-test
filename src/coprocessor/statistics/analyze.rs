@@ -1,41 +1,38 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{cmp::Reverse, collections::BinaryHeap, mem, sync::Arc};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use kvproto::coprocessor::{KeyRange, Response};
 use protobuf::Message;
-use rand::{rngs::StdRng, Rng};
-use tidb_query_common::storage::{
-    scanner::{RangesScanner, RangesScannerOptions},
-    Range,
+use rand::rngs::StdRng;
+use rand::Rng;
+use tidb_query_common::storage::scanner::{RangesScanner, RangesScannerOptions};
+use tidb_query_common::storage::Range;
+use tidb_query_datatype::codec::datum::{
+    encode_value, split_datum, Datum, DatumDecoder, DURATION_FLAG, INT_FLAG, NIL_FLAG, UINT_FLAG,
 };
-use tidb_query_datatype::{
-    codec::{
-        datum::{
-            encode_value, split_datum, Datum, DatumDecoder, DURATION_FLAG, INT_FLAG, NIL_FLAG,
-            UINT_FLAG,
-        },
-        table,
-    },
-    def::Collation,
-    expr::{EvalConfig, EvalContext},
-    FieldTypeAccessor,
+use tidb_query_datatype::codec::table;
+use tidb_query_datatype::def::Collation;
+use tidb_query_datatype::expr::{EvalConfig, EvalContext};
+use tidb_query_datatype::FieldTypeAccessor;
+use tidb_query_executors::{
+    interface::BatchExecutor, runner::MAX_TIME_SLICE, BatchTableScanExecutor,
 };
-use tidb_query_executors::{interface::BatchExecutor, BatchTableScanExecutor};
 use tidb_query_expr::BATCH_MAX_SIZE;
-use tikv_alloc::trace::{MemoryTraceGuard, TraceEvent};
-use tikv_util::{
-    metrics::{ThrottleType, NON_TXN_COMMAND_THROTTLE_TIME_COUNTER_VEC_STATIC},
-    quota_limiter::QuotaLimiter,
-};
+use tikv_util::time::Instant;
 use tipb::{self, AnalyzeColumnsReq, AnalyzeIndexReq, AnalyzeReq, AnalyzeType};
+use yatp::task::future::reschedule;
 
-use super::{cmsketch::CmSketch, fmsketch::FmSketch, histogram::Histogram};
-use crate::{
-    coprocessor::{dag::TikvStorage, MEMTRACE_ANALYZE, *},
-    storage::{Snapshot, SnapshotStore, Statistics},
-};
+use super::cmsketch::CmSketch;
+use super::fmsketch::FmSketch;
+use super::histogram::Histogram;
+use crate::coprocessor::dag::TiKVStorage;
+use crate::coprocessor::*;
+use crate::storage::{Snapshot, SnapshotStore, Statistics};
 
 const ANALYZE_VERSION_V1: i32 = 1;
 const ANALYZE_VERSION_V2: i32 = 2;
@@ -43,11 +40,9 @@ const ANALYZE_VERSION_V2: i32 = 2;
 // `AnalyzeContext` is used to handle `AnalyzeReq`
 pub struct AnalyzeContext<S: Snapshot> {
     req: AnalyzeReq,
-    storage: Option<TikvStorage<SnapshotStore<S>>>,
+    storage: Option<TiKVStorage<SnapshotStore<S>>>,
     ranges: Vec<KeyRange>,
     storage_stats: Statistics,
-    quota_limiter: Arc<QuotaLimiter>,
-    is_auto_analyze: bool,
 }
 
 impl<S: Snapshot> AnalyzeContext<S> {
@@ -57,7 +52,6 @@ impl<S: Snapshot> AnalyzeContext<S> {
         start_ts: u64,
         snap: S,
         req_ctx: &ReqContext,
-        quota_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self> {
         let store = SnapshotStore::new(
             snap,
@@ -65,18 +59,13 @@ impl<S: Snapshot> AnalyzeContext<S> {
             req_ctx.context.get_isolation_level(),
             !req_ctx.context.get_not_fill_cache(),
             req_ctx.bypass_locks.clone(),
-            req_ctx.access_locks.clone(),
             false,
         );
-        let is_auto_analyze = req.get_flags() & REQ_FLAG_TIDB_SYSSESSION > 0;
-
         Ok(Self {
             req,
-            storage: Some(TikvStorage::new(store, false)),
+            storage: Some(TiKVStorage::new(store, false)),
             ranges,
             storage_stats: Statistics::default(),
-            quota_limiter,
-            is_auto_analyze,
         })
     }
 
@@ -122,7 +111,7 @@ impl<S: Snapshot> AnalyzeContext<S> {
     // it would build a histogram and count-min sketch of index values.
     async fn handle_index(
         req: AnalyzeIndexReq,
-        scanner: &mut RangesScanner<TikvStorage<SnapshotStore<S>>>,
+        scanner: &mut RangesScanner<TiKVStorage<SnapshotStore<S>>>,
         is_common_handle: bool,
     ) -> Result<Vec<u8>> {
         let mut hist = Histogram::new(req.get_bucket_size() as usize);
@@ -131,10 +120,12 @@ impl<S: Snapshot> AnalyzeContext<S> {
             req.get_cmsketch_width() as usize,
         );
         let mut fms = FmSketch::new(req.get_sketch_size() as usize);
+        let mut row_count = 0;
+        let mut time_slice_start = Instant::now();
         let mut topn_heap = BinaryHeap::new();
-        // cur_val recording the current value's data and its counts when iterating
-        // index's rows. Once we met a new value, the old value will be pushed
-        // into the topn_heap to maintain the top-n information.
+        // cur_val recording the current value's data and its counts when iterating index's rows.
+        // Once we met a new value, the old value will be pushed into the topn_heap to maintain the
+        // top-n information.
         let mut cur_val: (u32, Vec<u8>) = (0, vec![]);
         let top_n_size = req.get_top_n_size() as usize;
         let stats_version = if req.has_version() {
@@ -142,7 +133,15 @@ impl<S: Snapshot> AnalyzeContext<S> {
         } else {
             ANALYZE_VERSION_V1
         };
-        while let Some((key, _)) = scanner.next().await? {
+        while let Some((key, _)) = scanner.next()? {
+            row_count += 1;
+            if row_count >= BATCH_MAX_SIZE {
+                if time_slice_start.saturating_elapsed() > MAX_TIME_SLICE {
+                    reschedule().await;
+                    time_slice_start = Instant::now();
+                }
+                row_count = 0;
+            }
             let mut key = &key[..];
             if is_common_handle {
                 table::check_record_key(key)?;
@@ -210,7 +209,7 @@ impl<S: Snapshot> AnalyzeContext<S> {
 
 #[async_trait]
 impl<S: Snapshot> RequestHandler for AnalyzeContext<S> {
-    async fn handle_request(&mut self) -> Result<MemoryTraceGuard<Response>> {
+    async fn handle_request(&mut self) -> Result<Response> {
         let ret = match self.req.get_tp() {
             AnalyzeType::TypeIndex | AnalyzeType::TypeCommonHandle => {
                 let req = self.req.take_idx_req();
@@ -262,15 +261,7 @@ impl<S: Snapshot> RequestHandler for AnalyzeContext<S> {
                 let col_req = self.req.take_col_req();
                 let storage = self.storage.take().unwrap();
                 let ranges = std::mem::take(&mut self.ranges);
-
-                let mut builder = RowSampleBuilder::new(
-                    col_req,
-                    storage,
-                    ranges,
-                    self.quota_limiter.clone(),
-                    self.is_auto_analyze,
-                )?;
-
+                let mut builder = RowSampleBuilder::new(col_req, storage, ranges)?;
                 let res = AnalyzeContext::handle_full_sampling(&mut builder).await;
                 builder.data.collect_storage_stats(&mut self.storage_stats);
                 res
@@ -282,15 +273,14 @@ impl<S: Snapshot> RequestHandler for AnalyzeContext<S> {
         };
         match ret {
             Ok(data) => {
-                let memory_size = data.capacity();
                 let mut resp = Response::default();
                 resp.set_data(data);
-                Ok(MEMTRACE_ANALYZE.trace_guard(resp, memory_size))
+                Ok(resp)
             }
             Err(Error::Other(e)) => {
                 let mut resp = Response::default();
                 resp.set_other_error(e);
-                Ok(resp.into())
+                Ok(resp)
             }
             Err(e) => Err(e),
         }
@@ -303,24 +293,19 @@ impl<S: Snapshot> RequestHandler for AnalyzeContext<S> {
 }
 
 struct RowSampleBuilder<S: Snapshot> {
-    data: BatchTableScanExecutor<TikvStorage<SnapshotStore<S>>>,
+    data: BatchTableScanExecutor<TiKVStorage<SnapshotStore<S>>>,
 
     max_sample_size: usize,
     max_fm_sketch_size: usize,
-    sample_rate: f64,
     columns_info: Vec<tipb::ColumnInfo>,
     column_groups: Vec<tipb::AnalyzeColumnGroup>,
-    quota_limiter: Arc<QuotaLimiter>,
-    is_auto_analyze: bool,
 }
 
 impl<S: Snapshot> RowSampleBuilder<S> {
     fn new(
         mut req: AnalyzeColumnsReq,
-        storage: TikvStorage<SnapshotStore<S>>,
+        storage: TiKVStorage<SnapshotStore<S>>,
         ranges: Vec<KeyRange>,
-        quota_limiter: Arc<QuotaLimiter>,
-        is_auto_analyze: bool,
     ) -> Result<Self> {
         let columns_info: Vec<_> = req.take_columns_info().into();
         if columns_info.is_empty() {
@@ -341,182 +326,125 @@ impl<S: Snapshot> RowSampleBuilder<S> {
             data: table_scanner,
             max_sample_size: req.get_sample_size() as usize,
             max_fm_sketch_size: req.get_sketch_size() as usize,
-            sample_rate: req.get_sample_rate(),
             columns_info,
             column_groups: req.take_column_groups().into(),
-            quota_limiter,
-            is_auto_analyze,
         })
-    }
-
-    fn new_collector(&mut self) -> Box<dyn RowSampleCollector> {
-        if self.max_sample_size > 0 {
-            return Box::new(ReservoirRowSampleCollector::new(
-                self.max_sample_size,
-                self.max_fm_sketch_size,
-                self.columns_info.len() + self.column_groups.len(),
-            ));
-        }
-        Box::new(BernoulliRowSampleCollector::new(
-            self.sample_rate,
-            self.max_fm_sketch_size,
-            self.columns_info.len() + self.column_groups.len(),
-        ))
     }
 
     async fn collect_column_stats(&mut self) -> Result<AnalyzeSamplingResult> {
         use tidb_query_datatype::{codec::collation::Collator, match_template_collator};
 
         let mut is_drained = false;
-        let mut collector = self.new_collector();
+        let mut time_slice_start = Instant::now();
+        let mut collector = RowSampleCollector::new(
+            self.max_sample_size,
+            self.max_fm_sketch_size,
+            self.columns_info.len() + self.column_groups.len(),
+        );
         while !is_drained {
-            let mut sample = self.quota_limiter.new_sample(!self.is_auto_analyze);
-            let mut read_size: usize = 0;
-            {
-                let result = {
-                    let (duration, res) = sample
-                        .observe_cpu_async(self.data.next_batch(BATCH_MAX_SIZE))
-                        .await;
-                    sample.add_cpu_time(duration);
-                    res
-                };
-                let _guard = sample.observe_cpu();
-                is_drained = result.is_drained?.stop();
+            let time_slice_elapsed = time_slice_start.saturating_elapsed();
+            if time_slice_elapsed > MAX_TIME_SLICE {
+                reschedule().await;
+                time_slice_start = Instant::now();
+            }
+            let result = self.data.next_batch(BATCH_MAX_SIZE);
+            is_drained = result.is_drained?;
 
-                let columns_slice = result.physical_columns.as_slice();
+            let columns_slice = result.physical_columns.as_slice();
 
-                for logical_row in &result.logical_rows {
-                    let mut column_vals: Vec<Vec<u8>> = Vec::new();
-                    let mut collation_key_vals: Vec<Vec<u8>> = Vec::new();
-                    for i in 0..self.columns_info.len() {
-                        let mut val = vec![];
-                        columns_slice[i].encode(
-                            *logical_row,
-                            &self.columns_info[i],
-                            &mut EvalContext::default(),
-                            &mut val,
-                        )?;
-                        if self.columns_info[i].as_accessor().is_string_like() {
-                            let sorted_val = match_template_collator! {
-                                TT, match self.columns_info[i].as_accessor().collation()? {
-                                    Collation::TT => {
-                                        let mut mut_val = &val[..];
-                                        let decoded_val = table::decode_col_value(&mut mut_val, &mut EvalContext::default(), &self.columns_info[i])?;
-                                        if decoded_val == Datum::Null {
-                                            val.clone()
-                                        } else {
-                                            // Only if the `decoded_val` is Datum::Null, `decoded_val` is a Ok(None).
-                                            // So it is safe the unwrap the Ok value.
-                                            let decoded_sorted_val = TT::sort_key(&decoded_val.as_string()?.unwrap().into_owned())?;
-                                            decoded_sorted_val
-                                        }
+            for logical_row in &result.logical_rows {
+                let mut column_vals: Vec<Vec<u8>> = Vec::new();
+                let mut collation_key_vals: Vec<Vec<u8>> = Vec::new();
+                for i in 0..self.columns_info.len() {
+                    let mut val = vec![];
+                    columns_slice[i].encode(
+                        *logical_row,
+                        &self.columns_info[i],
+                        &mut EvalContext::default(),
+                        &mut val,
+                    )?;
+                    if self.columns_info[i].as_accessor().is_string_like() {
+                        let sorted_val = match_template_collator! {
+                            TT, match self.columns_info[i].as_accessor().collation()? {
+                                Collation::TT => {
+                                    let mut mut_val = &val[..];
+                                    let decoded_val = table::decode_col_value(&mut mut_val, &mut EvalContext::default(), &self.columns_info[i])?;
+                                    if decoded_val == Datum::Null {
+                                        val.clone()
+                                    } else {
+                                        // Only if the `decoded_val` is Datum::Null, `decoded_val` is a Ok(None).
+                                        // So it is safe the unwrap the Ok value.
+                                        let decoded_sorted_val = TT::sort_key(&decoded_val.as_string()?.unwrap().into_owned())?;
+                                        decoded_sorted_val
                                     }
                                 }
-                            };
-                            collation_key_vals.push(sorted_val);
-                        } else {
-                            collation_key_vals.push(Vec::new());
-                        }
-                        read_size += val.len();
-                        column_vals.push(val);
+                            }
+                        };
+                        collation_key_vals.push(sorted_val);
+                    } else {
+                        collation_key_vals.push(Vec::new());
                     }
-                    collector.mut_base().count += 1;
-                    collector.collect_column_group(
-                        &column_vals,
-                        &collation_key_vals,
-                        &self.columns_info,
-                        &self.column_groups,
-                    );
-                    collector.collect_column(column_vals, collation_key_vals, &self.columns_info);
+                    column_vals.push(val);
                 }
-            }
-
-            sample.add_read_bytes(read_size);
-            // Don't let analyze bandwidth limit the quota limiter, this is already limited
-            // in rate limiter.
-            let quota_delay = {
-                if !self.is_auto_analyze {
-                    self.quota_limiter.consume_sample(sample, true).await
-                } else {
-                    self.quota_limiter.consume_sample(sample, false).await
-                }
-            };
-
-            if !quota_delay.is_zero() {
-                NON_TXN_COMMAND_THROTTLE_TIME_COUNTER_VEC_STATIC
-                    .get(ThrottleType::analyze_full_sampling)
-                    .inc_by(quota_delay.as_micros() as u64);
+                collector.count += 1;
+                collector.collect_column_group(
+                    &column_vals,
+                    &collation_key_vals,
+                    &self.columns_info,
+                    &self.column_groups,
+                );
+                collector.collect_column(column_vals, collation_key_vals, &self.columns_info);
             }
         }
         Ok(AnalyzeSamplingResult::new(collector))
     }
 }
 
-trait RowSampleCollector: Send {
-    fn mut_base(&mut self) -> &mut BaseRowSampleCollector;
-    fn collect_column_group(
-        &mut self,
-        columns_val: &[Vec<u8>],
-        collation_keys_val: &[Vec<u8>],
-        columns_info: &[tipb::ColumnInfo],
-        column_groups: &[tipb::AnalyzeColumnGroup],
-    );
-    fn collect_column(
-        &mut self,
-        columns_val: Vec<Vec<u8>>,
-        collation_keys_val: Vec<Vec<u8>>,
-        columns_info: &[tipb::ColumnInfo],
-    );
-    fn sampling(&mut self, data: Vec<Vec<u8>>);
-    fn to_proto(&mut self) -> tipb::RowSampleCollector;
-    fn get_reported_memory_usage(&mut self) -> usize {
-        self.mut_base().reported_memory_usage
-    }
-    fn get_memory_usage(&mut self) -> usize {
-        self.mut_base().memory_usage
-    }
-}
-
 #[derive(Clone)]
-struct BaseRowSampleCollector {
+struct RowSampleCollector {
+    samples: BinaryHeap<Reverse<(i64, Vec<Vec<u8>>)>>,
     null_count: Vec<i64>,
     count: u64,
+    max_sample_size: usize,
     fm_sketches: Vec<FmSketch>,
     rng: StdRng,
     total_sizes: Vec<i64>,
     row_buf: Vec<u8>,
-    memory_usage: usize,
-    reported_memory_usage: usize,
 }
 
-impl Default for BaseRowSampleCollector {
+impl Default for RowSampleCollector {
     fn default() -> Self {
-        BaseRowSampleCollector {
+        RowSampleCollector {
+            samples: BinaryHeap::new(),
             null_count: vec![],
             count: 0,
+            max_sample_size: 0,
             fm_sketches: vec![],
             rng: StdRng::from_entropy(),
             total_sizes: vec![],
             row_buf: Vec::new(),
-            memory_usage: 0,
-            reported_memory_usage: 0,
         }
     }
 }
 
-impl BaseRowSampleCollector {
-    fn new(max_fm_sketch_size: usize, col_and_group_len: usize) -> BaseRowSampleCollector {
-        BaseRowSampleCollector {
+impl RowSampleCollector {
+    fn new(
+        max_sample_size: usize,
+        max_fm_sketch_size: usize,
+        col_and_group_len: usize,
+    ) -> RowSampleCollector {
+        RowSampleCollector {
+            samples: BinaryHeap::new(),
             null_count: vec![0; col_and_group_len],
             count: 0,
+            max_sample_size,
             fm_sketches: vec![FmSketch::new(max_fm_sketch_size); col_and_group_len],
             rng: StdRng::from_entropy(),
             total_sizes: vec![0; col_and_group_len],
             row_buf: Vec::new(),
-            memory_usage: 0,
-            reported_memory_usage: 0,
         }
     }
+
     pub fn collect_column_group(
         &mut self,
         columns_val: &[Vec<u8>],
@@ -534,7 +462,7 @@ impl BaseRowSampleCollector {
                     continue;
                 }
                 has_null = false;
-                self.total_sizes[col_len + i] += columns_val[*j as usize].len() as i64 - 1
+                self.total_sizes[col_len + i] += columns_val[*j as usize].len() as i64
             }
             // We only maintain the null count for single column case.
             if has_null && offsets.len() == 1 {
@@ -556,7 +484,7 @@ impl BaseRowSampleCollector {
 
     pub fn collect_column(
         &mut self,
-        columns_val: &[Vec<u8>],
+        columns_val: Vec<Vec<u8>>,
         collation_keys_val: Vec<Vec<u8>>,
         columns_info: &[tipb::ColumnInfo],
     ) {
@@ -570,199 +498,28 @@ impl BaseRowSampleCollector {
             } else {
                 self.fm_sketches[i].insert(&columns_val[i]);
             }
-            self.total_sizes[i] += columns_val[i].len() as i64 - 1;
+            self.total_sizes[i] += columns_val[i].len() as i64;
         }
-    }
-
-    pub fn fill_proto(&mut self, proto_collector: &mut tipb::RowSampleCollector) {
-        proto_collector.set_null_counts(self.null_count.clone());
-        proto_collector.set_count(self.count as i64);
-        let pb_fm_sketches = mem::take(&mut self.fm_sketches)
-            .into_iter()
-            .map(|fm_sketch| fm_sketch.into_proto())
-            .collect();
-        proto_collector.set_fm_sketch(pb_fm_sketches);
-        proto_collector.set_total_size(self.total_sizes.clone());
-    }
-
-    fn report_memory_usage(&mut self, on_finish: bool) {
-        let diff = self.memory_usage as isize - self.reported_memory_usage as isize;
-        if on_finish || diff.abs() > 1024 * 1024 {
-            let event = if diff >= 0 {
-                TraceEvent::Add(diff as usize)
-            } else {
-                TraceEvent::Sub(-diff as usize)
-            };
-            MEMTRACE_ANALYZE.trace(event);
-            self.reported_memory_usage = self.memory_usage;
-        }
-    }
-}
-
-#[derive(Clone)]
-struct BernoulliRowSampleCollector {
-    base: BaseRowSampleCollector,
-    samples: Vec<Vec<Vec<u8>>>,
-    sample_rate: f64,
-}
-
-impl BernoulliRowSampleCollector {
-    fn new(
-        sample_rate: f64,
-        max_fm_sketch_size: usize,
-        col_and_group_len: usize,
-    ) -> BernoulliRowSampleCollector {
-        BernoulliRowSampleCollector {
-            base: BaseRowSampleCollector::new(max_fm_sketch_size, col_and_group_len),
-            samples: Vec::new(),
-            sample_rate,
-        }
-    }
-}
-
-impl Default for BernoulliRowSampleCollector {
-    fn default() -> Self {
-        BernoulliRowSampleCollector {
-            base: Default::default(),
-            samples: Vec::new(),
-            sample_rate: 0.0,
-        }
-    }
-}
-
-impl RowSampleCollector for BernoulliRowSampleCollector {
-    fn mut_base(&mut self) -> &mut BaseRowSampleCollector {
-        &mut self.base
-    }
-    fn collect_column_group(
-        &mut self,
-        columns_val: &[Vec<u8>],
-        collation_keys_val: &[Vec<u8>],
-        columns_info: &[tipb::ColumnInfo],
-        column_groups: &[tipb::AnalyzeColumnGroup],
-    ) {
-        self.base.collect_column_group(
-            columns_val,
-            collation_keys_val,
-            columns_info,
-            column_groups,
-        );
-    }
-    fn collect_column(
-        &mut self,
-        columns_val: Vec<Vec<u8>>,
-        collation_keys_val: Vec<Vec<u8>>,
-        columns_info: &[tipb::ColumnInfo],
-    ) {
-        self.base
-            .collect_column(&columns_val, collation_keys_val, columns_info);
-        self.sampling(columns_val);
-    }
-    fn sampling(&mut self, data: Vec<Vec<u8>>) {
-        let cur_rng = self.base.rng.gen_range(0.0, 1.0);
-        if cur_rng >= self.sample_rate {
-            return;
-        }
-        self.base.memory_usage += data.iter().map(|x| x.capacity()).sum::<usize>();
-        self.base.report_memory_usage(false);
-        self.samples.push(data);
-    }
-    fn to_proto(&mut self) -> tipb::RowSampleCollector {
-        self.base.memory_usage = 0;
-        self.base.report_memory_usage(true);
-        let mut s = tipb::RowSampleCollector::default();
-        let samples = mem::take(&mut self.samples)
-            .into_iter()
-            .map(|row| {
-                let mut pb_sample = tipb::RowSample::default();
-                pb_sample.set_row(row.into());
-                pb_sample
-            })
-            .collect();
-        s.set_samples(samples);
-        self.base.fill_proto(&mut s);
-        s
-    }
-}
-
-#[derive(Clone, Default)]
-struct ReservoirRowSampleCollector {
-    base: BaseRowSampleCollector,
-    samples: BinaryHeap<Reverse<(i64, Vec<Vec<u8>>)>>,
-    max_sample_size: usize,
-}
-
-impl ReservoirRowSampleCollector {
-    fn new(
-        max_sample_size: usize,
-        max_fm_sketch_size: usize,
-        col_and_group_len: usize,
-    ) -> ReservoirRowSampleCollector {
-        ReservoirRowSampleCollector {
-            base: BaseRowSampleCollector::new(max_fm_sketch_size, col_and_group_len),
-            samples: BinaryHeap::new(),
-            max_sample_size,
-        }
-    }
-}
-
-impl RowSampleCollector for ReservoirRowSampleCollector {
-    fn mut_base(&mut self) -> &mut BaseRowSampleCollector {
-        &mut self.base
-    }
-    fn collect_column_group(
-        &mut self,
-        columns_val: &[Vec<u8>],
-        collation_keys_val: &[Vec<u8>],
-        columns_info: &[tipb::ColumnInfo],
-        column_groups: &[tipb::AnalyzeColumnGroup],
-    ) {
-        self.base.collect_column_group(
-            columns_val,
-            collation_keys_val,
-            columns_info,
-            column_groups,
-        );
-    }
-
-    fn collect_column(
-        &mut self,
-        columns_val: Vec<Vec<u8>>,
-        collation_keys_val: Vec<Vec<u8>>,
-        columns_info: &[tipb::ColumnInfo],
-    ) {
-        self.base
-            .collect_column(&columns_val, collation_keys_val, columns_info);
         self.sampling(columns_val);
     }
 
-    fn sampling(&mut self, data: Vec<Vec<u8>>) {
-        // We should tolerate the abnormal case => `self.max_sample_size == 0`.
-        if self.max_sample_size == 0 {
-            return;
-        }
-        let mut need_push = false;
-        let cur_rng = self.base.rng.gen_range(0, i64::MAX);
+    pub fn sampling(&mut self, data: Vec<Vec<u8>>) {
+        let cur_rng = self.rng.gen_range(0, i64::MAX);
         if self.samples.len() < self.max_sample_size {
-            need_push = true;
-        } else if self.samples.peek().unwrap().0.0 < cur_rng {
-            need_push = true;
-            let (_, evicted) = self.samples.pop().unwrap().0;
-            self.base.memory_usage -= evicted.iter().map(|x| x.capacity()).sum::<usize>();
-        }
-
-        if need_push {
-            self.base.memory_usage += data.iter().map(|x| x.capacity()).sum::<usize>();
             self.samples.push(Reverse((cur_rng, data)));
-            self.base.report_memory_usage(false);
+            return;
+        }
+        if self.samples.len() == self.max_sample_size && self.samples.peek().unwrap().0.0 < cur_rng
+        {
+            self.samples.pop();
+            self.samples.push(Reverse((cur_rng, data)));
         }
     }
 
-    fn to_proto(&mut self) -> tipb::RowSampleCollector {
-        self.base.memory_usage = 0;
-        self.base.report_memory_usage(true);
+    pub fn into_proto(self) -> tipb::RowSampleCollector {
         let mut s = tipb::RowSampleCollector::default();
-        let samples = mem::take(&mut self.samples)
+        let samples = self
+            .samples
             .into_iter()
             .map(|r_tuple| {
                 let mut pb_sample = tipb::RowSample::default();
@@ -772,20 +529,21 @@ impl RowSampleCollector for ReservoirRowSampleCollector {
             })
             .collect();
         s.set_samples(samples);
-        self.base.fill_proto(&mut s);
+        s.set_null_counts(self.null_count);
+        s.set_count(self.count as i64);
+        let pb_fm_sketches = self
+            .fm_sketches
+            .into_iter()
+            .map(|fm_sketch| fm_sketch.into_proto())
+            .collect();
+        s.set_fm_sketch(pb_fm_sketches);
+        s.set_total_size(self.total_sizes);
         s
     }
 }
 
-impl Drop for BaseRowSampleCollector {
-    fn drop(&mut self) {
-        self.memory_usage = 0;
-        self.report_memory_usage(true);
-    }
-}
-
 struct SampleBuilder<S: Snapshot> {
-    data: BatchTableScanExecutor<TikvStorage<SnapshotStore<S>>>,
+    data: BatchTableScanExecutor<TiKVStorage<SnapshotStore<S>>>,
 
     max_bucket_size: usize,
     max_sample_size: usize,
@@ -806,7 +564,7 @@ impl<S: Snapshot> SampleBuilder<S> {
     fn new(
         mut req: AnalyzeColumnsReq,
         common_handle_req: Option<tipb::AnalyzeIndexReq>,
-        storage: TikvStorage<SnapshotStore<S>>,
+        storage: TiKVStorage<SnapshotStore<S>>,
         ranges: Vec<KeyRange>,
     ) -> Result<Self> {
         let columns_info: Vec<_> = req.take_columns_info().into();
@@ -843,25 +601,26 @@ impl<S: Snapshot> SampleBuilder<S> {
                 .map_or_else(|| 0_usize, |req| req.get_top_n_size() as usize),
             common_handle_col_ids: common_handle_ids,
             columns_info,
-            analyze_common_handle: common_handle_req.is_some(),
+            analyze_common_handle: common_handle_req != None,
         })
     }
 
-    // `collect_columns_stats` returns the sample collectors which contain total
-    // count, null count, distinct values count and count-min sketch. And it
-    // also returns the statistic builder for PK which contains the histogram.
-    // When PK is common handle, it returns index stats for PK.
+    // `collect_columns_stats` returns the sample collectors which contain total count,
+    // null count, distinct values count and count-min sketch. And it also returns the statistic
+    // builder for PK which contains the histogram. When PK is common handle, it returns index stats
+    // for PK.
     // See https://en.wikipedia.org/wiki/Reservoir_sampling
     async fn collect_columns_stats(
         &mut self,
     ) -> Result<(AnalyzeColumnsResult, Option<AnalyzeIndexResult>)> {
-        use tidb_query_datatype::{codec::collation::Collator, match_template_collator};
+        use tidb_query_datatype::codec::collation::Collator;
+        use tidb_query_datatype::match_template_collator;
         let columns_without_handle_len =
             self.columns_info.len() - self.columns_info[0].get_pk_handle() as usize;
 
         // The number of columns need to be sampled is `columns_without_handle_len`.
-        // It equals to `columns_info.len()` if the first column doesn't contain a
-        // handle. Otherwise, it equals to `columns_info.len() - 1`.
+        // It equals to `columns_info.len()` if the first column doesn't contain a handle.
+        // Otherwise, it equals to `columns_info.len() - 1`.
         let mut pk_builder = Histogram::new(self.max_bucket_size);
         let mut collectors = vec![
             SampleCollector::new(
@@ -873,12 +632,18 @@ impl<S: Snapshot> SampleBuilder<S> {
             columns_without_handle_len
         ];
         let mut is_drained = false;
+        let mut time_slice_start = Instant::now();
         let mut common_handle_hist = Histogram::new(self.max_bucket_size);
         let mut common_handle_cms = CmSketch::new(self.cm_sketch_depth, self.cm_sketch_width);
         let mut common_handle_fms = FmSketch::new(self.max_fm_sketch_size);
         while !is_drained {
-            let result = self.data.next_batch(BATCH_MAX_SIZE).await;
-            is_drained = result.is_drained?.stop();
+            let time_slice_elapsed = time_slice_start.saturating_elapsed();
+            if time_slice_elapsed > MAX_TIME_SLICE {
+                reschedule().await;
+                time_slice_start = Instant::now();
+            }
+            let result = self.data.next_batch(BATCH_MAX_SIZE);
+            is_drained = result.is_drained?;
 
             let mut columns_slice = result.physical_columns.as_slice();
             let mut columns_info = &self.columns_info[..];
@@ -898,9 +663,9 @@ impl<S: Snapshot> SampleBuilder<S> {
             }
 
             if self.analyze_common_handle {
-                // cur_val recording the current value's data and its counts when iterating
-                // index's rows. Once we met a new value, the old value will be pushed into the
-                // topn_heap to maintain the top-n information.
+                // cur_val recording the current value's data and its counts when iterating index's rows.
+                // Once we met a new value, the old value will be pushed into the topn_heap to maintain the
+                // top-n information.
                 let mut cur_val: (u32, Vec<u8>) = (0, vec![]);
                 let mut topn_heap = BinaryHeap::new();
                 for logical_row in &result.logical_rows {
@@ -962,21 +727,16 @@ impl<S: Snapshot> SampleBuilder<S> {
                         &mut val,
                     )?;
 
-                    // This is a workaround for different encoding methods used by TiDB and TiKV for
-                    // CM Sketch. We need this because we must ensure we are using the same encoding
-                    // method when we are querying values from CM Sketch (in TiDB) and inserting
-                    // values into CM Sketch (here).
-                    // We are inserting raw bytes from TableScanExecutor into CM Sketch here and
-                    // query CM Sketch using bytes encoded by tablecodec.EncodeValue() in TiDB.
-                    // Their results are different after row format becomes ver 2.
+                    // This is a workaround for different encoding methods used by TiDB and TiKV for CM Sketch.
+                    // We need this because we must ensure we are using the same encoding method when we are querying values from
+                    //   CM Sketch (in TiDB) and inserting values into CM Sketch (here).
+                    // We are inserting raw bytes from TableScanExecutor into CM Sketch here and query CM Sketch using bytes
+                    //   encoded by tablecodec.EncodeValue() in TiDB. Their results are different after row format becomes ver 2.
                     //
-                    // Here we:
-                    // - convert INT bytes to VAR_INT bytes
-                    // - convert UINT bytes to VAR_UINT bytes
-                    // - "flatten" the duration value from DURATION bytes into i64 value, then
-                    //   convert it to VAR_INT bytes.
-                    // These are the only 3 cases we need to care about according to TiDB's
-                    // tablecodec.EncodeValue() and TiKV's V1CompatibleEncoder::write_v2_as_datum().
+                    // Here we (1) convert INT bytes to VAR_INT bytes, (2) convert UINT bytes to VAR_UINT bytes,
+                    //   and (3) "flatten" the duration value from DURATION bytes into i64 value, then convert it to VAR_INT bytes.
+                    // These are the only 3 cases we need to care about according to TiDB's tablecodec.EncodeValue() and
+                    //   TiKV's V1CompatibleEncoder::write_v2_as_datum().
                     val = match val[0] {
                         INT_FLAG | UINT_FLAG | DURATION_FLAG => {
                             let mut mut_val = &val[..];
@@ -1025,8 +785,7 @@ impl<S: Snapshot> SampleBuilder<S> {
     }
 }
 
-/// `SampleCollector` will collect Samples and calculate the count, ndv and
-/// total size of an attribute.
+/// `SampleCollector` will collect Samples and calculate the count, ndv and total size of an attribute.
 #[derive(Clone)]
 struct SampleCollector {
     samples: Vec<Vec<u8>>,
@@ -1081,7 +840,7 @@ impl SampleCollector {
         if let Some(c) = self.cm_sketch.as_mut() {
             c.insert(&data);
         }
-        self.total_size += data.len() as u64 - 1;
+        self.total_size += data.len() as u64;
         if self.samples.len() < self.max_sample_size {
             self.samples.push(data);
             return;
@@ -1095,28 +854,23 @@ impl SampleCollector {
     }
 }
 
+#[derive(Default)]
 struct AnalyzeSamplingResult {
-    row_sample_collector: Box<dyn RowSampleCollector>,
+    row_sample_collector: RowSampleCollector,
 }
 
 impl AnalyzeSamplingResult {
-    fn new(row_sample_collector: Box<dyn RowSampleCollector>) -> AnalyzeSamplingResult {
+    fn new(row_sample_collector: RowSampleCollector) -> AnalyzeSamplingResult {
         AnalyzeSamplingResult {
             row_sample_collector,
         }
     }
 
-    fn into_proto(mut self) -> tipb::AnalyzeColumnsResp {
-        let pb_collector = self.row_sample_collector.to_proto();
+    fn into_proto(self) -> tipb::AnalyzeColumnsResp {
+        let pb_collector = self.row_sample_collector.into_proto();
         let mut res = tipb::AnalyzeColumnsResp::default();
         res.set_row_collector(pb_collector);
         res
-    }
-}
-
-impl Default for AnalyzeSamplingResult {
-    fn default() -> Self {
-        AnalyzeSamplingResult::new(Box::<ReservoirRowSampleCollector>::default())
     }
 }
 
@@ -1199,10 +953,11 @@ impl AnalyzeMixedResult {
 
 #[cfg(test)]
 mod tests {
-    use ::std::collections::HashMap;
-    use tidb_query_datatype::codec::{datum, datum::Datum};
-
     use super::*;
+
+    use ::std::collections::HashMap;
+    use tidb_query_datatype::codec::datum;
+    use tidb_query_datatype::codec::datum::Datum;
 
     #[test]
     fn test_sample_collector() {
@@ -1225,11 +980,11 @@ mod tests {
         assert_eq!(sample.null_count, 1);
         assert_eq!(sample.count, 3);
         assert_eq!(sample.cm_sketch.unwrap().count(), 3);
-        assert_eq!(sample.total_size, 3)
+        assert_eq!(sample.total_size, 6)
     }
 
     #[test]
-    fn test_row_reservoir_sample_collector() {
+    fn test_row_sample_collector() {
         let sample_num = 20;
         let row_num = 100;
         let loop_cnt = 1000;
@@ -1240,31 +995,16 @@ mod tests {
                 datum::encode_value(&mut EvalContext::default(), &[Datum::I64(i as i64)]).unwrap(),
             );
         }
-        for loop_i in 0..loop_cnt {
-            let mut collector = ReservoirRowSampleCollector::new(sample_num, 1000, 1);
+        for _loop_i in 0..loop_cnt {
+            let mut collector = RowSampleCollector::new(sample_num, 1000, 1);
             for row in &nums {
                 collector.sampling([row.clone()].to_vec());
             }
             assert_eq!(collector.samples.len(), sample_num);
-            for sample in &collector.samples {
+            for sample in collector.samples.into_vec() {
                 *item_cnt.entry(sample.0.1[0].clone()).or_insert(0) += 1;
             }
-
-            // Test memory usage tracing is correct.
-            collector.mut_base().report_memory_usage(true);
-            assert_eq!(
-                collector.get_reported_memory_usage(),
-                collector.get_memory_usage()
-            );
-            if loop_i % 2 == 0 {
-                collector.to_proto();
-                assert_eq!(collector.get_memory_usage(), 0);
-                assert_eq!(MEMTRACE_ANALYZE.sum(), 0);
-            }
-            drop(collector);
-            assert_eq!(MEMTRACE_ANALYZE.sum(), 0);
         }
-
         let exp_freq = sample_num as f64 * loop_cnt as f64 / row_num as f64;
         let delta = 0.5;
         for (_, v) in item_cnt.into_iter() {
@@ -1273,83 +1013,6 @@ mod tests {
                 "v: {}",
                 v
             );
-        }
-    }
-
-    #[test]
-    fn test_row_bernoulli_sample_collector() {
-        let sample_num = 20;
-        let row_num = 100;
-        let loop_cnt = 1000;
-        let mut item_cnt: HashMap<Vec<u8>, usize> = HashMap::new();
-        let mut nums: Vec<Vec<u8>> = Vec::with_capacity(row_num);
-        for i in 0..row_num {
-            nums.push(
-                datum::encode_value(&mut EvalContext::default(), &[Datum::I64(i as i64)]).unwrap(),
-            );
-        }
-        for loop_i in 0..loop_cnt {
-            let mut collector =
-                BernoulliRowSampleCollector::new(sample_num as f64 / row_num as f64, 1000, 1);
-            for row in &nums {
-                collector.sampling([row.clone()].to_vec());
-            }
-            for sample in &collector.samples {
-                *item_cnt.entry(sample[0].clone()).or_insert(0) += 1;
-            }
-
-            // Test memory usage tracing is correct.
-            collector.mut_base().report_memory_usage(true);
-            assert_eq!(
-                collector.get_reported_memory_usage(),
-                collector.get_memory_usage()
-            );
-            if loop_i % 2 == 0 {
-                collector.to_proto();
-                assert_eq!(collector.get_memory_usage(), 0);
-                assert_eq!(MEMTRACE_ANALYZE.sum(), 0);
-            }
-            drop(collector);
-            assert_eq!(MEMTRACE_ANALYZE.sum(), 0);
-        }
-
-        let exp_freq = sample_num as f64 * loop_cnt as f64 / row_num as f64;
-        let delta = 0.5;
-        for (_, v) in item_cnt.into_iter() {
-            assert!(
-                v as f64 >= exp_freq / (1.0 + delta) && v as f64 <= exp_freq * (1.0 + delta),
-                "v: {}",
-                v
-            );
-        }
-    }
-
-    #[test]
-    fn test_abnormal_sampling() {
-        let sample_num = 0; // abnormal.
-        let row_num = 100;
-        let mut nums: Vec<Vec<u8>> = Vec::with_capacity(row_num);
-        for i in 0..row_num {
-            nums.push(
-                datum::encode_value(&mut EvalContext::default(), &[Datum::I64(i as i64)]).unwrap(),
-            );
-        }
-        {
-            // Test for ReservoirRowSampleCollector
-            let mut collector = ReservoirRowSampleCollector::new(sample_num, 1000, 1);
-            for row in &nums {
-                collector.sampling([row.clone()].to_vec());
-            }
-            assert_eq!(collector.samples.len(), 0);
-        }
-        {
-            // Test for BernoulliRowSampleCollector
-            let mut collector =
-                BernoulliRowSampleCollector::new(sample_num as f64 / row_num as f64, 1000, 1);
-            for row in &nums {
-                collector.sampling([row.clone()].to_vec());
-            }
-            assert_eq!(collector.samples.len(), 0);
         }
     }
 }

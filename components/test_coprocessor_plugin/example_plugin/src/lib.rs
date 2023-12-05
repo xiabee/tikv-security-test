@@ -1,8 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::ops::Range;
-
 use coprocessor_plugin_api::*;
+use std::ops::Range;
 
 #[derive(Default)]
 struct ExamplePlugin;

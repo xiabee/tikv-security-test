@@ -2,12 +2,17 @@
 
 use std::sync::Arc;
 
-use criterion::{black_box, measurement::Measurement};
-use tidb_query_datatype::expr::EvalConfig;
-use tidb_query_executors::BatchTopNExecutor;
+use criterion::black_box;
+use criterion::measurement::Measurement;
+
 use tipb::Expr;
 
-use crate::util::{bencher::Bencher, FixtureBuilder};
+use tidb_query_datatype::expr::EvalConfig;
+use tidb_query_executors::BatchTopNExecutor;
+
+use crate::util::bencher::Bencher;
+
+use crate::util::FixtureBuilder;
 
 pub trait TopNBencher<M>
 where
@@ -17,7 +22,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         fb: &FixtureBuilder,
         order_by_expr: &[Expr],
         order_is_desc: &[bool],
@@ -51,7 +56,7 @@ where
 
     fn bench(
         &self,
-        b: &mut criterion::Bencher<'_, M>,
+        b: &mut criterion::Bencher<M>,
         fb: &FixtureBuilder,
         order_by_expr: &[Expr],
         order_is_desc: &[bool],

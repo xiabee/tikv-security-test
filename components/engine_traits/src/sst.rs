@@ -1,13 +1,12 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{path::PathBuf, sync::Arc};
-
+use crate::errors::Result;
+use crate::iterable::Iterable;
 use kvproto::import_sstpb::SstMeta;
-
-use crate::{errors::Result, EncryptionKeyManager, RefIterable};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
-pub struct SstMetaInfo {
+pub struct SSTMetaInfo {
     pub total_bytes: u64,
     pub total_kvs: u64,
     pub meta: SstMeta,
@@ -20,10 +19,11 @@ pub trait SstExt: Sized {
 }
 
 /// SstReader is used to read an SST file.
-pub trait SstReader: RefIterable + Sized {
+pub trait SstReader: Iterable + Sized {
     fn open(path: &str) -> Result<Self>;
-    fn open_encrypted<E: EncryptionKeyManager>(path: &str, mgr: Arc<E>) -> Result<Self>;
     fn verify_checksum(&self) -> Result<()>;
+    // FIXME: Shouldn't this me a method on Iterable?
+    fn iter(&self) -> Self::Iterator;
 }
 
 /// SstWriter is used to create sst files that can be added to database later.
@@ -66,22 +66,17 @@ where
     fn new() -> Self;
 
     /// Set DB for the builder. The builder may need some config from the DB.
-    #[must_use]
     fn set_db(self, db: &E) -> Self;
 
     /// Set CF for the builder. The builder may need some config from the CF.
-    #[must_use]
     fn set_cf(self, cf: &str) -> Self;
 
     /// Set it to true, the builder builds a in-memory SST builder.
-    #[must_use]
     fn set_in_memory(self, in_memory: bool) -> Self;
 
     /// set other config specified by writer
-    #[must_use]
     fn set_compression_type(self, compression: Option<SstCompressionType>) -> Self;
 
-    #[must_use]
     fn set_compression_level(self, level: i32) -> Self;
 
     /// Builder a SstWriter.
