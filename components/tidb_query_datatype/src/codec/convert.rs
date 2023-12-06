@@ -1,22 +1,23 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::borrow::Cow;
-use std::fmt::Display;
-use std::{self, char, i16, i32, i64, i8, str, u16, u32, u64, u8};
+use std::{borrow::Cow, fmt::Display};
 
-// use crate::{self, FieldTypeTp, UNSPECIFIED_LENGTH};
-use crate::{Collation, FieldTypeAccessor};
-use crate::{FieldTypeTp, UNSPECIFIED_LENGTH};
 use tipb::FieldType;
 
-use super::mysql::{RoundMode, DEFAULT_FSP};
-use super::{Error, Result};
-use crate::codec::data_type::*;
-use crate::codec::error::ERR_DATA_OUT_OF_RANGE;
-use crate::codec::mysql::decimal::max_or_min_dec;
-use crate::codec::mysql::{charset, Res};
-use crate::expr::EvalContext;
-use crate::expr::Flag;
+use super::{
+    mysql::{RoundMode, DEFAULT_FSP},
+    Error, Result,
+};
+// use crate::{self, FieldTypeTp, UNSPECIFIED_LENGTH};
+use crate::{
+    codec::{
+        data_type::*,
+        error::ERR_DATA_OUT_OF_RANGE,
+        mysql::{charset, decimal::max_or_min_dec, Res},
+    },
+    expr::{EvalContext, Flag},
+    Collation, FieldTypeAccessor, FieldTypeTp, UNSPECIFIED_LENGTH,
+};
 
 /// A trait for converting a value to an `Int`.
 pub trait ToInt {
@@ -532,12 +533,12 @@ impl<'a> ToInt for JsonRef<'a> {
 
 #[inline]
 pub fn get_valid_utf8_prefix<'a>(ctx: &mut EvalContext, bytes: &'a [u8]) -> Result<&'a str> {
-    let valid = match str::from_utf8(bytes) {
+    let valid = match std::str::from_utf8(bytes) {
         Ok(s) => s,
         Err(err) => {
             ctx.handle_truncate(true)?;
             let (valid, _) = bytes.split_at(err.valid_up_to());
-            unsafe { str::from_utf8_unchecked(valid) }
+            unsafe { std::str::from_utf8_unchecked(valid) }
         }
     };
     Ok(valid)
@@ -676,7 +677,7 @@ pub fn produce_float_with_specified_tp(
     let ul = crate::UNSPECIFIED_LENGTH;
 
     let res = if flen != ul && decimal != ul {
-        assert!(flen < std::u8::MAX as isize && decimal < std::u8::MAX as isize);
+        assert!(flen < u8::MAX as isize && decimal < u8::MAX as isize);
         let r = truncate_f64(num, flen as u8, decimal as u8);
         r.into_result_with_overflow_err(ctx, Error::overflow(num, "DOUBLE"))?
     } else {
@@ -693,10 +694,6 @@ pub fn produce_float_with_specified_tp(
 
 /// `produce_str_with_specified_tp`(`ProduceStrWithSpecifiedTp` in TiDB) produces
 /// a new string according to `flen` and `chs`.
-///
-/// # Panics
-///
-/// The s must represent a valid str, otherwise, panic!
 pub fn produce_str_with_specified_tp<'a>(
     ctx: &mut EvalContext,
     s: Cow<'a, [u8]>,
@@ -711,20 +708,21 @@ pub fn produce_str_with_specified_tp<'a>(
     // flen is the char length, not byte length, for UTF8 charset, we need to calculate the
     // char count and truncate to flen chars if it is too long.
     if chs == charset::CHARSET_UTF8 || chs == charset::CHARSET_UTF8MB4 {
-        let truncate_info = {
-            // In TiDB's version, the param `s` is a string,
-            // so we can unwrap directly here because we need the `s` represent a valid str
-            let s: &str = std::str::from_utf8(s.as_ref()).unwrap();
-            let mut indices = s.char_indices().skip(flen);
-            indices.next().map(|(truncate_pos, _)| {
-                let char_count = flen + 1 + indices.count();
-                (char_count, truncate_pos)
-            })
+        let (char_count, truncate_pos) = {
+            let s = &String::from_utf8_lossy(&s);
+            let mut truncate_pos = 0;
+            s.chars().take(flen).for_each(|utf8_char| {
+                if utf8_char == char::REPLACEMENT_CHARACTER {
+                    truncate_pos += 1;
+                } else {
+                    truncate_pos += utf8_char.len_utf8();
+                }
+            });
+            (s.chars().count(), truncate_pos)
         };
-        if truncate_info.is_none() {
+        if char_count <= flen {
             return Ok(s);
         }
-        let (char_count, truncate_pos) = truncate_info.unwrap();
         ctx.handle_truncate_err(Error::data_too_long(format!(
             "Data Too Long, field len {}, data len {}",
             flen, char_count
@@ -806,9 +804,9 @@ impl ConvertTo<f64> for &[u8] {
         if val.is_infinite() {
             ctx.handle_truncate_err(Error::truncated_wrong_val("DOUBLE", &vs))?;
             if val.is_sign_negative() {
-                return Ok(std::f64::MIN);
+                return Ok(f64::MIN);
             } else {
-                return Ok(std::f64::MAX);
+                return Ok(f64::MAX);
             }
         }
         Ok(val)
@@ -979,7 +977,7 @@ fn exp_float_str_to_int_str<'a>(
     let int_cnt: i64;
     match dot_idx {
         None => {
-            digits.extend_from_slice(&valid_float[..e_idx].as_bytes());
+            digits.extend_from_slice(valid_float[..e_idx].as_bytes());
             // if digits.len() > i64::MAX,
             // then the input str has at least 9223372036854775808 chars,
             // which make the str >= 8388608.0 TB,
@@ -987,9 +985,9 @@ fn exp_float_str_to_int_str<'a>(
             int_cnt = digits.len() as i64;
         }
         Some(dot_idx) => {
-            digits.extend_from_slice(&valid_float[..dot_idx].as_bytes());
+            digits.extend_from_slice(valid_float[..dot_idx].as_bytes());
             int_cnt = digits.len() as i64;
-            digits.extend_from_slice(&valid_float[(dot_idx + 1)..e_idx].as_bytes());
+            digits.extend_from_slice(valid_float[(dot_idx + 1)..e_idx].as_bytes());
         }
     }
     // make `digits` immutable
@@ -1102,18 +1100,20 @@ fn no_exp_float_str_to_int_str(valid_float: &str, mut dot_idx: usize) -> Cow<'_,
 mod tests {
     #![allow(clippy::float_cmp)]
 
-    use std::fmt::Debug;
-    use std::sync::Arc;
-    use std::{f64, i64, isize, u64};
-
-    use crate::codec::error::{
-        ERR_DATA_OUT_OF_RANGE, ERR_M_BIGGER_THAN_D, ERR_TRUNCATE_WRONG_VALUE, WARN_DATA_TRUNCATED,
-    };
-    use crate::codec::mysql::{Res, UNSPECIFIED_FSP};
-    use crate::expr::{EvalConfig, EvalContext, Flag};
-    use crate::{Collation, FieldTypeFlag};
+    use std::{fmt::Debug, sync::Arc};
 
     use super::*;
+    use crate::{
+        codec::{
+            error::{
+                ERR_DATA_OUT_OF_RANGE, ERR_M_BIGGER_THAN_D, ERR_TRUNCATE_WRONG_VALUE,
+                WARN_DATA_TRUNCATED,
+            },
+            mysql::{Res, UNSPECIFIED_FSP},
+        },
+        expr::{EvalConfig, EvalContext, Flag},
+        Collation, FieldTypeFlag,
+    };
 
     #[test]
     fn test_int_to_int() {
@@ -2217,6 +2217,41 @@ mod tests {
 
             let p = r.unwrap();
             assert_eq!(p.len(), char_num as usize, "{}, {}, {}", s, char_num, cs);
+        }
+
+        // test with invalid utf8 characters 0x80 and 0x81
+        let test_vec = vec![0xE4, 0xBD, 0xA0, 0x80, 0x81, 0xE4, 0xBD, 0xA0];
+        let cases = vec![
+            (
+                test_vec.clone(),
+                1,
+                charset::CHARSET_UTF8,
+                vec![0xE4, 0xBD, 0xA0],
+            ),
+            (
+                test_vec.clone(),
+                2,
+                charset::CHARSET_UTF8,
+                vec![0xE4, 0xBD, 0xA0, 0x80],
+            ),
+            (
+                test_vec.clone(),
+                3,
+                charset::CHARSET_UTF8,
+                vec![0xE4, 0xBD, 0xA0, 0x80, 0x81],
+            ),
+            (test_vec.clone(), 4, charset::CHARSET_UTF8, test_vec.clone()),
+            (test_vec.clone(), 5, charset::CHARSET_UTF8, test_vec),
+        ];
+
+        for (s, char_num, cs, result) in cases {
+            ft.set_charset(cs.to_string());
+            ft.set_flen(char_num);
+            let r = produce_str_with_specified_tp(&mut ctx, Cow::Borrowed(&s), &ft, true);
+            assert!(r.is_ok(), "{:?}, {}, {}, {:?}", &s, char_num, cs, result);
+
+            let p = r.unwrap();
+            assert_eq!(p, result, "{:?}, {}, {}, {:?}", &s, char_num, cs, result);
         }
     }
 

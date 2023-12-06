@@ -19,18 +19,20 @@
 //! * null column ids: when flag == 1 (big), id is 4 bytes, otherwise 1 byte
 //! * non-null values offset: when big, offset is 4 bytes, otherwise 2 bytes
 
-use crate::codec::{
-    data_type::ScalarValue,
-    mysql::{decimal::DecimalEncoder, json::JsonEncoder},
-    Error, Result,
-};
+use std::{i16, i32, i8, u16, u32, u8};
 
-use crate::{FieldTypeAccessor, FieldTypeFlag, FieldTypeTp};
+use codec::prelude::*;
 use tipb::FieldType;
 
-use crate::expr::EvalContext;
-use codec::prelude::*;
-use std::{i16, i32, i8, u16, u32, u8};
+use crate::{
+    codec::{
+        data_type::ScalarValue,
+        mysql::{decimal::DecimalEncoder, json::JsonEncoder},
+        Error, Result,
+    },
+    expr::EvalContext,
+    FieldTypeAccessor, FieldTypeFlag, FieldTypeTp,
+};
 
 const MAX_I8: i64 = i8::MAX as i64;
 const MIN_I8: i64 = i8::MIN as i64;
@@ -62,6 +64,7 @@ impl Column {
         &self.ft
     }
 
+    #[must_use]
     pub fn with_tp(mut self, tp: FieldTypeTp) -> Self {
         self.ft.as_mut_accessor().set_tp(tp);
         self
@@ -71,11 +74,13 @@ impl Column {
         self.ft.is_unsigned()
     }
 
+    #[must_use]
     pub fn with_unsigned(mut self) -> Self {
         self.ft.as_mut_accessor().set_flag(FieldTypeFlag::UNSIGNED);
         self
     }
 
+    #[must_use]
     pub fn with_decimal(mut self, decimal: isize) -> Self {
         self.ft.as_mut_accessor().set_decimal(decimal);
         self
@@ -217,18 +222,21 @@ impl<T: BufferWriter> ScalarValueEncoder for T {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Column, RowEncoder};
-    use crate::codec::{
-        data_type::ScalarValue,
-        mysql::{duration::NANOS_PER_SEC, Decimal, Duration, Json, Time},
-    };
-    use crate::expr::EvalContext;
     use std::str::FromStr;
+
+    use super::{Column, RowEncoder};
+    use crate::{
+        codec::{
+            data_type::ScalarValue,
+            mysql::{duration::NANOS_PER_SEC, Decimal, Duration, Json, Time},
+        },
+        expr::EvalContext,
+    };
 
     #[test]
     fn test_encode_unsigned() {
         let cols = vec![
-            Column::new(1, std::u64::MAX as i64).with_unsigned(),
+            Column::new(1, u64::MAX as i64).with_unsigned(),
             Column::new(2, -1),
         ];
         let exp: Vec<u8> = vec![

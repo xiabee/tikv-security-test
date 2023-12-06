@@ -1,31 +1,33 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::fmt::{self, Debug, Display, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use engine_rocks::file_system::get_env as get_inspected_env;
-use engine_rocks::raw::DBOptions;
-use engine_rocks::raw_util::CFOptions;
-use engine_rocks::{RocksEngine as BaseRocksEngine, RocksEngineIterator};
-use engine_traits::CfName;
-use engine_traits::{
-    Engines, IterOptions, Iterable, Iterator, KvEngine, Peekable, ReadOptions, SeekKey,
-};
-use file_system::IORateLimiter;
-use kvproto::kvrpcpb::Context;
-use tempfile::{Builder, TempDir};
-use txn_types::{Key, Value};
-
-use tikv_util::worker::{Runnable, Scheduler, Worker};
-
-use super::{
-    write_modifies, Callback, CbContext, Engine, Error, ErrorInner, ExtCallback,
-    Iterator as EngineIterator, Modify, Result, SnapContext, Snapshot, WriteData,
+use std::{
+    fmt::{self, Debug, Display, Formatter},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 pub use engine_rocks::RocksSnapshot;
+use engine_rocks::{
+    get_env, raw::DBOptions, raw_util::CFOptions, RocksEngine as BaseRocksEngine,
+    RocksEngineIterator,
+};
+use engine_traits::{
+    CfName, Engines, IterOptions, Iterable, Iterator, KvEngine, Peekable, ReadOptions, SeekKey,
+};
+use file_system::IORateLimiter;
+use kvproto::{kvrpcpb::Context, metapb, raft_cmdpb};
+use raftstore::coprocessor::CoprocessorHost;
+use tempfile::{Builder, TempDir};
+use tikv_util::worker::{Runnable, Scheduler, Worker};
+use txn_types::{Key, Value};
+
+use super::{
+    write_modifies, Callback, DummySnapshotExt, Engine, Error, ErrorInner, ExtCallback,
+    Iterator as EngineIterator, Modify, Result, SnapContext, Snapshot, WriteData,
+};
 
 // Duplicated in test_engine_builder
 const TEMP_DIR: &str = "";
@@ -53,10 +55,8 @@ impl Runnable for Runner {
 
     fn run(&mut self, t: Task) {
         match t {
-            Task::Write(modifies, cb) => {
-                cb((CbContext::new(), write_modifies(&self.0.kv, modifies)))
-            }
-            Task::Snapshot(cb) => cb((CbContext::new(), Ok(Arc::new(self.0.kv.snapshot())))),
+            Task::Write(modifies, cb) => cb(write_modifies(&self.0.kv, modifies)),
+            Task::Snapshot(cb) => cb(Ok(Arc::new(self.0.kv.snapshot()))),
             Task::Pause(dur) => std::thread::sleep(dur),
         }
     }
@@ -83,6 +83,7 @@ pub struct RocksEngine {
     sched: Scheduler<Task>,
     engines: Engines<BaseRocksEngine, BaseRocksEngine>,
     not_leader: Arc<AtomicBool>,
+    coprocessor: CoprocessorHost<BaseRocksEngine>,
 }
 
 impl RocksEngine {
@@ -92,6 +93,7 @@ impl RocksEngine {
         cfs_opts: Option<Vec<CFOptions<'_>>>,
         shared_block_cache: bool,
         io_rate_limiter: Option<Arc<IORateLimiter>>,
+        db_opts: Option<DBOptions>,
     ) -> Result<RocksEngine> {
         info!("RocksEngine: creating for path"; "path" => path);
         let (path, temp_dir) = match path {
@@ -102,9 +104,11 @@ impl RocksEngine {
             _ => (path.to_owned(), None),
         };
         let worker = Worker::new("engine-rocksdb");
-        let mut db_opts = DBOptions::new();
-        let env = get_inspected_env(None, io_rate_limiter).unwrap();
-        db_opts.set_env(env);
+        let mut db_opts = db_opts.unwrap_or_else(|| DBOptions::new());
+        if io_rate_limiter.is_some() {
+            db_opts.set_env(get_env(None /*key_manager*/, io_rate_limiter).unwrap());
+        }
+
         let db = Arc::new(engine_rocks::raw_util::new_engine(
             &path,
             Some(db_opts),
@@ -124,11 +128,21 @@ impl RocksEngine {
             core: Arc::new(Mutex::new(RocksEngineCore { temp_dir, worker })),
             not_leader: Arc::new(AtomicBool::new(false)),
             engines,
+            coprocessor: CoprocessorHost::default(),
         })
     }
 
     pub fn trigger_not_leader(&self) {
         self.not_leader.store(true, Ordering::SeqCst);
+    }
+
+    fn not_leader_error(&self) -> Error {
+        let not_leader = {
+            let mut header = kvproto::errorpb::Error::default();
+            header.mut_not_leader().set_region_id(100);
+            header
+        };
+        Error::from(ErrorInner::Request(not_leader))
     }
 
     pub fn pause(&self, dur: Duration) {
@@ -146,6 +160,35 @@ impl RocksEngine {
     pub fn stop(&self) {
         let core = self.core.lock().unwrap();
         core.worker.stop();
+    }
+
+    pub fn register_observer(&mut self, f: impl FnOnce(&mut CoprocessorHost<BaseRocksEngine>)) {
+        f(&mut self.coprocessor);
+    }
+
+    /// `pre_propose` is called before propose.
+    /// It's used to trigger "pre_propose_query" observers for RawKV API V2 by now.
+    fn pre_propose(&self, mut batch: WriteData) -> Result<WriteData> {
+        let requests = batch
+            .modifies
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        let mut cmd_req = raft_cmdpb::RaftCmdRequest::default();
+        cmd_req.set_requests(requests.into());
+
+        let mut region = metapb::Region::default();
+        region.set_id(1);
+        self.coprocessor
+            .pre_propose(&region, &mut cmd_req)
+            .map_err(|err| Error::from(ErrorInner::Other(box_err!(err))))?;
+
+        batch.modifies = cmd_req
+            .take_requests()
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        Ok(batch)
     }
 }
 
@@ -181,6 +224,13 @@ impl Engine for RocksEngine {
         write_modifies(&self.engines.kv, modifies)
     }
 
+    fn precheck_write_with_ctx(&self, _ctx: &Context) -> Result<()> {
+        if self.not_leader.load(Ordering::SeqCst) {
+            return Err(self.not_leader_error());
+        }
+        Ok(())
+    }
+
     fn async_write(&self, ctx: &Context, batch: WriteData, cb: Callback<()>) -> Result<()> {
         self.async_write_ext(ctx, batch, cb, None, None)
     }
@@ -198,6 +248,9 @@ impl Engine for RocksEngine {
         if batch.modifies.is_empty() {
             return Err(Error::from(ErrorInner::EmptyRequest));
         }
+
+        let batch = self.pre_propose(batch)?;
+
         if let Some(cb) = proposed_cb {
             cb();
         }
@@ -212,16 +265,11 @@ impl Engine for RocksEngine {
         fail_point!("rockskv_async_snapshot", |_| Err(box_err!(
             "snapshot failed"
         )));
-        let not_leader = {
-            let mut header = kvproto::errorpb::Error::default();
-            header.mut_not_leader().set_region_id(100);
-            header
-        };
         fail_point!("rockskv_async_snapshot_not_leader", |_| {
-            Err(Error::from(ErrorInner::Request(not_leader.clone())))
+            Err(self.not_leader_error())
         });
         if self.not_leader.load(Ordering::SeqCst) {
-            return Err(Error::from(ErrorInner::Request(not_leader)));
+            return Err(self.not_leader_error());
         }
         box_try!(self.sched.schedule(Task::Snapshot(cb)));
         Ok(())
@@ -230,6 +278,7 @@ impl Engine for RocksEngine {
 
 impl Snapshot for Arc<RocksSnapshot> {
     type Iter = RocksEngineIterator;
+    type Ext<'a> = DummySnapshotExt;
 
     fn get(&self, key: &Key) -> Result<Option<Value>> {
         trace!("RocksSnapshot: get"; "key" => %key);
@@ -257,6 +306,10 @@ impl Snapshot for Arc<RocksSnapshot> {
     fn iter_cf(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter> {
         trace!("RocksSnapshot: create cf iterator");
         Ok(self.iterator_cf_opt(cf, iter_opt)?)
+    }
+
+    fn ext(&self) -> DummySnapshotExt {
+        DummySnapshotExt
     }
 }
 

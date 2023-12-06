@@ -1,15 +1,18 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cmp::Ordering;
-use std::fmt::{Display, Formatter};
+use std::{
+    cmp::Ordering,
+    fmt::{Display, Formatter},
+};
 
+use codec::prelude::*;
 use tipb::FieldType;
 
-use crate::codec::convert::ToInt;
-use crate::codec::Result;
-use crate::expr::EvalContext;
-use crate::FieldTypeTp;
-use codec::prelude::*;
+use crate::{
+    codec::{convert::ToInt, Result},
+    expr::EvalContext,
+    FieldTypeTp,
+};
 
 #[derive(Clone, Debug)]
 pub struct Enum {
@@ -162,7 +165,7 @@ impl<'a> PartialEq for EnumRef<'a> {
 
 impl<'a> Ord for EnumRef<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.value.cmp(&other.value)
+        self.value.cmp(other.value)
     }
 }
 
@@ -190,7 +193,7 @@ impl<'a> ToString for EnumRef<'a> {
 
 pub trait EnumEncoder: NumberEncoder {
     #[inline]
-    fn write_enum_uint(&mut self, data: EnumRef) -> Result<()> {
+    fn write_enum_uint(&mut self, data: EnumRef<'_>) -> Result<()> {
         self.write_u64(*data.value)?;
         Ok(())
     }

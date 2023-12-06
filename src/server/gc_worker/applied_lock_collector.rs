@@ -1,28 +1,31 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use keys::origin_key;
-use std::cmp::Ordering::*;
-use std::fmt::{self, Debug, Display};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use txn_types::Key;
+use std::{
+    cmp::Ordering::*,
+    fmt::{self, Debug, Display},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use concurrency_manager::ConcurrencyManager;
-use engine_rocks::RocksEngine;
-use engine_traits::{CfName, CF_LOCK};
-use kvproto::kvrpcpb::LockInfo;
-use kvproto::raft_cmdpb::CmdType;
-use tikv_util::worker::{Builder as WorkerBuilder, Runnable, ScheduleError, Scheduler, Worker};
-
-use crate::storage::mvcc::{ErrorInner as MvccErrorInner, Lock, TimeStamp};
-use crate::storage::txn::Error as TxnError;
+use engine_traits::{CfName, KvEngine, CF_LOCK};
+use keys::origin_key;
+use kvproto::{kvrpcpb::LockInfo, raft_cmdpb::CmdType};
 use raftstore::coprocessor::{
     ApplySnapshotObserver, BoxApplySnapshotObserver, BoxQueryObserver, Cmd, Coprocessor,
     CoprocessorHost, ObserverContext, QueryObserver,
 };
+use tikv_util::worker::{Builder as WorkerBuilder, Runnable, ScheduleError, Scheduler, Worker};
+use txn_types::Key;
 
 // TODO: Use new error type for GCWorker instead of storage::Error.
 use super::{Error, ErrorInner, Result};
+use crate::storage::{
+    mvcc::{ErrorInner as MvccErrorInner, Lock, TimeStamp},
+    txn::Error as TxnError,
+};
 
 const MAX_COLLECT_SIZE: usize = 1024;
 
@@ -123,7 +126,7 @@ impl LockObserver {
         Self { state, sender }
     }
 
-    pub fn register(self, coprocessor_host: &mut CoprocessorHost<RocksEngine>) {
+    pub fn register(self, coprocessor_host: &mut CoprocessorHost<impl KvEngine>) {
         coprocessor_host
             .registry
             .register_apply_snapshot_observer(1, BoxApplySnapshotObserver::new(self.clone()));
@@ -392,7 +395,7 @@ pub struct AppliedLockCollector {
 
 impl AppliedLockCollector {
     pub fn new(
-        coprocessor_host: &mut CoprocessorHost<RocksEngine>,
+        coprocessor_host: &mut CoprocessorHost<impl KvEngine>,
         concurrency_manager: ConcurrencyManager,
     ) -> Result<Self> {
         let worker = Mutex::new(WorkerBuilder::new("lock-collector").create());
@@ -482,16 +485,19 @@ impl Drop for AppliedLockCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::mpsc::channel;
+
+    use engine_test::kv::KvTestEngine;
     use engine_traits::CF_DEFAULT;
     use futures::executor::block_on;
-    use kvproto::kvrpcpb::Op;
-    use kvproto::metapb::Region;
-    use kvproto::raft_cmdpb::{
-        PutRequest, RaftCmdRequest, RaftCmdResponse, Request as RaftRequest,
+    use kvproto::{
+        kvrpcpb::Op,
+        metapb::Region,
+        raft_cmdpb::{PutRequest, RaftCmdRequest, RaftCmdResponse, Request as RaftRequest},
     };
-    use std::sync::mpsc::channel;
     use txn_types::LockType;
+
+    use super::*;
 
     fn lock_info_to_kv(mut lock_info: LockInfo) -> (Vec<u8>, Vec<u8>) {
         let key = Key::from_raw(lock_info.get_key()).into_encoded();
@@ -538,7 +544,7 @@ mod tests {
         Cmd::new(0, req, RaftCmdResponse::default())
     }
 
-    fn new_test_collector() -> (AppliedLockCollector, CoprocessorHost<RocksEngine>) {
+    fn new_test_collector() -> (AppliedLockCollector, CoprocessorHost<KvTestEngine>) {
         let mut coprocessor_host = CoprocessorHost::default();
         let collector =
             AppliedLockCollector::new(&mut coprocessor_host, ConcurrencyManager::new(1.into()))

@@ -1,9 +1,12 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{
+    fmt::{self, Debug, Formatter},
+    ops::Deref,
+};
+
 use engine_traits::DBVector;
 use rocksdb::DBVector as RawDBVector;
-use std::fmt::{self, Debug, Formatter};
-use std::ops::Deref;
 
 pub struct RocksDBVector(RawDBVector);
 
@@ -24,7 +27,7 @@ impl Deref for RocksDBVector {
 }
 
 impl Debug for RocksDBVector {
-    fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(formatter, "{:?}", &**self)
     }
 }

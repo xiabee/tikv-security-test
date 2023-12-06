@@ -1,17 +1,17 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::{RocksEngine, RocksWriteBatch};
-
+// #[PerformanceCriticalPath]
 use engine_traits::{
-    Error, Iterable, KvEngine, MiscExt, Mutable, Peekable, RaftEngine, RaftEngineReadOnly,
-    RaftLogBatch, Result, SyncMutable, WriteBatch, WriteBatchExt, WriteOptions, CF_DEFAULT,
+    Error, Iterable, KvEngine, MiscExt, Mutable, Peekable, RaftEngine, RaftEngineDebug,
+    RaftEngineReadOnly, RaftLogBatch, RaftLogGCTask, Result, SyncMutable, WriteBatch,
+    WriteBatchExt, WriteOptions, CF_DEFAULT, RAFT_LOG_MULTI_GET_CNT,
 };
 use kvproto::raft_serverpb::RaftLocalState;
 use protobuf::Message;
 use raft::eraftpb::Entry;
 use tikv_util::{box_err, box_try};
 
-const RAFT_LOG_MULTI_GET_CNT: u64 = 8;
+use crate::{util, RocksEngine, RocksWriteBatch};
 
 impl RaftEngineReadOnly for RocksEngine {
     fn get_raft_state(&self, raft_group_id: u64) -> Result<Option<RaftLocalState>> {
@@ -57,7 +57,7 @@ impl RaftEngineReadOnly for RocksEngine {
             return Ok(count);
         }
 
-        let (mut check_compacted, mut next_index) = (true, low);
+        let (mut check_compacted, mut compacted, mut next_index) = (true, false, low);
         let start_key = keys::raft_log_key(region_id, low);
         let end_key = keys::raft_log_key(region_id, high);
         self.scan(
@@ -70,6 +70,7 @@ impl RaftEngineReadOnly for RocksEngine {
 
                 if check_compacted {
                     if entry.get_index() != low {
+                        compacted = true;
                         // May meet gap or has been compacted.
                         return Ok(false);
                     }
@@ -92,8 +93,82 @@ impl RaftEngineReadOnly for RocksEngine {
             return Ok(count);
         }
 
+        if compacted {
+            return Err(Error::EntriesCompacted);
+        }
+
         // Here means we don't fetch enough entries.
         Err(Error::EntriesUnavailable)
+    }
+
+    fn get_all_entries_to(&self, region_id: u64, buf: &mut Vec<Entry>) -> Result<()> {
+        let start_key = keys::raft_log_key(region_id, 0);
+        let end_key = keys::raft_log_key(region_id, u64::MAX);
+        self.scan(
+            &start_key,
+            &end_key,
+            false, // fill_cache
+            |_, value| {
+                let mut entry = Entry::default();
+                entry.merge_from_bytes(value)?;
+                buf.push(entry);
+                Ok(true)
+            },
+        )?;
+        Ok(())
+    }
+}
+
+impl RaftEngineDebug for RocksEngine {
+    fn scan_entries<F>(&self, raft_group_id: u64, mut f: F) -> Result<()>
+    where
+        F: FnMut(&Entry) -> Result<bool>,
+    {
+        let start_key = keys::raft_log_key(raft_group_id, 0);
+        let end_key = keys::raft_log_key(raft_group_id, u64::MAX);
+        self.scan(
+            &start_key,
+            &end_key,
+            false, // fill_cache
+            |_, value| {
+                let mut entry = Entry::default();
+                entry.merge_from_bytes(value)?;
+                f(&entry)
+            },
+        )
+    }
+}
+
+impl RocksEngine {
+    fn gc_impl(
+        &self,
+        raft_group_id: u64,
+        mut from: u64,
+        to: u64,
+        raft_wb: &mut RocksWriteBatch,
+    ) -> Result<usize> {
+        if from == 0 {
+            let start_key = keys::raft_log_key(raft_group_id, 0);
+            let prefix = keys::raft_log_prefix(raft_group_id);
+            match self.seek(&start_key)? {
+                Some((k, _)) if k.starts_with(&prefix) => from = box_try!(keys::raft_log_index(&k)),
+                // No need to gc.
+                _ => return Ok(0),
+            }
+        }
+        if from >= to {
+            return Ok(0);
+        }
+
+        for idx in from..to {
+            let key = keys::raft_log_key(raft_group_id, idx);
+            raft_wb.delete(&key)?;
+            if raft_wb.count() >= Self::WRITE_BATCH_MAX_KEYS * 2 {
+                raft_wb.write()?;
+                raft_wb.clear();
+            }
+        }
+        Ok((to - from) as usize)
     }
 }
 
@@ -104,7 +179,7 @@ impl RaftEngine for RocksEngine {
     type LogBatch = RocksWriteBatch;
 
     fn log_batch(&self, capacity: usize) -> Self::LogBatch {
-        RocksWriteBatch::with_capacity(self.as_inner().clone(), capacity)
+        RocksWriteBatch::with_capacity(self, capacity)
     }
 
     fn sync(&self) -> Result<()> {
@@ -169,7 +244,7 @@ impl RaftEngine for RocksEngine {
     }
 
     fn append(&self, raft_group_id: u64, entries: Vec<Entry>) -> Result<usize> {
-        let mut wb = RocksWriteBatch::new(self.as_inner().clone());
+        let mut wb = self.write_batch();
         let buf = Vec::with_capacity(1024);
         wb.append_impl(raft_group_id, &entries, buf)?;
         self.consume(&mut wb, false)
@@ -179,43 +254,31 @@ impl RaftEngine for RocksEngine {
         self.put_msg(&keys::raft_state_key(raft_group_id), state)
     }
 
-    fn gc(&self, raft_group_id: u64, mut from: u64, to: u64) -> Result<usize> {
-        if from >= to {
-            return Ok(0);
-        }
-        if from == 0 {
-            let start_key = keys::raft_log_key(raft_group_id, 0);
-            let prefix = keys::raft_log_prefix(raft_group_id);
-            match self.seek(&start_key)? {
-                Some((k, _)) if k.starts_with(&prefix) => from = box_try!(keys::raft_log_index(&k)),
-                // No need to gc.
-                _ => return Ok(0),
-            }
-        }
-
+    fn batch_gc(&self, groups: Vec<RaftLogGCTask>) -> Result<usize> {
+        let mut total = 0;
         let mut raft_wb = self.write_batch_with_cap(4 * 1024);
-        for idx in from..to {
-            let key = keys::raft_log_key(raft_group_id, idx);
-            raft_wb.delete(&key)?;
-            if raft_wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
-                raft_wb.write()?;
-                raft_wb.clear();
-            }
+        for task in groups {
+            total += self.gc_impl(task.raft_group_id, task.from, task.to, &mut raft_wb)?;
         }
-
         // TODO: disable WAL here.
         if !WriteBatch::is_empty(&raft_wb) {
             raft_wb.write()?;
         }
-        Ok((to - from) as usize)
+        Ok(total)
+    }
+
+    fn gc(&self, raft_group_id: u64, from: u64, to: u64) -> Result<usize> {
+        let mut raft_wb = self.write_batch_with_cap(1024);
+        let total = self.gc_impl(raft_group_id, from, to, &mut raft_wb)?;
+        // TODO: disable WAL here.
+        if !WriteBatch::is_empty(&raft_wb) {
+            raft_wb.write()?;
+        }
+        Ok(total)
     }
 
     fn purge_expired_files(&self) -> Result<Vec<u64>> {
         Ok(vec![])
-    }
-
-    fn has_builtin_entry_cache(&self) -> bool {
-        false
     }
 
     fn flush_metrics(&self, instance: &str) {
@@ -228,6 +291,13 @@ impl RaftEngine for RocksEngine {
 
     fn dump_stats(&self) -> Result<String> {
         MiscExt::dump_stats(self)
+    }
+
+    fn get_engine_size(&self) -> Result<u64> {
+        let handle = util::get_cf_handle(self.as_inner(), CF_DEFAULT)?;
+        let used_size = util::get_engine_cf_used_size(self.as_inner(), handle);
+
+        Ok(used_size)
     }
 }
 
@@ -251,13 +321,16 @@ impl RaftLogBatch for RocksWriteBatch {
         self.put_msg(&keys::raft_state_key(raft_group_id), state)
     }
 
-    #[inline]
-    fn size(&self) -> usize {
+    fn persist_size(&self) -> usize {
         self.data_size()
     }
 
     fn is_empty(&self) -> bool {
         WriteBatch::is_empty(self)
+    }
+
+    fn merge(&mut self, src: Self) -> Result<()> {
+        WriteBatch::merge(self, src)
     }
 }
 

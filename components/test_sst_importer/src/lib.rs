@@ -1,27 +1,19 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
-use engine_rocks::RocksEngine;
-use engine_rocks::RocksSstReader;
-pub use engine_rocks::RocksSstWriter;
-use engine_rocks::RocksSstWriterBuilder;
-use engine_traits::KvEngine;
-use engine_traits::SstWriter;
-use engine_traits::SstWriterBuilder;
+use engine_rocks::{
+    raw::{
+        ColumnFamilyOptions, DBEntryType, DBOptions, Env, TablePropertiesCollector,
+        TablePropertiesCollectorFactory,
+    },
+    raw_util::{new_engine, CFOptions},
+    RocksEngine, RocksSstReader, RocksSstWriterBuilder,
+};
+pub use engine_rocks::{RocksEngine as TestEngine, RocksSstWriter};
+use engine_traits::{KvEngine, SstWriter, SstWriterBuilder};
 use kvproto::import_sstpb::*;
 use uuid::Uuid;
-
-use engine_rocks::raw::{
-    ColumnFamilyOptions, DBEntryType, DBOptions, Env, TablePropertiesCollector,
-    TablePropertiesCollectorFactory,
-};
-use engine_rocks::raw_util::{new_engine, CFOptions};
-use std::sync::Arc;
-
-pub use engine_rocks::RocksEngine as TestEngine;
 
 pub const PROP_TEST_MARKER_CF_NAME: &[u8] = b"tikv.test_marker_cf_name";
 
@@ -52,7 +44,7 @@ where
             apply(*cf, &mut opt);
             opt.add_table_properties_collector_factory(
                 "tikv.test_properties",
-                Box::new(TestPropertiesCollectorFactory::new(*cf)),
+                TestPropertiesCollectorFactory::new(*cf),
             );
             CFOptions::new(*cf, opt)
         })
@@ -166,9 +158,9 @@ impl TestPropertiesCollectorFactory {
     }
 }
 
-impl TablePropertiesCollectorFactory for TestPropertiesCollectorFactory {
-    fn create_table_properties_collector(&mut self, _: u32) -> Box<dyn TablePropertiesCollector> {
-        Box::new(TestPropertiesCollector::new(self.cf.clone()))
+impl TablePropertiesCollectorFactory<TestPropertiesCollector> for TestPropertiesCollectorFactory {
+    fn create_table_properties_collector(&mut self, _: u32) -> TestPropertiesCollector {
+        TestPropertiesCollector::new(self.cf.clone())
     }
 }
 

@@ -1,17 +1,19 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cell::RefCell;
-use std::mem;
+use std::{cell::RefCell, mem, sync::Arc};
 
-use crate::storage::{kv::PerfStatisticsDelta, FlowStatsReporter, Statistics};
 use collections::HashMap;
-use kvproto::metapb;
-use raftstore::store::util::build_key_range;
-use raftstore::store::ReadStats;
-
-use crate::server::metrics::{GcKeysCF, GcKeysDetail};
+use engine_rocks::ReadPerfContext;
+use kvproto::{metapb, pdpb::QueryKind};
+use pd_client::BucketMeta;
 use prometheus::*;
 use prometheus_static_metric::*;
+use raftstore::store::{util::build_key_range, ReadStats};
+
+use crate::{
+    server::metrics::{GcKeysCF, GcKeysDetail},
+    storage::{FlowStatsReporter, Statistics},
+};
 
 make_auto_flush_static_metric! {
     pub label_enum ReqTag {
@@ -51,7 +53,7 @@ make_auto_flush_static_metric! {
         prev_tombstone,
         seek_tombstone,
         seek_for_prev_tombstone,
-        ttl_tombstone,
+        raw_value_tombstone,
     }
 
     pub label_enum WaitType {
@@ -264,7 +266,7 @@ make_static_metric! {
 pub struct CopLocalMetrics {
     local_scan_details: HashMap<ReqTag, Statistics>,
     local_read_stats: ReadStats,
-    local_perf_stats: HashMap<ReqTag, PerfStatisticsDelta>,
+    local_perf_stats: HashMap<ReqTag, ReadPerfContext>,
 }
 
 thread_local! {
@@ -282,7 +284,7 @@ macro_rules! tls_flush_perf_stats {
         COPR_ROCKSDB_PERF_COUNTER_STATIC
             .get($tag)
             .$stat
-            .inc_by($local_stats.0.$stat as i64);
+            .inc_by($local_stats.$stat as u64);
     };
 }
 
@@ -310,7 +312,7 @@ impl From<GcKeysDetail> for ScanKind {
             GcKeysDetail::prev_tombstone => ScanKind::prev_tombstone,
             GcKeysDetail::seek_tombstone => ScanKind::seek_tombstone,
             GcKeysDetail::seek_for_prev_tombstone => ScanKind::seek_for_prev_tombstone,
-            GcKeysDetail::ttl_tombstone => ScanKind::ttl_tombstone,
+            GcKeysDetail::raw_value_tombstone => ScanKind::raw_value_tombstone,
         }
     }
 }
@@ -327,7 +329,7 @@ pub fn tls_flush<R: FlowStatsReporter>(reporter: &R) {
                         .get(req_tag)
                         .get((*cf).into())
                         .get((*tag).into())
-                        .inc_by(*count as i64);
+                        .inc_by(*count as u64);
                 }
             }
         }
@@ -402,18 +404,27 @@ pub fn tls_collect_scan_details(cmd: ReqTag, stats: &Statistics) {
     });
 }
 
-pub fn tls_collect_read_flow(region_id: u64, statistics: &Statistics) {
+pub fn tls_collect_read_flow(
+    region_id: u64,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    statistics: &Statistics,
+    buckets: Option<&Arc<BucketMeta>>,
+) {
     TLS_COP_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.local_read_stats.add_flow(
             region_id,
+            buckets,
+            start,
+            end,
             &statistics.write.flow_stats,
             &statistics.data.flow_stats,
         );
     });
 }
 
-pub fn tls_collect_qps(
+pub fn tls_collect_query(
     region_id: u64,
     peer: &metapb::Peer,
     start_key: &[u8],
@@ -423,11 +434,12 @@ pub fn tls_collect_qps(
     TLS_COP_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         let key_range = build_key_range(start_key, end_key, reverse_scan);
-        m.local_read_stats.add_qps(region_id, peer, key_range);
+        m.local_read_stats
+            .add_query_num(region_id, peer, key_range, QueryKind::Coprocessor);
     });
 }
 
-pub fn tls_collect_perf_stats(cmd: ReqTag, perf_stats: &PerfStatisticsDelta) {
+pub fn tls_collect_perf_stats(cmd: ReqTag, perf_stats: &ReadPerfContext) {
     TLS_COP_METRICS.with(|m| {
         *(m.borrow_mut()
             .local_perf_stats

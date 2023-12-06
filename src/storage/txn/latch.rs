@@ -1,9 +1,11 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
-use std::usize;
+// #[PerformanceCriticalPath]
+use std::{
+    collections::{hash_map::DefaultHasher, VecDeque},
+    hash::{Hash, Hasher},
+    usize,
+};
 
 use crossbeam::utils::CachePadded;
 use parking_lot::{Mutex, MutexGuard};
@@ -200,7 +202,7 @@ impl Latches {
     }
 
     #[inline]
-    fn lock_latch(&self, hash: u64) -> MutexGuard<Latch> {
+    fn lock_latch(&self, hash: u64) -> MutexGuard<'_, Latch> {
         self.slots[(hash as usize) & (self.size - 1)].lock()
     }
 }

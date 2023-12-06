@@ -1,14 +1,11 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::BTreeMap;
-use std::convert::TryInto;
-use std::{f64, str};
+use std::{collections::BTreeMap, convert::TryInto, f64, str};
 
-use super::constants::*;
-use super::{Json, JsonRef, JsonType};
+use codec::{number::NumberCodec, prelude::*};
+
+use super::{constants::*, Json, JsonRef, JsonType};
 use crate::codec::{Error, Result};
-use codec::number::NumberCodec;
-use codec::prelude::*;
 
 impl<'a> JsonRef<'a> {
     fn encoded_len(&self) -> usize {
@@ -22,7 +19,7 @@ impl<'a> JsonRef<'a> {
 }
 
 pub trait JsonEncoder: NumberEncoder {
-    fn write_json(&mut self, data: JsonRef) -> Result<()> {
+    fn write_json(&mut self, data: JsonRef<'_>) -> Result<()> {
         self.write_u8(data.get_type() as u8)?;
         self.write_bytes(data.value()).map_err(Error::from)
     }
@@ -241,7 +238,7 @@ pub trait JsonDecoder: NumberDecoder {
             }
             JsonType::String => {
                 let value = self.bytes();
-                let (str_len, len_len) = NumberCodec::try_decode_var_u64(&value)?;
+                let (str_len, len_len) = NumberCodec::try_decode_var_u64(value)?;
                 self.read_bytes(str_len as usize + len_len)?
             }
             JsonType::I64 | JsonType::U64 | JsonType::Double => self.read_bytes(NUMBER_LEN)?,

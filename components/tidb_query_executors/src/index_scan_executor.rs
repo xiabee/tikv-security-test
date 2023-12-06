@@ -2,29 +2,32 @@
 
 use std::sync::Arc;
 
+use codec::{number::NumberCodec, prelude::NumberDecoder};
+use itertools::izip;
 use kvproto::coprocessor::KeyRange;
-use tidb_query_datatype::{EvalType, FieldTypeAccessor};
-use tipb::ColumnInfo;
-use tipb::FieldType;
-use tipb::IndexScan;
+use tidb_query_common::{
+    storage::{IntervalRange, Storage},
+    Result,
+};
+use tidb_query_datatype::{
+    codec::{
+        batch::{LazyBatchColumn, LazyBatchColumnVec},
+        collation::collator::PADDING_SPACE,
+        datum,
+        datum::DatumDecoder,
+        row::v2::{decode_v2_u64, RowSlice, V1CompatibleEncoder},
+        table,
+        table::{check_index_key, INDEX_VALUE_VERSION_FLAG, MAX_OLD_ENCODED_VALUE_LEN},
+        Datum,
+    },
+    expr::{EvalConfig, EvalContext},
+    EvalType, FieldTypeAccessor,
+};
+use tipb::{ColumnInfo, FieldType, IndexScan};
+use DecodeHandleStrategy::*;
 
 use super::util::scan_executor::*;
 use crate::interface::*;
-use codec::number::NumberCodec;
-use codec::prelude::NumberDecoder;
-use itertools::izip;
-use tidb_query_common::storage::{IntervalRange, Storage};
-use tidb_query_common::Result;
-use tidb_query_datatype::codec::batch::{LazyBatchColumn, LazyBatchColumnVec};
-use tidb_query_datatype::codec::row::v2::{decode_v2_u64, RowSlice, V1CompatibleEncoder};
-use tidb_query_datatype::codec::table::{
-    check_index_key, INDEX_VALUE_VERSION_FLAG, MAX_OLD_ENCODED_VALUE_LEN,
-};
-use tidb_query_datatype::codec::{datum, datum::DatumDecoder, table, Datum};
-use tidb_query_datatype::expr::{EvalConfig, EvalContext};
-
-use tidb_query_datatype::codec::collation::collator::PADDING_SPACE;
-use DecodeHandleStrategy::*;
 
 pub struct BatchIndexScanExecutor<S: Storage>(ScanExecutor<S, IndexScanExecutorImpl>);
 
@@ -66,11 +69,25 @@ impl<S: Storage> BatchIndexScanExecutor<S> {
         // Note 4: When process global indexes, an extra partition ID column with column ID
         // `table::EXTRA_PARTITION_ID_COL_ID` will append to column info to indicate which partiton
         // handles belong to. See https://github.com/pingcap/parser/pull/1010 for more information.
-        let pid_column_cnt = columns_info.last().map_or(0, |ci| {
-            (ci.get_column_id() == table::EXTRA_PARTITION_ID_COL_ID) as usize
+        //
+        // Note 5: When process a partitioned table's index under tidb_partition_prune_mode = 'dynamic'
+        // and with either an active transaction buffer or with a SelectLock/pessimistic lock, we
+        // need to return the physical table id since several partitions may be included in the
+        // range.
+        //
+        // Note 6: Also int_handle (-1), EXTRA_PARTITION_ID_COL_ID (-2) and
+        // EXTRA_PHYSICAL_TABLE_ID_COL_ID (-3) must be requested in this order in columns_info!
+        // since current implementation looks for them backards for -3, -2, -1.
+        let physical_table_id_column_cnt = columns_info.last().map_or(0, |ci| {
+            (ci.get_column_id() == table::EXTRA_PHYSICAL_TABLE_ID_COL_ID) as usize
         });
+        let pid_column_cnt = columns_info
+            .get(columns_info.len() - 1 - physical_table_id_column_cnt)
+            .map_or(0, |ci| {
+                (ci.get_column_id() == table::EXTRA_PARTITION_ID_COL_ID) as usize
+            });
         let is_int_handle = columns_info
-            .get(columns_info.len() - 1 - pid_column_cnt)
+            .get(columns_info.len() - 1 - pid_column_cnt - physical_table_id_column_cnt)
             .map_or(false, |ci| ci.get_pk_handle());
         let is_common_handle = primary_column_ids_len > 0;
         let (decode_handle_strategy, handle_column_cnt) = match (is_int_handle, is_common_handle) {
@@ -86,7 +103,7 @@ impl<S: Storage> BatchIndexScanExecutor<S> {
             }
         };
 
-        if handle_column_cnt + pid_column_cnt > columns_info.len() {
+        if handle_column_cnt + pid_column_cnt + physical_table_id_column_cnt > columns_info.len() {
             return Err(other_err!(
                 "The number of handle columns exceeds the length of `columns_info`"
             ));
@@ -94,17 +111,19 @@ impl<S: Storage> BatchIndexScanExecutor<S> {
 
         let schema: Vec<_> = columns_info
             .iter()
-            .map(|ci| field_type_from_column_info(&ci))
+            .map(|ci| field_type_from_column_info(ci))
             .collect();
 
-        let columns_id_without_handle: Vec<_> = columns_info
-            [..columns_info.len() - handle_column_cnt - pid_column_cnt]
+        let columns_id_without_handle: Vec<_> = columns_info[..columns_info.len()
+            - handle_column_cnt
+            - pid_column_cnt
+            - physical_table_id_column_cnt]
             .iter()
             .map(|ci| ci.get_column_id())
             .collect();
 
-        let columns_id_for_common_handle = columns_info
-            [columns_id_without_handle.len()..columns_info.len() - pid_column_cnt]
+        let columns_id_for_common_handle = columns_info[columns_id_without_handle.len()
+            ..columns_info.len() - pid_column_cnt - physical_table_id_column_cnt]
             .iter()
             .map(|ci| ci.get_column_id())
             .collect();
@@ -116,6 +135,7 @@ impl<S: Storage> BatchIndexScanExecutor<S> {
             columns_id_for_common_handle,
             decode_handle_strategy,
             pid_column_cnt,
+            physical_table_id_column_cnt,
             index_version: -1,
         };
         let wrapper = ScanExecutor::new(ScanExecutorOptions {
@@ -189,7 +209,12 @@ struct IndexScanExecutorImpl {
     decode_handle_strategy: DecodeHandleStrategy,
 
     /// Number of partition ID columns, now it can only be 0 or 1.
+    /// Must be after all normal columns and handle, but before physical_table_id_column
     pid_column_cnt: usize,
+
+    /// Number of Physical Table ID columns, can only be 0 or 1.
+    /// Must be last, after pid_column
+    physical_table_id_column_cnt: usize,
 
     index_version: i64,
 }
@@ -226,13 +251,22 @@ impl ScanExecutorImpl for IndexScanExecutorImpl {
                 ));
             }
             DecodeCommonHandle => {
-                for _ in self.columns_id_without_handle.len()..columns_len - self.pid_column_cnt {
+                for _ in self.columns_id_without_handle.len()
+                    ..columns_len - self.pid_column_cnt - self.physical_table_id_column_cnt
+                {
                     columns.push(LazyBatchColumn::raw_with_capacity(scan_rows));
                 }
             }
         }
 
         if self.pid_column_cnt > 0 {
+            columns.push(LazyBatchColumn::decoded_with_capacity_and_tp(
+                scan_rows,
+                EvalType::Int,
+            ));
+        }
+
+        if self.physical_table_id_column_cnt > 0 {
             columns.push(LazyBatchColumn::decoded_with_capacity_and_tp(
                 scan_rows,
                 EvalType::Int,
@@ -299,6 +333,9 @@ impl ScanExecutorImpl for IndexScanExecutorImpl {
         columns: &mut LazyBatchColumnVec,
     ) -> Result<()> {
         check_index_key(key)?;
+        if self.physical_table_id_column_cnt > 0 {
+            self.process_physical_table_id_column(key, columns)?;
+        }
         key = &key[table::PREFIX_LEN + table::ID_LEN..];
         if self.index_version == -1 {
             self.index_version = Self::get_index_version(value)?
@@ -640,7 +677,7 @@ impl IndexScanExecutorImpl {
         &mut self,
         mut key_payload: &[u8],
         columns: &mut LazyBatchColumnVec,
-        restore_data: RestoreData,
+        restore_data: RestoreData<'_>,
     ) -> Result<()> {
         match restore_data {
             RestoreData::NotExists => {
@@ -679,9 +716,9 @@ impl IndexScanExecutorImpl {
     #[inline]
     fn decode_handle_columns(
         &mut self,
-        decode_handle: DecodeHandleOp,
+        decode_handle: DecodeHandleOp<'_>,
         columns: &mut LazyBatchColumnVec,
-        restore_data: RestoreData,
+        restore_data: RestoreData<'_>,
     ) -> Result<()> {
         match decode_handle {
             DecodeHandleOp::Nop => {}
@@ -698,7 +735,8 @@ impl IndexScanExecutorImpl {
                     .push_int(Some(handle));
             }
             DecodeHandleOp::CommonHandle(mut handle) => {
-                let end_index = columns.columns_len() - self.pid_column_cnt;
+                let end_index =
+                    columns.columns_len() - self.pid_column_cnt - self.physical_table_id_column_cnt;
                 Self::extract_columns_from_datum_format(
                     &mut handle,
                     &mut columns[self.columns_id_without_handle.len()..end_index],
@@ -713,7 +751,8 @@ impl IndexScanExecutorImpl {
 
         if let DecodeHandleOp::CommonHandle(_) = decode_handle {
             let skip = self.columns_id_without_handle.len();
-            let end_index = columns.columns_len() - self.pid_column_cnt;
+            let end_index =
+                columns.columns_len() - self.pid_column_cnt - self.physical_table_id_column_cnt;
             self.restore_original_data(
                 restore_data_bytes,
                 izip!(
@@ -728,17 +767,30 @@ impl IndexScanExecutorImpl {
     }
 
     #[inline]
+    fn process_physical_table_id_column(
+        &mut self,
+        key: &[u8],
+        columns: &mut LazyBatchColumnVec,
+    ) -> Result<()> {
+        let table_id = table::decode_table_id(key)?;
+        let col_index = columns.columns_len() - 1;
+        columns[col_index].mut_decoded().push_int(Some(table_id));
+        Ok(())
+    }
+
+    #[inline]
     fn decode_pid_columns(
         &mut self,
         columns: &mut LazyBatchColumnVec,
-        decode_pid: DecodePartitionIdOp,
+        decode_pid: DecodePartitionIdOp<'_>,
     ) -> Result<()> {
         match decode_pid {
             DecodePartitionIdOp::Nop => {}
             DecodePartitionIdOp::PID(pid) => {
-                // If need partition id, append partition id to the last column.
+                // If need partition id, append partition id to the last column
+                // before physical table id column if exists.
                 let pid = NumberCodec::decode_i64(pid);
-                let idx = columns.columns_len() - 1;
+                let idx = columns.columns_len() - self.physical_table_id_column_cnt - 1;
                 columns[idx].mut_decoded().push_int(Some(pid))
             }
         }
@@ -802,24 +854,24 @@ impl IndexScanExecutorImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
     use codec::prelude::NumberEncoder;
     use kvproto::coprocessor::KeyRange;
-    use tidb_query_datatype::{Collation, FieldTypeAccessor, FieldTypeTp};
+    use tidb_query_common::{storage::test_fixture::FixtureStorage, util::convert_to_prefix_next};
+    use tidb_query_datatype::{
+        codec::{
+            data_type::*,
+            datum,
+            row::v2::encoder_for_test::{Column, RowEncoder},
+            table, Datum,
+        },
+        expr::EvalConfig,
+        Collation, FieldTypeAccessor, FieldTypeTp,
+    };
     use tipb::ColumnInfo;
 
-    use tidb_query_common::storage::test_fixture::FixtureStorage;
-    use tidb_query_common::util::convert_to_prefix_next;
-    use tidb_query_datatype::codec::data_type::*;
-    use tidb_query_datatype::codec::{
-        datum,
-        row::v2::encoder_for_test::{Column, RowEncoder},
-        table, Datum,
-    };
-    use tidb_query_datatype::expr::EvalConfig;
+    use super::*;
 
     #[test]
     fn test_basic() {
@@ -854,12 +906,19 @@ mod tests {
                 ci.set_pk_handle(true);
                 ci
             },
+            {
+                let mut ci = ColumnInfo::default();
+                ci.as_mut_accessor().set_tp(FieldTypeTp::LongLong);
+                ci.set_column_id(table::EXTRA_PHYSICAL_TABLE_ID_COL_ID);
+                ci
+            },
         ];
 
         // The schema of these columns. Used to check executor output.
         let schema = vec![
             FieldTypeTp::LongLong.into(),
             FieldTypeTp::Double.into(),
+            FieldTypeTp::LongLong.into(),
             FieldTypeTp::LongLong.into(),
         ];
 
@@ -930,6 +989,172 @@ mod tests {
                     Real::new(5.1).ok(),
                     Real::new(0.3).ok()
                 ]
+            );
+        }
+
+        {
+            // Case 1.1.b Normal index, without PK, scan total index in reverse order.
+            // With Physical Table ID Column
+
+            let key_ranges = vec![{
+                let mut range = KeyRange::default();
+                let start_data = datum::encode_key(&mut ctx, &[Datum::Min]).unwrap();
+                let start_key = table::encode_index_seek_key(TABLE_ID, INDEX_ID, &start_data);
+                range.set_start(start_key);
+                let end_data = datum::encode_key(&mut ctx, &[Datum::Max]).unwrap();
+                let end_key = table::encode_index_seek_key(TABLE_ID, INDEX_ID, &end_data);
+                range.set_end(end_key);
+                range
+            }];
+
+            let mut executor = BatchIndexScanExecutor::new(
+                store.clone(),
+                Arc::new(EvalConfig::default()),
+                vec![
+                    columns_info[0].clone(),
+                    columns_info[1].clone(),
+                    columns_info[3].clone(),
+                ],
+                key_ranges,
+                0,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+
+            let mut result = executor.next_batch(10);
+            assert!(result.is_drained.as_ref().unwrap());
+            assert_eq!(result.physical_columns.columns_len(), 3);
+            assert_eq!(result.physical_columns.rows_len(), 3);
+            assert!(result.physical_columns[0].is_raw());
+            result.physical_columns[0]
+                .ensure_all_decoded_for_test(&mut ctx, &schema[0])
+                .unwrap();
+            assert_eq!(
+                result.physical_columns[0].decoded().to_int_vec(),
+                &[Some(5), Some(5), Some(-5)]
+            );
+            assert!(result.physical_columns[1].is_raw());
+            result.physical_columns[1]
+                .ensure_all_decoded_for_test(&mut ctx, &schema[1])
+                .unwrap();
+            assert_eq!(
+                result.physical_columns[1].decoded().to_real_vec(),
+                &[
+                    Real::new(10.5).ok(),
+                    Real::new(5.1).ok(),
+                    Real::new(0.3).ok()
+                ]
+            );
+            result.physical_columns[2]
+                .ensure_all_decoded_for_test(&mut ctx, &schema[3])
+                .unwrap();
+            assert_eq!(
+                result.physical_columns[2].decoded().to_int_vec(),
+                &[Some(TABLE_ID), Some(TABLE_ID), Some(TABLE_ID)]
+            );
+        }
+
+        {
+            // Case 1.1.c Normal index, without PK, scan total index in reverse order.
+            // With Columns in WRONG order!!
+
+            let key_ranges = vec![{
+                let mut range = KeyRange::default();
+                let start_data = datum::encode_key(&mut ctx, &[Datum::Min]).unwrap();
+                let start_key = table::encode_index_seek_key(TABLE_ID, INDEX_ID, &start_data);
+                range.set_start(start_key);
+                let end_data = datum::encode_key(&mut ctx, &[Datum::Max]).unwrap();
+                let end_key = table::encode_index_seek_key(TABLE_ID, INDEX_ID, &end_data);
+                range.set_end(end_key);
+                range
+            }];
+
+            let mut executor = BatchIndexScanExecutor::new(
+                store.clone(),
+                Arc::new(EvalConfig::default()),
+                vec![columns_info[1].clone(), columns_info[0].clone()],
+                key_ranges,
+                0,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+
+            let mut result = executor.next_batch(10);
+            assert!(result.is_drained.as_ref().unwrap());
+            assert_eq!(result.physical_columns.columns_len(), 2);
+            assert_eq!(result.physical_columns.rows_len(), 3);
+            assert!(result.physical_columns[0].is_raw());
+            assert!(
+                result.physical_columns[0]
+                    .ensure_all_decoded_for_test(&mut ctx, &schema[1])
+                    .is_err()
+            );
+            assert!(result.physical_columns[1].is_raw());
+            assert!(
+                result.physical_columns[1]
+                    .ensure_all_decoded_for_test(&mut ctx, &schema[0])
+                    .is_err()
+            );
+        }
+
+        {
+            // Case 1.1.d Normal index, without PK, scan total index in reverse order.
+            // With Physical Table ID Column in WRONG order!!
+
+            let key_ranges = vec![{
+                let mut range = KeyRange::default();
+                let start_data = datum::encode_key(&mut ctx, &[Datum::Min]).unwrap();
+                let start_key = table::encode_index_seek_key(TABLE_ID, INDEX_ID, &start_data);
+                range.set_start(start_key);
+                let end_data = datum::encode_key(&mut ctx, &[Datum::Max]).unwrap();
+                let end_key = table::encode_index_seek_key(TABLE_ID, INDEX_ID, &end_data);
+                range.set_end(end_key);
+                range
+            }];
+
+            let mut executor = BatchIndexScanExecutor::new(
+                store.clone(),
+                Arc::new(EvalConfig::default()),
+                vec![
+                    columns_info[0].clone(),
+                    columns_info[3].clone(),
+                    columns_info[1].clone(),
+                ],
+                key_ranges,
+                0,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+
+            let mut result = executor.next_batch(10);
+            assert!(result.is_drained.as_ref().unwrap());
+            assert_eq!(result.physical_columns.columns_len(), 3);
+            assert_eq!(result.physical_columns.rows_len(), 3);
+            assert!(result.physical_columns[0].is_raw());
+            result.physical_columns[0]
+                .ensure_all_decoded_for_test(&mut ctx, &schema[0])
+                .unwrap();
+            assert_eq!(
+                result.physical_columns[0].decoded().to_int_vec(),
+                &[Some(5), Some(5), Some(-5)]
+            );
+            assert!(result.physical_columns[1].is_raw());
+            assert!(
+                result.physical_columns[1]
+                    .ensure_all_decoded_for_test(&mut ctx, &schema[3])
+                    .is_err()
+            );
+            assert!(result.physical_columns[2].is_raw());
+            assert!(
+                result.physical_columns[2]
+                    .ensure_all_decoded_for_test(&mut ctx, &schema[1])
+                    .is_err()
             );
         }
 
@@ -1810,6 +2035,7 @@ mod tests {
             columns_id_for_common_handle: vec![],
             decode_handle_strategy: DecodeHandleStrategy::DecodeIntHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         let mut columns = idx_exe.build_column_vec(10);
@@ -1859,6 +2085,7 @@ mod tests {
             columns_id_for_common_handle: vec![],
             decode_handle_strategy: DecodeHandleStrategy::DecodeIntHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -1908,6 +2135,7 @@ mod tests {
             columns_id_for_common_handle: vec![],
             decode_handle_strategy: DecodeHandleStrategy::DecodeIntHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -1965,6 +2193,7 @@ mod tests {
             columns_id_for_common_handle: vec![],
             decode_handle_strategy: DecodeHandleStrategy::DecodeIntHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -2042,6 +2271,7 @@ mod tests {
             columns_id_for_common_handle: vec![],
             decode_handle_strategy: DecodeHandleStrategy::DecodeIntHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         let mut columns = idx_exe.build_column_vec(10);
@@ -2091,6 +2321,7 @@ mod tests {
             columns_id_for_common_handle: vec![],
             decode_handle_strategy: DecodeHandleStrategy::DecodeIntHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -2145,6 +2376,7 @@ mod tests {
             columns_id_for_common_handle: vec![],
             decode_handle_strategy: DecodeHandleStrategy::DecodeIntHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -2204,6 +2436,7 @@ mod tests {
             columns_id_for_common_handle: vec![],
             decode_handle_strategy: DecodeHandleStrategy::DecodeIntHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -2323,6 +2556,7 @@ mod tests {
             columns_id_for_common_handle: vec![1, 2, 3, 4, 5],
             decode_handle_strategy: DecodeHandleStrategy::DecodeCommonHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         let mut columns = idx_exe.build_column_vec(10);
@@ -2438,6 +2672,7 @@ mod tests {
             columns_id_for_common_handle: vec![1, 2, 3, 4, 5],
             decode_handle_strategy: DecodeHandleStrategy::DecodeCommonHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -2553,6 +2788,7 @@ mod tests {
             columns_id_for_common_handle: vec![1, 2, 3, 4, 5],
             decode_handle_strategy: DecodeHandleStrategy::DecodeCommonHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -2668,6 +2904,7 @@ mod tests {
             columns_id_for_common_handle: vec![1, 2, 3, 4, 5],
             decode_handle_strategy: DecodeHandleStrategy::DecodeCommonHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -2783,6 +3020,7 @@ mod tests {
             columns_id_for_common_handle: vec![1, 2, 3, 4, 5],
             decode_handle_strategy: DecodeHandleStrategy::DecodeCommonHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -2911,6 +3149,7 @@ mod tests {
             columns_id_for_common_handle: vec![1, 2, 3, 4, 5],
             decode_handle_strategy: DecodeHandleStrategy::DecodeCommonHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         columns = idx_exe.build_column_vec(10);
@@ -3053,6 +3292,7 @@ mod tests {
             columns_id_for_common_handle: vec![1],
             decode_handle_strategy: DecodeHandleStrategy::DecodeCommonHandle,
             pid_column_cnt: 0,
+            physical_table_id_column_cnt: 0,
             index_version: -1,
         };
         let mut columns = idx_exe.build_column_vec(1);

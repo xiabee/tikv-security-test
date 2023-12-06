@@ -1,15 +1,18 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::{Error, Result};
-use futures::channel::mpsc::{self, UnboundedSender};
-use futures::future::{self, BoxFuture};
-use futures::sink::SinkExt;
-use futures::stream::{StreamExt, TryStreamExt};
+use std::{sync::Arc, time::Duration};
+
+use futures::{
+    channel::mpsc::{self, UnboundedSender},
+    future::{self, BoxFuture},
+    sink::SinkExt,
+    stream::{StreamExt, TryStreamExt},
+};
 use grpcio::{ChannelBuilder, EnvBuilder, Environment, WriteFlags};
 use kvproto::deadlock::*;
 use security::SecurityManager;
-use std::sync::Arc;
-use std::time::Duration;
+
+use super::{Error, Result};
 
 type DeadlockFuture<T> = BoxFuture<'static, Result<T>>;
 
@@ -30,7 +33,6 @@ pub fn env() -> Arc<Environment> {
 
 #[derive(Clone)]
 pub struct Client {
-    addr: String,
     client: DeadlockClient,
     sender: Option<UnboundedSender<DeadlockRequest>>,
 }
@@ -43,7 +45,6 @@ impl Client {
         let channel = security_mgr.connect(cb, addr);
         let client = DeadlockClient::new(channel);
         Self {
-            addr: addr.to_owned(),
             client,
             sender: None,
         }

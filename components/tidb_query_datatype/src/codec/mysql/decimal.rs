@@ -1,21 +1,28 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cmp::Ordering;
-use std::fmt::{self, Display, Formatter};
-use std::hash::{Hash, Hasher};
-use std::intrinsics::copy_nonoverlapping;
-use std::ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub};
-use std::str::{self, FromStr};
-use std::string::ToString;
-use std::{cmp, i32, i64, mem, u32, u64};
+use std::{
+    cmp,
+    cmp::Ordering,
+    fmt::{self, Display, Formatter},
+    hash::{Hash, Hasher},
+    intrinsics::copy_nonoverlapping,
+    mem,
+    ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub},
+    str::{self, FromStr},
+    string::ToString,
+};
 
 use codec::prelude::*;
 use tikv_util::escape;
 
-use crate::codec::convert::{self, ConvertTo};
-use crate::codec::data_type::*;
-use crate::codec::{Error, Result, TEN_POW};
-use crate::expr::EvalContext;
+use crate::{
+    codec::{
+        convert::{self, ConvertTo},
+        data_type::*,
+        Error, Result, TEN_POW,
+    },
+    expr::EvalContext,
+};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Res<T> {
@@ -643,7 +650,7 @@ fn do_div_mod_impl(
             + 1,
     );
     let mut buf = vec![0; l_len];
-    (&mut buf[0..i]).copy_from_slice(&lhs.word_buf[l_idx..l_idx + i]);
+    buf[0..i].copy_from_slice(&lhs.word_buf[l_idx..l_idx + i]);
     let mut l_idx = 0;
     let (r_start, mut r_stop) = (r_idx, r_idx + word_cnt!(r_prec as usize, usize) - 1);
     while rhs.word_buf[r_stop] == 0 && r_stop >= r_start {
@@ -2392,16 +2399,13 @@ impl Hash for Decimal {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::{DEFAULT_DIV_FRAC_INCR, WORD_BUF_LEN};
+    use std::{cmp::Ordering, collections::hash_map::DefaultHasher, sync::Arc};
 
-    use crate::codec::error::ERR_DATA_OUT_OF_RANGE;
-    use crate::expr::{EvalConfig, Flag};
-    use std::cmp::Ordering;
-    use std::collections::hash_map::DefaultHasher;
-    use std::f64::EPSILON;
-    use std::iter::repeat;
-    use std::sync::Arc;
+    use super::{DEFAULT_DIV_FRAC_INCR, WORD_BUF_LEN, *};
+    use crate::{
+        codec::error::ERR_DATA_OUT_OF_RANGE,
+        expr::{EvalConfig, Flag},
+    };
 
     #[test]
     fn test_from_i64() {
@@ -2438,14 +2442,8 @@ mod tests {
     #[test]
     fn test_from_f64() {
         let cs = vec![
-            (
-                std::f64::INFINITY,
-                Err(Error::InvalidDataType(String::new())),
-            ),
-            (
-                -std::f64::INFINITY,
-                Err(Error::InvalidDataType(String::new())),
-            ),
+            (f64::INFINITY, Err(Error::InvalidDataType(String::new()))),
+            (-f64::INFINITY, Err(Error::InvalidDataType(String::new()))),
             (10.123, Ok(Decimal::from_str("10.123").unwrap())),
             (-10.123, Ok(Decimal::from_str("-10.123").unwrap())),
             (10.111, Ok(Decimal::from_str("10.111").unwrap())),
@@ -2582,7 +2580,12 @@ mod tests {
             assert_eq!(res, dec_str);
 
             let f: f64 = dec.convert(&mut ctx).unwrap();
-            assert!((exp - f).abs() < EPSILON, "expect: {}, got: {}", exp, f);
+            assert!(
+                (exp - f).abs() < f64::EPSILON,
+                "expect: {}, got: {}",
+                exp,
+                f
+            );
         }
     }
 
@@ -3202,9 +3205,9 @@ mod tests {
 
     #[test]
     fn test_add() {
-        let a = "2".to_owned() + &repeat('1').take(71).collect::<String>();
-        let b: String = repeat('8').take(81).collect();
-        let c = "8888888890".to_owned() + &repeat('9').take(71).collect::<String>();
+        let a = "2".to_owned() + &"1".repeat(71);
+        let b: String = "8".repeat(81);
+        let c = "8888888890".to_owned() + &"9".repeat(71);
         let cases = vec![
             (
                 ".00012345000098765",
@@ -3297,8 +3300,8 @@ mod tests {
 
     #[test]
     fn test_mul() {
-        let a = "1".to_owned() + &repeat('0').take(60).collect::<String>();
-        let b = "1".to_owned() + &repeat("0").take(60).collect::<String>();
+        let a = "1".to_owned() + &"0".repeat(60);
+        let b = "1".to_owned() + &"0".repeat(60);
         let cases = vec![
             ("12", "10", Res::Ok("120")),
             ("0", "-1.1", Res::Ok("0")),
@@ -3690,13 +3693,7 @@ mod tests {
         let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::OVERFLOW_AS_WARNING)));
         let val: Decimal = big.as_bytes().convert(&mut ctx).unwrap();
         let max = max_decimal(WORD_BUF_LEN * DIGITS_PER_WORD, 0);
-        assert_eq!(
-            val,
-            max,
-            "expect: {}, got: {}",
-            val.to_string(),
-            max.to_string()
-        );
+        assert_eq!(val, max, "expect: {}, got: {}", val, max);
         assert_eq!(ctx.warnings.warning_cnt, 1);
         assert_eq!(ctx.warnings.warnings[0].get_code(), ERR_DATA_OUT_OF_RANGE);
     }

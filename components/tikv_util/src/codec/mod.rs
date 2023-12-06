@@ -2,6 +2,7 @@
 
 pub mod bytes;
 pub mod number;
+pub mod stream_event;
 
 use std::io::{self, ErrorKind};
 
@@ -33,6 +34,8 @@ pub enum Error {
     KeyNotFound,
     #[error("bad format value(length)")]
     ValueLength,
+    #[error("bad format value(meta)")]
+    ValueMeta,
 }
 
 impl Error {
@@ -42,6 +45,7 @@ impl Error {
             Error::KeyPadding => Some(Error::KeyPadding),
             Error::KeyNotFound => Some(Error::KeyNotFound),
             Error::ValueLength => Some(Error::ValueLength),
+            Error::ValueMeta => Some(Error::ValueMeta),
             Error::Io(_) => None,
         }
     }
@@ -60,6 +64,7 @@ impl ErrorCodeExt for Error {
             Error::KeyPadding => error_code::codec::BAD_PADDING,
             Error::KeyNotFound => error_code::codec::KEY_NOT_FOUND,
             Error::ValueLength => error_code::codec::VALUE_LENGTH,
+            Error::ValueMeta => error_code::codec::VALUE_META,
         }
     }
 }

@@ -3,20 +3,34 @@
 #![cfg_attr(test, feature(test))]
 #![feature(thread_id_value)]
 #![feature(box_patterns)]
+#![feature(vec_into_raw_parts)]
+#![feature(let_chains)]
 
 #[cfg(test)]
 extern crate test;
 
-use std::collections::hash_map::Entry;
-use std::collections::vec_deque::{Iter, VecDeque};
-use std::fs::File;
-use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
-use std::{env, thread, u64};
+use std::{
+    collections::{
+        hash_map::Entry,
+        vec_deque::{Iter, VecDeque},
+    },
+    convert::AsRef,
+    env,
+    fs::File,
+    ops::{Deref, DerefMut},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    },
+    thread,
+    time::Duration,
+};
 
+use nix::{
+    sys::wait::{wait, WaitStatus},
+    unistd::{fork, ForkResult},
+};
 use rand::rngs::ThreadRng;
 
 #[macro_use]
@@ -36,6 +50,7 @@ pub mod math;
 pub mod memory;
 pub mod metrics;
 pub mod mpsc;
+pub mod quota_limiter;
 pub mod stream;
 pub mod sys;
 pub mod thread_group;
@@ -287,7 +302,7 @@ impl<T: FnOnce()> Drop for DeferContext<T> {
 }
 
 /// Represents a value of one of two possible types (a more generic Result.)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Either<L, R> {
     Left(L),
     Right(R),
@@ -323,6 +338,20 @@ impl<L, R> Either<L, R> {
         match self {
             Either::Right(r) => Some(r),
             _ => None,
+        }
+    }
+}
+
+impl<L, R, T> AsRef<T> for Either<L, R>
+where
+    T: ?Sized,
+    L: AsRef<T>,
+    R: AsRef<T>,
+{
+    fn as_ref(&self) -> &T {
+        match self {
+            Self::Left(l) => l.as_ref(),
+            Self::Right(r) => r.as_ref(),
         }
     }
 }
@@ -393,6 +422,7 @@ impl<T> MustConsumeVec<T> {
         }
     }
 
+    #[must_use]
     pub fn take(&mut self) -> Self {
         MustConsumeVec {
             tag: self.tag,
@@ -425,8 +455,7 @@ impl<T> Drop for MustConsumeVec<T> {
 
 /// Exit the whole process when panic.
 pub fn set_panic_hook(panic_abort: bool, data_dir: &str) {
-    use std::panic;
-    use std::process;
+    use std::{panic, process};
 
     // HACK! New a backtrace ahead for caching necessary elf sections of this
     // tikv-server, in case it can not open more files during panicking
@@ -472,7 +501,7 @@ pub fn set_panic_hook(panic_abort: bool, data_dir: &str) {
         // When the old global async logger is replaced, the old async guard will be taken and dropped.
         // In the drop() the async guard, it waits for the finish of the remaining logs in the async logger.
         if let Some(level) = ::log::max_level().to_level() {
-            let drainer = logger::text_format(logger::term_writer());
+            let drainer = logger::text_format(logger::term_writer(), true);
             let _ = logger::init_log(
                 drainer,
                 logger::convert_log_level_to_slog_level(level),
@@ -525,6 +554,21 @@ pub fn check_environment_variables() {
     }
 }
 
+/// Create a child process and wait to get its exit code.
+pub fn run_and_wait_child_process(child: impl Fn()) -> Result<i32, String> {
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { .. }) => match wait().unwrap() {
+            WaitStatus::Exited(_, status) => Ok(status),
+            v => Err(format!("{:?}", v)),
+        },
+        Ok(ForkResult::Child) => {
+            child();
+            std::process::exit(0);
+        }
+        Err(e) => Err(format!("Fork failed: {}", e)),
+    }
+}
+
 #[inline]
 pub fn is_zero_duration(d: &Duration) -> bool {
     d.as_secs() == 0 && d.subsec_nanos() == 0
@@ -541,21 +585,20 @@ pub fn build_on_master_branch() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use std::io::Read;
-    use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::*;
+    use std::{
+        io::Read,
+        rc::Rc,
+        sync::atomic::{AtomicBool, Ordering},
+        *,
+    };
 
     use tempfile::Builder;
 
+    use super::*;
+
     #[test]
-    #[cfg(unix)]
     fn test_panic_hook() {
         use gag::BufferRedirect;
-        use nix::sys::wait::{wait, WaitStatus};
-        use nix::unistd::{fork, ForkResult};
         use slog::{self, Drain, OwnedKVList, Record};
 
         struct DelayDrain<D>(D);
@@ -578,24 +621,10 @@ mod tests {
             }
         }
 
-        fn run_and_wait_child_process(child: impl Fn()) -> Result<i32, String> {
-            match fork() {
-                Ok(ForkResult::Parent { .. }) => match wait().unwrap() {
-                    WaitStatus::Exited(_, status) => Ok(status),
-                    v => Err(format!("{:?}", v)),
-                },
-                Ok(ForkResult::Child) => {
-                    child();
-                    std::process::exit(0);
-                }
-                Err(e) => Err(format!("Fork failed: {}", e)),
-            }
-        }
-
         let mut stderr = BufferRedirect::stderr().unwrap();
         let status = run_and_wait_child_process(|| {
             set_panic_hook(false, "./");
-            let drainer = logger::text_format(logger::term_writer());
+            let drainer = logger::text_format(logger::term_writer(), true);
             crate::logger::init_log(
                 DelayDrain(drainer),
                 logger::get_level_by_string("debug").unwrap(),

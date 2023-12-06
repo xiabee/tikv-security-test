@@ -1,13 +1,14 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{
+    sync::{mpsc::channel, Arc, Mutex},
+    time::Duration,
+};
+
 use file_system::calc_crc32;
-use futures::executor::block_on;
-use futures::{stream, SinkExt};
+use futures::{executor::block_on, stream, SinkExt};
 use grpcio::{Result, WriteFlags};
 use kvproto::import_sstpb::*;
-use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tempfile::Builder;
 use test_raftstore::Simulator;
 use test_sst_importer::*;
@@ -126,8 +127,10 @@ fn test_ingest_reentrant() {
     assert!(!resp.has_error());
 
     let checksum2 = calc_crc32(save_path).unwrap();
-    // Checksums are different because ingest changed global seqno in sst file.
-    assert_ne!(checksum1, checksum2);
+    // TODO: Remove this once write_global_seqno is deprecated.
+    // Checksums are the same since the global seqno in the SST file no longer gets updated with the
+    // default setting, which is write_global_seqno=false.
+    assert_eq!(checksum1, checksum2);
     // Do ingest again and it can be reentrant
     let resp = import.ingest(&ingest).unwrap();
     assert!(!resp.has_error());

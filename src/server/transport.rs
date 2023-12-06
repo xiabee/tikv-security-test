@@ -1,14 +1,12 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use kvproto::raft_serverpb::RaftMessage;
-
-use crate::server::raft_client::RaftClient;
-use crate::server::resolve::StoreAddrResolver;
-use engine_traits::KvEngine;
-use raftstore::router::RaftStoreRouter;
-use raftstore::store::Transport;
-use raftstore::Result as RaftStoreResult;
 use std::marker::PhantomData;
+
+use engine_traits::KvEngine;
+use kvproto::raft_serverpb::RaftMessage;
+use raftstore::{router::RaftStoreRouter, store::Transport, Result as RaftStoreResult};
+
+use crate::server::{raft_client::RaftClient, resolve::StoreAddrResolver};
 
 pub struct ServerTransport<T, S, E>
 where
@@ -59,6 +57,10 @@ where
             Ok(()) => Ok(()),
             Err(reason) => Err(raftstore::Error::Transport(reason)),
         }
+    }
+
+    fn set_store_allowlist(&mut self, stores: Vec<u64>) {
+        self.raft_client.set_store_allowlist(stores)
     }
 
     fn need_flush(&self) -> bool {

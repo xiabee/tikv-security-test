@@ -1,12 +1,26 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::mem;
+
 use kvproto::{
     encryptionpb::EncryptionMeta,
     kvrpcpb::LockInfo,
     metapb::{Peer, Region, RegionEpoch},
     raft_cmdpb::{self, RaftCmdRequest, ReadIndexRequest},
 };
-use std::mem;
+
+/// Transmute vec from one type to the other type.
+///
+/// # Safety
+///
+/// The two types should be with same memory layout.
+#[inline]
+pub unsafe fn vec_transmute<F, T>(from: Vec<F>) -> Vec<T> {
+    debug_assert!(mem::size_of::<F>() == mem::size_of::<T>());
+    debug_assert!(mem::align_of::<F>() == mem::align_of::<T>());
+    let (ptr, len, cap) = from.into_raw_parts();
+    Vec::from_raw_parts(ptr as _, len, cap)
+}
 
 pub trait HeapSize {
     fn heap_size(&self) -> usize {

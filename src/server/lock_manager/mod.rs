@@ -6,35 +6,42 @@ pub mod deadlock;
 mod metrics;
 pub mod waiter_manager;
 
-pub use self::config::{Config, LockManagerConfigManager};
-pub use self::deadlock::{Scheduler as DetectorScheduler, Service as DeadlockService};
-pub use self::waiter_manager::Scheduler as WaiterMgrScheduler;
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-
-use self::deadlock::{Detector, RoleChangeNotifier};
-use self::waiter_manager::WaiterManager;
-use crate::server::resolve::StoreAddrResolver;
-use crate::server::{Error, Result};
-use crate::storage::{
-    lock_manager::{Lock, LockManager as LockManagerTrait, WaitTimeout},
-    ProcessResult, StorageCallback,
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
 };
-use raftstore::coprocessor::CoprocessorHost;
 
-use crate::storage::lock_manager::DiagnosticContext;
 use collections::HashSet;
 use crossbeam::utils::CachePadded;
 use engine_traits::KvEngine;
 use parking_lot::Mutex;
 use pd_client::PdClient;
+use raftstore::coprocessor::CoprocessorHost;
 use security::SecurityManager;
 use tikv_util::worker::FutureWorker;
 use txn_types::TimeStamp;
+
+pub use self::{
+    config::{Config, LockManagerConfigManager},
+    deadlock::{Scheduler as DetectorScheduler, Service as DeadlockService},
+    waiter_manager::Scheduler as WaiterMgrScheduler,
+};
+use self::{
+    deadlock::{Detector, RoleChangeNotifier},
+    waiter_manager::WaiterManager,
+};
+use crate::{
+    server::{resolve::StoreAddrResolver, Error, Result},
+    storage::{
+        lock_manager::{DiagnosticContext, Lock, LockManager as LockManagerTrait, WaitTimeout},
+        DynamicConfigs as StorageDynamicConfigs, ProcessResult, StorageCallback,
+    },
+};
 
 const DETECTED_SLOTS_NUM: usize = 128;
 
@@ -61,6 +68,8 @@ pub struct LockManager {
     detected: Arc<[CachePadded<Mutex<HashSet<TimeStamp>>>]>,
 
     pipelined: Arc<AtomicBool>,
+
+    in_memory: Arc<AtomicBool>,
 }
 
 impl Clone for LockManager {
@@ -73,12 +82,13 @@ impl Clone for LockManager {
             waiter_count: self.waiter_count.clone(),
             detected: self.detected.clone(),
             pipelined: self.pipelined.clone(),
+            in_memory: self.in_memory.clone(),
         }
     }
 }
 
 impl LockManager {
-    pub fn new(pipelined: bool) -> Self {
+    pub fn new(cfg: &Config) -> Self {
         let waiter_mgr_worker = FutureWorker::new("waiter-manager");
         let detector_worker = FutureWorker::new("deadlock-detector");
         let mut detected = Vec::with_capacity(DETECTED_SLOTS_NUM);
@@ -91,7 +101,8 @@ impl LockManager {
             detector_worker: Some(detector_worker),
             waiter_count: Arc::new(AtomicUsize::new(0)),
             detected: detected.into(),
-            pipelined: Arc::new(AtomicBool::new(pipelined)),
+            pipelined: Arc::new(AtomicBool::new(cfg.pipelined)),
+            in_memory: Arc::new(AtomicBool::new(cfg.in_memory)),
         }
     }
 
@@ -210,11 +221,15 @@ impl LockManager {
             self.waiter_mgr_scheduler.clone(),
             self.detector_scheduler.clone(),
             self.pipelined.clone(),
+            self.in_memory.clone(),
         )
     }
 
-    pub fn get_pipelined(&self) -> Arc<AtomicBool> {
-        self.pipelined.clone()
+    pub fn get_storage_dynamic_configs(&self) -> StorageDynamicConfigs {
+        StorageDynamicConfigs {
+            pipelined_pessimistic_lock: self.pipelined.clone(),
+            in_memory_pessimistic_lock: self.in_memory.clone(),
+        }
     }
 
     fn add_to_detected(&self, txn_ts: TimeStamp) {
@@ -291,31 +306,29 @@ impl LockManagerTrait for LockManager {
 
 #[cfg(test)]
 mod tests {
-    use self::deadlock::tests::*;
-    use self::metrics::*;
-    use self::waiter_manager::tests::*;
-    use super::*;
+    use std::{thread, time::Duration};
+
     use engine_test::kv::KvTestEngine;
+    use futures::executor::block_on;
+    use kvproto::metapb::{Peer, Region};
+    use raft::StateRole;
     use raftstore::coprocessor::RegionChangeEvent;
     use security::SecurityConfig;
     use tikv_util::config::ReadableDuration;
 
-    use std::thread;
-    use std::time::Duration;
-
-    use futures::executor::block_on;
-    use kvproto::metapb::{Peer, Region};
-    use raft::StateRole;
+    use self::{deadlock::tests::*, metrics::*, waiter_manager::tests::*};
+    use super::*;
 
     fn start_lock_manager() -> LockManager {
         let mut coprocessor_host = CoprocessorHost::<KvTestEngine>::default();
 
-        let mut lock_mgr = LockManager::new(false);
         let cfg = Config {
             wait_for_lock_timeout: ReadableDuration::millis(3000),
             wake_up_delay_duration: ReadableDuration::millis(100),
-            ..Default::default()
+            pipelined: false,
+            in_memory: false,
         };
+        let mut lock_mgr = LockManager::new(&cfg);
 
         lock_mgr.register_detector_role_change_observer(&mut coprocessor_host);
         lock_mgr
@@ -503,7 +516,11 @@ mod tests {
 
     #[bench]
     fn bench_lock_mgr_clone(b: &mut test::Bencher) {
-        let lock_mgr = LockManager::new(false);
+        let lock_mgr = LockManager::new(&Config {
+            pipelined: false,
+            in_memory: false,
+            ..Default::default()
+        });
         b.iter(|| {
             test::black_box(lock_mgr.clone());
         });

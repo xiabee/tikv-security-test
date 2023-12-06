@@ -1,19 +1,24 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cell::Cell;
-use std::ffi::CString;
-use std::mem;
-use std::result::Result;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use engine_rocks::raw::{
-    new_compaction_filter_raw, CompactionFilter, CompactionFilterContext, CompactionFilterDecision,
-    CompactionFilterFactory, CompactionFilterValueType, DBCompactionFilter,
+use std::{
+    cell::Cell,
+    ffi::CString,
+    mem,
+    result::Result,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
+
 use engine_rocks::{
-    RocksEngine, RocksMvccProperties, RocksUserCollectedPropertiesNoRc, RocksWriteBatch,
+    raw::{
+        new_compaction_filter_raw, CompactionFilter, CompactionFilterContext,
+        CompactionFilterDecision, CompactionFilterFactory, CompactionFilterValueType,
+        DBCompactionFilter,
+    },
+    RocksEngine, RocksMvccProperties, RocksWriteBatch,
 };
 use engine_traits::{
     KvEngine, MiscExt, Mutable, MvccProperties, WriteBatch, WriteBatchExt, WriteOptions,
@@ -22,15 +27,19 @@ use file_system::{IOType, WithIOType};
 use pd_client::{Feature, FeatureGate};
 use prometheus::{local::*, *};
 use raftstore::coprocessor::RegionInfoProvider;
-use tikv_util::time::Instant;
-use tikv_util::worker::{ScheduleError, Scheduler};
+use tikv_util::{
+    time::Instant,
+    worker::{ScheduleError, Scheduler},
+};
 use txn_types::{Key, TimeStamp, WriteRef, WriteType};
 
-use crate::server::gc_worker::{GcConfig, GcTask, GcWorkerConfigManager};
-use crate::storage::mvcc::{GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VERSIONS_HISTOGRAM};
+use crate::{
+    server::gc_worker::{GcConfig, GcTask, GcWorkerConfigManager},
+    storage::mvcc::{GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VERSIONS_HISTOGRAM},
+};
 
 const DEFAULT_DELETE_BATCH_SIZE: usize = 256 * 1024;
-const DEFAULT_DELETE_BATCH_COUNT: usize = 128;
+pub const DEFAULT_DELETE_BATCH_COUNT: usize = 128;
 
 // The default version that can enable compaction filter for GC. This is necessary because after
 // compaction filter is enabled, it's impossible to fallback to ealier version which modifications
@@ -38,15 +47,15 @@ const DEFAULT_DELETE_BATCH_COUNT: usize = 128;
 const COMPACTION_FILTER_GC_FEATURE: Feature = Feature::require(5, 0, 0);
 
 // Global context to create a compaction filter for write CF. It's necessary as these fields are
-// not available when construcing `WriteCompactionFilterFactory`.
-struct GcContext {
-    db: RocksEngine,
-    store_id: u64,
-    safe_point: Arc<AtomicU64>,
+// not available when constructing `WriteCompactionFilterFactory`.
+pub struct GcContext {
+    pub(crate) db: RocksEngine,
+    pub(crate) store_id: u64,
+    pub(crate) safe_point: Arc<AtomicU64>,
     cfg_tracker: GcWorkerConfigManager,
     feature_gate: FeatureGate,
-    gc_scheduler: Scheduler<GcTask>,
-    region_info_provider: Arc<dyn RegionInfoProvider + 'static>,
+    pub(crate) gc_scheduler: Scheduler<GcTask<RocksEngine>>,
+    pub(crate) region_info_provider: Arc<dyn RegionInfoProvider + 'static>,
     #[cfg(any(test, feature = "failpoints"))]
     callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
 }
@@ -55,16 +64,16 @@ struct GcContext {
 static ORPHAN_VERSIONS_ID: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
-    static ref GC_CONTEXT: Mutex<Option<GcContext>> = Mutex::new(None);
+    pub static ref GC_CONTEXT: Mutex<Option<GcContext>> = Mutex::new(None);
 
     // Filtered keys in `WriteCompactionFilter::filter_v2`.
-    static ref GC_COMPACTION_FILTERED: IntCounter = register_int_counter!(
+    pub static ref GC_COMPACTION_FILTERED: IntCounter = register_int_counter!(
         "tikv_gc_compaction_filtered",
         "Filtered versions by compaction"
     )
     .unwrap();
     // A counter for errors met by `WriteCompactionFilter`.
-    static ref GC_COMPACTION_FAILURE: IntCounterVec = register_int_counter_vec!(
+    pub static ref GC_COMPACTION_FAILURE: IntCounterVec = register_int_counter_vec!(
         "tikv_gc_compaction_failure",
         "Compaction filter meets failure",
         &["type"]
@@ -84,7 +93,7 @@ lazy_static! {
 
 
     // `WriteType::Rollback` and `WriteType::Lock` are handled in different ways.
-    static ref GC_COMPACTION_MVCC_ROLLBACK: IntCounter = register_int_counter!(
+    pub static ref GC_COMPACTION_MVCC_ROLLBACK: IntCounter = register_int_counter!(
         "tikv_gc_compaction_mvcc_rollback",
         "Compaction of mvcc rollbacks"
     )
@@ -96,26 +105,43 @@ lazy_static! {
         &["tag"]
     ).unwrap();
 
+    /// Counter of mvcc deletions met in compaction filter.
+    pub static ref GC_COMPACTION_FILTER_MVCC_DELETION_MET: IntCounter = register_int_counter!(
+        "tikv_gc_compaction_filter_mvcc_deletion_met",
+        "MVCC deletion from compaction filter met"
+    ).unwrap();
+
+    /// Counter of mvcc deletions handled in gc worker.
     pub static ref GC_COMPACTION_FILTER_MVCC_DELETION_HANDLED: IntCounter = register_int_counter!(
         "tikv_gc_compaction_filter_mvcc_deletion_handled",
         "MVCC deletion from compaction filter handled"
     )
     .unwrap();
+
+    /// Mvcc deletions sent to gc worker can have already been cleared, in which case resources are
+    /// wasted to seek them.
+    pub static ref GC_COMPACTION_FILTER_MVCC_DELETION_WASTED: IntCounter = register_int_counter!(
+        "tikv_gc_compaction_filter_mvcc_deletion_wasted",
+        "MVCC deletion from compaction filter wasted"
+    ).unwrap();
 }
 
-pub trait CompactionFilterInitializer {
+pub trait CompactionFilterInitializer<EK>
+where
+    EK: KvEngine,
+{
     fn init_compaction_filter(
         &self,
         store_id: u64,
         safe_point: Arc<AtomicU64>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
-        gc_scheduler: Scheduler<GcTask>,
+        gc_scheduler: Scheduler<GcTask<EK>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
     );
 }
 
-impl<EK> CompactionFilterInitializer for EK
+impl<EK> CompactionFilterInitializer<EK> for EK
 where
     EK: KvEngine,
 {
@@ -125,21 +151,21 @@ where
         _safe_point: Arc<AtomicU64>,
         _cfg_tracker: GcWorkerConfigManager,
         _feature_gate: FeatureGate,
-        _gc_scheduler: Scheduler<GcTask>,
+        _gc_scheduler: Scheduler<GcTask<EK>>,
         _region_info_provider: Arc<dyn RegionInfoProvider>,
     ) {
         info!("Compaction filter is not supported for this engine.");
     }
 }
 
-impl CompactionFilterInitializer for RocksEngine {
+impl CompactionFilterInitializer<RocksEngine> for RocksEngine {
     fn init_compaction_filter(
         &self,
         store_id: u64,
         safe_point: Arc<AtomicU64>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
-        gc_scheduler: Scheduler<GcTask>,
+        gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
     ) {
         info!("initialize GC context for compaction filter");
@@ -223,13 +249,13 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
             "manual" => context.is_manual_compaction(),
         );
 
-        let filter = Box::new(WriteCompactionFilter::new(
+        let filter = WriteCompactionFilter::new(
             db,
             safe_point,
             context,
             gc_scheduler,
             (store_id, region_info_provider),
-        ));
+        );
         let name = CString::new("write_compaction_filter").unwrap();
         unsafe { new_compaction_filter_raw(name, filter) }
     }
@@ -242,7 +268,7 @@ struct WriteCompactionFilter {
     encountered_errors: bool,
 
     write_batch: RocksWriteBatch,
-    gc_scheduler: Scheduler<GcTask>,
+    gc_scheduler: Scheduler<GcTask<RocksEngine>>,
     // A key batch which is going to be sent to the GC worker.
     mvcc_deletions: Vec<Key>,
     // The count of records covered the current mvcc-deletion mark. The mvcc-deletion
@@ -273,7 +299,7 @@ impl WriteCompactionFilter {
         engine: RocksEngine,
         safe_point: u64,
         context: &CompactionFilterContext,
-        gc_scheduler: Scheduler<GcTask>,
+        gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         regions_provider: (u64, Arc<dyn RegionInfoProvider>),
     ) -> Self {
         // Safe point must have been initialized.
@@ -314,7 +340,7 @@ impl WriteCompactionFilter {
 
     // `log_on_error` indicates whether to print an error log on scheduling failures.
     // It's only enabled for `GcTask::OrphanVersions`.
-    fn schedule_gc_task(&self, task: GcTask, log_on_error: bool) {
+    fn schedule_gc_task(&self, task: GcTask<RocksEngine>, log_on_error: bool) {
         match self.gc_scheduler.schedule(task) {
             Ok(_) => {}
             Err(e) => {
@@ -395,6 +421,7 @@ impl WriteCompactionFilter {
                     self.remove_older = true;
                     if self.is_bottommost_level {
                         self.mvcc_deletion_overlaps = Some(0);
+                        GC_COMPACTION_FILTER_MVCC_DELETION_MET.inc();
                     }
                 }
             }
@@ -419,7 +446,7 @@ impl WriteCompactionFilter {
         Ok(decision)
     }
 
-    fn handle_filtered_write(&mut self, write: WriteRef) -> Result<(), String> {
+    fn handle_filtered_write(&mut self, write: WriteRef<'_>) -> Result<(), String> {
         if write.short_value.is_none() && write.write_type == WriteType::Put {
             let prefix = Key::from_encoded_slice(&self.mvcc_key_prefix);
             let def_key = prefix.append_ts(write.start_ts).into_encoded();
@@ -483,11 +510,11 @@ impl WriteCompactionFilter {
     }
 
     fn flush_metrics(&self) {
-        GC_COMPACTION_FILTERED.inc_by(self.total_filtered as i64);
-        GC_COMPACTION_MVCC_ROLLBACK.inc_by(self.mvcc_rollback_and_locks as i64);
+        GC_COMPACTION_FILTERED.inc_by(self.total_filtered as u64);
+        GC_COMPACTION_MVCC_ROLLBACK.inc_by(self.mvcc_rollback_and_locks as u64);
         GC_COMPACTION_FILTER_ORPHAN_VERSIONS
             .with_label_values(&["generated"])
-            .inc_by(self.orphan_versions as i64);
+            .inc_by(self.orphan_versions as u64);
         if let Some((versions, filtered)) = STATS.with(|stats| {
             stats.versions.update(|x| x + self.total_versions);
             stats.filtered.update(|x| x + self.total_filtered);
@@ -503,18 +530,18 @@ impl WriteCompactionFilter {
     }
 }
 
-struct CompactionFilterStats {
-    versions: Cell<usize>, // Total stale versions meet by compaction filters.
-    filtered: Cell<usize>, // Filtered versions by compaction filters.
-    last_report: Cell<Instant>,
+pub struct CompactionFilterStats {
+    pub versions: Cell<usize>, // Total stale versions meet by compaction filters.
+    pub filtered: Cell<usize>, // Filtered versions by compaction filters.
+    pub last_report: Cell<Instant>,
 }
 impl CompactionFilterStats {
-    fn need_report(&self) -> bool {
+    pub fn need_report(&self) -> bool {
         self.versions.get() >= 1024 * 1024 // 1M versions.
             || self.last_report.get().saturating_elapsed() >= Duration::from_secs(60)
     }
 
-    fn prepare_report(&self) -> (usize, usize) {
+    pub fn prepare_report(&self) -> (usize, usize) {
         let versions = self.versions.replace(0);
         let filtered = self.filtered.replace(0);
         self.last_report.set(Instant::now());
@@ -554,7 +581,7 @@ impl Drop for WriteCompactionFilter {
 
         #[cfg(any(test, feature = "failpoints"))]
         for callback in &self.callbacks_on_drop {
-            callback(&self);
+            callback(self);
         }
     }
 }
@@ -595,7 +622,7 @@ fn split_ts(key: &[u8]) -> Result<(&[u8], u64), String> {
     }
 }
 
-fn parse_write(value: &[u8]) -> Result<WriteRef, String> {
+fn parse_write(value: &[u8]) -> Result<WriteRef<'_>, String> {
     match WriteRef::parse(value) {
         Ok(write) => Ok(write),
         Err(_) => Err(format!(
@@ -650,10 +677,7 @@ fn check_need_gc(
     let (mut sum_props, mut needs_gc) = (MvccProperties::new(), 0);
     for i in 0..context.file_numbers().len() {
         let table_props = context.table_properties(i);
-        let user_props = unsafe {
-            &*(table_props.user_collected_properties() as *const _
-                as *const RocksUserCollectedPropertiesNoRc)
-        };
+        let user_props = table_props.user_collected_properties();
         if let Ok(props) = RocksMvccProperties::decode(user_props) {
             sum_props.add(&props);
             let (sst_needs_gc, skip_more_checks) = check_props(&props);
@@ -674,15 +698,20 @@ fn check_need_gc(
 #[allow(dead_code)] // Some interfaces are not used with different compile options.
 #[cfg(any(test, feature = "failpoints"))]
 pub mod test_utils {
+    use engine_rocks::{
+        raw::{CompactOptions, CompactionOptions},
+        util::get_cf_handle,
+        RocksEngine,
+    };
+    use engine_traits::{SyncMutable, CF_DEFAULT, CF_WRITE};
+    use raftstore::coprocessor::region_info_accessor::MockRegionInfoProvider;
+    use tikv_util::{
+        config::VersionTrack,
+        worker::{dummy_scheduler, ReceiverWrapper},
+    };
+
     use super::*;
     use crate::storage::kv::RocksEngine as StorageRocksEngine;
-    use engine_rocks::raw::{CompactOptions, CompactionOptions};
-    use engine_rocks::util::get_cf_handle;
-    use engine_rocks::RocksEngine;
-    use engine_traits::{SyncMutable, CF_WRITE};
-    use raftstore::coprocessor::region_info_accessor::MockRegionInfoProvider;
-    use tikv_util::config::VersionTrack;
-    use tikv_util::worker::{dummy_scheduler, ReceiverWrapper};
 
     /// Do a global GC with the given safe point.
     pub fn gc_by_compact(engine: &StorageRocksEngine, _: &[u8], safe_point: u64) {
@@ -711,8 +740,8 @@ pub mod test_utils {
         pub start: Option<&'a [u8]>,
         pub end: Option<&'a [u8]>,
         pub target_level: Option<usize>,
-        pub gc_scheduler: Scheduler<GcTask>,
-        pub gc_receiver: ReceiverWrapper<GcTask>,
+        pub gc_scheduler: Scheduler<GcTask<RocksEngine>>,
+        pub gc_receiver: ReceiverWrapper<GcTask<RocksEngine>>,
         pub(super) callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
     }
 
@@ -790,6 +819,21 @@ pub mod test_utils {
             self.post_gc();
         }
 
+        pub fn gc_raw(&mut self, engine: &RocksEngine) {
+            let _guard = LOCK.lock().unwrap();
+            self.prepare_gc(engine);
+
+            let db = engine.as_inner();
+            let handle = get_cf_handle(db, CF_DEFAULT).unwrap();
+            let mut compact_opts = default_compact_options();
+            if let Some(target_level) = self.target_level {
+                compact_opts.set_change_level(true);
+                compact_opts.set_target_level(target_level as i32);
+            }
+            db.compact_range_cf_opt(handle, &compact_opts, None, None);
+            self.post_gc();
+        }
+
         pub fn gc_on_files(&mut self, engine: &RocksEngine, input_files: &[String]) {
             let _guard = LOCK.lock().unwrap();
             self.prepare_gc(engine);
@@ -829,14 +873,17 @@ pub mod test_utils {
 
 #[cfg(test)]
 pub mod tests {
-    use super::test_utils::*;
-    use super::*;
-
-    use crate::config::DbConfig;
-    use crate::storage::kv::TestEngineBuilder;
-    use crate::storage::mvcc::tests::{must_get, must_get_none};
-    use crate::storage::txn::tests::{must_commit, must_prewrite_delete, must_prewrite_put};
     use engine_traits::{DeleteStrategy, MiscExt, Peekable, Range, SyncMutable, CF_WRITE};
+
+    use super::{test_utils::*, *};
+    use crate::{
+        config::DbConfig,
+        storage::{
+            kv::TestEngineBuilder,
+            mvcc::tests::{must_get, must_get_none},
+            txn::tests::{must_commit, must_prewrite_delete, must_prewrite_put},
+        },
+    };
 
     #[test]
     fn test_is_compaction_filter_allowed() {

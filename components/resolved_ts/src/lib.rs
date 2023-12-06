@@ -10,6 +10,8 @@
 //!   3. Resolved TS must be advanced by the region leader after it has applied on its term.
 
 #![feature(box_patterns)]
+#![feature(result_flattening)]
+#![feature(let_chains)]
 
 #[macro_use]
 extern crate tikv_util;
@@ -33,3 +35,4 @@ mod scanner;
 pub use scanner::*;
 mod metrics;
 pub use metrics::*;
+mod util;

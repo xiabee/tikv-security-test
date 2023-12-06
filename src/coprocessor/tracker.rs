@@ -1,18 +1,14 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use kvproto::kvrpcpb;
-use kvproto::kvrpcpb::ScanDetailV2;
-
-use crate::storage::kv::PerfStatisticsDelta;
-
-use engine_rocks::set_perf_level;
+use engine_rocks::{ReadPerfContext, RocksPerfContext};
+use engine_traits::{PerfContext, PerfContextKind};
+use kvproto::{kvrpcpb, kvrpcpb::ScanDetailV2};
+use pd_client::BucketMeta;
 use tikv_util::time::{self, Duration, Instant};
+use txn_types::Key;
 
 use super::metrics::*;
-use crate::coprocessor::*;
-use crate::storage::Statistics;
-
-use txn_types::Key;
+use crate::{coprocessor::*, storage::Statistics};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TrackerState {
@@ -64,9 +60,14 @@ pub struct Tracker {
     item_process_time: Duration,
     total_process_time: Duration,
     total_storage_stats: Statistics,
-    total_perf_stats: PerfStatisticsDelta, // Accumulated perf statistics
+    // TODO: This leaks the RocksDB engine from abstraction, try to use the PerfContext
+    // in engine_trait instead.
+    perf_context: RocksPerfContext,
+    total_perf_stats: ReadPerfContext, // Accumulated perf statistics
     slow_log_threshold: Duration,
     scan_process_time_ms: u64,
+
+    pub buckets: Option<Arc<BucketMeta>>,
 
     // Request info, used to print slow log.
     pub req_ctx: ReqContext,
@@ -91,25 +92,27 @@ impl Tracker {
             total_suspend_time: Duration::default(),
             total_process_time: Duration::default(),
             total_storage_stats: Statistics::default(),
-            total_perf_stats: PerfStatisticsDelta::default(),
+            perf_context: RocksPerfContext::new(req_ctx.perf_level, PerfContextKind::GenericRead),
+            total_perf_stats: ReadPerfContext::default(),
             scan_process_time_ms: 0,
             slow_log_threshold,
             req_ctx,
+            buckets: None,
         }
     }
 
     pub fn on_scheduled(&mut self) {
         assert_eq!(self.current_stage, TrackerState::Initialized);
         let now = Instant::now_coarse();
-        self.schedule_wait_time = now.saturating_duration_since(self.request_begin_at);
+        self.schedule_wait_time = now - self.request_begin_at;
         self.current_stage = TrackerState::Scheduled(now);
     }
 
     pub fn on_snapshot_finished(&mut self) {
         if let TrackerState::Scheduled(at) = self.current_stage {
             let now = Instant::now_coarse();
-            self.snapshot_wait_time = now.saturating_duration_since(at);
-            self.wait_time = now.saturating_duration_since(self.request_begin_at);
+            self.snapshot_wait_time = now - at;
+            self.wait_time = now - self.request_begin_at;
             self.current_stage = TrackerState::SnapshotRetrieved(now);
         } else {
             unreachable!()
@@ -119,7 +122,7 @@ impl Tracker {
     pub fn on_begin_all_items(&mut self) {
         if let TrackerState::SnapshotRetrieved(at) = self.current_stage {
             let now = Instant::now_coarse();
-            self.handler_build_time = now.saturating_duration_since(at);
+            self.handler_build_time = now - at;
             self.current_stage = TrackerState::AllItemsBegan;
         } else {
             unreachable!()
@@ -131,29 +134,27 @@ impl Tracker {
         match self.current_stage {
             TrackerState::AllItemsBegan => {}
             TrackerState::ItemFinished(at) => {
-                self.item_suspend_time = now.saturating_duration_since(at);
+                self.item_suspend_time = now - at;
                 self.total_suspend_time += self.item_suspend_time;
             }
             _ => unreachable!(),
         }
 
-        set_perf_level(self.req_ctx.perf_level);
+        self.perf_context.start_observe();
         self.current_stage = TrackerState::ItemBegan(now);
     }
 
-    pub fn on_finish_item(
-        &mut self,
-        some_storage_stats: Option<Statistics>,
-        perf_statistics: PerfStatisticsDelta,
-    ) {
+    pub fn on_finish_item(&mut self, some_storage_stats: Option<Statistics>) {
         if let TrackerState::ItemBegan(at) = self.current_stage {
             let now = Instant::now_coarse();
-            self.item_process_time = now.saturating_duration_since(at);
+            self.item_process_time = now - at;
             self.total_process_time += self.item_process_time;
             if let Some(storage_stats) = some_storage_stats {
                 self.total_storage_stats.add(&storage_stats);
             }
             // Record delta perf statistics
+            self.perf_context.report_metrics();
+            let perf_statistics = self.perf_context.stats.read;
             self.total_perf_stats += perf_statistics;
             self.current_stage = TrackerState::ItemFinished(now);
         } else {
@@ -209,18 +210,17 @@ impl Tracker {
 
         let mut detail_v2 = ScanDetailV2::default();
         detail_v2.set_processed_versions(self.total_storage_stats.write.processed_keys as u64);
+        detail_v2.set_processed_versions_size(self.total_storage_stats.processed_size as u64);
         detail_v2.set_total_versions(self.total_storage_stats.write.total_op_count() as u64);
         detail_v2.set_rocksdb_delete_skipped_count(
-            self.total_perf_stats.0.internal_delete_skipped_count as u64,
+            self.total_perf_stats.internal_delete_skipped_count as u64,
         );
-        detail_v2.set_rocksdb_key_skipped_count(
-            self.total_perf_stats.0.internal_key_skipped_count as u64,
-        );
-        detail_v2.set_rocksdb_block_cache_hit_count(
-            self.total_perf_stats.0.block_cache_hit_count as u64,
-        );
-        detail_v2.set_rocksdb_block_read_count(self.total_perf_stats.0.block_read_count as u64);
-        detail_v2.set_rocksdb_block_read_byte(self.total_perf_stats.0.block_read_byte as u64);
+        detail_v2
+            .set_rocksdb_key_skipped_count(self.total_perf_stats.internal_key_skipped_count as u64);
+        detail_v2
+            .set_rocksdb_block_cache_hit_count(self.total_perf_stats.block_cache_hit_count as u64);
+        detail_v2.set_rocksdb_block_read_count(self.total_perf_stats.block_read_count as u64);
+        detail_v2.set_rocksdb_block_read_byte(self.total_perf_stats.block_read_byte as u64);
         exec_details_v2.set_scan_detail_v2(detail_v2);
 
         (exec_details, exec_details_v2)
@@ -233,7 +233,7 @@ impl Tracker {
             _ => unreachable!(),
         }
 
-        self.req_lifetime = self.request_begin_at.saturating_elapsed();
+        self.req_lifetime = Instant::now_coarse() - self.request_begin_at;
         self.current_stage = TrackerState::AllItemFinished;
         self.track();
     }
@@ -267,16 +267,17 @@ impl Tracker {
                 "tag" => self.req_ctx.tag.get_str(),
                 "scan.is_desc" => self.req_ctx.is_desc_scan,
                 "scan.processed" => total_storage_stats.write.processed_keys,
+                "scan.processed_size" => total_storage_stats.processed_size,
                 "scan.total" => total_storage_stats.write.total_op_count(),
                 "scan.ranges" => self.req_ctx.ranges.len(),
                 "scan.range.first" => ?first_range,
-                "perf_stats.block_cache_hit_count" => self.total_perf_stats.0.block_cache_hit_count,
-                "perf_stats.block_read_count" => self.total_perf_stats.0.block_read_count,
-                "perf_stats.block_read_byte" => self.total_perf_stats.0.block_read_byte,
+                "perf_stats.block_cache_hit_count" => self.total_perf_stats.block_cache_hit_count,
+                "perf_stats.block_read_count" => self.total_perf_stats.block_read_count,
+                "perf_stats.block_read_byte" => self.total_perf_stats.block_read_byte,
                 "perf_stats.internal_key_skipped_count"
-                    => self.total_perf_stats.0.internal_key_skipped_count,
+                    => self.total_perf_stats.internal_key_skipped_count,
                 "perf_stats.internal_delete_skipped_count"
-                    => self.total_perf_stats.0.internal_delete_skipped_count,
+                    => self.total_perf_stats.internal_delete_skipped_count,
             );
         }
 
@@ -324,7 +325,6 @@ impl Tracker {
             .observe(total_storage_stats.write.processed_keys as f64);
 
         tls_collect_scan_details(self.req_ctx.tag, &total_storage_stats);
-        tls_collect_read_flow(self.req_ctx.context.get_region_id(), &total_storage_stats);
         tls_collect_perf_stats(self.req_ctx.tag, &self.total_perf_stats);
 
         let peer = self.req_ctx.context.get_peer();
@@ -337,12 +337,19 @@ impl Tracker {
             false
         };
 
-        tls_collect_qps(
+        tls_collect_query(
             region_id,
             peer,
             Key::from_raw(start_key).as_encoded(),
             Key::from_raw(end_key).as_encoded(),
             reverse_scan,
+        );
+        tls_collect_read_flow(
+            self.req_ctx.context.get_region_id(),
+            Some(start_key),
+            Some(end_key),
+            &total_storage_stats,
+            self.buckets.as_ref(),
         );
         self.current_stage = TrackerState::Tracked;
     }
@@ -362,7 +369,7 @@ impl Drop for Tracker {
             self.on_begin_all_items();
         }
         if let TrackerState::ItemBegan(_) = self.current_stage {
-            self.on_finish_item(None, PerfStatisticsDelta::default());
+            self.on_finish_item(None);
         }
         if self.current_stage == TrackerState::AllItemsBegan {
             self.on_finish_all_items();

@@ -1,13 +1,14 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::{error::Error, net::SocketAddr, sync::Arc};
+
 use hyper::{body, Client, StatusCode, Uri};
 use security::SecurityConfig;
-use std::error::Error;
-use std::net::SocketAddr;
-use std::sync::Arc;
 use test_raftstore::{new_server_cluster, Simulator};
-use tikv::config::ConfigController;
-use tikv::server::status_server::{region_meta::RegionMeta, StatusServer};
+use tikv::{
+    config::ConfigController,
+    server::status_server::{region_meta::RegionMeta, StatusServer},
+};
 use tikv_util::HandyRwLock;
 
 async fn check(authority: SocketAddr, region_id: u64) -> Result<(), Box<dyn Error>> {
@@ -44,16 +45,16 @@ fn test_region_meta_endpoint() {
     assert!(router.is_some());
     let mut status_server = StatusServer::new(
         1,
-        None,
         ConfigController::default(),
         Arc::new(SecurityConfig::default()),
         router.unwrap(),
+        std::env::temp_dir(),
     )
     .unwrap();
     let addr = format!("127.0.0.1:{}", test_util::alloc_port());
-    assert!(status_server.start(addr.clone(), addr).is_ok());
+    assert!(status_server.start(addr).is_ok());
     let check_task = check(status_server.listening_addr(), region_id);
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
     if let Err(err) = rt.block_on(check_task) {
         panic!("{}", err);
     }

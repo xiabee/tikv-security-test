@@ -1,6 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use configuration::{ConfigChange, ConfigManager};
+use online_config::{ConfigChange, ConfigManager};
 use tikv_util::worker::Scheduler;
 
 use crate::Task;

@@ -1,24 +1,19 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::*;
-use std::time::Duration;
+use std::{sync::*, time::Duration};
 
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
-use configuration::ConfigValue;
 use engine_rocks::{RocksEngine, RocksSnapshot};
-use grpcio::ClientUnaryReceiver;
-use grpcio::{ChannelBuilder, Environment};
-use kvproto::kvrpcpb::*;
-use kvproto::tikvpb::TikvClient;
+use grpcio::{ChannelBuilder, ClientUnaryReceiver, Environment};
+use kvproto::{kvrpcpb::*, tikvpb::TikvClient};
+use online_config::ConfigValue;
 use raftstore::coprocessor::CoprocessorHost;
+use resolved_ts::{Observer, Task};
 use test_raftstore::*;
 use tikv::config::ResolvedTsConfig;
-use tikv_util::worker::LazyWorker;
-use tikv_util::HandyRwLock;
+use tikv_util::{worker::LazyWorker, HandyRwLock};
 use txn_types::TimeStamp;
-
-use resolved_ts::{Observer, Task};
 static INIT: Once = Once::new();
 
 pub fn init() {
@@ -128,6 +123,7 @@ impl TestSuite {
         muts: Vec<Mutation>,
         pk: Vec<u8>,
         ts: TimeStamp,
+        try_one_pc: bool,
     ) {
         let mut prewrite_req = PrewriteRequest::default();
         prewrite_req.set_context(self.get_context(region_id));
@@ -135,6 +131,7 @@ impl TestSuite {
         prewrite_req.primary_lock = pk;
         prewrite_req.start_version = ts.into_inner();
         prewrite_req.lock_ttl = prewrite_req.start_version + 1;
+        prewrite_req.try_one_pc = try_one_pc;
         let prewrite_resp = self
             .get_tikv_client(region_id)
             .kv_prewrite(&prewrite_req)
@@ -149,6 +146,9 @@ impl TestSuite {
             "{:?}",
             prewrite_resp.get_errors()
         );
+        if try_one_pc {
+            assert_ne!(prewrite_resp.get_one_pc_commit_ts(), 0);
+        }
     }
 
     pub fn must_kv_commit(
@@ -340,6 +340,20 @@ impl TestSuite {
                 .unwrap()
                 .into(),
         )
+    }
+
+    pub fn region_tracked_index(&mut self, region_id: u64) -> u64 {
+        for _ in 0..50 {
+            if let Some(leader) = self.cluster.leader_of_region(region_id) {
+                let meta = self.cluster.store_metas[&leader.store_id].lock().unwrap();
+                if let Some(tracked_index) = meta.region_read_progress.get_tracked_index(&region_id)
+                {
+                    return tracked_index;
+                }
+            }
+            sleep_ms(100)
+        }
+        panic!("fail to get region tracked index after 50 trys");
     }
 
     pub fn must_get_rts(&mut self, region_id: u64, rts: TimeStamp) {

@@ -4,15 +4,13 @@ pub use self::imp::wait_for_signal;
 
 #[cfg(unix)]
 mod imp {
-    use engine_rocks::RocksEngine;
-    use engine_traits::{Engines, MiscExt, RaftEngine};
+    use engine_traits::{Engines, KvEngine, MiscExt, RaftEngine};
     use libc::c_int;
-    use nix::sys::signal::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
-    use signal::trap::Trap;
+    use signal::{trap::Trap, Signal::*};
     use tikv_util::metrics;
 
     #[allow(dead_code)]
-    pub fn wait_for_signal<ER: RaftEngine>(engines: Option<Engines<RocksEngine, ER>>) {
+    pub fn wait_for_signal(engines: Option<Engines<impl KvEngine, impl RaftEngine>>) {
         let trap = Trap::trap(&[SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2]);
         for sig in trap {
             match sig {
@@ -22,7 +20,7 @@ mod imp {
                 }
                 SIGUSR1 => {
                     // Use SIGUSR1 to log metrics.
-                    info!("{}", metrics::dump());
+                    info!("{}", metrics::dump(false));
                     if let Some(ref engines) = engines {
                         info!("{:?}", MiscExt::dump_stats(&engines.kv));
                         info!("{:?}", RaftEngine::dump_stats(&engines.raft));
@@ -37,8 +35,7 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
-    use engine_rocks::RocksEngine;
-    use engine_traits::Engines;
+    use engine_traits::{Engines, KvEngine, RaftEngine};
 
-    pub fn wait_for_signal(_: Option<Engines<RocksEngine, RocksEngine>>) {}
+    pub fn wait_for_signal(_: Option<Engines<impl KvEngine, impl RaftEngine>>) {}
 }

@@ -2,16 +2,11 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use futures::executor::block_on;
-use futures::stream::StreamExt;
-use protobuf::Message;
-
+use futures::{executor::block_on, stream::StreamExt};
 use kvproto::coprocessor::{Request, Response};
-use tipb::ColumnInfo;
-use tipb::{SelectResponse, StreamResponse};
-
-use tikv::coprocessor::Endpoint;
-use tikv::storage::Engine;
+use protobuf::Message;
+use tikv::{coprocessor::Endpoint, storage::Engine};
+use tipb::{ColumnInfo, SelectResponse, StreamResponse};
 
 static ID_GENERATOR: AtomicUsize = AtomicUsize::new(1);
 
@@ -23,7 +18,7 @@ pub fn handle_request<E>(copr: &Endpoint<E>, req: Request) -> Response
 where
     E: Engine,
 {
-    block_on(copr.parse_and_handle_unary_request(req, None))
+    block_on(copr.parse_and_handle_unary_request(req, None)).consume()
 }
 
 pub fn handle_select<E>(copr: &Endpoint<E>, req: Request) -> SelectResponse

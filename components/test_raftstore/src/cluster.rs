@@ -1,47 +1,61 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::hash_map::Entry;
-use std::error::Error as StdError;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::time::Duration;
-use std::{result, thread};
-
-use crossbeam::channel::TrySendError;
-use futures::executor::block_on;
-use kvproto::errorpb::Error as PbError;
-use kvproto::metapb::{self, Peer, RegionEpoch, StoreLabel};
-use kvproto::pdpb;
-use kvproto::raft_cmdpb::*;
-use kvproto::raft_serverpb::{
-    self, PeerState, RaftApplyState, RaftLocalState, RaftMessage, RaftTruncatedState,
-    RegionLocalState,
+use std::{
+    collections::hash_map::Entry as MapEntry,
+    error::Error as StdError,
+    result,
+    sync::{mpsc, Arc, Mutex, RwLock},
+    thread,
+    time::Duration,
 };
-use raft::eraftpb::ConfChangeType;
-use tempfile::TempDir;
 
 use collections::{HashMap, HashSet};
+use crossbeam::channel::TrySendError;
 use encryption_export::DataKeyManager;
-use engine_rocks::raw::DB;
-use engine_rocks::{Compat, RocksEngine, RocksSnapshot};
+use engine_rocks::{raw::DB, Compat, RocksEngine, RocksSnapshot};
+use engine_test::raft::RaftTestEngine;
 use engine_traits::{
-    CompactExt, Engines, Iterable, MiscExt, Mutable, Peekable, WriteBatch, WriteBatchExt,
-    CF_DEFAULT, CF_RAFT,
+    CompactExt, Engines, Iterable, MiscExt, Mutable, Peekable, RaftEngineReadOnly, WriteBatch,
+    WriteBatchExt, CF_DEFAULT, CF_RAFT,
 };
 use file_system::IORateLimiter;
-use pd_client::PdClient;
-use raftstore::store::fsm::store::{StoreMeta, PENDING_MSG_CAP};
-use raftstore::store::fsm::{create_raft_batch_system, RaftBatchSystem, RaftRouter};
-use raftstore::store::transport::CasualRouter;
-use raftstore::store::*;
-use raftstore::{Error, Result};
-use tikv::config::TiKvConfig;
+use futures::executor::block_on;
+use kvproto::{
+    errorpb::Error as PbError,
+    kvrpcpb::{ApiVersion, Context},
+    metapb::{self, Buckets, PeerRole, RegionEpoch, StoreLabel},
+    pdpb::{self, CheckPolicy, StoreReport},
+    raft_cmdpb::*,
+    raft_serverpb::{
+        PeerState, RaftApplyState, RaftLocalState, RaftMessage, RaftTruncatedState,
+        RegionLocalState,
+    },
+};
+use pd_client::{BucketStat, PdClient};
+use raft::eraftpb::ConfChangeType;
+use raftstore::{
+    store::{
+        fsm::{
+            create_raft_batch_system,
+            store::{StoreMeta, PENDING_MSG_CAP},
+            RaftBatchSystem, RaftRouter,
+        },
+        transport::CasualRouter,
+        *,
+    },
+    Error, Result,
+};
+use tempfile::TempDir;
 use tikv::server::Result as ServerResult;
-use tikv_util::thread_group::GroupProperties;
-use tikv_util::time::Instant;
-use tikv_util::HandyRwLock;
+use tikv_util::{
+    thread_group::GroupProperties,
+    time::{Instant, ThreadReadId},
+    worker::LazyWorker,
+    HandyRwLock,
+};
 
 use super::*;
-use tikv_util::time::ThreadReadId;
+use crate::Config;
 
 // We simulate 3 or 5 nodes, each has a store.
 // Sometimes, we use fixed id to test, which means the id
@@ -57,12 +71,12 @@ pub trait Simulator {
     fn run_node(
         &mut self,
         node_id: u64,
-        cfg: TiKvConfig,
-        engines: Engines<RocksEngine, RocksEngine>,
+        cfg: Config,
+        engines: Engines<RocksEngine, RaftTestEngine>,
         store_meta: Arc<Mutex<StoreMeta>>,
         key_manager: Option<Arc<DataKeyManager>>,
-        router: RaftRouter<RocksEngine, RocksEngine>,
-        system: RaftBatchSystem<RocksEngine, RocksEngine>,
+        router: RaftRouter<RocksEngine, RaftTestEngine>,
+        system: RaftBatchSystem<RocksEngine, RaftTestEngine>,
     ) -> ServerResult<u64>;
     fn stop_node(&mut self, node_id: u64);
     fn get_node_ids(&self) -> HashSet<u64>;
@@ -71,11 +85,20 @@ pub trait Simulator {
         node_id: u64,
         request: RaftCmdRequest,
         cb: Callback<RocksSnapshot>,
+    ) -> Result<()> {
+        self.async_command_on_node_with_opts(node_id, request, cb, Default::default())
+    }
+    fn async_command_on_node_with_opts(
+        &self,
+        node_id: u64,
+        request: RaftCmdRequest,
+        cb: Callback<RocksSnapshot>,
+        opts: RaftCmdExtraOpts,
     ) -> Result<()>;
     fn send_raft_msg(&mut self, msg: RaftMessage) -> Result<()>;
     fn get_snap_dir(&self, node_id: u64) -> String;
     fn get_snap_mgr(&self, node_id: u64) -> &SnapManager;
-    fn get_router(&self, node_id: u64) -> Option<RaftRouter<RocksEngine, RocksEngine>>;
+    fn get_router(&self, node_id: u64) -> Option<RaftRouter<RocksEngine, RaftTestEngine>>;
     fn add_send_filter(&mut self, node_id: u64, filter: Box<dyn Filter>);
     fn clear_send_filters(&mut self, node_id: u64);
     fn add_recv_filter(&mut self, node_id: u64, filter: Box<dyn Filter>);
@@ -124,25 +147,26 @@ pub trait Simulator {
             }
         }
         rx.recv_timeout(timeout)
-            .map_err(|_| Error::Timeout(format!("request timeout for {:?}", timeout)))
+            .map_err(|e| Error::Timeout(format!("request timeout for {:?}: {:?}", timeout, e)))
     }
 }
 
 pub struct Cluster<T: Simulator> {
-    pub cfg: TiKvConfig,
+    pub cfg: Config,
     leaders: HashMap<u64, metapb::Peer>,
     pub count: usize,
 
     pub paths: Vec<TempDir>,
-    pub dbs: Vec<Engines<RocksEngine, RocksEngine>>,
+    pub dbs: Vec<Engines<RocksEngine, RaftTestEngine>>,
     pub store_metas: HashMap<u64, Arc<Mutex<StoreMeta>>>,
     key_managers: Vec<Option<Arc<DataKeyManager>>>,
     pub io_rate_limiter: Option<Arc<IORateLimiter>>,
-    pub engines: HashMap<u64, Engines<RocksEngine, RocksEngine>>,
+    pub engines: HashMap<u64, Engines<RocksEngine, RaftTestEngine>>,
     key_managers_map: HashMap<u64, Option<Arc<DataKeyManager>>>,
     pub labels: HashMap<u64, HashMap<String, String>>,
     group_props: HashMap<u64, GroupProperties>,
-
+    pub sst_workers: Vec<LazyWorker<String>>,
+    pub sst_workers_map: HashMap<u64, usize>,
     pub sim: Arc<RwLock<T>>,
     pub pd_client: Arc<TestPdClient>,
 }
@@ -154,10 +178,14 @@ impl<T: Simulator> Cluster<T> {
         count: usize,
         sim: Arc<RwLock<T>>,
         pd_client: Arc<TestPdClient>,
+        api_version: ApiVersion,
     ) -> Cluster<T> {
         // TODO: In the future, maybe it's better to test both case where `use_delete_range` is true and false
         Cluster {
-            cfg: new_tikv_config(id),
+            cfg: Config {
+                tikv: new_tikv_config_with_api_ver(id, api_version),
+                prefer_mem: true,
+            },
             leaders: HashMap::default(),
             count,
             paths: vec![],
@@ -171,6 +199,8 @@ impl<T: Simulator> Cluster<T> {
             group_props: HashMap::default(),
             sim,
             pd_client,
+            sst_workers: vec![],
+            sst_workers_map: HashMap::default(),
         }
     }
 
@@ -201,14 +231,16 @@ impl<T: Simulator> Cluster<T> {
         let key_mgr = self.key_managers[offset].clone();
         assert!(self.engines.insert(node_id, engines).is_none());
         assert!(self.key_managers_map.insert(node_id, key_mgr).is_none());
+        assert!(self.sst_workers_map.insert(node_id, offset).is_none());
     }
 
-    fn create_engine(&mut self, router: Option<RaftRouter<RocksEngine, RocksEngine>>) {
-        let (engines, key_manager, dir) =
+    fn create_engine(&mut self, router: Option<RaftRouter<RocksEngine, RaftTestEngine>>) {
+        let (engines, key_manager, dir, sst_worker) =
             create_test_engine(router, self.io_rate_limiter.clone(), &self.cfg);
         self.dbs.push(engines);
         self.key_managers.push(key_manager);
         self.paths.push(dir);
+        self.sst_workers.push(sst_worker);
     }
 
     pub fn create_engines(&mut self) {
@@ -256,6 +288,8 @@ impl<T: Simulator> Cluster<T> {
             self.engines.insert(node_id, engines);
             self.store_metas.insert(node_id, store_meta);
             self.key_managers_map.insert(node_id, key_mgr);
+            self.sst_workers_map
+                .insert(node_id, self.sst_workers.len() - 1);
         }
         Ok(())
     }
@@ -305,12 +339,12 @@ impl<T: Simulator> Cluster<T> {
             cfg.server.labels = labels.to_owned();
         }
         let store_meta = match self.store_metas.entry(node_id) {
-            Entry::Occupied(o) => {
+            MapEntry::Occupied(o) => {
                 let mut meta = o.get().lock().unwrap();
                 *meta = StoreMeta::new(PENDING_MSG_CAP);
                 o.get().clone()
             }
-            Entry::Vacant(v) => v
+            MapEntry::Vacant(v) => v
                 .insert(Arc::new(Mutex::new(StoreMeta::new(PENDING_MSG_CAP))))
                 .clone(),
         };
@@ -338,14 +372,14 @@ impl<T: Simulator> Cluster<T> {
     }
 
     pub fn get_engine(&self, node_id: u64) -> Arc<DB> {
-        Arc::clone(&self.engines[&node_id].kv.as_inner())
+        Arc::clone(self.engines[&node_id].kv.as_inner())
     }
 
-    pub fn get_raft_engine(&self, node_id: u64) -> Arc<DB> {
-        Arc::clone(&self.engines[&node_id].raft.as_inner())
+    pub fn get_raft_engine(&self, node_id: u64) -> RaftTestEngine {
+        self.engines[&node_id].raft.clone()
     }
 
-    pub fn get_all_engines(&self, node_id: u64) -> Engines<RocksEngine, RocksEngine> {
+    pub fn get_all_engines(&self, node_id: u64) -> Engines<RocksEngine, RaftTestEngine> {
         self.engines[&node_id].clone()
     }
 
@@ -446,7 +480,7 @@ impl<T: Simulator> Cluster<T> {
     }
 
     fn valid_leader_id(&self, region_id: u64, leader_id: u64) -> bool {
-        let store_ids = match self.store_ids_of_region(region_id) {
+        let store_ids = match self.voter_store_ids_of_region(region_id) {
             None => return false,
             Some(ids) => ids,
         };
@@ -454,10 +488,22 @@ impl<T: Simulator> Cluster<T> {
         store_ids.contains(&leader_id) && node_ids.contains(&leader_id)
     }
 
-    fn store_ids_of_region(&self, region_id: u64) -> Option<Vec<u64>> {
+    fn voter_store_ids_of_region(&self, region_id: u64) -> Option<Vec<u64>> {
         block_on(self.pd_client.get_region_by_id(region_id))
             .unwrap()
-            .map(|region| region.get_peers().iter().map(Peer::get_store_id).collect())
+            .map(|region| {
+                region
+                    .get_peers()
+                    .iter()
+                    .flat_map(|p| {
+                        if p.get_role() != PeerRole::Learner {
+                            Some(p.get_store_id())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
     }
 
     pub fn query_leader(
@@ -489,10 +535,19 @@ impl<T: Simulator> Cluster<T> {
     }
 
     pub fn leader_of_region(&mut self, region_id: u64) -> Option<metapb::Peer> {
-        let store_ids = match self.store_ids_of_region(region_id) {
-            None => return None,
-            Some(ids) => ids,
-        };
+        let timer = Instant::now_coarse();
+        let timeout = Duration::from_secs(5);
+        let mut store_ids = None;
+        while timer.saturating_elapsed() < timeout {
+            match self.voter_store_ids_of_region(region_id) {
+                None => thread::sleep(Duration::from_millis(10)),
+                Some(ids) => {
+                    store_ids = Some(ids);
+                    break;
+                }
+            };
+        }
+        let store_ids = store_ids?;
         if let Some(l) = self.leaders.get(&region_id) {
             // leader may be stopped in some tests.
             if self.valid_leader_id(region_id, l.get_store_id()) {
@@ -511,7 +566,7 @@ impl<T: Simulator> Cluster<T> {
             .filter(|id| node_ids.contains(id))
             .cloned()
             .collect();
-        for _ in 0..500 {
+        while timer.saturating_elapsed() < timeout {
             for store_id in &alive_store_ids {
                 let l = match self.query_leader(*store_id, region_id, Duration::from_secs(1)) {
                     None => continue,
@@ -523,16 +578,20 @@ impl<T: Simulator> Cluster<T> {
                     .1
                     .push(*store_id);
             }
-            if let Some((_, (l, c))) = leaders.drain().max_by_key(|(_, (_, c))| c.len()) {
+            if let Some((_, (l, c))) = leaders.iter().max_by_key(|(_, (_, c))| c.len()) {
                 // It may be a step down leader.
                 if c.contains(&l.get_store_id()) {
-                    leader = Some(l);
+                    leader = Some(l.clone());
+                    // Technically, correct calculation should use two quorum when in joint
+                    // state. Here just for simplicity.
                     if c.len() > store_ids.len() / 2 {
                         break;
                     }
                 }
             }
+            debug!("failed to detect leaders"; "leaders" => ?leaders, "store_ids" => ?store_ids);
             sleep_ms(10);
+            leaders.clear();
         }
 
         if let Some(l) = leader {
@@ -577,6 +636,7 @@ impl<T: Simulator> Cluster<T> {
             self.store_metas.insert(id, store_meta);
             self.key_managers_map
                 .insert(id, self.key_managers[i].clone());
+            self.sst_workers_map.insert(id, i);
         }
 
         let mut region = metapb::Region::default();
@@ -589,11 +649,11 @@ impl<T: Simulator> Cluster<T> {
         for (&id, engines) in &self.engines {
             let peer = new_peer(id, id);
             region.mut_peers().push(peer.clone());
-            bootstrap_store(&engines, self.id(), id).unwrap();
+            bootstrap_store(engines, self.id(), id).unwrap();
         }
 
         for engines in self.engines.values() {
-            prepare_bootstrap_cluster(&engines, &region)?;
+            prepare_bootstrap_cluster(engines, &region)?;
         }
 
         self.bootstrap_cluster(region);
@@ -610,10 +670,11 @@ impl<T: Simulator> Cluster<T> {
             self.store_metas.insert(id, store_meta);
             self.key_managers_map
                 .insert(id, self.key_managers[i].clone());
+            self.sst_workers_map.insert(id, i);
         }
 
         for (&id, engines) in &self.engines {
-            bootstrap_store(&engines, self.id(), id).unwrap();
+            bootstrap_store(engines, self.id(), id).unwrap();
         }
 
         let node_id = 1;
@@ -664,6 +725,8 @@ impl<T: Simulator> Cluster<T> {
 
         let key_mgr = self.key_managers.last().unwrap().clone();
         self.key_managers_map.insert(node_id, key_mgr);
+        self.sst_workers_map
+            .insert(node_id, self.sst_workers.len() - 1);
 
         self.run_node(node_id).unwrap();
         node_id
@@ -700,20 +763,22 @@ impl<T: Simulator> Cluster<T> {
 
     pub fn shutdown(&mut self) {
         debug!("about to shutdown cluster");
-        let keys;
-        match self.sim.read() {
-            Ok(s) => keys = s.get_node_ids(),
+        let keys = match self.sim.read() {
+            Ok(s) => s.get_node_ids(),
             Err(_) => {
                 safe_panic!("failed to acquire read lock");
                 // Leave the resource to avoid double panic.
                 return;
             }
-        }
+        };
         for id in keys {
             self.stop_node(id);
         }
         self.leaders.clear();
         self.store_metas.clear();
+        for sst_worker in self.sst_workers.drain(..) {
+            sst_worker.stop_worker();
+        }
         debug!("all nodes are shut down.");
     }
 
@@ -735,8 +800,8 @@ impl<T: Simulator> Cluster<T> {
         }
 
         // If command is stale, leadership may have changed.
-        // Or epoch not match, it can be introduced by wrong leader.
-        if err.has_stale_command() || err.has_epoch_not_match() {
+        // EpochNotMatch is not checked as leadership is checked first in raftstore.
+        if err.has_stale_command() {
             self.reset_leader_of_region(region_id);
             return true;
         }
@@ -871,7 +936,15 @@ impl<T: Simulator> Cluster<T> {
 
     pub fn async_request(
         &mut self,
+        req: RaftCmdRequest,
+    ) -> Result<mpsc::Receiver<RaftCmdResponse>> {
+        self.async_request_with_opts(req, Default::default())
+    }
+
+    pub fn async_request_with_opts(
+        &mut self,
         mut req: RaftCmdRequest,
+        opts: RaftCmdExtraOpts,
     ) -> Result<mpsc::Receiver<RaftCmdResponse>> {
         let region_id = req.get_header().get_region_id();
         let leader = self.leader_of_region(region_id).unwrap();
@@ -879,7 +952,7 @@ impl<T: Simulator> Cluster<T> {
         let (cb, rx) = make_cb(&req);
         self.sim
             .rl()
-            .async_command_on_node(leader.get_store_id(), req, cb)?;
+            .async_command_on_node_with_opts(leader.get_store_id(), req, cb, opts)?;
         Ok(rx)
     }
 
@@ -937,14 +1010,8 @@ impl<T: Simulator> Cluster<T> {
     }
 
     pub fn must_put_cf(&mut self, cf: &str, key: &[u8], value: &[u8]) {
-        match self.batch_put(key, vec![new_put_cf_cmd(cf, key, value)]) {
-            Ok(resp) => {
-                assert_eq!(resp.get_responses().len(), 1);
-                assert_eq!(resp.get_responses()[0].get_cmd_type(), CmdType::Put);
-            }
-            Err(e) => {
-                panic!("has error: {:?}", e);
-            }
+        if let Err(e) = self.batch_put(key, vec![new_put_cf_cmd(cf, key, value)]) {
+            panic!("has error: {:?}", e);
         }
     }
 
@@ -980,8 +1047,6 @@ impl<T: Simulator> Cluster<T> {
         if resp.get_header().has_error() {
             panic!("response {:?} has error", resp);
         }
-        assert_eq!(resp.get_responses().len(), 1);
-        assert_eq!(resp.get_responses()[0].get_cmd_type(), CmdType::Delete);
     }
 
     pub fn must_delete_range_cf(&mut self, cf: &str, start: &[u8], end: &[u8]) {
@@ -994,8 +1059,6 @@ impl<T: Simulator> Cluster<T> {
         if resp.get_header().has_error() {
             panic!("response {:?} has error", resp);
         }
-        assert_eq!(resp.get_responses().len(), 1);
-        assert_eq!(resp.get_responses()[0].get_cmd_type(), CmdType::DeleteRange);
     }
 
     pub fn must_notify_delete_range_cf(&mut self, cf: &str, start: &[u8], end: &[u8]) {
@@ -1005,14 +1068,27 @@ impl<T: Simulator> Cluster<T> {
         if resp.get_header().has_error() {
             panic!("response {:?} has error", resp);
         }
-        assert_eq!(resp.get_responses().len(), 1);
-        assert_eq!(resp.get_responses()[0].get_cmd_type(), CmdType::DeleteRange);
     }
 
     pub fn must_flush_cf(&mut self, cf: &str, sync: bool) {
         for engines in &self.dbs {
             engines.kv.flush_cf(cf, sync).unwrap();
         }
+    }
+
+    pub fn must_get_buckets(&mut self, region_id: u64) -> BucketStat {
+        let timer = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut tried_times = 0;
+        // At least retry once.
+        while tried_times < 2 || timer.saturating_elapsed() < timeout {
+            tried_times += 1;
+            match self.pd_client.get_buckets(region_id) {
+                Some(buckets) => return buckets,
+                None => sleep_ms(100),
+            }
+        }
+        panic!("failed to get buckets for region {}", region_id);
     }
 
     pub fn get_region_epoch(&self, region_id: u64) -> RegionEpoch {
@@ -1058,13 +1134,13 @@ impl<T: Simulator> Cluster<T> {
         }
     }
 
-    pub fn wait_tombstone(&self, region_id: u64, peer: metapb::Peer) {
+    pub fn wait_tombstone(&self, region_id: u64, peer: metapb::Peer, check_exist: bool) {
         let timer = Instant::now();
         let mut state;
         loop {
             state = self.region_local_state(region_id, peer.get_store_id());
             if state.get_state() == PeerState::Tombstone
-                && state.get_region().get_peers().contains(&peer)
+                && (!check_exist || state.get_region().get_peers().contains(&peer))
             {
                 return;
             }
@@ -1079,6 +1155,26 @@ impl<T: Simulator> Cluster<T> {
         );
     }
 
+    pub fn wait_destroy_and_clean(&self, region_id: u64, peer: metapb::Peer) {
+        let timer = Instant::now();
+        self.wait_tombstone(region_id, peer.clone(), false);
+        let mut state;
+        loop {
+            state = self.get_raft_local_state(region_id, peer.get_store_id());
+            if state.is_none() {
+                return;
+            }
+            if timer.saturating_elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "{:?} is still not cleaned in region {} {:?}",
+            peer, region_id, state
+        );
+    }
+
     pub fn apply_state(&self, region_id: u64, store_id: u64) -> RaftApplyState {
         let key = keys::apply_state_key(region_id);
         self.get_engine(store_id)
@@ -1088,13 +1184,15 @@ impl<T: Simulator> Cluster<T> {
             .unwrap()
     }
 
+    pub fn get_raft_local_state(&self, region_id: u64, store_id: u64) -> Option<RaftLocalState> {
+        self.engines[&store_id]
+            .raft
+            .get_raft_state(region_id)
+            .unwrap()
+    }
+
     pub fn raft_local_state(&self, region_id: u64, store_id: u64) -> RaftLocalState {
-        let key = keys::raft_state_key(region_id);
-        self.get_raft_engine(store_id)
-            .c()
-            .get_msg::<raft_serverpb::RaftLocalState>(&key)
-            .unwrap()
-            .unwrap()
+        self.get_raft_local_state(region_id, store_id).unwrap()
     }
 
     pub fn region_local_state(&self, region_id: u64, store_id: u64) -> RegionLocalState {
@@ -1106,6 +1204,28 @@ impl<T: Simulator> Cluster<T> {
             )
             .unwrap()
             .unwrap()
+    }
+
+    pub fn must_peer_state(&self, region_id: u64, store_id: u64, peer_state: PeerState) {
+        for _ in 0..100 {
+            let state = self
+                .get_engine(store_id)
+                .c()
+                .get_msg_cf::<RegionLocalState>(
+                    engine_traits::CF_RAFT,
+                    &keys::region_state_key(region_id),
+                )
+                .unwrap()
+                .unwrap();
+            if state.get_state() == peer_state {
+                return;
+            }
+            sleep_ms(10);
+        }
+        panic!(
+            "[region {}] peer state still not reach {:?}",
+            region_id, peer_state
+        );
     }
 
     pub fn wait_last_index(
@@ -1129,16 +1249,6 @@ impl<T: Simulator> Cluster<T> {
                 );
             }
             thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    pub fn get_first_log(&self, region_id: u64, store_id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
-        let raft_engine = self.engines[&store_id].raft.clone();
-        let seek_key = keys::raft_log_key(region_id, 0);
-        let prefix = keys::raft_log_prefix(region_id);
-        match raft_engine.seek(&seek_key).unwrap() {
-            Some((k, v)) if k.starts_with(&prefix) => Some((k, v)),
-            _ => None,
         }
     }
 
@@ -1180,41 +1290,11 @@ impl<T: Simulator> Cluster<T> {
         kv_wb.write().unwrap();
     }
 
-    pub fn restore_raft(&self, region_id: u64, store_id: u64, snap: &RocksSnapshot) {
-        let (raft_start, raft_end) = (
-            keys::region_raft_prefix(region_id),
-            keys::region_raft_prefix(region_id + 1),
-        );
-        let mut raft_wb = self.engines[&store_id].raft.write_batch();
-        self.engines[&store_id]
-            .raft
-            .scan(&raft_start, &raft_end, false, |k, _| {
-                raft_wb.delete(k).unwrap();
-                Ok(true)
-            })
-            .unwrap();
-        snap.scan(&raft_start, &raft_end, false, |k, v| {
-            raft_wb.put(k, v).unwrap();
-            Ok(true)
-        })
-        .unwrap();
-        raft_wb.write().unwrap();
-    }
-
     pub fn add_send_filter<F: FilterFactory>(&self, factory: F) {
         let mut sim = self.sim.wl();
         for node_id in sim.get_node_ids() {
             for filter in factory.generate(node_id) {
                 sim.add_send_filter(node_id, filter);
-            }
-        }
-    }
-
-    pub fn add_recv_filter<F: FilterFactory>(&self, factory: F) {
-        let mut sim = self.sim.wl();
-        for node_id in sim.get_node_ids() {
-            for filter in factory.generate(node_id) {
-                sim.add_recv_filter(node_id, filter);
             }
         }
     }
@@ -1270,13 +1350,6 @@ impl<T: Simulator> Cluster<T> {
         }
     }
 
-    pub fn clear_recv_filters(&mut self) {
-        let mut sim = self.sim.wl();
-        for node_id in sim.get_node_ids() {
-            sim.clear_recv_filters(node_id);
-        }
-    }
-
     // It's similar to `ask_split`, the difference is the msg, it sends, is `Msg::SplitRegion`,
     // and `region` will not be embedded to that msg.
     // Caller must ensure that the `split_key` is in the `region`.
@@ -1302,10 +1375,48 @@ impl<T: Simulator> Cluster<T> {
         .unwrap();
     }
 
+    pub fn enter_force_leader(&mut self, region_id: u64, store_id: u64, failed_stores: Vec<u64>) {
+        let mut plan = pdpb::RecoveryPlan::default();
+        let mut force_leader = pdpb::ForceLeader::default();
+        force_leader.set_enter_force_leaders([region_id].to_vec());
+        force_leader.set_failed_stores(failed_stores.to_vec());
+        plan.set_force_leader(force_leader);
+        // Triggers the unsafe recovery plan execution.
+        self.pd_client.must_set_unsafe_recovery_plan(store_id, plan);
+        self.must_send_store_heartbeat(store_id);
+    }
+
+    pub fn must_enter_force_leader(
+        &mut self,
+        region_id: u64,
+        store_id: u64,
+        failed_stores: Vec<u64>,
+    ) -> StoreReport {
+        self.enter_force_leader(region_id, store_id, failed_stores);
+        let mut store_report = None;
+        for _ in 0..20 {
+            store_report = self.pd_client.must_get_store_report(store_id);
+            if store_report.is_some() {
+                break;
+            }
+            sleep_ms(100);
+        }
+        assert_ne!(store_report, None);
+        store_report.unwrap()
+    }
+
+    pub fn exit_force_leader(&mut self, region_id: u64, store_id: u64) {
+        let router = self.sim.rl().get_router(store_id).unwrap();
+        router
+            .significant_send(region_id, SignificantMsg::ExitForceLeaderState)
+            .unwrap();
+    }
+
     pub fn must_split(&mut self, region: &metapb::Region, split_key: &[u8]) {
         let mut try_cnt = 0;
         let split_count = self.pd_client.get_split_count();
         loop {
+            debug!("asking split"; "region" => ?region, "key" => ?split_key);
             // In case ask split message is ignored, we should retry.
             if try_cnt % 50 == 0 {
                 self.reset_leader_of_region(region.get_id());
@@ -1333,7 +1444,9 @@ impl<T: Simulator> Cluster<T> {
                     assert_eq!(regions[0].get_end_key(), key.as_slice());
                     assert_eq!(regions[0].get_end_key(), regions[1].get_start_key());
                 });
-                self.split_region(region, split_key, Callback::write(check));
+                if self.leader_of_region(region.get_id()).is_some() {
+                    self.split_region(region, split_key, Callback::write(check));
+                }
             }
 
             if self.pd_client.check_split(region, split_key)
@@ -1516,23 +1629,26 @@ impl<T: Simulator> Cluster<T> {
         self.add_send_filter(PartitionFilterFactory::new(s1, s2));
     }
 
-    // Request a snapshot on the given region.
-    pub fn must_request_snapshot(&self, store_id: u64, region_id: u64) -> u64 {
-        // Request snapshot.
-        let (request_tx, request_rx) = mpsc::channel();
-        let router = self.sim.rl().get_router(store_id).unwrap();
-        CasualRouter::send(
-            &router,
-            region_id,
-            CasualMessage::AccessPeer(Box::new(move |peer: &mut dyn AbstractPeer| {
-                let idx = peer.raft_commit_index();
-                peer.raft_request_snapshot(idx);
-                debug!("{} request snapshot at {:?}", idx, peer.meta_peer());
-                request_tx.send(idx).unwrap();
-            })),
-        )
-        .unwrap();
-        request_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    pub fn must_wait_for_leader_expire(&self, node_id: u64, region_id: u64) {
+        let timer = Instant::now_coarse();
+        while timer.saturating_elapsed() < Duration::from_secs(5) {
+            if self
+                .query_leader(node_id, region_id, Duration::from_secs(1))
+                .is_none()
+            {
+                return;
+            }
+            sleep_ms(100);
+        }
+        panic!(
+            "region {}'s replica in store {} still has a valid leader after 5 secs",
+            region_id, node_id
+        );
+    }
+
+    pub fn must_send_store_heartbeat(&self, node_id: u64) {
+        let router = self.sim.rl().get_router(node_id).unwrap();
+        StoreRouter::send(&router, StoreMsg::Tick(StoreTick::PdStoreHeartbeat)).unwrap();
     }
 
     pub fn gc_peer(
@@ -1565,6 +1681,93 @@ impl<T: Simulator> Cluster<T> {
             "gc peer timeout: region id {}, node id {}, peer {:?}",
             region_id, node_id, peer
         );
+    }
+
+    pub fn get_ctx(&mut self, key: &[u8]) -> Context {
+        let region = self.get_region(key);
+        let leader = self.leader_of_region(region.id).unwrap();
+        let epoch = self.get_region_epoch(region.id);
+        let mut ctx = Context::default();
+        ctx.set_region_id(region.id);
+        ctx.set_peer(leader);
+        ctx.set_region_epoch(epoch);
+        ctx
+    }
+
+    pub fn refresh_region_bucket_keys(
+        &mut self,
+        region: &metapb::Region,
+        buckets: Vec<Bucket>,
+        bucket_ranges: Option<Vec<BucketRange>>,
+        expect_buckets: Option<Buckets>,
+    ) -> u64 {
+        let leader = self.leader_of_region(region.get_id()).unwrap();
+        let router = self.sim.rl().get_router(leader.get_store_id()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let cb = Callback::Test {
+            cb: Box::new(move |stat: PeerInternalStat| {
+                if let Some(expect_buckets) = expect_buckets {
+                    assert_eq!(expect_buckets.get_keys(), stat.buckets.keys);
+                    assert_eq!(
+                        expect_buckets.get_keys().len() - 1,
+                        stat.buckets.sizes.len()
+                    );
+                }
+                tx.send(stat.buckets.version).unwrap();
+            }),
+        };
+        CasualRouter::send(
+            &router,
+            region.get_id(),
+            CasualMessage::RefreshRegionBuckets {
+                region_epoch: region.get_region_epoch().clone(),
+                buckets,
+                bucket_ranges,
+                cb,
+            },
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    pub fn send_half_split_region_message(
+        &mut self,
+        region: &metapb::Region,
+        expected_bucket_ranges: Option<Vec<BucketRange>>,
+    ) {
+        let leader = self.leader_of_region(region.get_id()).unwrap();
+        let router = self.sim.rl().get_router(leader.get_store_id()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let cb = Callback::Test {
+            cb: Box::new(move |stat: PeerInternalStat| {
+                assert_eq!(
+                    expected_bucket_ranges.is_none(),
+                    stat.bucket_ranges.is_none()
+                );
+                if let Some(expected_bucket_ranges) = expected_bucket_ranges {
+                    let actual_bucket_ranges = stat.bucket_ranges.unwrap();
+                    assert_eq!(expected_bucket_ranges.len(), actual_bucket_ranges.len());
+                    for i in 0..actual_bucket_ranges.len() {
+                        assert_eq!(expected_bucket_ranges[i].0, actual_bucket_ranges[i].0);
+                        assert_eq!(expected_bucket_ranges[i].1, actual_bucket_ranges[i].1);
+                    }
+                }
+                tx.send(1).unwrap();
+            }),
+        };
+
+        CasualRouter::send(
+            &router,
+            region.get_id(),
+            CasualMessage::HalfSplitRegion {
+                region_epoch: region.get_region_epoch().clone(),
+                policy: CheckPolicy::Scan,
+                source: "test",
+                cb,
+            },
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 }
 

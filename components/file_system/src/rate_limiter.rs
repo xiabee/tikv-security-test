@@ -1,20 +1,24 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::metrics::{tls_collect_rate_limiter_request_wait, RATE_LIMITER_MAX_BYTES_PER_SEC};
-use super::{IOOp, IOPriority, IOType};
-
-use std::str::FromStr;
-use std::sync::{
-    atomic::{AtomicU32, AtomicUsize, Ordering},
-    Arc,
+use std::{
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
-use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use strum::EnumCount;
 use tikv_util::time::Instant;
+
+use super::{
+    metrics::{tls_collect_rate_limiter_request_wait, RATE_LIMITER_MAX_BYTES_PER_SEC},
+    IOOp, IOPriority, IOType,
+};
 
 const DEFAULT_REFILL_PERIOD: Duration = Duration::from_millis(50);
 const DEFAULT_REFILLS_PER_SEC: usize = (1.0 / DEFAULT_REFILL_PERIOD.as_secs_f32()) as usize;
@@ -92,7 +96,7 @@ impl<'de> Deserialize<'de> for IORateLimitMode {
                     Ok(p) => p,
                     _ => {
                         return Err(E::invalid_value(
-                            Unexpected::Other(&"invalid IO rate limit mode".to_string()),
+                            Unexpected::Other("invalid IO rate limit mode"),
                             &self,
                         ));
                     }
@@ -149,6 +153,12 @@ impl IORateLimiterStatistics {
     }
 }
 
+impl Default for IORateLimiterStatistics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Used to dynamically adjust the proportion of total budgets allocated for rate limited
 /// IO. This is needed when global IOs are only partially rate limited, e.g. when mode is
 /// IORateLimitMode::WriteOnly.
@@ -191,7 +201,7 @@ macro_rules! do_sleep {
         std::thread::sleep($duration);
     };
     ($duration:expr, async) => {
-        tokio::time::delay_for($duration).await;
+        tokio::time::sleep($duration).await;
     };
     ($duration:expr, skewed_sync) => {
         use rand::Rng;
@@ -255,7 +265,7 @@ macro_rules! request_imp {
                         / cached_bytes_per_epoch) as u32
             } else {
                 // `(a-1)/b` is equivalent to `roundup(a.saturating_sub(b)/b)`.
-                locked.next_refill_time.saturating_duration_since(now)
+                locked.next_refill_time - now
                     + DEFAULT_REFILL_PERIOD
                         * ((locked.pending_bytes[priority_idx] - 1) / cached_bytes_per_epoch) as u32
             };
@@ -346,8 +356,8 @@ impl PriorityBasedIORateLimiter {
             return;
         }
         debug_assert!(now >= locked.next_refill_time);
-        let skipped_epochs = (now.saturating_duration_since(locked.next_refill_time)).as_secs_f32()
-            / DEFAULT_REFILL_PERIOD.as_secs_f32();
+        let skipped_epochs =
+            (now - locked.next_refill_time).as_secs_f32() / DEFAULT_REFILL_PERIOD.as_secs_f32();
         locked.next_refill_time = now + DEFAULT_REFILL_PERIOD;
 
         debug_assert!(
@@ -432,8 +442,8 @@ pub struct IORateLimiter {
 impl IORateLimiter {
     pub fn new(mode: IORateLimitMode, strict: bool, enable_statistics: bool) -> Self {
         let priority_map: [CachePadded<AtomicU32>; IOType::COUNT] = Default::default();
-        for i in 0..IOType::COUNT {
-            priority_map[i].store(IOPriority::High as u32, Ordering::Relaxed);
+        for p in priority_map.iter() {
+            p.store(IOPriority::High as u32, Ordering::Relaxed);
         }
         IORateLimiter {
             mode,
@@ -549,8 +559,9 @@ pub fn get_io_rate_limiter() -> Option<Arc<IORateLimiter>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::AtomicBool;
+
+    use super::*;
 
     macro_rules! approximate_eq {
         ($left:expr, $right:expr) => {
@@ -675,7 +686,7 @@ mod tests {
                 std::thread::sleep(duration);
             }
             let end = Instant::now();
-            end.saturating_duration_since(begin)
+            end.duration_since(begin)
         };
         approximate_eq!(
             stats.fetch(IOType::ForegroundWrite, IOOp::Write) as f64,
@@ -746,7 +757,7 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(2));
             }
             let end = Instant::now();
-            end.saturating_duration_since(begin)
+            end.duration_since(begin)
         };
         approximate_eq!(
             stats.fetch(IOType::Compaction, IOOp::Write) as f64,
@@ -801,7 +812,7 @@ mod tests {
             std::thread::sleep(Duration::from_secs(2));
         }
         let end = Instant::now();
-        let duration = end.saturating_duration_since(begin);
+        let duration = end.duration_since(begin);
         let write_bytes = stats.fetch(IOType::ForegroundWrite, IOOp::Write);
         approximate_eq!(
             write_bytes as f64,

@@ -1,5 +1,6 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+// #[PerformanceCriticalPath]
 //! Commands used in the transaction system
 #[macro_use]
 mod macros;
@@ -21,6 +22,13 @@ pub(crate) mod resolve_lock_readphase;
 pub(crate) mod rollback;
 pub(crate) mod txn_heart_beat;
 
+use std::{
+    fmt::{self, Debug, Display, Formatter},
+    iter,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+};
+
 pub use acquire_pessimistic_lock::AcquirePessimisticLock;
 pub use atomic_store::RawAtomicStore;
 pub use check_secondary_locks::CheckSecondaryLocks;
@@ -28,37 +36,33 @@ pub use check_txn_status::CheckTxnStatus;
 pub use cleanup::Cleanup;
 pub use commit::Commit;
 pub use compare_and_swap::RawCompareAndSwap;
+use concurrency_manager::{ConcurrencyManager, KeyHandleGuard};
+use kvproto::kvrpcpb::*;
 pub use mvcc_by_key::MvccByKey;
 pub use mvcc_by_start_ts::MvccByStartTs;
 pub use pause::Pause;
 pub use pessimistic_rollback::PessimisticRollback;
 pub use prewrite::{one_pc_commit_ts, Prewrite, PrewritePessimistic};
-pub use resolve_lock::ResolveLock;
+pub use resolve_lock::{ResolveLock, RESOLVE_LOCK_BATCH_SIZE};
 pub use resolve_lock_lite::ResolveLockLite;
 pub use resolve_lock_readphase::ResolveLockReadPhase;
 pub use rollback::Rollback;
+use tikv_util::deadline::Deadline;
 pub use txn_heart_beat::TxnHeartBeat;
-
-pub use resolve_lock::RESOLVE_LOCK_BATCH_SIZE;
-
-use std::fmt::{self, Debug, Display, Formatter};
-use std::iter;
-use std::marker::PhantomData;
-
-use kvproto::kvrpcpb::*;
 use txn_types::{Key, OldValues, TimeStamp, Value, Write};
 
-use crate::storage::kv::WriteData;
-use crate::storage::lock_manager::{self, LockManager, WaitTimeout};
-use crate::storage::mvcc::{Lock as MvccLock, MvccReader, ReleasedLock};
-use crate::storage::txn::latch;
-use crate::storage::txn::{ProcessResult, Result};
-use crate::storage::types::{
-    MvccInfo, PessimisticLockRes, PrewriteResult, SecondaryLocksStatus, StorageCallbackType,
-    TxnStatus,
+use crate::storage::{
+    kv::WriteData,
+    lock_manager::{self, LockManager, WaitTimeout},
+    metrics,
+    mvcc::{Lock as MvccLock, MvccReader, ReleasedLock, SnapshotReader},
+    txn::{latch, ProcessResult, Result},
+    types::{
+        MvccInfo, PessimisticLockRes, PrewriteResult, SecondaryLocksStatus, StorageCallbackType,
+        TxnStatus,
+    },
+    Result as StorageResult, Snapshot, Statistics,
 };
-use crate::storage::{metrics, Result as StorageResult, Snapshot, Statistics};
-use concurrency_manager::{ConcurrencyManager, KeyHandleGuard};
 
 /// Store Transaction scheduler commands.
 ///
@@ -151,6 +155,7 @@ impl From<PrewriteRequest> for TypedCommand<PrewriteResult> {
                 req.get_max_commit_ts().into(),
                 secondary_keys,
                 req.get_try_one_pc(),
+                req.get_assertion_level(),
                 req.take_context(),
             )
         } else {
@@ -172,6 +177,7 @@ impl From<PrewriteRequest> for TypedCommand<PrewriteResult> {
                 req.get_max_commit_ts().into(),
                 secondary_keys,
                 req.get_try_one_pc(),
+                req.get_assertion_level(),
                 req.take_context(),
             )
         }
@@ -203,6 +209,7 @@ impl From<PessimisticLockRequest> for TypedCommand<StorageResult<PessimisticLock
             req.get_return_values(),
             req.get_min_commit_ts().into(),
             OldValues::default(),
+            req.get_check_existence(),
             req.take_context(),
         )
     }
@@ -464,6 +471,8 @@ pub trait CommandExt: Display {
 
     fn get_ctx_mut(&mut self) -> &mut Context;
 
+    fn deadline(&self) -> Deadline;
+
     fn incr_cmd_metric(&self);
 
     fn ts(&self) -> TimeStamp {
@@ -493,6 +502,37 @@ pub struct WriteContext<'a, L: LockManager> {
     pub extra_op: ExtraOp,
     pub statistics: &'a mut Statistics,
     pub async_apply_prewrite: bool,
+}
+
+pub struct ReaderWithStats<'a, S: Snapshot> {
+    reader: SnapshotReader<S>,
+    statistics: &'a mut Statistics,
+}
+
+impl<'a, S: Snapshot> ReaderWithStats<'a, S> {
+    fn new(reader: SnapshotReader<S>, statistics: &'a mut Statistics) -> Self {
+        Self { reader, statistics }
+    }
+}
+
+impl<'a, S: Snapshot> Deref for ReaderWithStats<'a, S> {
+    type Target = SnapshotReader<S>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.reader
+    }
+}
+
+impl<'a, S: Snapshot> DerefMut for ReaderWithStats<'a, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.reader
+    }
+}
+
+impl<'a, S: Snapshot> Drop for ReaderWithStats<'a, S> {
+    fn drop(&mut self) {
+        self.statistics.add(&self.reader.take_statistics())
+    }
 }
 
 impl Command {
@@ -628,6 +668,10 @@ impl Command {
     pub fn ctx_mut(&mut self) -> &mut Context {
         self.command_ext_mut().get_ctx_mut()
     }
+
+    pub fn deadline(&self) -> Deadline {
+        self.command_ext().deadline()
+    }
 }
 
 impl Display for Command {
@@ -654,13 +698,14 @@ pub trait WriteCommand<S: Snapshot, L: LockManager>: CommandExt {
 
 #[cfg(test)]
 pub mod test_util {
-    use super::*;
-
-    use crate::storage::mvcc::{Error as MvccError, ErrorInner as MvccErrorInner};
-    use crate::storage::txn::{Error, ErrorInner, Result};
-    use crate::storage::DummyLockManager;
-    use crate::storage::Engine;
     use txn_types::Mutation;
+
+    use super::*;
+    use crate::storage::{
+        mvcc::{Error as MvccError, ErrorInner as MvccErrorInner},
+        txn::{Error, ErrorInner, Result},
+        DummyLockManager, Engine,
+    };
 
     // Some utils for tests that may be used in multiple source code files.
 

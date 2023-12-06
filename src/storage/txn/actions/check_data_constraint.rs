@@ -1,8 +1,12 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::storage::mvcc::{ErrorInner, Result as MvccResult, SnapshotReader};
-use crate::storage::Snapshot;
+// #[PerformanceCriticalPath]
 use txn_types::{Key, TimeStamp, Write, WriteType};
+
+use crate::storage::{
+    mvcc::{ErrorInner, Result as MvccResult, SnapshotReader},
+    Snapshot,
+};
 
 /// Checks the existence of the key according to `should_not_exist`.
 /// If not, returns an `AlreadyExist` error.
@@ -25,7 +29,7 @@ pub(crate) fn check_data_constraint<S: Snapshot>(
     // The current key exists under any of the following conditions:
     // 1.The current write type is `PUT`
     // 2.The current write type is `Rollback` or `Lock`, and the key have an older version.
-    if write.write_type == WriteType::Put || reader.key_exist(&key, write_commit_ts.prev())? {
+    if write.write_type == WriteType::Put || reader.key_exist(key, write_commit_ts.prev())? {
         return Err(ErrorInner::AlreadyExist { key: key.to_raw()? }.into());
     }
     Ok(())
@@ -33,12 +37,14 @@ pub(crate) fn check_data_constraint<S: Snapshot>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::mvcc::tests::write;
-    use crate::storage::mvcc::MvccTxn;
-    use crate::storage::{Engine, TestEngineBuilder};
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
+
+    use super::*;
+    use crate::storage::{
+        mvcc::{tests::write, MvccTxn},
+        Engine, TestEngineBuilder,
+    };
 
     #[test]
     fn test_check_data_constraint() {

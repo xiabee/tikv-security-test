@@ -1,30 +1,25 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::engine::RocksEngine;
-use crate::options::RocksReadOptions;
-use engine_traits::Error;
-use engine_traits::IterOptions;
-use engine_traits::CF_DEFAULT;
+use std::{path::PathBuf, rc::Rc, sync::Arc};
+
 use engine_traits::{
-    ExternalSstFileInfo, SSTMetaInfo, SstCompressionType, SstWriter, SstWriterBuilder,
+    EncryptionKeyManager, Error, ExternalSstFileInfo, IterOptions, Iterable, Iterator, Result,
+    SeekKey, SstCompressionType, SstExt, SstMetaInfo, SstReader, SstWriter, SstWriterBuilder,
+    CF_DEFAULT,
 };
-use engine_traits::{Iterable, Result, SstExt, SstReader};
-use engine_traits::{Iterator, SeekKey};
 use fail::fail_point;
-use rocksdb::rocksdb::supported_compression;
-use rocksdb::DBCompressionType;
-use rocksdb::DBIterator;
-use rocksdb::ExternalSstFileInfo as RawExternalSstFileInfo;
-use rocksdb::DB;
-use rocksdb::{ColumnFamilyOptions, SstFileReader};
-use rocksdb::{Env, EnvOptions, SequentialFile, SstFileWriter};
-use std::rc::Rc;
-use std::sync::Arc;
-// FIXME: Move RocksSeekKey into a common module since
-// it's shared between multiple iterators
-use crate::engine_iterator::RocksSeekKey;
 use kvproto::import_sstpb::SstMeta;
-use std::path::PathBuf;
+use rocksdb::{
+    rocksdb::supported_compression, ColumnFamilyOptions, DBCompressionType, DBIterator, Env,
+    EnvOptions, ExternalSstFileInfo as RawExternalSstFileInfo, SequentialFile, SstFileReader,
+    SstFileWriter, DB,
+};
+use tikv_util::box_err;
+
+use crate::{
+    encryption::WrappedEncryptionKeyManager, engine::RocksEngine, options::RocksReadOptions,
+    RocksSeekKey,
+};
 
 impl SstExt for RocksEngine {
     type SstReader = RocksSstReader;
@@ -40,8 +35,8 @@ pub struct RocksSstReader {
 }
 
 impl RocksSstReader {
-    pub fn sst_meta_info(&self, sst: SstMeta) -> SSTMetaInfo {
-        let mut meta = SSTMetaInfo {
+    pub fn sst_meta_info(&self, sst: SstMeta) -> SstMetaInfo {
+        let mut meta = SstMetaInfo {
             total_kvs: 0,
             total_bytes: 0,
             meta: sst,
@@ -63,11 +58,27 @@ impl RocksSstReader {
         let inner = Rc::new(reader);
         Ok(RocksSstReader { inner })
     }
+
+    pub fn compression_name(&self) -> String {
+        let mut result = String::new();
+        self.inner.read_table_properties(|p| {
+            result = p.compression_name().to_owned();
+        });
+        result
+    }
 }
 
 impl SstReader for RocksSstReader {
     fn open(path: &str) -> Result<Self> {
         Self::open_with_env(path, None)
+    }
+    fn open_encrypted<E: EncryptionKeyManager>(path: &str, mgr: Arc<E>) -> Result<Self> {
+        let env = Env::new_key_managed_encrypted_env(
+            Arc::default(),
+            WrappedEncryptionKeyManager::new(mgr),
+        )
+        .map_err(|err| Error::Other(box_err!("failed to open encrypted env: {}", err)))?;
+        Self::open_with_env(path, Some(Arc::new(env)))
     }
     fn verify_checksum(&self) -> Result<()> {
         self.inner.verify_checksum()?;
@@ -103,21 +114,29 @@ pub struct RocksSstIterator(DBIterator<Rc<SstFileReader>>);
 unsafe impl Send for RocksSstIterator {}
 
 impl Iterator for RocksSstIterator {
-    fn seek(&mut self, key: SeekKey) -> Result<bool> {
-        let k: RocksSeekKey = key.into();
+    fn seek(&mut self, key: SeekKey<'_>) -> Result<bool> {
+        let k: RocksSeekKey<'_> = key.into();
         self.0.seek(k.into_raw()).map_err(Error::Engine)
     }
 
-    fn seek_for_prev(&mut self, key: SeekKey) -> Result<bool> {
-        let k: RocksSeekKey = key.into();
+    fn seek_for_prev(&mut self, key: SeekKey<'_>) -> Result<bool> {
+        let k: RocksSeekKey<'_> = key.into();
         self.0.seek_for_prev(k.into_raw()).map_err(Error::Engine)
     }
 
     fn prev(&mut self) -> Result<bool> {
+        #[cfg(not(feature = "nortcheck"))]
+        if !self.valid()? {
+            return Err(Error::Engine("Iterator invalid".to_string()));
+        }
         self.0.prev().map_err(Error::Engine)
     }
 
     fn next(&mut self) -> Result<bool> {
+        #[cfg(not(feature = "nortcheck"))]
+        if !self.valid()? {
+            return Err(Error::Engine("Iterator invalid".to_string()));
+        }
         self.0.next().map_err(Error::Engine)
     }
 
@@ -337,12 +356,23 @@ fn to_rocks_compression_type(ct: SstCompressionType) -> DBCompressionType {
     }
 }
 
+pub fn from_rocks_compression_type(ct: DBCompressionType) -> Option<SstCompressionType> {
+    match ct {
+        DBCompressionType::Lz4 => Some(SstCompressionType::Lz4),
+        DBCompressionType::Snappy => Some(SstCompressionType::Snappy),
+        DBCompressionType::Zstd => Some(SstCompressionType::Zstd),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
+    use tempfile::Builder;
+
     use super::*;
     use crate::util::new_default_engine;
-    use std::io::Read;
-    use tempfile::Builder;
 
     #[test]
     fn test_smoke() {

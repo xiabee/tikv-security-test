@@ -1,12 +1,5 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use bytes::Bytes;
-use futures::future::{self};
-use futures::stream::{self, Stream};
-use futures_util::io::AsyncRead;
-use http::status::StatusCode;
-use rand::{thread_rng, Rng};
-use rusoto_core::{request::HttpDispatchError, RusotoError};
 use std::{
     future::Future,
     io, iter,
@@ -16,7 +9,14 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::{runtime::Builder, time::delay_for};
+
+use bytes::Bytes;
+use futures::stream::{self, Stream};
+use futures_util::io::AsyncRead;
+use http::status::StatusCode;
+use rand::{thread_rng, Rng};
+use rusoto_core::{request::HttpDispatchError, RusotoError};
+use tokio::{runtime::Builder, time::sleep};
 
 /// Wrapper of an `AsyncRead` instance, exposed as a `Sync` `Stream` of `Bytes`.
 pub struct AsyncReadAsSyncStreamOfBytes<R> {
@@ -74,8 +74,7 @@ pub fn error_stream(e: io::Error) -> impl Stream<Item = io::Result<Bytes>> + Unp
 // FIXME: get rid of this function, so that futures_executor::block_on is sufficient.
 pub fn block_on_external_io<F: Future>(f: F) -> F::Output {
     // we need a Tokio runtime, Tokio futures require Tokio executor.
-    Builder::new()
-        .basic_scheduler()
+    Builder::new_current_thread()
         .enable_io()
         .enable_time()
         .build()
@@ -96,22 +95,72 @@ pub trait RetryError {
 /// <https://cloud.google.com/storage/docs/exponential-backoff>
 /// Since rusoto does not have transparent auto-retry
 /// (<https://github.com/rusoto/rusoto/issues/234>), we need to implement this manually.
-pub async fn retry<G, T, F, E>(mut action: G) -> Result<T, E>
+pub async fn retry<G, T, F, E>(action: G) -> Result<T, E>
+where
+    G: FnMut() -> F,
+    F: Future<Output = Result<T, E>>,
+    E: RetryError,
+{
+    retry_ext(action, RetryExt::default()).await
+}
+
+/// The extra configuration for retry.
+pub struct RetryExt<E> {
+    // NOTE: we can move `MAX_RETRY_DELAY` and `MAX_RETRY_TIMES`
+    // to here, for making the retry more configurable.
+    // However those are constant for now and no place for configure them.
+    on_failure: Option<Box<dyn FnMut(&E) + Send + Sync + 'static>>,
+}
+
+impl<E> RetryExt<E> {
+    /// Attaches the failure hook to the ext.
+    pub fn with_fail_hook<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&E) + Send + Sync + 'static,
+    {
+        self.on_failure = Some(Box::new(f));
+        self
+    }
+}
+
+// If we use the default derive macro, it would complain that `E` isn't
+// `Default` :(
+impl<E> Default for RetryExt<E> {
+    fn default() -> Self {
+        Self {
+            on_failure: Default::default(),
+        }
+    }
+}
+
+/// Retires a future execution. Comparing to `retry`, this version allows more
+/// configurations.
+pub async fn retry_ext<G, T, F, E>(mut action: G, mut ext: RetryExt<E>) -> Result<T, E>
 where
     G: FnMut() -> F,
     F: Future<Output = Result<T, E>>,
     E: RetryError,
 {
     const MAX_RETRY_DELAY: Duration = Duration::from_secs(32);
-    const MAX_RETRY_TIMES: usize = 4;
+    const MAX_RETRY_TIMES: usize = 14;
+    let max_retry_times = (|| {
+        fail::fail_point!("retry_count", |t| t
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(MAX_RETRY_TIMES));
+        MAX_RETRY_TIMES
+    })();
+
     let mut retry_wait_dur = Duration::from_secs(1);
 
     let mut final_result = action().await;
-    for _ in 1..MAX_RETRY_TIMES {
+    for _ in 1..max_retry_times {
         if let Err(e) = &final_result {
+            if let Some(ref mut f) = ext.on_failure {
+                f(e);
+            }
             if e.is_retryable() {
-                delay_for(retry_wait_dur + Duration::from_millis(thread_rng().gen_range(0, 1000)))
-                    .await;
+                let backoff = thread_rng().gen_range(0..1000);
+                sleep(retry_wait_dur + Duration::from_millis(backoff)).await;
                 retry_wait_dur = MAX_RETRY_DELAY.min(retry_wait_dur * 2);
                 final_result = action().await;
                 continue;
@@ -128,10 +177,9 @@ where
     Fut: Future<Output = Result<T, E>> + std::marker::Unpin,
     E: From<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let timeout = tokio::time::delay_for(timeout_duration);
-    match future::select(fut, timeout).await {
-        future::Either::Left((resp, _)) => resp,
-        future::Either::Right(((), _)) => Err(box_err!(
+    match tokio::time::timeout(timeout_duration, fut).await {
+        Ok(resp) => resp,
+        Err(_) => Err(box_err!(
             "request timeout. duration: {:?}",
             timeout_duration
         )),

@@ -1,14 +1,11 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use tipb::{Expr, ExprType, FieldType};
-
-use crate::impl_bit_op::*;
-use crate::impl_max_min::*;
-use crate::impl_variance::*;
-use crate::AggrFunction;
 use tidb_query_common::Result;
 use tidb_query_datatype::expr::EvalContext;
 use tidb_query_expr::{RpnExpression, RpnExpressionBuilder};
+use tipb::{Expr, ExprType, FieldType};
+
+use crate::{impl_bit_op::*, impl_max_min::*, impl_variance::*, AggrFunction};
 
 /// Parse a specific aggregate function definition from protobuf.
 ///
@@ -44,7 +41,7 @@ pub trait AggrDefinitionParser {
         let child = aggr_def.take_children().into_iter().next().unwrap();
         let exp = RpnExpressionBuilder::build_from_expr_tree(child, ctx, src_schema.len())?;
 
-        Self::parse_rpn(&self, aggr_def, exp, ctx, src_schema, out_schema, out_exp)
+        Self::parse_rpn(self, aggr_def, exp, ctx, src_schema, out_schema, out_exp)
     }
 
     #[inline]

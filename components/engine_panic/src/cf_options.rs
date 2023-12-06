@@ -1,9 +1,8 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::db_options::PanicTitanDBOptions;
-use crate::engine::PanicEngine;
-use engine_traits::{CFOptionsExt, Result};
-use engine_traits::{ColumnFamilyOptions, SstPartitionerFactory};
+use engine_traits::{CFOptionsExt, ColumnFamilyOptions, Result, SstPartitionerFactory};
+
+use crate::{db_options::PanicTitanDBOptions, engine::PanicEngine};
 
 impl CFOptionsExt for PanicEngine {
     type ColumnFamilyOptions = PanicColumnFamilyOptions;
@@ -58,6 +57,9 @@ impl ColumnFamilyOptions for PanicColumnFamilyOptions {
         panic!()
     }
     fn get_disable_auto_compactions(&self) -> bool {
+        panic!()
+    }
+    fn get_disable_write_stall(&self) -> bool {
         panic!()
     }
     fn set_sst_partitioner_factory<F: SstPartitionerFactory>(&mut self, factory: F) {

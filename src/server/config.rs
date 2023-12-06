@@ -1,22 +1,21 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::Arc;
-use std::{cmp, i32, isize};
-
-use super::Result;
-use grpcio::CompressionAlgorithms;
-use regex::Regex;
+use std::{cmp, i32, isize, sync::Arc, time::Duration};
 
 use collections::HashMap;
-use configuration::{ConfigChange, ConfigManager, Configuration};
-use tikv_util::config::{self, ReadableDuration, ReadableSize, VersionTrack};
-use tikv_util::sys::SysQuota;
-use tikv_util::worker::Scheduler;
-
-pub use crate::storage::config::Config as StorageConfig;
+use engine_traits::{perf_level_serde, PerfLevel};
+use grpcio::{CompressionAlgorithms, ResourceQuota};
+use online_config::{ConfigChange, ConfigManager, OnlineConfig};
 pub use raftstore::store::Config as RaftStoreConfig;
+use regex::Regex;
+use tikv_util::{
+    config::{self, ReadableDuration, ReadableSize, VersionTrack},
+    sys::SysQuota,
+    worker::Scheduler,
+};
 
-use super::snap::Task as SnapTask;
+use super::{snap::Task as SnapTask, Result};
+pub use crate::storage::config::Config as StorageConfig;
 
 pub const DEFAULT_CLUSTER_ID: u64 = 0;
 pub const DEFAULT_LISTENING_ADDR: &str = "127.0.0.1:20160";
@@ -54,127 +53,149 @@ pub enum GrpcCompressionType {
     Gzip,
 }
 
-/// Configuration for the `server` module.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Configuration)]
+/// OnlineConfig for the `server` module.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
     #[serde(skip)]
-    #[config(skip)]
+    #[online_config(skip)]
     pub cluster_id: u64,
 
     // Server listening address.
-    #[config(skip)]
+    #[online_config(skip)]
     pub addr: String,
 
     // Server advertise listening address for outer communication.
     // If not set, we will use listening address instead.
-    #[config(skip)]
+    #[online_config(skip)]
     pub advertise_addr: String,
 
     // These are related to TiKV status.
-    #[config(skip)]
+    #[online_config(skip)]
     pub status_addr: String,
 
     // Status server's advertise listening address for outer communication.
     // If not set, the status server's listening address will be used.
-    #[config(skip)]
+    #[online_config(skip)]
     pub advertise_status_addr: String,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub status_thread_pool_size: usize,
 
-    #[config(skip)]
     pub max_grpc_send_msg_len: i32,
 
     // When merge raft messages into a batch message, leave a buffer.
+    #[online_config(skip)]
     pub raft_client_grpc_send_msg_buffer: usize,
-
-    #[config(skip)]
+    #[online_config(skip)]
     pub raft_client_queue_size: usize,
+    // Test only
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
+    #[online_config(skip)]
+    pub raft_client_max_backoff: ReadableDuration,
+    // Test only
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
+    #[online_config(skip)]
+    pub raft_client_initial_reconnect_backoff: ReadableDuration,
 
     pub raft_msg_max_batch_size: usize,
 
     // TODO: use CompressionAlgorithms instead once it supports traits like Clone etc.
-    #[config(skip)]
+    #[online_config(skip)]
     pub grpc_compression_type: GrpcCompressionType,
-    #[config(skip)]
+    #[online_config(skip)]
     pub grpc_concurrency: usize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub grpc_concurrent_stream: i32,
-    #[config(skip)]
+    #[online_config(skip)]
     pub grpc_raft_conn_num: usize,
-    #[config(skip)]
     pub grpc_memory_pool_quota: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub grpc_stream_initial_window_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub grpc_keepalive_time: ReadableDuration,
-    #[config(skip)]
+    #[online_config(skip)]
     pub grpc_keepalive_timeout: ReadableDuration,
     /// How many snapshots can be sent concurrently.
     pub concurrent_send_snap_limit: usize,
     /// How many snapshots can be recv concurrently.
     pub concurrent_recv_snap_limit: usize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_recursion_limit: u32,
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_stream_channel_size: usize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_batch_row_limit: usize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_stream_batch_row_limit: usize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_enable_batch_if_possible: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_request_max_handle_duration: ReadableDuration,
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_max_concurrency: usize,
+    #[serde(with = "perf_level_serde")]
+    #[online_config(skip)]
+    pub end_point_perf_level: PerfLevel,
     pub snap_max_write_bytes_per_sec: ReadableSize,
     pub snap_max_total_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub stats_concurrency: usize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub heavy_load_threshold: usize,
-    #[config(skip)]
-    pub heavy_load_wait_duration: ReadableDuration,
-    #[config(skip)]
+    #[online_config(skip)]
+    pub heavy_load_wait_duration: Option<ReadableDuration>,
+    #[online_config(skip)]
     pub enable_request_batch: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub background_thread_count: usize,
     // If handle time is larger than the threshold, it will print slow log in end point.
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_slow_log_threshold: ReadableDuration,
     /// Max connections per address for forwarding request.
-    #[config(skip)]
+    #[online_config(skip)]
     pub forward_max_connections_per_address: usize,
 
-    // Test only.
     #[doc(hidden)]
-    #[serde(skip_serializing)]
-    #[config(skip)]
-    pub raft_client_backoff_step: ReadableDuration,
+    #[online_config(skip)]
+    /// When TiKV memory usage reaches `memory_usage_high_water` it will try to limit memory
+    /// increasing. For server layer some messages will be rejected or droped, if they utilize
+    /// memory more than `reject_messages_on_memory_ratio` * total.
+    ///
+    /// Set it to 0 can disable message rejecting.
+    // By default it's 0.2. So for different memory capacity, messages are rejected when:
+    // * system=8G,  memory_usage_limit=6G,  reject_at=1.2G
+    // * system=16G, memory_usage_limit=12G, reject_at=2.4G
+    // * system=32G, memory_usage_limit=24G, reject_at=4.8G
+    pub reject_messages_on_memory_ratio: f64,
+
+    // whether to compact metrics or not.
+    #[doc(hidden)]
+    pub simplify_metrics: bool,
 
     // Server labels to specify some attributes about this server.
-    #[config(skip)]
+    #[online_config(skip)]
     pub labels: HashMap<String, String>,
 
     // deprecated. use readpool.coprocessor.xx_concurrency.
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_concurrency: Option<usize>,
 
     // deprecated. use readpool.coprocessor.stack_size.
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_stack_size: Option<ReadableSize>,
 
     // deprecated. use readpool.coprocessor.max_tasks_per_worker_xx.
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[config(skip)]
+    #[online_config(skip)]
     pub end_point_max_tasks: Option<usize>,
 }
 
@@ -193,6 +214,8 @@ impl Default for Config {
             max_grpc_send_msg_len: DEFAULT_MAX_GRPC_SEND_MSG_LEN,
             raft_client_grpc_send_msg_buffer: 512 * 1024,
             raft_client_queue_size: 8192,
+            raft_client_max_backoff: ReadableDuration::secs(5),
+            raft_client_initial_reconnect_backoff: ReadableDuration::secs(1),
             raft_msg_max_batch_size: 128,
             grpc_compression_type: GrpcCompressionType::None,
             grpc_concurrency: DEFAULT_GRPC_CONCURRENCY,
@@ -218,25 +241,33 @@ impl Default for Config {
                 DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS,
             ),
             end_point_max_concurrency: cmp::max(cpu_num as usize, MIN_ENDPOINT_MAX_CONCURRENCY),
+            end_point_perf_level: PerfLevel::Uninitialized,
             snap_max_write_bytes_per_sec: ReadableSize(DEFAULT_SNAP_MAX_BYTES_PER_SEC),
             snap_max_total_size: ReadableSize(0),
             stats_concurrency: 1,
-            // 300 means gRPC threads are under heavy load if their total CPU usage
-            // is greater than 300%.
-            heavy_load_threshold: 300,
-            // The resolution of timer in tokio is 1ms.
-            heavy_load_wait_duration: ReadableDuration::millis(1),
+            // 75 means a gRPC thread is under heavy load if its total CPU usage
+            // is greater than 75%.
+            heavy_load_threshold: 75,
+            heavy_load_wait_duration: None,
             enable_request_batch: true,
-            raft_client_backoff_step: ReadableDuration::secs(1),
+            reject_messages_on_memory_ratio: 0.2,
             background_thread_count,
             end_point_slow_log_threshold: ReadableDuration::secs(1),
             // Go tikv client uses 4 as well.
             forward_max_connections_per_address: 4,
+            simplify_metrics: false,
         }
     }
 }
 
 impl Config {
+    #[inline]
+    pub fn heavy_load_wait_duration(&self) -> Duration {
+        self.heavy_load_wait_duration
+            .unwrap_or_else(|| ReadableDuration::micros(50))
+            .0
+    }
+
     /// Validates the configuration and returns an error if it is misconfigured.
     pub fn validate(&mut self) -> Result<()> {
         box_try!(config::check_addr(&self.addr));
@@ -296,6 +327,10 @@ impl Config {
                 "concurrent-recv-snap-limit",
                 self.concurrent_recv_snap_limit,
             ),
+            (
+                "grpc-memory-pool-quota",
+                self.grpc_memory_pool_quota.0 as usize,
+            ),
         ];
         for (label, value) in non_zero_entries {
             if value == 0 {
@@ -312,6 +347,12 @@ impl Config {
         {
             return Err(box_err!(
                 "server.end-point-request-max-handle-secs is too small."
+            ));
+        }
+
+        if self.max_grpc_send_msg_len <= 0 {
+            return Err(box_err!(
+                "server.max-grpc-send-msg-len must be bigger than 0."
             ));
         }
 
@@ -332,6 +373,18 @@ impl Config {
             ));
         }
 
+        if self.reject_messages_on_memory_ratio < 0.0 {
+            return Err(box_err!(
+                "server.reject_messages_on_memory_ratio must be greater than 0"
+            ));
+        }
+
+        if self.heavy_load_threshold > 100 {
+            // The configuration has been changed to describe CPU usage of a single thread instead
+            // of all threads. So migrate from the old style.
+            self.heavy_load_threshold = 75;
+        }
+
         Ok(())
     }
 
@@ -348,11 +401,23 @@ impl Config {
 pub struct ServerConfigManager {
     tx: Scheduler<SnapTask>,
     config: Arc<VersionTrack<Config>>,
+    grpc_mem_quota: ResourceQuota,
 }
 
+unsafe impl Send for ServerConfigManager {}
+unsafe impl Sync for ServerConfigManager {}
+
 impl ServerConfigManager {
-    pub fn new(tx: Scheduler<SnapTask>, config: Arc<VersionTrack<Config>>) -> ServerConfigManager {
-        ServerConfigManager { tx, config }
+    pub fn new(
+        tx: Scheduler<SnapTask>,
+        config: Arc<VersionTrack<Config>>,
+        grpc_mem_quota: ResourceQuota,
+    ) -> ServerConfigManager {
+        ServerConfigManager {
+            tx,
+            config,
+            grpc_mem_quota,
+        }
     }
 }
 
@@ -360,8 +425,15 @@ impl ConfigManager for ServerConfigManager {
     fn dispatch(&mut self, c: ConfigChange) -> std::result::Result<(), Box<dyn std::error::Error>> {
         {
             let change = c.clone();
-            self.config
-                .update(move |cfg: &mut Config| cfg.update(change));
+            self.config.update(move |cfg| cfg.update(change));
+            if let Some(value) = c.get("grpc_memory_pool_quota") {
+                let mem_quota: ReadableSize = value.clone().into();
+                // the resize is done inplace indeed, but grpc-rs's api need self, so we just
+                // clone it here, but this no extra side effect here.
+                self.grpc_mem_quota
+                    .clone()
+                    .resize_memory(mem_quota.0 as usize);
+            }
             if let Err(e) = self.tx.schedule(SnapTask::RefreshConfigEvent) {
                 error!("server configuration manager schedule refresh snapshot work task failed"; "err"=> ?e);
             }
@@ -403,8 +475,9 @@ fn validate_label_value(s: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tikv_util::config::ReadableDuration;
+
+    use super::*;
 
     #[test]
     fn test_config_validate() {
@@ -425,6 +498,10 @@ mod tests {
 
         let mut invalid_cfg = cfg.clone();
         invalid_cfg.end_point_recursion_limit = 0;
+        assert!(invalid_cfg.validate().is_err());
+
+        let mut invalid_cfg = cfg.clone();
+        invalid_cfg.grpc_memory_pool_quota = ReadableSize::mb(0);
         assert!(invalid_cfg.validate().is_err());
 
         let mut invalid_cfg = cfg.clone();
@@ -449,6 +526,10 @@ mod tests {
         invalid_cfg = Config::default();
         invalid_cfg.advertise_addr = "127.0.0.1:1000".to_owned();
         invalid_cfg.advertise_status_addr = "127.0.0.1:1000".to_owned();
+        assert!(invalid_cfg.validate().is_err());
+
+        invalid_cfg = Config::default();
+        invalid_cfg.max_grpc_send_msg_len = 0;
         assert!(invalid_cfg.validate().is_err());
 
         invalid_cfg = Config::default();

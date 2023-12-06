@@ -1,12 +1,16 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Mutex,
+};
 
+use collections::HashMap;
 use fail::fail_point;
-use kvproto::metapb::{Peer, Region, Store, StoreState};
-use kvproto::pdpb::*;
+use kvproto::{
+    metapb::{Peer, Region, Store, StoreState},
+    pdpb::*,
+};
 
 use super::*;
 
@@ -51,9 +55,15 @@ impl Service {
     }
 }
 
+impl Default for Service {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn make_members_response(eps: Vec<String>) -> GetMembersResponse {
     let mut members = Vec::with_capacity(eps.len());
-    for (i, ep) in (&eps).iter().enumerate() {
+    for (i, ep) in eps.iter().enumerate() {
         let mut m = Member::default();
         m.set_name(format!("pd{}", i));
         m.set_member_id(100 + i as u64);
@@ -228,6 +238,7 @@ impl PdMocker for Service {
             .insert(region_id, req.get_leader().clone());
 
         let mut resp = RegionHeartbeatResponse::default();
+        resp.set_region_id(req.get_region().get_id());
         let header = Service::header();
         resp.set_header(header);
         Some(Ok(resp))

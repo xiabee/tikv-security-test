@@ -1,19 +1,23 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::storage::kv::WriteData;
-use crate::storage::lock_manager::LockManager;
-use crate::storage::mvcc::{LockType, MvccTxn, SnapshotReader, TimeStamp, TxnCommitRecord};
-use crate::storage::txn::{
-    actions::check_txn_status::{collapse_prev_rollback, make_rollback},
-    commands::{
-        Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand,
-        WriteContext, WriteResult,
-    },
-    Result,
-};
-use crate::storage::types::SecondaryLocksStatus;
-use crate::storage::{ProcessResult, Snapshot};
+// #[PerformanceCriticalPath]
 use txn_types::{Key, Lock, WriteType};
+
+use crate::storage::{
+    kv::WriteData,
+    lock_manager::LockManager,
+    mvcc::{LockType, MvccTxn, SnapshotReader, TimeStamp, TxnCommitRecord},
+    txn::{
+        actions::check_txn_status::{collapse_prev_rollback, make_rollback},
+        commands::{
+            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
+            WriteCommand, WriteContext, WriteResult,
+        },
+        Result,
+    },
+    types::SecondaryLocksStatus,
+    ProcessResult, Snapshot,
+};
 
 command! {
     /// Check secondary locks of an async commit transaction.
@@ -56,8 +60,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
         context.concurrency_manager.update_max_ts(self.start_ts);
 
         let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
-        let mut reader =
-            SnapshotReader::new(self.start_ts, snapshot, !self.ctx.get_not_fill_cache());
+        let mut reader = ReaderWithStats::new(
+            SnapshotReader::new_with_ctx(self.start_ts, snapshot, &self.ctx),
+            context.statistics,
+        );
         let mut released_locks = ReleasedLocks::new(self.start_ts, TimeStamp::zero());
         let mut result = SecondaryLocksStatus::Locked(Vec::new());
 
@@ -140,9 +146,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
             // One row is mutated only when a secondary lock is rolled back.
             rows = 1;
         }
-        context.statistics.add(&reader.take_statistics());
         let pr = ProcessResult::SecondaryLocksStatus { status: result };
-        let write_data = WriteData::from_modifies(txn.into_modifies());
+        let mut write_data = WriteData::from_modifies(txn.into_modifies());
+        write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
             ctx: self.ctx,
             to_be_write: write_data,
@@ -157,15 +163,18 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-    use crate::storage::kv::TestEngineBuilder;
-    use crate::storage::lock_manager::DummyLockManager;
-    use crate::storage::mvcc::tests::*;
-    use crate::storage::txn::commands::WriteCommand;
-    use crate::storage::txn::tests::*;
-    use crate::storage::Engine;
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
+    use tikv_util::deadline::Deadline;
+
+    use super::*;
+    use crate::storage::{
+        kv::TestEngineBuilder,
+        lock_manager::DummyLockManager,
+        mvcc::tests::*,
+        txn::{commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*},
+        Engine,
+    };
 
     pub fn must_success<E: Engine>(
         engine: &E,
@@ -181,6 +190,7 @@ pub mod tests {
             ctx: ctx.clone(),
             keys: vec![Key::from_raw(key)],
             start_ts: lock_ts,
+            deadline: Deadline::from_now(DEFAULT_EXECUTION_DURATION_LIMIT),
         };
         let result = command
             .process_write(
@@ -216,6 +226,7 @@ pub mod tests {
                 ctx: Default::default(),
                 keys: vec![key],
                 start_ts: ts,
+                deadline: Deadline::from_now(DEFAULT_EXECUTION_DURATION_LIMIT),
             };
             let result = command
                 .process_write(

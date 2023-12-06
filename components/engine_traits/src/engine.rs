@@ -20,11 +20,11 @@ pub trait KvEngine:
     + CFOptionsExt
     + ImportExt
     + SstExt
-    + TablePropertiesExt
     + CompactExt
     + RangePropertiesExt
     + MvccPropertiesExt
     + TtlPropertiesExt
+    + TablePropertiesExt
     + PerfContextExt
     + MiscExt
     + Send
@@ -56,4 +56,12 @@ pub trait KvEngine:
     /// This only exists as a temporary hack during refactoring.
     /// It cannot be used forever.
     fn bad_downcast<T: 'static>(&self) -> &T;
+}
+
+/// A factory trait to create new engine.
+///
+// It should be named as `EngineFactory` for consistency, but we are about to rename
+// engine to tablet, so always use tablet for new traits/types.
+pub trait TabletFactory<EK> {
+    fn create_tablet(&self) -> Result<EK>;
 }

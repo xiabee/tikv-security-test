@@ -1,16 +1,29 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::fsm::{Fsm, FsmScheduler, FsmState};
-use crate::mailbox::{BasicMailbox, Mailbox};
+// #[PerformanceCriticalPath]
+use std::{
+    cell::Cell,
+    mem,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+};
+
 use collections::HashMap;
 use crossbeam::channel::{SendError, TrySendError};
-use std::cell::Cell;
-use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use tikv_util::lru::LruCache;
-use tikv_util::Either;
-use tikv_util::{debug, info};
+use tikv_util::{
+    debug, info,
+    lru::LruCache,
+    time::{duration_to_sec, Instant},
+    Either,
+};
+
+use crate::{
+    fsm::{Fsm, FsmScheduler, FsmState},
+    mailbox::{BasicMailbox, Mailbox},
+    metrics::*,
+};
 
 /// A struct that traces the approximate memory usage of router.
 #[derive(Default)]
@@ -50,7 +63,7 @@ pub struct Router<N: Fsm, C: Fsm, Ns, Cs> {
     // it's not possible to write FsmScheduler<Fsm=C> + FsmScheduler<Fsm=N>
     // for now.
     pub(crate) normal_scheduler: Ns,
-    control_scheduler: Cs,
+    pub(crate) control_scheduler: Cs,
 
     // Count of Mailboxes that is not destroyed.
     // Added when a Mailbox created, and subtracted it when a Mailbox destroyed.
@@ -211,7 +224,9 @@ where
             match mailbox.try_send(m, &self.normal_scheduler) {
                 Ok(()) => Some(Ok(())),
                 r @ Err(TrySendError::Full(_)) => {
-                    // TODO: report channel full
+                    CHANNEL_FULL_COUNTER_VEC
+                        .with_label_values(&["normal"])
+                        .inc();
                     Some(r)
                 }
                 Err(TrySendError::Disconnected(m)) => {
@@ -265,7 +280,9 @@ where
         match self.control_box.try_send(msg, &self.control_scheduler) {
             Ok(()) => Ok(()),
             r @ Err(TrySendError::Full(_)) => {
-                // TODO: record metrics.
+                CHANNEL_FULL_COUNTER_VEC
+                    .with_label_values(&["control"])
+                    .inc();
                 r
             }
             r => r,
@@ -274,10 +291,12 @@ where
 
     /// Try to notify all normal fsm a message.
     pub fn broadcast_normal(&self, mut msg_gen: impl FnMut() -> N::Message) {
+        let timer = Instant::now_coarse();
         let mailboxes = self.normals.lock().unwrap();
         for mailbox in mailboxes.map.values() {
             let _ = mailbox.force_send(msg_gen(), &self.normal_scheduler);
         }
+        BROADCAST_NORMAL_DURATION.observe(duration_to_sec(timer.saturating_elapsed()) as f64);
     }
 
     /// Try to notify all fsm that the cluster is being shutdown.

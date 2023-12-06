@@ -1,9 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::io::Result;
-use std::sync::Arc;
+use std::{io::Result, sync::Arc};
 
-use crate::raw::Env;
 use encryption::{self, DataKeyManager};
 use engine_traits::{EncryptionKeyManager, EncryptionMethod, FileEncryptionInfo};
 use rocksdb::{
@@ -11,11 +9,13 @@ use rocksdb::{
     FileEncryptionInfo as DBFileEncryptionInfo,
 };
 
+use crate::raw::Env;
+
 // Use engine::Env directly since Env is not abstracted.
-pub fn get_env(
-    key_manager: Option<Arc<DataKeyManager>>,
+pub(crate) fn get_env(
     base_env: Option<Arc<Env>>,
-) -> encryption::Result<Arc<Env>> {
+    key_manager: Option<Arc<DataKeyManager>>,
+) -> std::result::Result<Arc<Env>, String> {
     let base_env = base_env.unwrap_or_else(|| Arc::new(Env::default()));
     if let Some(manager) = key_manager {
         Ok(Arc::new(Env::new_key_managed_encrypted_env(
@@ -29,6 +29,12 @@ pub fn get_env(
 
 pub struct WrappedEncryptionKeyManager<T: EncryptionKeyManager> {
     manager: Arc<T>,
+}
+
+impl<T: EncryptionKeyManager> WrappedEncryptionKeyManager<T> {
+    pub fn new(manager: Arc<T>) -> Self {
+        Self { manager }
+    }
 }
 
 impl<T: EncryptionKeyManager> DBEncryptionKeyManager for WrappedEncryptionKeyManager<T> {

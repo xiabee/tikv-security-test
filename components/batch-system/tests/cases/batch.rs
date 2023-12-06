@@ -1,11 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use batch_system::test_runner::*;
-use batch_system::*;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
-use std::thread::sleep;
-use std::time::Duration;
+use std::{
+    sync::{atomic::AtomicUsize, Arc},
+    thread::sleep,
+    time::Duration,
+};
+
+use batch_system::{test_runner::*, *};
 use tikv_util::mpsc;
 
 #[test]
@@ -88,14 +89,13 @@ fn test_priority() {
         .unwrap();
     assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(2));
 
-    let tx_ = tx.clone();
     router
         .send(
             2,
             Message::Callback(Box::new(move |h: &Handler, r: &mut Runner| {
                 assert_eq!(h.get_priority(), Priority::Low);
                 assert_eq!(h.get_priority(), r.get_priority());
-                tx_.send(3).unwrap();
+                tx.send(3).unwrap();
             })),
         )
         .unwrap();

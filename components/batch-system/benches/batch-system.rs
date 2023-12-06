@@ -2,13 +2,10 @@
 
 #![feature(test)]
 
-extern crate test;
+use std::sync::{atomic::*, Arc};
 
-use batch_system::test_runner::*;
-use batch_system::*;
+use batch_system::{test_runner::*, *};
 use criterion::*;
-use std::sync::atomic::*;
-use std::sync::Arc;
 
 fn end_hook(tx: &std::sync::mpsc::Sender<()>) -> Message {
     let tx = tx.clone();

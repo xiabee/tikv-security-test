@@ -1,11 +1,12 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::db_vector::PanicDBVector;
-use crate::engine::PanicEngine;
+use std::ops::Deref;
+
 use engine_traits::{
     IterOptions, Iterable, Iterator, Peekable, ReadOptions, Result, SeekKey, Snapshot,
 };
-use std::ops::Deref;
+
+use crate::{db_vector::PanicDBVector, engine::PanicEngine};
 
 #[derive(Clone, Debug)]
 pub struct PanicSnapshot;
@@ -46,10 +47,10 @@ impl Iterable for PanicSnapshot {
 pub struct PanicSnapshotIterator;
 
 impl Iterator for PanicSnapshotIterator {
-    fn seek(&mut self, key: SeekKey) -> Result<bool> {
+    fn seek(&mut self, key: SeekKey<'_>) -> Result<bool> {
         panic!()
     }
-    fn seek_for_prev(&mut self, key: SeekKey) -> Result<bool> {
+    fn seek_for_prev(&mut self, key: SeekKey<'_>) -> Result<bool> {
         panic!()
     }
 

@@ -1,13 +1,20 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::storage::config::BlockCacheConfig;
-use crate::storage::kv::{Result, RocksEngine};
-use engine_rocks::raw::ColumnFamilyOptions;
-use engine_rocks::raw_util::CFOptions;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use engine_rocks::{raw::ColumnFamilyOptions, raw_util::CFOptions};
 use engine_traits::{CfName, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use file_system::IORateLimiter;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use kvproto::kvrpcpb::ApiVersion;
+use tikv_util::config::ReadableSize;
+
+use crate::storage::{
+    config::BlockCacheConfig,
+    kv::{Result, RocksEngine},
+};
 
 // Duplicated from rocksdb_engine
 const TEMP_DIR: &str = "";
@@ -20,7 +27,7 @@ pub struct TestEngineBuilder {
     path: Option<PathBuf>,
     cfs: Option<Vec<CfName>>,
     io_rate_limiter: Option<Arc<IORateLimiter>>,
-    enable_ttl: bool,
+    api_version: ApiVersion,
 }
 
 impl TestEngineBuilder {
@@ -29,7 +36,7 @@ impl TestEngineBuilder {
             path: None,
             cfs: None,
             io_rate_limiter: None,
-            enable_ttl: false,
+            api_version: ApiVersion::V1,
         }
     }
 
@@ -49,8 +56,8 @@ impl TestEngineBuilder {
         self
     }
 
-    pub fn ttl(mut self, b: bool) -> Self {
-        self.enable_ttl = b;
+    pub fn api_version(mut self, api_version: ApiVersion) -> Self {
+        self.api_version = api_version;
         self
     }
 
@@ -59,26 +66,54 @@ impl TestEngineBuilder {
         self
     }
 
+    /// Register causal observer for RawKV API V2.
+    // TODO: `RocksEngine` is coupling with RawKV features including GC (compaction filter) & CausalObserver.
+    // Consider decoupling them.
+    fn register_causal_observer(engine: &mut RocksEngine) {
+        let causal_ts_provider = Arc::new(causal_ts::tests::TestProvider::default());
+        let causal_ob = causal_ts::CausalObserver::new(causal_ts_provider);
+        engine.register_observer(|host| {
+            causal_ob.register_to(host);
+        });
+    }
+
     /// Build a `RocksEngine`.
     pub fn build(self) -> Result<RocksEngine> {
         let cfg_rocksdb = crate::config::DbConfig::default();
-        self.build_with_cfg(&cfg_rocksdb)
+        self.do_build(&cfg_rocksdb, true)
     }
 
     pub fn build_with_cfg(self, cfg_rocksdb: &crate::config::DbConfig) -> Result<RocksEngine> {
+        self.do_build(cfg_rocksdb, true)
+    }
+
+    pub fn build_without_cache(self) -> Result<RocksEngine> {
+        let cfg_rocksdb = crate::config::DbConfig::default();
+        self.do_build(&cfg_rocksdb, false)
+    }
+
+    fn do_build(
+        self,
+        cfg_rocksdb: &crate::config::DbConfig,
+        enable_block_cache: bool,
+    ) -> Result<RocksEngine> {
         let path = match self.path {
             None => TEMP_DIR.to_owned(),
             Some(p) => p.to_str().unwrap().to_owned(),
         };
-        let enable_ttl = self.enable_ttl;
+        let api_version = self.api_version;
         let cfs = self.cfs.unwrap_or_else(|| ALL_CFS.to_vec());
-        let cache = BlockCacheConfig::default().build_shared_cache();
+        let mut cache_opt = BlockCacheConfig::default();
+        if !enable_block_cache {
+            cache_opt.capacity = Some(ReadableSize::kb(0));
+        }
+        let cache = cache_opt.build_shared_cache();
         let cfs_opts = cfs
             .iter()
             .map(|cf| match *cf {
                 CF_DEFAULT => CFOptions::new(
                     CF_DEFAULT,
-                    cfg_rocksdb.defaultcf.build_opt(&cache, None, enable_ttl),
+                    cfg_rocksdb.defaultcf.build_opt(&cache, None, api_version),
                 ),
                 CF_LOCK => CFOptions::new(CF_LOCK, cfg_rocksdb.lockcf.build_opt(&cache)),
                 CF_WRITE => CFOptions::new(CF_WRITE, cfg_rocksdb.writecf.build_opt(&cache, None)),
@@ -86,28 +121,42 @@ impl TestEngineBuilder {
                 _ => CFOptions::new(*cf, ColumnFamilyOptions::new()),
             })
             .collect();
-        RocksEngine::new(
+        let mut engine = RocksEngine::new(
             &path,
             &cfs,
             Some(cfs_opts),
             cache.is_some(),
             self.io_rate_limiter,
-        )
+            None, /* CFOptions */
+        )?;
+
+        if let ApiVersion::V2 = api_version {
+            Self::register_causal_observer(&mut engine);
+        }
+
+        Ok(engine)
+    }
+}
+
+impl Default for TestEngineBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::CfStatistics;
-    use super::super::PerfStatisticsInstant;
-    use super::super::{Engine, Snapshot};
-    use super::*;
-    use crate::storage::{Cursor, CursorBuilder, ScanMode};
+    use engine_rocks::ReadPerfInstant;
     use engine_traits::IterOptions;
     use kvproto::kvrpcpb::Context;
     use tikv_kv::tests::*;
-    use txn_types::Key;
-    use txn_types::TimeStamp;
+    use txn_types::{Key, TimeStamp};
+
+    use super::{
+        super::{CfStatistics, Engine, Snapshot, TEST_ENGINE_CFS},
+        *,
+    };
+    use crate::storage::{Cursor, CursorBuilder, ScanMode};
 
     #[test]
     fn test_rocksdb() {
@@ -214,25 +263,25 @@ mod tests {
 
         let mut statistics = CfStatistics::default();
 
-        let perf_statistics = PerfStatisticsInstant::new();
+        let perf_statistics = ReadPerfInstant::new();
         iter.seek(&Key::from_raw(b"foo30"), &mut statistics)
             .unwrap();
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 0);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 0);
 
-        let perf_statistics = PerfStatisticsInstant::new();
+        let perf_statistics = ReadPerfInstant::new();
         iter.near_seek(&Key::from_raw(b"foo55"), &mut statistics)
             .unwrap();
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 2);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 2);
 
-        let perf_statistics = PerfStatisticsInstant::new();
+        let perf_statistics = ReadPerfInstant::new();
         iter.prev(&mut statistics);
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 2);
-
-        iter.prev(&mut statistics);
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 3);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 2);
 
         iter.prev(&mut statistics);
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 3);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 3);
+
+        iter.prev(&mut statistics);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 3);
     }
 
     #[test]
@@ -286,40 +335,40 @@ mod tests {
             .unwrap();
 
         let mut statistics = CfStatistics::default();
-        let perf_statistics = PerfStatisticsInstant::new();
+        let perf_statistics = ReadPerfInstant::new();
         iter.seek(
             &Key::from_raw(b"aoo").append_ts(TimeStamp::zero()),
             &mut statistics,
         )
         .unwrap();
         assert_eq!(iter.valid().unwrap(), true);
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 0);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 0);
 
-        let perf_statistics = PerfStatisticsInstant::new();
+        let perf_statistics = ReadPerfInstant::new();
         iter.seek(
             &Key::from_raw(b"foo").append_ts(TimeStamp::zero()),
             &mut statistics,
         )
         .unwrap();
         assert_eq!(iter.valid().unwrap(), false);
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 1);
-        let perf_statistics = PerfStatisticsInstant::new();
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 1);
+        let perf_statistics = ReadPerfInstant::new();
         iter.seek(
             &Key::from_raw(b"foo1").append_ts(TimeStamp::zero()),
             &mut statistics,
         )
         .unwrap();
         assert_eq!(iter.valid().unwrap(), false);
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 1);
-        let perf_statistics = PerfStatisticsInstant::new();
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 1);
+        let perf_statistics = ReadPerfInstant::new();
         iter.seek(
             &Key::from_raw(b"foo2").append_ts(TimeStamp::zero()),
             &mut statistics,
         )
         .unwrap();
         assert_eq!(iter.valid().unwrap(), false);
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 1);
-        let perf_statistics = PerfStatisticsInstant::new();
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 1);
+        let perf_statistics = ReadPerfInstant::new();
         assert_eq!(
             iter.seek(
                 &Key::from_raw(b"foo4").append_ts(TimeStamp::zero()),
@@ -336,6 +385,6 @@ mod tests {
                 .as_encoded()
                 .as_slice()
         );
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 0);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 0);
     }
 }

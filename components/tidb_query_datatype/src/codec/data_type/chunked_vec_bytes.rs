@@ -1,8 +1,6 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::bit_vec::BitVec;
-use super::{Bytes, BytesRef};
-use super::{ChunkRef, ChunkedVec, UnsafeRefInto};
+use super::{bit_vec::BitVec, Bytes, BytesRef, ChunkRef, ChunkedVec, UnsafeRefInto};
 use crate::impl_chunked_vec_common;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -22,7 +20,7 @@ pub struct ChunkedVecBytes {
 /// position of each element.
 impl ChunkedVecBytes {
     #[inline]
-    pub fn push_data_ref(&mut self, value: BytesRef) {
+    pub fn push_data_ref(&mut self, value: BytesRef<'_>) {
         self.bitmap.push(true);
         self.data.extend_from_slice(value);
         self.finish_append();
@@ -35,7 +33,7 @@ impl ChunkedVecBytes {
     }
 
     #[inline]
-    pub fn push_ref(&mut self, value: Option<BytesRef>) {
+    pub fn push_ref(&mut self, value: Option<BytesRef<'_>>) {
         if let Some(x) = value {
             self.push_data_ref(x);
         } else {
@@ -43,7 +41,7 @@ impl ChunkedVecBytes {
         }
     }
     #[inline]
-    pub fn get(&self, idx: usize) -> Option<BytesRef> {
+    pub fn get(&self, idx: usize) -> Option<BytesRef<'_>> {
         assert!(idx < self.len());
         if self.bitmap.get(idx) {
             Some(&self.data[self.var_offset[idx]..self.var_offset[idx + 1]])
@@ -152,8 +150,27 @@ impl BytesWriter {
         }
     }
 
-    pub fn write_ref(mut self, data: Option<BytesRef>) -> BytesGuard {
+    pub fn write_ref(mut self, data: Option<BytesRef<'_>>) -> BytesGuard {
         self.chunked_vec.push_ref(data);
+        BytesGuard {
+            chunked_vec: self.chunked_vec,
+        }
+    }
+
+    pub fn write_from_char_iter(self, iter: impl Iterator<Item = char>) -> BytesGuard {
+        let mut writer = self.begin();
+        for c in iter {
+            let mut buf = [0; 4];
+            let result = c.encode_utf8(&mut buf);
+            writer.partial_write(result.as_bytes());
+        }
+        writer.finish()
+    }
+
+    pub fn write_from_byte_iter(mut self, iter: impl Iterator<Item = u8>) -> BytesGuard {
+        self.chunked_vec.data.extend(iter);
+        self.chunked_vec.bitmap.push(true);
+        self.chunked_vec.finish_append();
         BytesGuard {
             chunked_vec: self.chunked_vec,
         }
@@ -161,7 +178,7 @@ impl BytesWriter {
 }
 
 impl<'a> PartialBytesWriter {
-    pub fn partial_write(&mut self, data: BytesRef) {
+    pub fn partial_write(&mut self, data: BytesRef<'_>) {
         self.chunked_vec.data.extend_from_slice(data);
     }
 
@@ -219,10 +236,7 @@ mod tests {
             None,
         ];
         assert_eq!(ChunkedVecBytes::from_slice(test_bytes).to_vec(), test_bytes);
-        assert_eq!(
-            ChunkedVecBytes::from_slice(&test_bytes.to_vec()).to_vec(),
-            test_bytes
-        );
+        assert_eq!(ChunkedVecBytes::from_slice(test_bytes).to_vec(), test_bytes);
     }
 
     #[test]

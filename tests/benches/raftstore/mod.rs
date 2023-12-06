@@ -1,11 +1,9 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::fmt;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use criterion::{Bencher, Criterion};
-use engine_rocks::raw::DB;
-use engine_rocks::Compat;
+use engine_rocks::{raw::DB, Compat};
 use engine_traits::{Mutable, WriteBatch, WriteBatchExt};
 use test_raftstore::*;
 use test_util::*;
@@ -35,7 +33,7 @@ struct SetConfig<F> {
     value_size: usize,
 }
 
-fn bench_set<T, F>(b: &mut Bencher, input: &SetConfig<F>)
+fn bench_set<T, F>(b: &mut Bencher<'_>, input: &SetConfig<F>)
 where
     T: Simulator,
     F: ClusterFactory<T>,
@@ -57,7 +55,7 @@ struct GetConfig<F> {
     nodes: usize,
 }
 
-fn bench_get<T, F>(b: &mut Bencher, input: &GetConfig<F>)
+fn bench_get<T, F>(b: &mut Bencher<'_>, input: &GetConfig<F>)
 where
     T: Simulator,
     F: ClusterFactory<T>,
@@ -84,7 +82,7 @@ struct DeleteConfig<F> {
     nodes: usize,
 }
 
-fn bench_delete<T, F>(b: &mut Bencher, input: &DeleteConfig<F>)
+fn bench_delete<T, F>(b: &mut Bencher<'_>, input: &DeleteConfig<F>)
 where
     T: Simulator,
     F: ClusterFactory<T>,

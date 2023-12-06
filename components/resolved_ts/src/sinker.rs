@@ -1,9 +1,9 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::Snapshot;
-use raftstore::coprocessor::ObserveID;
-use raftstore::store::RegionSnapshot;
 use std::marker::PhantomData;
+
+use engine_traits::Snapshot;
+use raftstore::{coprocessor::ObserveID, store::RegionSnapshot};
 use txn_types::TimeStamp;
 
 use crate::cmd::ChangeLog;
@@ -27,6 +27,12 @@ pub struct DummySinker<S: Snapshot>(PhantomData<S>);
 impl<S: Snapshot> DummySinker<S> {
     pub fn new() -> Self {
         Self(PhantomData::default())
+    }
+}
+
+impl<S: Snapshot> Default for DummySinker<S> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

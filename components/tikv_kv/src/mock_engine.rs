@@ -1,11 +1,14 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::Result;
-use crate::{Callback, ExtCallback, Modify, SnapContext, WriteData};
-use crate::{Engine, RocksEngine};
+use std::{
+    collections::LinkedList,
+    sync::{Arc, Mutex},
+};
+
 use kvproto::kvrpcpb::Context;
-use std::collections::LinkedList;
-use std::sync::{Arc, Mutex};
+
+use super::Result;
+use crate::{Callback, Engine, ExtCallback, Modify, RocksEngine, SnapContext, WriteData};
 
 /// A mock engine is a simple wrapper around RocksEngine
 /// but with the ability to assert the modifies,
@@ -36,6 +39,7 @@ impl ExpectedWrite {
     pub fn new() -> Self {
         Default::default()
     }
+    #[must_use]
     pub fn expect_modify(self, modify: Modify) -> Self {
         Self {
             modify: Some(modify),
@@ -43,6 +47,7 @@ impl ExpectedWrite {
             use_committed_cb: self.use_committed_cb,
         }
     }
+    #[must_use]
     pub fn expect_proposed_cb(self) -> Self {
         Self {
             modify: self.modify,
@@ -50,6 +55,7 @@ impl ExpectedWrite {
             use_committed_cb: self.use_committed_cb,
         }
     }
+    #[must_use]
     pub fn expect_no_proposed_cb(self) -> Self {
         Self {
             modify: self.modify,
@@ -57,6 +63,7 @@ impl ExpectedWrite {
             use_committed_cb: self.use_committed_cb,
         }
     }
+    #[must_use]
     pub fn expect_committed_cb(self) -> Self {
         Self {
             modify: self.modify,
@@ -64,6 +71,7 @@ impl ExpectedWrite {
             use_committed_cb: Some(true),
         }
     }
+    #[must_use]
     pub fn expect_no_committed_cb(self) -> Self {
         Self {
             modify: self.modify,
@@ -196,6 +204,7 @@ impl MockEngineBuilder {
         }
     }
 
+    #[must_use]
     pub fn add_expected_write(mut self, write: ExpectedWrite) -> Self {
         match self.expected_modifies.as_mut() {
             Some(expected_modifies) => expected_modifies.push_back(write),

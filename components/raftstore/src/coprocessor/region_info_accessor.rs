@@ -1,22 +1,28 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::BTreeMap;
-use std::collections::Bound::{Excluded, Unbounded};
-use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::sync::{mpsc, Mutex};
-use std::time::Duration;
-
-use super::metrics::*;
-use super::{
-    BoxRegionChangeObserver, BoxRoleObserver, Coprocessor, CoprocessorHost, ObserverContext,
-    RegionChangeEvent, RegionChangeObserver, Result, RoleObserver,
+use std::{
+    collections::{
+        BTreeMap,
+        Bound::{Excluded, Unbounded},
+    },
+    fmt::{Display, Formatter, Result as FmtResult},
+    sync::{mpsc, Arc, Mutex, RwLock},
+    time::Duration,
 };
-use collections::HashMap;
+
+use collections::{HashMap, HashSet};
 use engine_traits::KvEngine;
 use kvproto::metapb::Region;
 use raft::StateRole;
-use tikv_util::worker::{Builder as WorkerBuilder, Runnable, RunnableWithTimer, Scheduler, Worker};
-use tikv_util::{box_err, debug, info, warn};
+use tikv_util::{
+    box_err, debug, info, warn,
+    worker::{Builder as WorkerBuilder, Runnable, RunnableWithTimer, Scheduler, Worker},
+};
+
+use super::{
+    metrics::*, BoxRegionChangeObserver, BoxRoleObserver, Coprocessor, CoprocessorHost,
+    ObserverContext, RegionChangeEvent, RegionChangeObserver, Result, RoleChange, RoleObserver,
+};
 
 /// `RegionInfoAccessor` is used to collect all regions' information on this TiKV into a collection
 /// so that other parts of TiKV can get region information from it. It registers a observer to
@@ -40,6 +46,7 @@ pub enum RaftStoreEvent {
     UpdateRegion { region: Region, role: StateRole },
     DestroyRegion { region: Region },
     RoleChange { region: Region, role: StateRole },
+    UpdateRegionBuckets { region: Region, buckets: usize },
 }
 
 impl RaftStoreEvent {
@@ -48,6 +55,7 @@ impl RaftStoreEvent {
             RaftStoreEvent::CreateRegion { region, .. }
             | RaftStoreEvent::UpdateRegion { region, .. }
             | RaftStoreEvent::DestroyRegion { region, .. }
+            | RaftStoreEvent::UpdateRegionBuckets { region, .. }
             | RaftStoreEvent::RoleChange { region, .. } => region,
         }
     }
@@ -57,11 +65,16 @@ impl RaftStoreEvent {
 pub struct RegionInfo {
     pub region: Region,
     pub role: StateRole,
+    pub buckets: usize,
 }
 
 impl RegionInfo {
     pub fn new(region: Region, role: StateRole) -> Self {
-        Self { region, role }
+        Self {
+            region,
+            role,
+            buckets: 1,
+        }
     }
 }
 
@@ -120,7 +133,7 @@ impl Display for RegionInfoQuery {
         match self {
             RegionInfoQuery::RaftStoreEvent(e) => write!(f, "RaftStoreEvent({:?})", e),
             RegionInfoQuery::SeekRegion { from, .. } => {
-                write!(f, "SeekRegion(from: {})", log_wrappers::Value::key(&from))
+                write!(f, "SeekRegion(from: {})", log_wrappers::Value::key(from))
             }
             RegionInfoQuery::FindRegionById { region_id, .. } => {
                 write!(f, "FindRegionById(region_id: {})", region_id)
@@ -157,8 +170,11 @@ impl RegionChangeObserver for RegionEventListener {
         let region = context.region().clone();
         let event = match event {
             RegionChangeEvent::Create => RaftStoreEvent::CreateRegion { region, role },
-            RegionChangeEvent::Update => RaftStoreEvent::UpdateRegion { region, role },
+            RegionChangeEvent::Update(_) => RaftStoreEvent::UpdateRegion { region, role },
             RegionChangeEvent::Destroy => RaftStoreEvent::DestroyRegion { region },
+            RegionChangeEvent::UpdateBuckets(buckets) => {
+                RaftStoreEvent::UpdateRegionBuckets { region, buckets }
+            }
         };
         self.scheduler
             .schedule(RegionInfoQuery::RaftStoreEvent(event))
@@ -167,8 +183,9 @@ impl RegionChangeObserver for RegionEventListener {
 }
 
 impl RoleObserver for RegionEventListener {
-    fn on_role_change(&self, context: &mut ObserverContext<'_>, role: StateRole) {
+    fn on_role_change(&self, context: &mut ObserverContext<'_>, role_change: &RoleChange) {
         let region = context.region().clone();
+        let role = role_change.state;
         let event = RaftStoreEvent::RoleChange { region, role };
         self.scheduler
             .schedule(RegionInfoQuery::RaftStoreEvent(event))
@@ -197,11 +214,14 @@ pub struct RegionCollector {
     regions: RegionsMap,
     // BTreeMap: data_end_key -> region_id
     region_ranges: RegionRangesMap,
+
+    region_leaders: Arc<RwLock<HashSet<u64>>>,
 }
 
 impl RegionCollector {
-    pub fn new() -> Self {
+    pub fn new(region_leaders: Arc<RwLock<HashSet<u64>>>) -> Self {
         Self {
+            region_leaders,
             regions: HashMap::default(),
             region_ranges: BTreeMap::default(),
         }
@@ -252,6 +272,13 @@ impl RegionCollector {
         *old_region = region;
     }
 
+    fn update_region_buckets(&mut self, region: Region, buckets: usize) {
+        let existing_region_info = self.regions.get_mut(&region.get_id()).unwrap();
+        let old_region = &mut existing_region_info.region;
+        assert_eq!(old_region.get_id(), region.get_id());
+        existing_region_info.buckets = buckets;
+    }
+
     fn handle_create_region(&mut self, region: Region, role: StateRole) {
         // During tests, we found that the `Create` event may arrive multiple times. And when we
         // receive an `Update` message, the region may have been deleted for some reason. So we
@@ -279,6 +306,17 @@ impl RegionCollector {
         }
     }
 
+    fn handle_update_region_buckets(&mut self, region: Region, buckets: usize) {
+        if self.regions.contains_key(&region.get_id()) {
+            self.update_region_buckets(region, buckets);
+        } else {
+            warn!(
+                "trying to update region buckets but the region doesn't exist, ignore";
+                "region_id" => region.get_id(),
+            );
+        }
+    }
+
     fn handle_destroy_region(&mut self, region: Region) {
         if let Some(removed_region_info) = self.regions.remove(&region.get_id()) {
             let removed_region = removed_region_info.region;
@@ -296,10 +334,20 @@ impl RegionCollector {
                 "region_id" => region.get_id(),
             )
         }
+        self.region_leaders
+            .write()
+            .unwrap()
+            .remove(&region.get_id());
     }
 
     fn handle_role_change(&mut self, region: Region, new_role: StateRole) {
         let region_id = region.get_id();
+
+        if new_role == StateRole::Leader {
+            self.region_leaders.write().unwrap().insert(region_id);
+        } else {
+            self.region_leaders.write().unwrap().remove(&region_id);
+        }
 
         if let Some(r) = self.regions.get_mut(&region_id) {
             r.role = new_role;
@@ -455,6 +503,9 @@ impl RegionCollector {
             RaftStoreEvent::RoleChange { region, role } => {
                 self.handle_role_change(region, role);
             }
+            RaftStoreEvent::UpdateRegionBuckets { region, buckets } => {
+                self.handle_update_region_buckets(region, buckets);
+            }
         }
     }
 }
@@ -497,11 +548,13 @@ impl RunnableWithTimer for RegionCollector {
     fn on_timeout(&mut self) {
         let mut count = 0;
         let mut leader = 0;
+        let mut buckets_count = 0;
         for r in self.regions.values() {
             count += 1;
             if r.role == StateRole::Leader {
                 leader += 1;
             }
+            buckets_count += r.buckets;
         }
         REGION_COUNT_GAUGE_VEC
             .with_label_values(&["region"])
@@ -509,6 +562,9 @@ impl RunnableWithTimer for RegionCollector {
         REGION_COUNT_GAUGE_VEC
             .with_label_values(&["leader"])
             .set(leader);
+        REGION_COUNT_GAUGE_VEC
+            .with_label_values(&["buckets"])
+            .set(buckets_count as i64);
     }
     fn get_interval(&self) -> Duration {
         Duration::from_millis(METRICS_FLUSH_INTERVAL)
@@ -525,6 +581,11 @@ pub struct RegionInfoAccessor {
     // https://github.com/tikv/tikv/issues/9044
     worker: Worker,
     scheduler: Scheduler<RegionInfoQuery>,
+
+    /// Region leader ids set on the store.
+    ///
+    /// Others can access this info directly, such as RaftKV.
+    region_leaders: Arc<RwLock<HashSet<u64>>>,
 }
 
 impl RegionInfoAccessor {
@@ -532,11 +593,24 @@ impl RegionInfoAccessor {
     /// `RegionInfoAccessor` doesn't need, and should not be created more than once. If it's needed
     /// in different places, just clone it, and their contents are shared.
     pub fn new(host: &mut CoprocessorHost<impl KvEngine>) -> Self {
+        let region_leaders = Arc::new(RwLock::new(HashSet::default()));
         let worker = WorkerBuilder::new("region-collector-worker").create();
-        let scheduler = worker.start_with_timer("region-collector-worker", RegionCollector::new());
+        let scheduler = worker.start_with_timer(
+            "region-collector-worker",
+            RegionCollector::new(region_leaders.clone()),
+        );
         register_region_event_listener(host, scheduler.clone());
 
-        Self { worker, scheduler }
+        Self {
+            worker,
+            scheduler,
+            region_leaders,
+        }
+    }
+
+    /// Get a set of region leader ids.
+    pub fn region_leaders(&self) -> Arc<RwLock<HashSet<u64>>> {
+        self.region_leaders.clone()
     }
 
     /// Stops the `RegionInfoAccessor`. It should be stopped after raftstore.
@@ -650,6 +724,10 @@ impl RegionInfoProvider for MockRegionInfoProvider {
 mod tests {
     use super::*;
 
+    fn new_region_collector() -> RegionCollector {
+        RegionCollector::new(Arc::new(RwLock::new(HashSet::default())))
+    }
+
     fn new_region(id: u64, start_key: &[u8], end_key: &[u8], version: u64) -> Region {
         let mut region = Region::default();
         region.set_id(id);
@@ -684,7 +762,7 @@ mod tests {
                 is_regions_equal = is_regions_equal
                     && c.regions.get(&expect_region.get_id()).map_or(
                         false,
-                        |RegionInfo { region, role }| {
+                        |RegionInfo { region, role, .. }| {
                             expect_region == region && expect_role == role
                         },
                     );
@@ -719,14 +797,14 @@ mod tests {
         assert!(c.region_ranges.is_empty());
 
         for region in regions {
-            must_create_region(c, &region, StateRole::Follower);
+            must_create_region(c, region, StateRole::Follower);
         }
 
         let expected_regions: Vec<_> = regions
             .iter()
             .map(|r| (r.clone(), StateRole::Follower))
             .collect();
-        check_collection(&c, &expected_regions);
+        check_collection(c, &expected_regions);
     }
 
     fn must_create_region(c: &mut RegionCollector, region: &Region, role: StateRole) {
@@ -783,6 +861,16 @@ mod tests {
         }
     }
 
+    fn must_update_region_buckets(c: &mut RegionCollector, region: &Region, buckets: usize) {
+        c.handle_raftstore_event(RaftStoreEvent::UpdateRegionBuckets {
+            region: region.clone(),
+            buckets,
+        });
+        let r = c.regions.get(&region.get_id()).unwrap();
+        assert_eq!(r.region, *region);
+        assert_eq!(r.buckets, buckets);
+    }
+
     fn must_destroy_region(c: &mut RegionCollector, region: Region) {
         let id = region.get_id();
         let end_key = c.regions.get(&id).map(|r| r.region.get_end_key().to_vec());
@@ -837,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_ignore_invalid_version() {
-        let mut c = RegionCollector::new();
+        let mut c = new_region_collector();
 
         c.handle_raftstore_event(RaftStoreEvent::CreateRegion {
             region: new_region(1, b"k1", b"k3", 0),
@@ -866,7 +954,7 @@ mod tests {
             region_with_conf(6, b"k7", b"", 20, 10),
         ];
 
-        let mut c = RegionCollector::new();
+        let mut c = new_region_collector();
         must_load_regions(&mut c, regions);
 
         assert!(c.check_region_range(&region_with_conf(1, b"", b"k1", 10, 10), false));
@@ -929,7 +1017,7 @@ mod tests {
             new_region(6, b"k7", b"", 1),
         ];
 
-        let mut c = RegionCollector::new();
+        let mut c = new_region_collector();
         must_load_regions(&mut c, &init_regions);
         let mut regions: Vec<_> = init_regions
             .iter()
@@ -960,7 +1048,7 @@ mod tests {
         check_collection(&c, &[]);
 
         // Test that the region with the same id will be kept in the collection
-        c = RegionCollector::new();
+        c = new_region_collector();
         must_load_regions(&mut c, &init_regions);
 
         c.check_region_range(&new_region(3, b"k1", b"k7", 2), true);
@@ -979,7 +1067,7 @@ mod tests {
 
     #[test]
     fn test_basic_updating() {
-        let mut c = RegionCollector::new();
+        let mut c = new_region_collector();
         let init_regions = &[
             new_region(1, b"", b"k1", 1),
             new_region(2, b"k1", b"k9", 1),
@@ -1015,6 +1103,8 @@ mod tests {
         must_create_region(&mut c, &new_region(5, b"k99", b"", 2), StateRole::Follower);
         must_change_role(&mut c, &new_region(2, b"k2", b"k8", 2), StateRole::Leader);
         must_update_region(&mut c, &new_region(2, b"k3", b"k7", 3), StateRole::Leader);
+        // test region buckets update
+        must_update_region_buckets(&mut c, &new_region(2, b"k3", b"k7", 3), 4);
         must_create_region(&mut c, &new_region(4, b"k1", b"k3", 3), StateRole::Follower);
         check_collection(
             &c,
@@ -1044,7 +1134,7 @@ mod tests {
     /// This is to ensure the collection is correct, no matter what the events' order to happen is.
     /// Values in `seq` and of `derive_index` start from 1.
     fn test_split_impl(derive_index: usize, seq: &[usize]) {
-        let mut c = RegionCollector::new();
+        let mut c = new_region_collector();
         let init_regions = &[
             new_region(1, b"", b"k1", 1),
             new_region(2, b"k1", b"k9", 1),
@@ -1097,7 +1187,7 @@ mod tests {
     }
 
     fn test_merge_impl(to_left: bool, update_first: bool) {
-        let mut c = RegionCollector::new();
+        let mut c = new_region_collector();
         let init_regions = &[
             region_with_conf(1, b"", b"k1", 1, 1),
             region_with_conf(2, b"k1", b"k2", 1, 100),
@@ -1141,7 +1231,7 @@ mod tests {
 
     #[test]
     fn test_extreme_cases() {
-        let mut c = RegionCollector::new();
+        let mut c = new_region_collector();
         let init_regions = &[
             new_region(1, b"", b"k1", 1),
             new_region(2, b"k1", b"k9", 1),

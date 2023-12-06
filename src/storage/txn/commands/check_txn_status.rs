@@ -1,17 +1,22 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+// #[PerformanceCriticalPath]
 use txn_types::{Key, TimeStamp};
 
-use crate::storage::kv::WriteData;
-use crate::storage::lock_manager::LockManager;
-use crate::storage::mvcc::{MvccTxn, SnapshotReader};
-use crate::storage::txn::actions::check_txn_status::*;
-use crate::storage::txn::commands::{
-    Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
-    WriteResult,
+use crate::storage::{
+    kv::WriteData,
+    lock_manager::LockManager,
+    mvcc::{MvccTxn, SnapshotReader},
+    txn::{
+        actions::check_txn_status::*,
+        commands::{
+            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
+            WriteCommand, WriteContext, WriteResult,
+        },
+        Result,
+    },
+    ProcessResult, Snapshot, TxnStatus,
 };
-use crate::storage::txn::Result;
-use crate::storage::{ProcessResult, Snapshot, TxnStatus};
 
 command! {
     /// Check the status of a transaction. This is usually invoked by a transaction that meets
@@ -74,8 +79,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
         context.concurrency_manager.update_max_ts(new_max_ts);
 
         let mut txn = MvccTxn::new(self.lock_ts, context.concurrency_manager);
-        let mut reader =
-            SnapshotReader::new(self.lock_ts, snapshot, !self.ctx.get_not_fill_cache());
+        let mut reader = ReaderWithStats::new(
+            SnapshotReader::new_with_ctx(self.lock_ts, snapshot, &self.ctx),
+            context.statistics,
+        );
 
         fail_point!("check_txn_status", |err| Err(
             crate::storage::mvcc::Error::from(crate::storage::mvcc::txn::make_txn_error(
@@ -97,8 +104,6 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
                 self.force_sync_commit,
                 self.resolving_pessimistic_lock,
             )?,
-            // The rollback must be protected, see more on
-            // [issue #7364](https://github.com/tikv/tikv/issues/7364)
             l => (
                 check_txn_status_missing_lock(
                     &mut txn,
@@ -119,9 +124,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
             released_locks.wake_up(context.lock_mgr);
         }
 
-        context.statistics.add(&reader.take_statistics());
         let pr = ProcessResult::TxnStatus { txn_status };
-        let write_data = WriteData::from_modifies(txn.into_modifies());
+        let mut write_data = WriteData::from_modifies(txn.into_modifies());
+        write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
             ctx: self.ctx,
             to_be_write: write_data,
@@ -136,18 +141,24 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
 
 #[cfg(test)]
 pub mod tests {
-    use super::TxnStatus::*;
-    use super::*;
-    use crate::storage::kv::Engine;
-    use crate::storage::lock_manager::DummyLockManager;
-    use crate::storage::mvcc::tests::*;
-    use crate::storage::txn::commands::{pessimistic_rollback, WriteCommand, WriteContext};
-    use crate::storage::txn::tests::*;
-    use crate::storage::{types::TxnStatus, ProcessResult, TestEngineBuilder};
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
-    use txn_types::Key;
-    use txn_types::WriteType;
+    use tikv_util::deadline::Deadline;
+    use txn_types::{Key, WriteType};
+
+    use super::{TxnStatus::*, *};
+    use crate::storage::{
+        kv::Engine,
+        lock_manager::DummyLockManager,
+        mvcc::tests::*,
+        txn::{
+            commands::{pessimistic_rollback, WriteCommand, WriteContext},
+            scheduler::DEFAULT_EXECUTION_DURATION_LIMIT,
+            tests::*,
+        },
+        types::TxnStatus,
+        ProcessResult, TestEngineBuilder,
+    };
 
     pub fn must_success<E: Engine>(
         engine: &E,
@@ -174,6 +185,7 @@ pub mod tests {
             rollback_if_not_exist,
             force_sync_commit,
             resolving_pessimistic_lock,
+            deadline: Deadline::from_now(DEFAULT_EXECUTION_DURATION_LIMIT),
         };
         let result = command
             .process_write(
@@ -219,6 +231,7 @@ pub mod tests {
             rollback_if_not_exist,
             force_sync_commit,
             resolving_pessimistic_lock,
+            deadline: Deadline::from_now(DEFAULT_EXECUTION_DURATION_LIMIT),
         };
         assert!(
             command
@@ -923,6 +936,8 @@ pub mod tests {
             /* min_commit_ts */ TimeStamp::zero(),
             /* max_commit_ts */ TimeStamp::zero(),
             false,
+            kvproto::kvrpcpb::Assertion::None,
+            kvproto::kvrpcpb::AssertionLevel::Off,
         );
         must_success(
             &engine,
@@ -1045,6 +1060,8 @@ pub mod tests {
             /* min_commit_ts */ TimeStamp::zero(),
             /* max_commit_ts */ TimeStamp::zero(),
             false,
+            kvproto::kvrpcpb::Assertion::None,
+            kvproto::kvrpcpb::AssertionLevel::Off,
         );
         must_success(
             &engine,

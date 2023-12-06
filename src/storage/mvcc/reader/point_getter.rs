@@ -1,23 +1,27 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use kvproto::kvrpcpb::IsolationLevel;
+// #[PerformanceCriticalPath
+use std::borrow::Cow;
 
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
-use std::borrow::Cow;
-use txn_types::{Key, Lock, TimeStamp, TsSet, Value, WriteRef, WriteType};
+use kvproto::kvrpcpb::IsolationLevel;
+use txn_types::{Key, Lock, LockType, TimeStamp, TsSet, Value, WriteRef, WriteType};
 
-use crate::storage::kv::{Cursor, CursorBuilder, ScanMode, Snapshot, Statistics};
-use crate::storage::mvcc::{default_not_found_error, NewerTsCheckState, Result};
+use crate::storage::{
+    kv::{Cursor, CursorBuilder, ScanMode, Snapshot, Statistics},
+    mvcc::{default_not_found_error, ErrorInner::WriteConflict, NewerTsCheckState, Result},
+    need_check_locks,
+};
 
 /// `PointGetter` factory.
 pub struct PointGetterBuilder<S: Snapshot> {
     snapshot: S,
-    multi: bool,
     fill_cache: bool,
     omit_value: bool,
     isolation_level: IsolationLevel,
     ts: TimeStamp,
     bypass_locks: TsSet,
+    access_locks: TsSet,
     check_has_newer_ts_data: bool,
 }
 
@@ -26,29 +30,21 @@ impl<S: Snapshot> PointGetterBuilder<S> {
     pub fn new(snapshot: S, ts: TimeStamp) -> Self {
         Self {
             snapshot,
-            multi: true,
             fill_cache: true,
             omit_value: false,
             isolation_level: IsolationLevel::Si,
             ts,
             bypass_locks: Default::default(),
+            access_locks: Default::default(),
             check_has_newer_ts_data: false,
         }
-    }
-
-    /// Set whether or not to get multiple keys.
-    ///
-    /// Defaults to `true`.
-    #[inline]
-    pub fn multi(mut self, multi: bool) -> Self {
-        self.multi = multi;
-        self
     }
 
     /// Set whether or not read operations should fill the cache.
     ///
     /// Defaults to `true`.
     #[inline]
+    #[must_use]
     pub fn fill_cache(mut self, fill_cache: bool) -> Self {
         self.fill_cache = fill_cache;
         self
@@ -61,6 +57,7 @@ impl<S: Snapshot> PointGetterBuilder<S> {
     ///
     /// Defaults to `false`.
     #[inline]
+    #[must_use]
     pub fn omit_value(mut self, omit_value: bool) -> Self {
         self.omit_value = omit_value;
         self
@@ -70,6 +67,7 @@ impl<S: Snapshot> PointGetterBuilder<S> {
     ///
     /// Defaults to `IsolationLevel::Si`.
     #[inline]
+    #[must_use]
     pub fn isolation_level(mut self, isolation_level: IsolationLevel) -> Self {
         self.isolation_level = isolation_level;
         self
@@ -79,8 +77,19 @@ impl<S: Snapshot> PointGetterBuilder<S> {
     ///
     /// Defaults to none.
     #[inline]
+    #[must_use]
     pub fn bypass_locks(mut self, locks: TsSet) -> Self {
         self.bypass_locks = locks;
+        self
+    }
+
+    /// Set a set to locks that the reading process can access their values.
+    ///
+    /// Defaults to none.
+    #[inline]
+    #[must_use]
+    pub fn access_locks(mut self, locks: TsSet) -> Self {
+        self.access_locks = locks;
         self
     }
 
@@ -89,6 +98,7 @@ impl<S: Snapshot> PointGetterBuilder<S> {
     ///
     /// Default is false.
     #[inline]
+    #[must_use]
     pub fn check_has_newer_ts_data(mut self, enabled: bool) -> Self {
         self.check_has_newer_ts_data = enabled;
         self
@@ -96,24 +106,19 @@ impl<S: Snapshot> PointGetterBuilder<S> {
 
     /// Build `PointGetter` from the current configuration.
     pub fn build(self) -> Result<PointGetter<S>> {
-        // If we only want to get single value, we can use prefix seek.
         let write_cursor = CursorBuilder::new(&self.snapshot, CF_WRITE)
             .fill_cache(self.fill_cache)
             .prefix_seek(true)
-            .scan_mode(if self.multi {
-                ScanMode::Mixed
-            } else {
-                ScanMode::Forward
-            })
+            .scan_mode(ScanMode::Mixed)
             .build()?;
 
         Ok(PointGetter {
             snapshot: self.snapshot,
-            multi: self.multi,
             omit_value: self.omit_value,
             isolation_level: self.isolation_level,
             ts: self.ts,
             bypass_locks: self.bypass_locks,
+            access_locks: self.access_locks,
             met_newer_ts_data: if self.check_has_newer_ts_data {
                 NewerTsCheckState::NotMetYet
             } else {
@@ -123,8 +128,6 @@ impl<S: Snapshot> PointGetterBuilder<S> {
             statistics: Statistics::default(),
 
             write_cursor,
-
-            drained: false,
         })
     }
 }
@@ -135,21 +138,16 @@ impl<S: Snapshot> PointGetterBuilder<S> {
 /// Use `PointGetterBuilder` to build `PointGetter`.
 pub struct PointGetter<S: Snapshot> {
     snapshot: S,
-    multi: bool,
     omit_value: bool,
     isolation_level: IsolationLevel,
     ts: TimeStamp,
     bypass_locks: TsSet,
+    access_locks: TsSet,
     met_newer_ts_data: NewerTsCheckState,
 
     statistics: Statistics,
 
     write_cursor: Cursor<S::Iter>,
-
-    /// Indicating whether or not this structure can serve more requests. It is meaningful only
-    /// when `multi == false`, to protect from producing undefined values when trying to get
-    /// multiple values under `multi == false`.
-    drained: bool,
 }
 
 impl<S: Snapshot> PointGetter<S> {
@@ -167,36 +165,27 @@ impl<S: Snapshot> PointGetter<S> {
     }
 
     /// Get the value of a user key.
-    ///
-    /// If `multi == false`, this function must be called only once. Future calls return nothing.
     pub fn get(&mut self, user_key: &Key) -> Result<Option<Value>> {
-        if !self.multi {
-            // Protect from calling `get()` multiple times when `multi == false`.
-            if self.drained {
-                return Ok(None);
-            } else {
-                self.drained = true;
-            }
-        }
+        fail_point!("point_getter_get");
 
-        match self.isolation_level {
-            IsolationLevel::Si => {
-                // Check for locks that signal concurrent writes in Si.
-                self.load_and_check_lock(user_key)?;
+        if need_check_locks(self.isolation_level) {
+            // Check locks that signal concurrent writes for `Si` or more recent writes for `RcCheckTs`.
+            if let Some(lock) = self.load_and_check_lock(user_key)? {
+                return self.load_data_from_lock(user_key, lock);
             }
-            IsolationLevel::Rc => {}
         }
 
         self.load_data(user_key)
     }
 
     /// Get a lock of a user key in the lock CF. If lock exists, it will be checked to
-    /// see whether it conflicts with the given `ts`.
+    /// see whether it conflicts with the given `ts` and return an error if so. If the
+    /// lock is in access_locks, it will be returned and caller can read through it.
     ///
     /// In common cases we expect to get nothing in lock cf. Using a `get_cf` instead of `seek`
     /// is fast in such cases due to no need for RocksDB to continue move and skip deleted entries
     /// until find a user key.
-    fn load_and_check_lock(&mut self, user_key: &Key) -> Result<()> {
+    fn load_and_check_lock(&mut self, user_key: &Key) -> Result<Option<Lock>> {
         self.statistics.lock.get += 1;
         let lock_value = self.snapshot.get_cf(CF_LOCK, user_key)?;
 
@@ -205,16 +194,23 @@ impl<S: Snapshot> PointGetter<S> {
             if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
                 self.met_newer_ts_data = NewerTsCheckState::Met;
             }
-            if let Err(e) =
-                Lock::check_ts_conflict(Cow::Owned(lock), user_key, self.ts, &self.bypass_locks)
-            {
+            if let Err(e) = Lock::check_ts_conflict(
+                Cow::Borrowed(&lock),
+                user_key,
+                self.ts,
+                &self.bypass_locks,
+                self.isolation_level,
+            ) {
                 self.statistics.lock.processed_keys += 1;
+                if self.access_locks.contains(lock.ts) {
+                    return Ok(Some(lock));
+                }
                 Err(e.into())
             } else {
-                Ok(())
+                Ok(None)
             }
         } else {
-            Ok(())
+            Ok(None)
         }
     }
 
@@ -226,7 +222,9 @@ impl<S: Snapshot> PointGetter<S> {
         let mut use_near_seek = false;
         let mut seek_key = user_key.clone();
 
-        if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+        if self.met_newer_ts_data == NewerTsCheckState::NotMetYet
+            || self.isolation_level == IsolationLevel::RcCheckTs
+        {
             seek_key = seek_key.append_ts(TimeStamp::max());
             if !self
                 .write_cursor
@@ -238,11 +236,24 @@ impl<S: Snapshot> PointGetter<S> {
             use_near_seek = true;
 
             let cursor_key = self.write_cursor.key(&mut self.statistics.write);
-            if !Key::is_user_key_eq(cursor_key, user_key.as_encoded().as_slice()) {
-                return Ok(None);
-            }
-            if Key::decode_ts_from(cursor_key)? > self.ts {
-                self.met_newer_ts_data = NewerTsCheckState::Met;
+            // No need to compare user key because it uses prefix seek.
+            let key_commit_ts = Key::decode_ts_from(cursor_key)?;
+            if key_commit_ts > self.ts {
+                if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+                    self.met_newer_ts_data = NewerTsCheckState::Met;
+                }
+                if self.isolation_level == IsolationLevel::RcCheckTs {
+                    // TODO: the more write recent version with `LOCK` or `ROLLBACK` write type
+                    //       could be skipped.
+                    return Err(WriteConflict {
+                        start_ts: self.ts,
+                        conflict_start_ts: Default::default(),
+                        conflict_commit_ts: key_commit_ts,
+                        key: cursor_key.into(),
+                        primary: vec![],
+                    }
+                    .into());
+                }
             }
         }
 
@@ -267,14 +278,7 @@ impl<S: Snapshot> PointGetter<S> {
         }
 
         loop {
-            // We may seek to another key. In this case, it means we cannot find the specified key.
-            {
-                let cursor_key = self.write_cursor.key(&mut self.statistics.write);
-                if !Key::is_user_key_eq(cursor_key, user_key.as_encoded().as_slice()) {
-                    return Ok(None);
-                }
-            }
-
+            // No need to compare user key because it uses prefix seek.
             let write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
 
             if !write.check_gc_fence_as_latest_version(self.ts) {
@@ -284,6 +288,7 @@ impl<S: Snapshot> PointGetter<S> {
             match write.write_type {
                 WriteType::Put => {
                     self.statistics.write.processed_keys += 1;
+                    resource_metering::record_read_keys(1);
 
                     if self.omit_value {
                         return Ok(Some(vec![]));
@@ -291,11 +296,14 @@ impl<S: Snapshot> PointGetter<S> {
                     match write.short_value {
                         Some(value) => {
                             // Value is carried in `write`.
+                            self.statistics.processed_size += user_key.len() + value.len();
                             return Ok(Some(value.to_vec()));
                         }
                         None => {
                             let start_ts = write.start_ts;
-                            return Ok(Some(self.load_data_from_default_cf(start_ts, user_key)?));
+                            let value = self.load_data_from_default_cf(start_ts, user_key)?;
+                            self.statistics.processed_size += user_key.len() + value.len();
+                            return Ok(Some(value));
                         }
                     }
                 }
@@ -339,36 +347,68 @@ impl<S: Snapshot> PointGetter<S> {
             ))
         }
     }
+
+    /// Load the value from the lock.
+    ///
+    /// The lock belongs to a committed transaction and its commit_ts <= read's start_ts.
+    fn load_data_from_lock(&mut self, user_key: &Key, lock: Lock) -> Result<Option<Value>> {
+        debug_assert!(lock.ts < self.ts && lock.min_commit_ts <= self.ts);
+        match lock.lock_type {
+            LockType::Put => {
+                if self.omit_value {
+                    return Ok(Some(vec![]));
+                }
+                match lock.short_value {
+                    Some(value) => {
+                        // Value is carried in `lock`.
+                        self.statistics.processed_size += user_key.len() + value.len();
+                        Ok(Some(value.to_vec()))
+                    }
+                    None => {
+                        let value = self.load_data_from_default_cf(lock.ts, user_key)?;
+                        self.statistics.processed_size += user_key.len() + value.len();
+                        Ok(Some(value))
+                    }
+                }
+            }
+            LockType::Delete => Ok(None),
+            LockType::Lock | LockType::Pessimistic => {
+                // Only when fails to call `Lock::check_ts_conflict()`, the function is called, so it's
+                // unreachable here.
+                unreachable!()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    use engine_rocks::ReadPerfInstant;
+    use kvproto::kvrpcpb::{Assertion, AssertionLevel};
     use txn_types::SHORT_VALUE_MAX_LEN;
 
-    use crate::storage::kv::{
-        CfStatistics, Engine, PerfStatisticsInstant, RocksEngine, TestEngineBuilder,
-    };
-    use crate::storage::txn::tests::{
-        must_acquire_pessimistic_lock, must_cleanup_with_gc_fence, must_commit, must_gc,
-        must_pessimistic_prewrite_delete, must_prewrite_delete, must_prewrite_lock,
-        must_prewrite_put, must_rollback,
+    use super::*;
+    use crate::storage::{
+        kv::{CfStatistics, Engine, RocksEngine, TestEngineBuilder},
+        txn::tests::{
+            must_acquire_pessimistic_lock, must_cleanup_with_gc_fence, must_commit, must_gc,
+            must_pessimistic_prewrite_delete, must_prewrite_delete, must_prewrite_lock,
+            must_prewrite_put, must_prewrite_put_impl, must_rollback,
+        },
     };
 
-    fn new_multi_point_getter<E: Engine>(engine: &E, ts: TimeStamp) -> PointGetter<E::Snap> {
-        let snapshot = engine.snapshot(Default::default()).unwrap();
-        PointGetterBuilder::new(snapshot, ts)
-            .isolation_level(IsolationLevel::Si)
-            .build()
-            .unwrap()
+    fn new_point_getter<E: Engine>(engine: &E, ts: TimeStamp) -> PointGetter<E::Snap> {
+        new_point_getter_with_iso(engine, ts, IsolationLevel::Si)
     }
 
-    fn new_single_point_getter<E: Engine>(engine: &E, ts: TimeStamp) -> PointGetter<E::Snap> {
+    fn new_point_getter_with_iso<E: Engine>(
+        engine: &E,
+        ts: TimeStamp,
+        iso_level: IsolationLevel,
+    ) -> PointGetter<E::Snap> {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         PointGetterBuilder::new(snapshot, ts)
-            .isolation_level(IsolationLevel::Si)
-            .multi(false)
+            .isolation_level(iso_level)
             .build()
             .unwrap()
     }
@@ -545,52 +585,91 @@ mod tests {
 
     /// No ts larger than get ts
     #[test]
-    fn test_multi_basic_1() {
+    fn test_basic_1() {
         let engine = new_sample_engine();
 
-        let mut getter = new_multi_point_getter(&engine, 200.into());
+        let mut getter = new_point_getter(&engine, 200.into());
 
         // Get a deleted key
         must_get_none(&mut getter, b"foo1");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
         // Get again
         must_get_none(&mut getter, b"foo1");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
         // Get a key that exists
         must_get_value(&mut getter, b"foo2", b"foo2v");
         let s = getter.take_statistics();
         // We have to check every version
         assert_seek_next_prev(&s.write, 1, 40, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"foo2").len()
+                + b"foo2".len()
+                + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
         // Get again
         must_get_value(&mut getter, b"foo2", b"foo2v");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 40, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"foo2").len()
+                + b"foo2".len()
+                + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
 
         // Get a smaller key
         must_get_none(&mut getter, b"foo1");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
         // Get a key that does not exist
         must_get_none(&mut getter, b"z");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
         // Get a key that exists
         must_get_value(&mut getter, b"zz", b"zzv");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"zz").len() + b"zz".len() + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
         // Get again
         must_get_value(&mut getter, b"zz", b"zzv");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"zz").len() + b"zz".len() + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
     }
 
     #[test]
-    fn test_multi_tombstone() {
+    fn test_use_prefix_seek() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+        must_prewrite_put(&engine, b"foo1", b"bar1", b"foo1", 10);
+        must_commit(&engine, b"foo1", 10, 20);
+
+        // Mustn't get the next user key even if point getter doesn't compare user key.
+        let mut getter = new_point_getter(&engine, 30.into());
+        must_get_none(&mut getter, b"foo0");
+
+        let mut getter = new_point_getter(&engine, 30.into());
+        must_get_none(&mut getter, b"foo");
+        must_get_none(&mut getter, b"foo0");
+    }
+
+    #[test]
+    fn test_tombstone() {
         let engine = TestEngineBuilder::new().build().unwrap();
 
         must_prewrite_put(&engine, b"foo", b"bar", b"foo", 10);
@@ -611,26 +690,26 @@ mod tests {
         must_gc(&engine, b"foo2", 50);
         must_gc(&engine, b"foo3", 50);
 
-        let mut getter = new_multi_point_getter(&engine, TimeStamp::max());
-        let perf_statistics = PerfStatisticsInstant::new();
+        let mut getter = new_point_getter(&engine, TimeStamp::max());
+        let perf_statistics = ReadPerfInstant::new();
         must_get_value(&mut getter, b"foo", b"bar");
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 0);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 0);
 
-        let perf_statistics = PerfStatisticsInstant::new();
+        let perf_statistics = ReadPerfInstant::new();
         must_get_none(&mut getter, b"foo1");
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 2);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 2);
 
-        let perf_statistics = PerfStatisticsInstant::new();
+        let perf_statistics = ReadPerfInstant::new();
         must_get_none(&mut getter, b"foo2");
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 2);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 2);
 
-        let perf_statistics = PerfStatisticsInstant::new();
+        let perf_statistics = ReadPerfInstant::new();
         must_get_value(&mut getter, b"foo3", b"bar3");
-        assert_eq!(perf_statistics.delta().0.internal_delete_skipped_count, 0);
+        assert_eq!(perf_statistics.delta().internal_delete_skipped_count, 0);
     }
 
     #[test]
-    fn test_multi_with_iter_lower_bound() {
+    fn test_with_iter_lower_bound() {
         let engine = TestEngineBuilder::new().build().unwrap();
         must_prewrite_put(&engine, b"foo", b"bar", b"foo", 10);
         must_commit(&engine, b"foo", 10, 20);
@@ -644,96 +723,127 @@ mod tests {
             .unwrap();
         let mut getter = PointGetter {
             snapshot,
-            multi: true,
             omit_value: false,
             isolation_level: IsolationLevel::Si,
             ts: TimeStamp::new(30),
             bypass_locks: Default::default(),
+            access_locks: Default::default(),
             met_newer_ts_data: NewerTsCheckState::NotMetYet,
             statistics: Statistics::default(),
             write_cursor,
-            drained: false,
         };
         must_get_value(&mut getter, b"foo", b"bar");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, Key::from_raw(b"foo").len() + b"bar".len());
     }
 
     /// Some ts larger than get ts
     #[test]
-    fn test_multi_basic_2() {
+    fn test_basic_2() {
         let engine = new_sample_engine();
 
-        let mut getter = new_multi_point_getter(&engine, 5.into());
+        let mut getter = new_point_getter(&engine, 5.into());
 
         must_get_value(&mut getter, b"bar", b"barv");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"bar").len() + b"bar".len() + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
 
         must_get_value(&mut getter, b"bar", b"barv");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"bar").len() + b"bar".len() + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
 
         must_get_none(&mut getter, b"bo");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
         must_get_none(&mut getter, b"box");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
         must_get_value(&mut getter, b"foo1", b"foo1");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"foo1").len()
+                + b"foo1".len()
+                + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
 
         must_get_none(&mut getter, b"zz");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
         must_get_value(&mut getter, b"foo1", b"foo1");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"foo1").len()
+                + b"foo1".len()
+                + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
 
         must_get_value(&mut getter, b"bar", b"barv");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"bar").len() + b"bar".len() + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
     }
 
     /// All ts larger than get ts
     #[test]
-    fn test_multi_basic_3() {
+    fn test_basic_3() {
         let engine = new_sample_engine();
 
-        let mut getter = new_multi_point_getter(&engine, 2.into());
+        let mut getter = new_point_getter(&engine, 2.into());
 
         must_get_none(&mut getter, b"foo1");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
         must_get_none(&mut getter, b"non_exist");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
         must_get_none(&mut getter, b"foo1");
         must_get_none(&mut getter, b"foo0");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 2, 0, 0);
+        assert_eq!(s.processed_size, 0);
     }
 
     /// There are some locks in the Lock CF.
     #[test]
-    fn test_multi_locked() {
+    fn test_locked() {
         let engine = new_sample_engine_2();
 
-        let mut getter = new_multi_point_getter(&engine, 1.into());
+        let mut getter = new_point_getter(&engine, 1.into());
         must_get_none(&mut getter, b"a");
         must_get_none(&mut getter, b"bar");
         must_get_none(&mut getter, b"foo1");
         must_get_none(&mut getter, b"foo2");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 4, 0, 0);
+        assert_eq!(s.processed_size, 0);
 
-        let mut getter = new_multi_point_getter(&engine, 3.into());
+        let mut getter = new_point_getter(&engine, 3.into());
         must_get_none(&mut getter, b"a");
         must_get_value(&mut getter, b"bar", b"barv");
         must_get_value(&mut getter, b"bar", b"barv");
@@ -743,8 +853,16 @@ mod tests {
         must_get_none(&mut getter, b"foo2");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 7, 0, 0);
+        assert_eq!(
+            s.processed_size,
+            (Key::from_raw(b"bar").len() + b"barval".len()) * 2
+                + (Key::from_raw(b"foo1").len()
+                    + b"foo1".len()
+                    + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len())
+                    * 2
+        );
 
-        let mut getter = new_multi_point_getter(&engine, 4.into());
+        let mut getter = new_point_getter(&engine, 4.into());
         must_get_none(&mut getter, b"a");
         must_get_err(&mut getter, b"bar");
         must_get_err(&mut getter, b"bar");
@@ -753,38 +871,12 @@ mod tests {
         must_get_none(&mut getter, b"zz");
         let s = getter.take_statistics();
         assert_seek_next_prev(&s.write, 3, 0, 0);
-    }
-
-    /// Single Point Getter can only get once.
-    #[test]
-    fn test_single_basic() {
-        let engine = new_sample_engine_2();
-
-        let mut getter = new_single_point_getter(&engine, 1.into());
-        must_get_none(&mut getter, b"foo1");
-
-        let mut getter = new_single_point_getter(&engine, 3.into());
-        must_get_value(&mut getter, b"bar", b"barv");
-        must_get_none(&mut getter, b"bar");
-        must_get_none(&mut getter, b"foo1");
-
-        let mut getter = new_single_point_getter(&engine, 3.into());
-        must_get_value(&mut getter, b"foo1", b"foo1v");
-        must_get_none(&mut getter, b"foo2");
-
-        let mut getter = new_single_point_getter(&engine, 3.into());
-        must_get_none(&mut getter, b"foo2");
-        must_get_none(&mut getter, b"foo2");
-
-        let mut getter = new_single_point_getter(&engine, 4.into());
-        must_get_err(&mut getter, b"bar");
-        must_get_none(&mut getter, b"bar");
-        must_get_none(&mut getter, b"a");
-        must_get_none(&mut getter, b"foo1");
-
-        let mut getter = new_single_point_getter(&engine, 4.into());
-        must_get_value(&mut getter, b"foo1", b"foo1v");
-        must_get_none(&mut getter, b"foo1");
+        assert_eq!(
+            s.processed_size,
+            Key::from_raw(b"foo1").len()
+                + b"foo1".len()
+                + "v".repeat(SHORT_VALUE_MAX_LEN + 1).len()
+        );
     }
 
     #[test]
@@ -793,7 +885,7 @@ mod tests {
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
 
-        let mut getter = PointGetterBuilder::new(snapshot.clone(), 4.into())
+        let mut getter = PointGetterBuilder::new(snapshot, 4.into())
             .isolation_level(IsolationLevel::Si)
             .omit_value(true)
             .build()
@@ -801,30 +893,6 @@ mod tests {
         must_get_err(&mut getter, b"bar");
         must_get_key(&mut getter, b"foo1");
         must_get_err(&mut getter, b"foo2");
-        must_get_none(&mut getter, b"foo3");
-
-        fn new_omit_value_single_point_getter<S>(snapshot: S, ts: TimeStamp) -> PointGetter<S>
-        where
-            S: Snapshot,
-        {
-            PointGetterBuilder::new(snapshot, ts)
-                .isolation_level(IsolationLevel::Si)
-                .omit_value(true)
-                .multi(false)
-                .build()
-                .unwrap()
-        }
-
-        let mut getter = new_omit_value_single_point_getter(snapshot.clone(), 4.into());
-        must_get_err(&mut getter, b"bar");
-        must_get_none(&mut getter, b"bar");
-
-        let mut getter = new_omit_value_single_point_getter(snapshot.clone(), 4.into());
-        must_get_key(&mut getter, b"foo1");
-        must_get_none(&mut getter, b"foo1");
-
-        let mut getter = new_omit_value_single_point_getter(snapshot, 4.into());
-        must_get_none(&mut getter, b"foo3");
         must_get_none(&mut getter, b"foo3");
     }
 
@@ -836,18 +904,18 @@ mod tests {
         must_prewrite_put(&engine, key, val, key, 10);
         must_commit(&engine, key, 10, 20);
 
-        let mut getter = new_single_point_getter(&engine, TimeStamp::max());
+        let mut getter = new_point_getter(&engine, TimeStamp::max());
         must_get_value(&mut getter, key, val);
 
         // Ignore the primary lock if read with max ts.
         must_prewrite_delete(&engine, key, key, 30);
-        let mut getter = new_single_point_getter(&engine, TimeStamp::max());
+        let mut getter = new_point_getter(&engine, TimeStamp::max());
         must_get_value(&mut getter, key, val);
         must_rollback(&engine, key, 30, false);
 
         // Should not ignore the secondary lock even though reading the latest version
         must_prewrite_delete(&engine, key, b"bar", 40);
-        let mut getter = new_single_point_getter(&engine, TimeStamp::max());
+        let mut getter = new_point_getter(&engine, TimeStamp::max());
         must_get_err(&mut getter, key);
         must_rollback(&engine, key, 40, false);
 
@@ -857,7 +925,7 @@ mod tests {
         // write.start_ts(10) < primary_lock.start_ts(15) < write.commit_ts(20)
         must_acquire_pessimistic_lock(&engine, key, key, 15, 50);
         must_pessimistic_prewrite_delete(&engine, key, key, 15, 50, true);
-        let mut getter = new_single_point_getter(&engine, TimeStamp::max());
+        let mut getter = new_point_getter(&engine, TimeStamp::max());
         must_get_value(&mut getter, key, val);
     }
 
@@ -886,6 +954,88 @@ mod tests {
             .build()
             .unwrap();
         must_get_err(&mut getter, key);
+    }
+
+    #[test]
+    fn test_get_access_locks() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+        let build_getter = |ts: u64, bypass_locks, access_locks| {
+            let snapshot = engine.snapshot(Default::default()).unwrap();
+            PointGetterBuilder::new(snapshot, ts.into())
+                .isolation_level(IsolationLevel::Si)
+                .bypass_locks(TsSet::from_u64s(bypass_locks))
+                .access_locks(TsSet::from_u64s(access_locks))
+                .build()
+                .unwrap()
+        };
+
+        // short value
+        let (key, val) = (b"foo", b"bar");
+        must_prewrite_put(&engine, key, val, key, 10);
+        must_get_value(&mut build_getter(20, vec![], vec![10]), key, val);
+        must_commit(&engine, key, 10, 15);
+        must_get_value(&mut build_getter(20, vec![], vec![]), key, val);
+
+        // load value from default cf.
+        let val = "v".repeat(SHORT_VALUE_MAX_LEN + 1);
+        let val = val.as_bytes();
+        must_prewrite_put(&engine, key, val, key, 20);
+        must_get_value(&mut build_getter(30, vec![], vec![20]), key, val);
+        must_commit(&engine, key, 20, 25);
+        must_get_value(&mut build_getter(30, vec![], vec![]), key, val);
+
+        // delete
+        must_prewrite_delete(&engine, key, key, 30);
+        must_get_none(&mut build_getter(40, vec![], vec![30]), key);
+        must_commit(&engine, key, 30, 35);
+        must_get_none(&mut build_getter(40, vec![], vec![]), key);
+
+        // ignore locks not blocking read
+        let (key, val) = (b"foo", b"bar");
+        // lock's ts > read's ts
+        must_prewrite_put(&engine, key, val, key, 50);
+        must_get_none(&mut build_getter(45, vec![], vec![50]), key);
+        must_commit(&engine, key, 50, 55);
+        // LockType::Lock
+        must_prewrite_lock(&engine, key, key, 60);
+        must_get_value(&mut build_getter(65, vec![], vec![60]), key, val);
+        must_commit(&engine, key, 60, 65);
+        // LockType::Pessimistic
+        must_acquire_pessimistic_lock(&engine, key, key, 70, 70);
+        must_get_value(&mut build_getter(75, vec![], vec![70]), key, val);
+        must_rollback(&engine, key, 70, false);
+        // lock's min_commit_ts > read's ts
+        must_prewrite_put_impl(
+            &engine,
+            key,
+            &val[..1],
+            key,
+            &None,
+            80.into(),
+            false,
+            100,
+            80.into(),
+            1,
+            100.into(), /* min_commit_ts */
+            TimeStamp::default(),
+            false,
+            Assertion::None,
+            AssertionLevel::Off,
+        );
+        must_get_value(&mut build_getter(85, vec![], vec![80]), key, val);
+        must_rollback(&engine, key, 80, false);
+        // read'ts == max && lock is a primary lock.
+        must_prewrite_put(&engine, key, &val[..1], key, 90);
+        must_get_value(
+            &mut build_getter(TimeStamp::max().into_inner(), vec![], vec![90]),
+            key,
+            val,
+        );
+        must_rollback(&engine, key, 90, false);
+        // lock in resolve_keys(it can't happen).
+        must_prewrite_put(&engine, key, &val[..1], key, 100);
+        must_get_value(&mut build_getter(105, vec![100], vec![100]), key, val);
+        must_rollback(&engine, key, 100, false);
     }
 
     #[test]
@@ -998,15 +1148,91 @@ mod tests {
         ];
 
         for (k, v) in &expected_results {
-            let mut single_getter = new_single_point_getter(&engine, 40.into());
+            let mut single_getter = new_point_getter(&engine, 40.into());
             let value = single_getter.get(&Key::from_raw(*k)).unwrap();
             assert_eq!(value, v.map(|v| v.to_vec()));
         }
 
-        let mut multi_getter = new_multi_point_getter(&engine, 40.into());
+        let mut getter = new_point_getter(&engine, 40.into());
         for (k, v) in &expected_results {
-            let value = multi_getter.get(&Key::from_raw(*k)).unwrap();
+            let value = getter.get(&Key::from_raw(*k)).unwrap();
             assert_eq!(value, v.map(|v| v.to_vec()));
         }
+    }
+
+    #[test]
+    fn test_point_get_check_rc_ts() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+
+        let (key0, val0) = (b"k0", b"v0");
+        must_prewrite_put(&engine, key0, val0, key0, 1);
+        must_commit(&engine, key0, 1, 5);
+
+        let (key1, val1) = (b"k1", b"v1");
+        must_prewrite_put(&engine, key1, val1, key1, 10);
+        must_commit(&engine, key1, 10, 20);
+
+        let (key2, val2, val22) = (b"k2", b"v2", b"v22");
+        must_prewrite_put(&engine, key2, val2, key2, 30);
+        must_commit(&engine, key2, 30, 40);
+        must_prewrite_put(&engine, key2, val22, key2, 41);
+        must_commit(&engine, key2, 41, 42);
+
+        let (key3, val3) = (b"k3", b"v3");
+        must_prewrite_put(&engine, key3, val3, key3, 50);
+
+        let (key4, val4) = (b"k4", b"val4");
+        must_prewrite_put(&engine, key4, val4, key4, 55);
+        must_commit(&engine, key4, 55, 56);
+        must_prewrite_lock(&engine, key4, key4, 60);
+
+        let (key5, val5) = (b"k5", b"val5");
+        must_prewrite_put(&engine, key5, val5, key5, 57);
+        must_commit(&engine, key5, 57, 58);
+        must_acquire_pessimistic_lock(&engine, key5, key5, 65, 65);
+
+        // No more recent version.
+        let mut getter_with_ts_ok =
+            new_point_getter_with_iso(&engine, 25.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut getter_with_ts_ok, key1, val1);
+
+        // The read_ts is stale error should be reported.
+        let mut getter_not_ok =
+            new_point_getter_with_iso(&engine, 35.into(), IsolationLevel::RcCheckTs);
+        must_get_err(&mut getter_not_ok, key2);
+
+        // Though lock.ts > read_ts error should still be reported.
+        let mut getter_not_ok =
+            new_point_getter_with_iso(&engine, 45.into(), IsolationLevel::RcCheckTs);
+        must_get_err(&mut getter_not_ok, key3);
+
+        // Error should not be reported if the lock type is rollback or lock.
+        let mut getter_ok =
+            new_point_getter_with_iso(&engine, 70.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut getter_ok, key4, val4);
+        let mut getter_ok =
+            new_point_getter_with_iso(&engine, 70.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut getter_ok, key5, val5);
+
+        // Test batch point get. Report error if more recent version is met.
+        let mut batch_getter =
+            new_point_getter_with_iso(&engine, 35.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut batch_getter, key0, val0);
+        must_get_value(&mut batch_getter, key1, val1);
+        must_get_err(&mut batch_getter, key2);
+
+        // Test batch point get. Report error if lock is met though lock.ts > read_ts.
+        let mut batch_getter =
+            new_point_getter_with_iso(&engine, 45.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut batch_getter, key0, val0);
+        must_get_value(&mut batch_getter, key1, val1);
+        must_get_value(&mut batch_getter, key2, val22);
+        must_get_err(&mut batch_getter, key3);
+
+        // Test batch point get. Error should not be reported if the lock type is rollback or lock.
+        let mut batch_getter_ok =
+            new_point_getter_with_iso(&engine, 70.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut batch_getter_ok, key4, val4);
+        must_get_value(&mut batch_getter_ok, key5, val5);
     }
 }

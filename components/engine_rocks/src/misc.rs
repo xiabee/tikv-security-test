@@ -1,17 +1,15 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::engine::RocksEngine;
-use crate::import::RocksIngestExternalFileOptions;
-use crate::sst::RocksSstWriterBuilder;
-use crate::{util, RocksSstWriter};
 use engine_traits::{
-    CFNamesExt, DeleteStrategy, ImportExt, IngestExternalFileOptions, IterOptions, Iterable,
-    Iterator, MiscExt, Mutable, Range, Result, SstWriter, SstWriterBuilder, WriteBatch,
-    WriteBatchExt, ALL_CFS,
+    CFNamesExt, DeleteStrategy, ImportExt, IterOptions, Iterable, Iterator, MiscExt, Mutable,
+    Range, Result, SstWriter, SstWriterBuilder, WriteBatch, WriteBatchExt, ALL_CFS,
 };
 use rocksdb::Range as RocksRange;
-use tikv_util::box_try;
-use tikv_util::keybuilder::KeyBuilder;
+use tikv_util::{box_try, keybuilder::KeyBuilder};
+
+use crate::{
+    engine::RocksEngine, rocks_metrics_defs::*, sst::RocksSstWriterBuilder, util, RocksSstWriter,
+};
 
 pub const MAX_DELETE_COUNT_BY_KEY: usize = 2048;
 
@@ -26,7 +24,7 @@ impl RocksEngine {
         &self,
         cf: &str,
         sst_path: String,
-        ranges: &[Range],
+        ranges: &[Range<'_>],
     ) -> Result<()> {
         let mut ranges = ranges.to_owned();
         ranges.sort_by(|a, b| a.start_key.cmp(b.start_key));
@@ -82,9 +80,7 @@ impl RocksEngine {
 
         if let Some(writer) = writer_wrapper {
             writer.finish()?;
-            let mut opt = RocksIngestExternalFileOptions::new();
-            opt.move_files(true);
-            self.ingest_external_file_cf(cf, &opt, &[sst_path.as_str()])?;
+            self.ingest_external_file_cf(cf, &[sst_path.as_str()])?;
         } else {
             let mut wb = self.write_batch();
             for key in data.iter() {
@@ -101,7 +97,7 @@ impl RocksEngine {
         Ok(())
     }
 
-    fn delete_all_in_range_cf_by_key(&self, cf: &str, range: &Range) -> Result<()> {
+    fn delete_all_in_range_cf_by_key(&self, cf: &str, range: &Range<'_>) -> Result<()> {
         let start = KeyBuilder::from_slice(range.start_key, 0, 0);
         let end = KeyBuilder::from_slice(range.end_key, 0, 0);
         let mut opts = IterOptions::new(Some(start), Some(end), false);
@@ -139,7 +135,12 @@ impl MiscExt for RocksEngine {
         Ok(self.as_inner().flush_cf(handle, sync)?)
     }
 
-    fn delete_ranges_cf(&self, cf: &str, strategy: DeleteStrategy, ranges: &[Range]) -> Result<()> {
+    fn delete_ranges_cf(
+        &self,
+        cf: &str,
+        strategy: DeleteStrategy,
+        ranges: &[Range<'_>],
+    ) -> Result<()> {
         if ranges.is_empty() {
             return Ok(());
         }
@@ -183,7 +184,7 @@ impl MiscExt for RocksEngine {
             }
             DeleteStrategy::DeleteByKey => {
                 for r in ranges {
-                    self.delete_all_in_range_cf_by_key(cf, &r)?;
+                    self.delete_all_in_range_cf_by_key(cf, r)?;
                 }
             }
             DeleteStrategy::DeleteByWriter { sst_path } => {
@@ -193,7 +194,7 @@ impl MiscExt for RocksEngine {
         Ok(())
     }
 
-    fn get_approximate_memtable_stats_cf(&self, cf: &str, range: &Range) -> Result<(u64, u64)> {
+    fn get_approximate_memtable_stats_cf(&self, cf: &str, range: &Range<'_>) -> Result<(u64, u64)> {
         let range = util::range_to_rocks_range(range);
         let handle = util::get_cf_handle(self.as_inner(), cf)?;
         Ok(self
@@ -293,7 +294,7 @@ impl MiscExt for RocksEngine {
     fn get_oldest_snapshot_sequence_number(&self) -> Option<u64> {
         match self
             .as_inner()
-            .get_property_int(crate::ROCKSDB_OLDEST_SNAPSHOT_SEQUENCE)
+            .get_property_int(ROCKSDB_OLDEST_SNAPSHOT_SEQUENCE)
         {
             // Some(0) indicates that no snapshot is in use
             Some(0) => None,
@@ -302,7 +303,6 @@ impl MiscExt for RocksEngine {
     }
 
     fn get_total_sst_files_size_cf(&self, cf: &str) -> Result<Option<u64>> {
-        const ROCKSDB_TOTAL_SST_FILES_SIZE: &str = "rocksdb.total-sst-files-size";
         let handle = util::get_cf_handle(self.as_inner(), cf)?;
         Ok(self
             .as_inner()
@@ -317,31 +317,6 @@ impl MiscExt for RocksEngine {
     ) -> Result<Option<(u64, u64)>> {
         Ok(crate::properties::get_range_entries_and_versions(
             self, cf, start, end,
-        ))
-    }
-
-    fn get_cf_num_files_at_level(&self, cf: &str, level: usize) -> Result<Option<u64>> {
-        let handle = util::get_cf_handle(self.as_inner(), cf)?;
-        Ok(crate::util::get_cf_num_files_at_level(
-            self.as_inner(),
-            &handle,
-            level,
-        ))
-    }
-
-    fn get_cf_num_immutable_mem_table(&self, cf: &str) -> Result<Option<u64>> {
-        let handle = util::get_cf_handle(self.as_inner(), cf)?;
-        Ok(crate::util::get_cf_num_immutable_mem_table(
-            self.as_inner(),
-            &handle,
-        ))
-    }
-
-    fn get_cf_compaction_pending_bytes(&self, cf: &str) -> Result<Option<u64>> {
-        let handle = util::get_cf_handle(self.as_inner(), cf)?;
-        Ok(crate::util::get_cf_compaction_pending_bytes(
-            self.as_inner(),
-            &handle,
         ))
     }
 
@@ -362,17 +337,19 @@ impl MiscExt for RocksEngine {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::Builder;
-
-    use crate::engine::RocksEngine;
-    use crate::raw::DB;
-    use crate::raw::{ColumnFamilyOptions, DBOptions};
-    use crate::raw_util::{new_engine_opt, CFOptions};
     use std::sync::Arc;
 
+    use engine_traits::{
+        DeleteStrategy, Iterable, Iterator, Mutable, SeekKey, SyncMutable, WriteBatchExt, ALL_CFS,
+    };
+    use tempfile::Builder;
+
     use super::*;
-    use engine_traits::{DeleteStrategy, ALL_CFS};
-    use engine_traits::{Iterable, Iterator, Mutable, SeekKey, SyncMutable, WriteBatchExt};
+    use crate::{
+        engine::RocksEngine,
+        raw::{ColumnFamilyOptions, DBOptions, DB},
+        raw_util::{new_engine_opt, CFOptions},
+    };
 
     fn check_data(db: &RocksEngine, cfs: &[&str], expected: &[(&[u8], &[u8])]) {
         for cf in cfs {
@@ -390,7 +367,7 @@ mod tests {
     fn test_delete_all_in_range(
         strategy: DeleteStrategy,
         origin_keys: &[Vec<u8>],
-        ranges: &[Range],
+        ranges: &[Range<'_>],
     ) {
         let path = Builder::new()
             .prefix("engine_delete_all_in_range")
@@ -596,7 +573,7 @@ mod tests {
         cf_opts
             .set_prefix_extractor(
                 "FixedSuffixSliceTransform",
-                Box::new(crate::util::FixedSuffixSliceTransform::new(8)),
+                crate::util::FixedSuffixSliceTransform::new(8),
             )
             .unwrap_or_else(|err| panic!("{:?}", err));
         // Create prefix bloom filter for memtable.

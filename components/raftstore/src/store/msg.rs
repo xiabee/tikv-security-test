@@ -1,28 +1,40 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::borrow::Cow;
-use std::fmt;
+// #[PerformanceCriticalPath]
+#[cfg(any(test, feature = "testexport"))]
+use std::sync::Arc;
+use std::{borrow::Cow, fmt};
 
-use bitflags::bitflags;
+use collections::HashSet;
 use engine_traits::{CompactedEvent, KvEngine, Snapshot};
-use kvproto::import_sstpb::SstMeta;
-use kvproto::kvrpcpb::ExtraOp as TxnExtraOp;
-use kvproto::metapb;
-use kvproto::metapb::RegionEpoch;
-use kvproto::pdpb::CheckPolicy;
-use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse};
-use kvproto::raft_serverpb::RaftMessage;
-use kvproto::replication_modepb::ReplicationStatus;
-use raft::SnapshotStatus;
-
-use crate::store::fsm::apply::TaskRes as ApplyTaskRes;
-use crate::store::fsm::apply::{CatchUpLogs, ChangeObserver};
-use crate::store::metrics::RaftEventDurationType;
-use crate::store::util::KeysInfoFormatter;
-use crate::store::SnapKey;
+use kvproto::{
+    import_sstpb::SstMeta,
+    kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp},
+    metapb,
+    metapb::RegionEpoch,
+    pdpb::{self, CheckPolicy},
+    raft_cmdpb::{RaftCmdRequest, RaftCmdResponse},
+    raft_serverpb::RaftMessage,
+    replication_modepb::ReplicationStatus,
+};
+#[cfg(any(test, feature = "testexport"))]
+use pd_client::BucketMeta;
+use raft::{GetEntriesContext, SnapshotStatus};
+use smallvec::{smallvec, SmallVec};
 use tikv_util::{deadline::Deadline, escape, memory::HeapSize, time::Instant};
 
 use super::{AbstractPeer, RegionSnapshot};
+use crate::store::{
+    fsm::apply::{CatchUpLogs, ChangeObserver, TaskRes as ApplyTaskRes},
+    metrics::RaftEventDurationType,
+    peer::{
+        UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryFillOutReportSyncer,
+        UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer,
+    },
+    util::{KeysInfoFormatter, LatencyInspector},
+    worker::{Bucket, BucketRange},
+    RaftlogFetchResult, SnapKey,
+};
 
 #[derive(Debug)]
 pub struct ReadResponse<S: Snapshot> {
@@ -34,6 +46,14 @@ pub struct ReadResponse<S: Snapshot> {
 #[derive(Debug)]
 pub struct WriteResponse {
     pub response: RaftCmdResponse,
+}
+
+// Peer's internal stat, for test purpose only
+#[cfg(any(test, feature = "testexport"))]
+#[derive(Debug)]
+pub struct PeerInternalStat {
+    pub buckets: Arc<BucketMeta>,
+    pub bucket_ranges: Option<Vec<BucketRange>>,
 }
 
 // This is only necessary because of seeming limitations in derive(Clone) w/r/t
@@ -55,6 +75,8 @@ where
 pub type ReadCallback<S> = Box<dyn FnOnce(ReadResponse<S>) + Send>;
 pub type WriteCallback = Box<dyn FnOnce(WriteResponse) + Send>;
 pub type ExtCallback = Box<dyn FnOnce() + Send>;
+#[cfg(any(test, feature = "testexport"))]
+pub type TestCallback = Box<dyn FnOnce(PeerInternalStat) + Send>;
 
 /// Variants of callbacks for `Msg`.
 ///  - `Read`: a callback for read only requests including `StatusRequest`,
@@ -76,7 +98,11 @@ pub enum Callback<S: Snapshot> {
         /// `committed_cb` is called after a request is committed and before it's being applied, and
         /// it's guaranteed that the request will be successfully applied soon.
         committed_cb: Option<ExtCallback>,
+        request_times: SmallVec<[Instant; 4]>,
     },
+    #[cfg(any(test, feature = "testexport"))]
+    /// Test purpose callback
+    Test { cb: TestCallback },
 }
 
 impl<S: Snapshot> HeapSize for Callback<S> {}
@@ -98,6 +124,14 @@ where
             cb,
             proposed_cb,
             committed_cb,
+            request_times: smallvec![Instant::now()],
+        }
+    }
+
+    pub fn get_request_times(&self) -> Option<&SmallVec<[Instant; 4]>> {
+        match self {
+            Callback::Write { request_times, .. } => Some(request_times),
+            _ => None,
         }
     }
 
@@ -116,6 +150,16 @@ where
                 let resp = WriteResponse { response: resp };
                 cb(resp);
             }
+            #[cfg(any(test, feature = "testexport"))]
+            Callback::Test { .. } => (),
+        }
+    }
+
+    pub fn has_proposed_cb(&mut self) -> bool {
+        if let Callback::Write { proposed_cb, .. } = self {
+            proposed_cb.is_some()
+        } else {
+            false
         }
     }
 
@@ -152,49 +196,62 @@ where
     S: Snapshot,
 {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
+        match self {
             Callback::None => write!(fmt, "Callback::None"),
             Callback::Read(_) => write!(fmt, "Callback::Read(..)"),
             Callback::Write { .. } => write!(fmt, "Callback::Write(..)"),
+            #[cfg(any(test, feature = "testexport"))]
+            Callback::Test { .. } => write!(fmt, "Callback::Test(..)"),
         }
     }
 }
 
-bitflags! {
-    pub struct PeerTicks: u8 {
-        const RAFT                   = 0b00000001;
-        const RAFT_LOG_GC            = 0b00000010;
-        const SPLIT_REGION_CHECK     = 0b00000100;
-        const PD_HEARTBEAT           = 0b00001000;
-        const CHECK_MERGE            = 0b00010000;
-        const CHECK_PEER_STALE_STATE = 0b00100000;
-        const ENTRY_CACHE_EVICT      = 0b01000000;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PeerTick {
+    Raft = 0,
+    RaftLogGc = 1,
+    SplitRegionCheck = 2,
+    PdHeartbeat = 3,
+    CheckMerge = 4,
+    CheckPeerStaleState = 5,
+    EntryCacheEvict = 6,
+    CheckLeaderLease = 7,
+    ReactivateMemoryLock = 8,
+    ReportBuckets = 9,
 }
 
-impl PeerTicks {
+impl PeerTick {
+    pub const VARIANT_COUNT: usize = Self::get_all_ticks().len();
+
     #[inline]
     pub fn tag(self) -> &'static str {
         match self {
-            PeerTicks::RAFT => "raft",
-            PeerTicks::RAFT_LOG_GC => "raft_log_gc",
-            PeerTicks::SPLIT_REGION_CHECK => "split_region_check",
-            PeerTicks::PD_HEARTBEAT => "pd_heartbeat",
-            PeerTicks::CHECK_MERGE => "check_merge",
-            PeerTicks::CHECK_PEER_STALE_STATE => "check_peer_stale_state",
-            PeerTicks::ENTRY_CACHE_EVICT => "entry_cache_evict",
-            _ => unreachable!(),
+            PeerTick::Raft => "raft",
+            PeerTick::RaftLogGc => "raft_log_gc",
+            PeerTick::SplitRegionCheck => "split_region_check",
+            PeerTick::PdHeartbeat => "pd_heartbeat",
+            PeerTick::CheckMerge => "check_merge",
+            PeerTick::CheckPeerStaleState => "check_peer_stale_state",
+            PeerTick::EntryCacheEvict => "entry_cache_evict",
+            PeerTick::CheckLeaderLease => "check_leader_lease",
+            PeerTick::ReactivateMemoryLock => "reactivate_memory_lock",
+            PeerTick::ReportBuckets => "report_buckets",
         }
     }
-    pub fn get_all_ticks() -> &'static [PeerTicks] {
-        const TICKS: &[PeerTicks] = &[
-            PeerTicks::RAFT,
-            PeerTicks::RAFT_LOG_GC,
-            PeerTicks::SPLIT_REGION_CHECK,
-            PeerTicks::PD_HEARTBEAT,
-            PeerTicks::CHECK_MERGE,
-            PeerTicks::CHECK_PEER_STALE_STATE,
-            PeerTicks::ENTRY_CACHE_EVICT,
+
+    pub const fn get_all_ticks() -> &'static [PeerTick] {
+        const TICKS: &[PeerTick] = &[
+            PeerTick::Raft,
+            PeerTick::RaftLogGc,
+            PeerTick::SplitRegionCheck,
+            PeerTick::PdHeartbeat,
+            PeerTick::CheckMerge,
+            PeerTick::CheckPeerStaleState,
+            PeerTick::EntryCacheEvict,
+            PeerTick::CheckLeaderLease,
+            PeerTick::ReactivateMemoryLock,
+            PeerTick::ReportBuckets,
         ];
         TICKS
     }
@@ -207,7 +264,7 @@ pub enum StoreTick {
     SnapGc,
     CompactLockCf,
     ConsistencyCheck,
-    CleanupImportSST,
+    CleanupImportSst,
 }
 
 impl StoreTick {
@@ -219,7 +276,7 @@ impl StoreTick {
             StoreTick::SnapGc => RaftEventDurationType::snap_gc,
             StoreTick::CompactLockCf => RaftEventDurationType::compact_lock_cf,
             StoreTick::ConsistencyCheck => RaftEventDurationType::consistency_check,
-            StoreTick::CleanupImportSST => RaftEventDurationType::cleanup_import_sst,
+            StoreTick::CleanupImportSst => RaftEventDurationType::cleanup_import_sst,
         }
     }
 }
@@ -280,6 +337,23 @@ where
     },
     LeaderCallback(Callback<SK>),
     RaftLogGcFlushed,
+    // Reports the result of asynchronous Raft logs fetching.
+    RaftlogFetched {
+        context: GetEntriesContext,
+        res: Box<RaftlogFetchResult>,
+    },
+    EnterForceLeaderState {
+        syncer: UnsafeRecoveryForceLeaderSyncer,
+        failed_stores: HashSet<u64>,
+    },
+    ExitForceLeaderState,
+    UnsafeRecoveryDemoteFailedVoters {
+        syncer: UnsafeRecoveryExecutePlanSyncer,
+        failed_voters: Vec<metapb::Peer>,
+    },
+    UnsafeRecoveryDestroy(UnsafeRecoveryExecutePlanSyncer),
+    UnsafeRecoveryWaitApply(UnsafeRecoveryWaitApplySyncer),
+    UnsafeRecoveryFillOutReport(UnsafeRecoveryFillOutReportSyncer),
 }
 
 /// Message that will be sent to a peer.
@@ -320,6 +394,7 @@ pub enum CasualMessage<EK: KvEngine> {
         region_epoch: RegionEpoch,
         policy: CheckPolicy,
         source: &'static str,
+        cb: Callback<EK::Snapshot>,
     },
     /// Remove snapshot files in `snaps`.
     GcSnap {
@@ -344,6 +419,26 @@ pub enum CasualMessage<EK: KvEngine> {
         region: metapb::Region,
         leader: metapb::Peer,
     },
+
+    /// For drop raft messages at an upper layer.
+    RejectRaftAppend {
+        peer_id: u64,
+    },
+    RefreshRegionBuckets {
+        region_epoch: RegionEpoch,
+        buckets: Vec<Bucket>,
+        bucket_ranges: Option<Vec<BucketRange>>,
+        cb: Callback<EK::Snapshot>,
+    },
+
+    // Try renew leader lease
+    RenewLease,
+
+    // Snapshot is applied
+    SnapshotApplied,
+
+    // Trigger raft to campaign which is used after exiting force leader
+    Campaign,
 }
 
 impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
@@ -357,7 +452,7 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
                 fmt,
                 "ComputeHashResult [index: {}, context: {}, hash: {}]",
                 index,
-                log_wrappers::Value::key(&context),
+                log_wrappers::Value::key(context),
                 escape(hash)
             ),
             CasualMessage::SplitRegion {
@@ -396,8 +491,22 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
             CasualMessage::ForceCompactRaftLogs => write!(fmt, "ForceCompactRaftLogs"),
             CasualMessage::AccessPeer(_) => write!(fmt, "AccessPeer"),
             CasualMessage::QueryRegionLeaderResp { .. } => write!(fmt, "QueryRegionLeaderResp"),
+            CasualMessage::RejectRaftAppend { peer_id } => {
+                write!(fmt, "RejectRaftAppend(peer_id={})", peer_id)
+            }
+            CasualMessage::RefreshRegionBuckets { .. } => write!(fmt, "RefreshRegionBuckets"),
+            CasualMessage::RenewLease => write!(fmt, "RenewLease"),
+            CasualMessage::SnapshotApplied => write!(fmt, "SnapshotApplied"),
+            CasualMessage::Campaign => write!(fmt, "Campaign"),
         }
     }
+}
+
+/// control options for raftcmd.
+#[derive(Debug, Default, Clone)]
+pub struct RaftCmdExtraOpts {
+    pub deadline: Option<Deadline>,
+    pub disk_full_opt: DiskFullOpt,
 }
 
 /// Raft command is the command that is expected to be proposed by the
@@ -407,7 +516,7 @@ pub struct RaftCommand<S: Snapshot> {
     pub send_time: Instant,
     pub request: RaftCmdRequest,
     pub callback: Callback<S>,
-    pub deadline: Option<Deadline>,
+    pub extra_opts: RaftCmdExtraOpts,
 }
 
 impl<S: Snapshot> RaftCommand<S> {
@@ -417,9 +526,30 @@ impl<S: Snapshot> RaftCommand<S> {
             request,
             callback,
             send_time: Instant::now(),
-            deadline: None,
+            extra_opts: RaftCmdExtraOpts::default(),
         }
     }
+
+    pub fn new_ext(
+        request: RaftCmdRequest,
+        callback: Callback<S>,
+        extra_opts: RaftCmdExtraOpts,
+    ) -> RaftCommand<S> {
+        RaftCommand {
+            request,
+            callback,
+            send_time: Instant::now(),
+            extra_opts: RaftCmdExtraOpts {
+                deadline: extra_opts.deadline,
+                disk_full_opt: extra_opts.disk_full_opt,
+            },
+        }
+    }
+}
+
+pub struct InspectedRaftMessage {
+    pub heap_size: usize,
+    pub msg: RaftMessage,
 }
 
 /// Message that can be sent to a peer.
@@ -427,14 +557,14 @@ pub enum PeerMsg<EK: KvEngine> {
     /// Raft message is the message sent between raft nodes in the same
     /// raft group. Messages need to be redirected to raftstore if target
     /// peer doesn't exist.
-    RaftMessage(RaftMessage),
+    RaftMessage(InspectedRaftMessage),
     /// Raft command is the command that is expected to be proposed by the
     /// leader of the target raft group. If it's failed to be sent, callback
     /// usually needs to be called before dropping in case of resource leak.
     RaftCommand(RaftCommand<EK::Snapshot>),
     /// Tick is periodical task. If target peer doesn't exist there is a potential
     /// that the raft node will not work anymore.
-    Tick(PeerTicks),
+    Tick(PeerTick),
     /// Result of applying committed entries. The message can't be lost.
     ApplyRes {
         res: ApplyTaskRes<EK::Snapshot>,
@@ -446,6 +576,10 @@ pub enum PeerMsg<EK: KvEngine> {
     Start,
     /// A message only used to notify a peer.
     Noop,
+    Persisted {
+        peer_id: u64,
+        ready_number: u64,
+    },
     /// Message that is not important and can be dropped occasionally.
     CasualMessage(CasualMessage<EK>),
     /// Ask region to report a heartbeat to PD.
@@ -469,6 +603,14 @@ impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
             PeerMsg::ApplyRes { res } => write!(fmt, "ApplyRes {:?}", res),
             PeerMsg::Start => write!(fmt, "Startup"),
             PeerMsg::Noop => write!(fmt, "Noop"),
+            PeerMsg::Persisted {
+                peer_id,
+                ready_number,
+            } => write!(
+                fmt,
+                "Persisted peer_id {}, ready_number {}",
+                peer_id, ready_number
+            ),
             PeerMsg::CasualMessage(msg) => write!(fmt, "CasualMessage {:?}", msg),
             PeerMsg::HeartbeatPd => write!(fmt, "HeartbeatPd"),
             PeerMsg::UpdateReplicationMode => write!(fmt, "UpdateReplicationMode"),
@@ -481,9 +623,9 @@ pub enum StoreMsg<EK>
 where
     EK: KvEngine,
 {
-    RaftMessage(RaftMessage),
+    RaftMessage(InspectedRaftMessage),
 
-    ValidateSSTResult {
+    ValidateSstResult {
         invalid_ssts: Vec<SstMeta>,
     },
 
@@ -503,11 +645,27 @@ where
     Start {
         store: metapb::Store,
     },
+
+    /// Asks the store to update replication mode.
+    UpdateReplicationMode(ReplicationStatus),
+
+    /// Inspect the latency of raftstore.
+    LatencyInspect {
+        send_time: Instant,
+        inspector: LatencyInspector,
+    },
+
     /// Message only used for test.
     #[cfg(any(test, feature = "testexport"))]
     Validate(Box<dyn FnOnce(&crate::store::Config) + Send>),
-    /// Asks the store to update replication mode.
-    UpdateReplicationMode(ReplicationStatus),
+
+    UnsafeRecoveryReport(pdpb::StoreReport),
+    UnsafeRecoveryCreatePeer {
+        syncer: UnsafeRecoveryExecutePlanSyncer,
+        create: metapb::Region,
+    },
+
+    GcSnapshotFinish,
 }
 
 impl<EK> fmt::Debug for StoreMsg<EK>
@@ -521,7 +679,7 @@ where
                 write!(fmt, "Store {}  is unreachable", store_id)
             }
             StoreMsg::CompactedEvent(ref event) => write!(fmt, "CompactedEvent cf {}", event.cf()),
-            StoreMsg::ValidateSSTResult { .. } => write!(fmt, "Validate SST Result"),
+            StoreMsg::ValidateSstResult { .. } => write!(fmt, "Validate SST Result"),
             StoreMsg::ClearRegionSizeInRange {
                 ref start_key,
                 ref end_key,
@@ -535,6 +693,12 @@ where
             #[cfg(any(test, feature = "testexport"))]
             StoreMsg::Validate(_) => write!(fmt, "Validate config"),
             StoreMsg::UpdateReplicationMode(_) => write!(fmt, "UpdateReplicationMode"),
+            StoreMsg::LatencyInspect { .. } => write!(fmt, "LatencyInspect"),
+            StoreMsg::UnsafeRecoveryReport(..) => write!(fmt, "UnsafeRecoveryReport"),
+            StoreMsg::UnsafeRecoveryCreatePeer { .. } => {
+                write!(fmt, "UnsafeRecoveryCreatePeer")
+            }
+            StoreMsg::GcSnapshotFinish => write!(fmt, "GcSnapshotFinish"),
         }
     }
 }

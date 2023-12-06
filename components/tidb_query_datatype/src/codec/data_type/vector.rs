@@ -1,11 +1,10 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::{match_template_collator, match_template_evaltype, EvalType, FieldTypeAccessor};
-
-use super::scalar::ScalarValueRef;
-use super::*;
-use crate::codec::mysql::decimal::DECIMAL_STRUCT_SIZE;
-use crate::codec::Result;
+use super::{scalar::ScalarValueRef, *};
+use crate::{
+    codec::{mysql::decimal::DECIMAL_STRUCT_SIZE, Result},
+    match_template_collator, match_template_evaltype, EvalType, FieldTypeAccessor,
+};
 
 /// A vector value container, a.k.a. column, for all concrete eval types.
 ///
@@ -37,8 +36,50 @@ impl VectorValue {
         }
     }
 
+    /// Creates a `VectorValue` of length `len` with the given value `scalar`.
+    #[inline]
+    pub fn from_scalar(scalar: &ScalarValue, len: usize) -> Self {
+        macro_rules! expand_convertion {
+            ($val:tt, $( $tp:tt : $chktp:ty ),* ) => {
+                match &$val {
+                    $(
+                        &ScalarValue::$tp(val) => {
+                            let mut v: $chktp = ChunkedVec::with_capacity(len);
+                            match val {
+                                None => {
+                                    for _ in 0..len {
+                                        v.push_null();
+                                    }
+                                },
+                                Some(val) => {
+                                    for _ in 0..len {
+                                        v.push_data(val.clone());
+                                    }
+                                }
+                            }
+                            VectorValue::$tp(v)
+                        }
+                    )*
+                }
+            }
+        }
+        expand_convertion!(
+            scalar,
+            Int: ChunkedVecSized<Int>,
+            Real: ChunkedVecSized<Real>,
+            Decimal: ChunkedVecSized<Decimal>,
+            DateTime: ChunkedVecSized<DateTime>,
+            Duration: ChunkedVecSized<Duration>,
+            Set: ChunkedVecSet,
+            Json: ChunkedVecJson,
+            Enum: ChunkedVecEnum,
+            Bytes: ChunkedVecBytes
+        )
+    }
+
     /// Creates a new empty `VectorValue` with the same eval type.
     #[inline]
+    #[must_use]
     pub fn clone_empty(&self, capacity: usize) -> Self {
         match_template_evaltype! {
             TT, match self {
@@ -331,8 +372,8 @@ impl VectorValue {
                     None => {
                         output.write_evaluable_datum_null()?;
                     }
-                    Some(ref val) => {
-                        output.write_evaluable_datum_bytes(*val)?;
+                    Some(val) => {
+                        output.write_evaluable_datum_bytes(val)?;
                     }
                 }
                 Ok(())
@@ -393,9 +434,10 @@ impl VectorValue {
         ctx: &mut EvalContext,
         output: &mut Vec<u8>,
     ) -> Result<()> {
-        use crate::codec::collation::Collator;
-        use crate::codec::datum_codec::EvaluableDatumEncoder;
-        use crate::Collation;
+        use crate::{
+            codec::{collation::Collator, datum_codec::EvaluableDatumEncoder},
+            Collation,
+        };
 
         match self {
             VectorValue::Bytes(ref vec) => {
@@ -403,7 +445,7 @@ impl VectorValue {
                     None => {
                         output.write_evaluable_datum_null()?;
                     }
-                    Some(ref val) => {
+                    Some(val) => {
                         let sort_key = match_template_collator! {
                             TT, match field_type.collation()? {
                                 Collation::TT => TT::sort_key(val)?

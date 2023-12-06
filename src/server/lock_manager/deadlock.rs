@@ -1,40 +1,53 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::client::{self, Client};
-use super::config::Config;
-use super::metrics::*;
-use super::waiter_manager::Scheduler as WaiterMgrScheduler;
-use super::{Error, Result};
-use crate::server::resolve::StoreAddrResolver;
-use crate::storage::lock_manager::{DiagnosticContext, Lock};
+use std::{
+    cell::RefCell,
+    fmt::{self, Display, Formatter},
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
+
 use collections::HashMap;
 use engine_traits::KvEngine;
-use futures::future::{self, FutureExt, TryFutureExt};
-use futures::sink::SinkExt;
-use futures::stream::TryStreamExt;
+use futures::{
+    future::{self, FutureExt, TryFutureExt},
+    sink::SinkExt,
+    stream::TryStreamExt,
+};
 use grpcio::{
     self, DuplexSink, Environment, RequestStream, RpcContext, RpcStatus, RpcStatusCode, UnarySink,
     WriteFlags,
 };
-use kvproto::deadlock::*;
-use kvproto::metapb::Region;
+use kvproto::{deadlock::*, metapb::Region};
 use pd_client::{PdClient, INVALID_ID};
 use raft::StateRole;
-use raftstore::coprocessor::{
-    BoxRegionChangeObserver, BoxRoleObserver, Coprocessor, CoprocessorHost, ObserverContext,
-    RegionChangeEvent, RegionChangeObserver, RoleObserver,
+use raftstore::{
+    coprocessor::{
+        BoxRegionChangeObserver, BoxRoleObserver, Coprocessor, CoprocessorHost, ObserverContext,
+        RegionChangeEvent, RegionChangeObserver, RoleChange, RoleObserver,
+    },
+    store::util::is_region_initialized,
 };
-use raftstore::store::util::is_region_initialized;
 use security::SecurityManager;
-use std::cell::RefCell;
-use std::fmt::{self, Display, Formatter};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use tikv_util::future::paired_future_callback;
-use tikv_util::time::{Duration, Instant};
-use tikv_util::worker::{FutureRunnable, FutureScheduler, Stopped};
+use tikv_util::{
+    future::paired_future_callback,
+    time::{Duration, Instant},
+    worker::{FutureRunnable, FutureScheduler, Stopped},
+};
 use tokio::task::spawn_local;
 use txn_types::TimeStamp;
+
+use super::{
+    client::{self, Client},
+    config::Config,
+    metrics::*,
+    waiter_manager::Scheduler as WaiterMgrScheduler,
+    Error, Result,
+};
+use crate::{
+    server::resolve::StoreAddrResolver,
+    storage::lock_manager::{DiagnosticContext, Lock},
+};
 
 /// `Locks` is a set of locks belonging to one transaction.
 struct Locks {
@@ -392,7 +405,7 @@ pub enum Task {
     /// It's the only way to change the node from leader to follower, and vice versa.
     ChangeRole(Role),
     /// Change the ttl of DetectTable
-    ChangeTTL(Duration),
+    ChangeTtl(Duration),
     // Task only used for test
     #[cfg(any(test, feature = "testexport"))]
     Validate(Box<dyn FnOnce(u64) + Send>),
@@ -412,7 +425,7 @@ impl Display for Task {
             ),
             Task::DetectRpc { .. } => write!(f, "Detect Rpc"),
             Task::ChangeRole(role) => write!(f, "ChangeRole {{ role: {:?} }}", role),
-            Task::ChangeTTL(ttl) => write!(f, "ChangeTTL {{ ttl: {:?} }}", ttl),
+            Task::ChangeTtl(ttl) => write!(f, "ChangeTtl {{ ttl: {:?} }}", ttl),
             #[cfg(any(test, feature = "testexport"))]
             Task::Validate(_) => write!(f, "Validate dead lock config"),
             #[cfg(test)]
@@ -471,7 +484,7 @@ impl Scheduler {
     }
 
     pub fn change_ttl(&self, t: Duration) {
-        self.notify_scheduler(Task::ChangeTTL(t));
+        self.notify_scheduler(Task::ChangeTtl(t));
     }
 
     #[cfg(any(test, feature = "testexport"))]
@@ -530,13 +543,13 @@ impl RoleChangeNotifier {
 impl Coprocessor for RoleChangeNotifier {}
 
 impl RoleObserver for RoleChangeNotifier {
-    fn on_role_change(&self, ctx: &mut ObserverContext<'_>, role: StateRole) {
+    fn on_role_change(&self, ctx: &mut ObserverContext<'_>, role_change: &RoleChange) {
         let region = ctx.region();
         // A region is created first, so the leader region id must be valid.
         if Self::is_leader_region(region)
             && *self.leader_region_id.lock().unwrap() == region.get_id()
         {
-            self.scheduler.change_role(role.into());
+            self.scheduler.change_role(role_change.state.into());
         }
     }
 }
@@ -551,7 +564,7 @@ impl RegionChangeObserver for RoleChangeNotifier {
         let region = ctx.region();
         if Self::is_leader_region(region) {
             match event {
-                RegionChangeEvent::Create | RegionChangeEvent::Update => {
+                RegionChangeEvent::Create | RegionChangeEvent::Update(_) => {
                     *self.leader_region_id.lock().unwrap() = region.get_id();
                     self.scheduler.change_role(role.into());
                 }
@@ -570,6 +583,7 @@ impl RegionChangeObserver for RoleChangeNotifier {
                         self.scheduler.change_role(Role::Follower);
                     }
                 }
+                RegionChangeEvent::UpdateBuckets(_) => {}
             }
         }
     }
@@ -988,7 +1002,7 @@ where
                 self.handle_detect_rpc(stream, sink);
             }
             Task::ChangeRole(role) => self.handle_change_role(role),
-            Task::ChangeTTL(ttl) => self.handle_change_ttl(ttl),
+            Task::ChangeTtl(ttl) => self.handle_change_ttl(ttl),
             #[cfg(any(test, feature = "testexport"))]
             Task::Validate(f) => f(self.inner.borrow().detect_table.ttl.as_millis() as u64),
             #[cfg(test)]
@@ -1061,12 +1075,14 @@ impl Deadlock for Service {
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-    use crate::server::resolve::Callback;
     use engine_test::kv::KvTestEngine;
     use futures::executor::block_on;
+    use raftstore::coprocessor::RegionChangeReason;
     use security::SecurityConfig;
     use tikv_util::worker::FutureWorker;
+
+    use super::*;
+    use crate::server::resolve::Callback;
 
     #[test]
     fn test_detect_table() {
@@ -1289,7 +1305,7 @@ pub mod tests {
         };
 
         // Detect specified edges sequentially, and expects the last one will cause the deadlock.
-        let test_once = |edges: &[Edge]| {
+        let test_once = |edges: &[Edge<'_>]| {
             let mut detect_table = DetectTable::new(Duration::from_millis(100));
             let mut edge_map = HashMap::default();
 
@@ -1446,7 +1462,7 @@ pub mod tests {
         ];
         let events = [
             RegionChangeEvent::Create,
-            RegionChangeEvent::Update,
+            RegionChangeEvent::Update(RegionChangeReason::ChangePeer),
             RegionChangeEvent::Destroy,
         ];
         let check_role = |role| {
@@ -1482,7 +1498,11 @@ pub mod tests {
         check_role(Role::Follower);
         // Leader region id is changed.
         region.set_id(2);
-        host.on_region_changed(&region, RegionChangeEvent::Update, StateRole::Leader);
+        host.on_region_changed(
+            &region,
+            RegionChangeEvent::Update(RegionChangeReason::ChangePeer),
+            StateRole::Leader,
+        );
         // Destroy the previous leader region.
         region.set_id(1);
         host.on_region_changed(&region, RegionChangeEvent::Destroy, StateRole::Leader);
@@ -1493,19 +1513,19 @@ pub mod tests {
         host.on_region_changed(&region, RegionChangeEvent::Create, StateRole::Follower);
         check_role(Role::Follower);
         for &follower_role in &follower_roles {
-            host.on_role_change(&region, follower_role);
+            host.on_role_change(&region, RoleChange::new(follower_role));
             check_role(Role::Follower);
-            host.on_role_change(&invalid, StateRole::Leader);
+            host.on_role_change(&invalid, RoleChange::new(StateRole::Leader));
             check_role(Role::Follower);
-            host.on_role_change(&other, StateRole::Leader);
+            host.on_role_change(&other, RoleChange::new(StateRole::Leader));
             check_role(Role::Follower);
-            host.on_role_change(&region, StateRole::Leader);
+            host.on_role_change(&region, RoleChange::new(StateRole::Leader));
             check_role(Role::Leader);
-            host.on_role_change(&invalid, follower_role);
+            host.on_role_change(&invalid, RoleChange::new(follower_role));
             check_role(Role::Leader);
-            host.on_role_change(&other, follower_role);
+            host.on_role_change(&other, RoleChange::new(follower_role));
             check_role(Role::Leader);
-            host.on_role_change(&region, follower_role);
+            host.on_role_change(&region, RoleChange::new(follower_role));
             check_role(Role::Follower);
         }
 

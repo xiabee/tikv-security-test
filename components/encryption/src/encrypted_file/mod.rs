@@ -1,17 +1,18 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::io::{Read, Write};
-use std::path::Path;
+use std::{
+    io::{Read, Write},
+    path::Path,
+};
 
 use file_system::{rename, File, OpenOptions};
 use kvproto::encryptionpb::EncryptedContent;
 use protobuf::Message;
 use rand::{thread_rng, RngCore};
+use slog_global::error;
 use tikv_util::time::Instant;
 
-use crate::master_key::*;
-use crate::metrics::*;
-use crate::Result;
+use crate::{master_key::*, metrics::*, Result};
 
 mod header;
 pub use header::*;
@@ -70,11 +71,18 @@ impl<'a> EncryptedFile<'a> {
             .create(true)
             .write(true)
             .open(&tmp_path)
-            .unwrap_or_else(|_| panic!("EncryptedFile::write {}", &tmp_path.to_str().unwrap()));
+            .map_err(|e| {
+                error!(
+                    "EncryptedFile::write open failed";
+                    "path" => %tmp_path.display(),
+                    "error" => %e,
+                );
+                e
+            })?;
 
         // Encrypt the content.
         let encrypted_content = master_key
-            .encrypt(&plaintext_content)?
+            .encrypt(plaintext_content)?
             .write_to_bytes()
             .unwrap();
         let header = Header::new(&encrypted_content, Version::V1);
@@ -98,11 +106,12 @@ impl<'a> EncryptedFile<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::Error;
+    use std::io::ErrorKind;
 
     use matches::assert_matches;
-    use std::io::ErrorKind;
+
+    use super::*;
+    use crate::Error;
 
     #[test]
     fn test_open_write() {
