@@ -386,6 +386,7 @@ pub fn create_aes_ctr_crypter(
         EncryptionMethod::Aes128Ctr => OCipher::aes_128_ctr(),
         EncryptionMethod::Aes192Ctr => OCipher::aes_192_ctr(),
         EncryptionMethod::Aes256Ctr => OCipher::aes_256_ctr(),
+        EncryptionMethod::Sm4Ctr => OCipher::sm4_ctr(),
     };
     let crypter = OCrypter::new(cipher, mode, key, Some(iv.as_slice()))?;
     Ok((cipher, crypter))
@@ -422,7 +423,8 @@ impl CrypterCore {
     }
 
     fn reset_buffer(&mut self, size: usize) {
-        // OCrypter require the output buffer to have block_size extra bytes, or it will panic.
+        // OCrypter require the output buffer to have block_size extra bytes, or it will
+        // panic.
         self.buffer.resize(size + self.block_size, 0);
     }
 
@@ -462,9 +464,10 @@ impl CrypterCore {
         Ok(())
     }
 
-    /// For simplicity, the following implementation rely on the fact that OpenSSL always
-    /// return exact same size as input in CTR mode. If it is not true in the future, or we
-    /// want to support other counter modes, this code needs to be updated.
+    /// For simplicity, the following implementation rely on the fact that
+    /// OpenSSL always return exact same size as input in CTR mode. If it is
+    /// not true in the future, or we want to support other counter modes,
+    /// this code needs to be updated.
     pub fn do_crypter_in_place(&mut self, buf: &mut [u8]) -> IoResult<()> {
         if self.crypter.is_none() {
             self.reset_crypter(self.offset)?;
@@ -607,6 +610,7 @@ mod tests {
             EncryptionMethod::Aes128Ctr,
             EncryptionMethod::Aes192Ctr,
             EncryptionMethod::Aes256Ctr,
+            EncryptionMethod::Sm4Ctr,
         ];
         let ivs = [
             Iv::new_ctr(),
@@ -682,6 +686,7 @@ mod tests {
             EncryptionMethod::Aes128Ctr,
             EncryptionMethod::Aes192Ctr,
             EncryptionMethod::Aes256Ctr,
+            EncryptionMethod::Sm4Ctr,
         ];
         let mut plaintext = vec![0; 10240];
         OsRng.fill_bytes(&mut plaintext);
@@ -718,6 +723,7 @@ mod tests {
             EncryptionMethod::Aes128Ctr,
             EncryptionMethod::Aes192Ctr,
             EncryptionMethod::Aes256Ctr,
+            EncryptionMethod::Sm4Ctr,
         ];
         let mut plaintext = vec![0; 10240];
         OsRng.fill_bytes(&mut plaintext);
@@ -764,6 +770,7 @@ mod tests {
             EncryptionMethod::Aes128Ctr,
             EncryptionMethod::Aes192Ctr,
             EncryptionMethod::Aes256Ctr,
+            EncryptionMethod::Sm4Ctr,
         ];
         let iv = Iv::new_ctr();
         let mut plain_text = vec![0; 10240];

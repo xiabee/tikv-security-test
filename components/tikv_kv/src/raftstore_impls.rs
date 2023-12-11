@@ -40,8 +40,14 @@ impl<'a, S: Snapshot> SnapshotExt for RegionSnapshotExt<'a, S> {
             .unwrap_or(false)
     }
 
+    #[inline]
     fn get_term(&self) -> Option<NonZeroU64> {
         self.snapshot.term
+    }
+
+    #[inline]
+    fn get_region_id(&self) -> Option<u64> {
+        Some(self.snapshot.get_region().id)
     }
 
     fn get_txn_extra_op(&self) -> TxnExtraOp {
@@ -85,18 +91,11 @@ impl<S: Snapshot> EngineSnapshot for RegionSnapshot<S> {
         Ok(v.map(|v| v.to_vec()))
     }
 
-    fn iter(&self, iter_opt: IterOptions) -> kv::Result<Self::Iter> {
+    fn iter(&self, cf: CfName, iter_opt: IterOptions) -> kv::Result<Self::Iter> {
         fail_point!("raftkv_snapshot_iter", |_| Err(box_err!(
-            "injected error for iter"
-        )));
-        Ok(RegionSnapshot::iter(self, iter_opt))
-    }
-
-    fn iter_cf(&self, cf: CfName, iter_opt: IterOptions) -> kv::Result<Self::Iter> {
-        fail_point!("raftkv_snapshot_iter_cf", |_| Err(box_err!(
             "injected error for iter_cf"
         )));
-        RegionSnapshot::iter_cf(self, cf, iter_opt).map_err(kv::Error::from)
+        RegionSnapshot::iter(self, cf, iter_opt).map_err(kv::Error::from)
     }
 
     #[inline]

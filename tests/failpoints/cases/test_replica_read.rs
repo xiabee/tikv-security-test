@@ -7,21 +7,23 @@ use std::{
 };
 
 use crossbeam::channel;
-use engine_rocks::Compat;
-use engine_traits::{Peekable, RaftEngineReadOnly, CF_RAFT};
+use engine_traits::RaftEngineReadOnly;
 use futures::executor::block_on;
 use kvproto::raft_serverpb::{PeerState, RaftMessage, RegionLocalState};
 use raft::eraftpb::MessageType;
 use test_raftstore::*;
-use tikv_util::{config::ReadableDuration, HandyRwLock};
+use test_raftstore_macro::test_case;
+use tikv::storage::config::EngineType;
+use tikv_util::{config::ReadableDuration, future::block_on_timeout, HandyRwLock};
 use txn_types::{Key, Lock, LockType};
 
-#[test]
+#[test_case(test_raftstore::new_node_cluster)]
+#[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_wait_for_apply_index() {
-    let mut cluster = new_server_cluster(0, 3);
+    let mut cluster = new_cluster(0, 3);
 
     // Increase the election tick to make this test case running reliably.
-    configure_for_lease_read(&mut cluster, Some(50), Some(10_000));
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10_000));
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -42,8 +44,8 @@ fn test_wait_for_apply_index() {
     cluster.must_put(b"k1", b"v1");
     must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
 
-    // Peer 3 does not apply the cmd of putting 'k1' right now, then the follower read must
-    // be blocked.
+    // Peer 3 does not apply the cmd of putting 'k1' right now, then the follower
+    // read must be blocked.
     must_get_none(&cluster.get_engine(3), b"k1");
     let mut request = new_request(
         region.get_id(),
@@ -53,18 +55,13 @@ fn test_wait_for_apply_index() {
     );
     request.mut_header().set_peer(p3);
     request.mut_header().set_replica_read(true);
-    let (cb, rx) = make_cb(&request);
-    cluster
-        .sim
-        .rl()
-        .async_command_on_node(3, request, cb)
-        .unwrap();
+    let mut rx = async_command_on_node(&mut cluster, 3, request);
     // Must timeout here
-    assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
+    block_on_timeout(rx.as_mut(), Duration::from_millis(500)).unwrap_err();
     fail::remove("on_apply_write_cmd");
 
     // After write cmd applied, the follower read will be executed.
-    match rx.recv_timeout(Duration::from_secs(3)) {
+    match block_on_timeout(rx.as_mut(), Duration::from_secs(3)) {
         Ok(resp) => {
             assert_eq!(resp.get_responses().len(), 1);
             assert_eq!(resp.get_responses()[0].get_get().get_value(), b"v1");
@@ -73,11 +70,12 @@ fn test_wait_for_apply_index() {
     }
 }
 
-#[test]
+#[test_case(test_raftstore::new_node_cluster)]
+#[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_duplicate_read_index_ctx() {
     // Initialize cluster
-    let mut cluster = new_node_cluster(0, 3);
-    configure_for_lease_read(&mut cluster, Some(50), Some(10_000));
+    let mut cluster = new_cluster(0, 3);
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10_000));
     cluster.cfg.raft_store.raft_heartbeat_ticks = 1;
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -119,44 +117,41 @@ fn test_duplicate_read_index_ctx() {
         true,
     );
     request.mut_header().set_peer(p2);
-    let (cb2, rx2) = make_cb(&request);
+    // In v2, we use replica read to force issue a read index.
+    if cluster.cfg.storage.engine == EngineType::RaftKv2 {
+        request.mut_requests()[0] = new_get_cmd(b"k0");
+        request.mut_header().set_replica_read(true);
+    }
     // send to peer 2
-    cluster
-        .sim
-        .rl()
-        .async_command_on_node(2, request.clone(), cb2)
-        .unwrap();
+    let mut rx2 = async_command_on_node(&mut cluster, 2, request.clone());
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
     must_get_equal(&cluster.get_engine(3), b"k0", b"v0");
     request.mut_header().set_peer(p3);
-    let (cb3, rx3) = make_cb(&request);
     // send to peer 3
-    cluster
-        .sim
-        .rl()
-        .async_command_on_node(3, request, cb3)
-        .unwrap();
+    let mut rx3 = async_command_on_node(&mut cluster, 3, request);
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
     let router = cluster.sim.wl().get_router(1).unwrap();
     fail::cfg("pause_on_peer_collect_message", "pause").unwrap();
     cluster.sim.wl().clear_recv_filters(1);
     for raft_msg in std::mem::take(&mut *dropped_msgs.lock().unwrap()) {
-        router.send_raft_message(raft_msg).unwrap();
+        #[allow(clippy::useless_conversion)]
+        router.send_raft_message(raft_msg.into()).unwrap();
     }
     fail::remove("pause_on_peer_collect_message");
 
     // read index response must not be dropped
-    rx2.recv_timeout(Duration::from_secs(5)).unwrap();
-    rx3.recv_timeout(Duration::from_secs(5)).unwrap();
+    block_on_timeout(rx2.as_mut(), Duration::from_secs(5)).unwrap();
+    block_on_timeout(rx3.as_mut(), Duration::from_secs(5)).unwrap();
 }
 
-#[test]
+#[test_case(test_raftstore::new_node_cluster)]
+#[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_read_before_init() {
     // Initialize cluster
-    let mut cluster = new_node_cluster(0, 3);
-    configure_for_lease_read(&mut cluster, Some(50), Some(10_000));
+    let mut cluster = new_cluster(0, 3);
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10_000));
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -185,13 +180,8 @@ fn test_read_before_init() {
     );
     request.mut_header().set_peer(p3);
     request.mut_header().set_replica_read(true);
-    let (cb, rx) = make_cb(&request);
-    cluster
-        .sim
-        .rl()
-        .async_command_on_node(3, request, cb)
-        .unwrap();
-    let resp = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut rx = async_command_on_node(&mut cluster, 3, request);
+    let resp = block_on_timeout(rx.as_mut(), Duration::from_secs(5)).unwrap();
     fail::remove("before_handle_snapshot_ready_3");
     assert!(
         resp.get_header()
@@ -203,11 +193,12 @@ fn test_read_before_init() {
     );
 }
 
-#[test]
+#[test_case(test_raftstore::new_node_cluster)]
+#[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_read_applying_snapshot() {
     // Initialize cluster
-    let mut cluster = new_node_cluster(0, 3);
-    configure_for_lease_read(&mut cluster, Some(50), Some(10_000));
+    let mut cluster = new_cluster(0, 3);
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10_000));
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -225,15 +216,11 @@ fn test_read_applying_snapshot() {
     cluster.pd_client.must_add_peer(r1, p3.clone());
     thread::sleep(Duration::from_millis(500));
 
-    // Check if peer 3 is applying snapshot
-    let region_key = keys::region_state_key(r1);
-    let region_state: RegionLocalState = cluster
-        .get_engine(3)
-        .c()
-        .get_msg_cf(CF_RAFT, &region_key)
-        .unwrap()
-        .unwrap();
-    assert_eq!(region_state.get_state(), PeerState::Applying);
+    // Check if peer 3 is applying snapshot for raftstore v1.
+    if cluster.cfg.storage.engine == EngineType::RaftKv {
+        let region_state: RegionLocalState = cluster.region_local_state(r1, 3);
+        assert_eq!(region_state.get_state(), PeerState::Applying);
+    }
     let region = cluster.get_region(b"k0");
     assert_eq!(cluster.leader_of_region(r1).unwrap(), p1);
 
@@ -245,35 +232,33 @@ fn test_read_applying_snapshot() {
     );
     request.mut_header().set_peer(p3);
     request.mut_header().set_replica_read(true);
-    let (cb, rx) = make_cb(&request);
-    cluster
-        .sim
-        .rl()
-        .async_command_on_node(3, request, cb)
-        .unwrap();
-    let resp = match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(r) => r,
+    let mut rx = async_command_on_node(&mut cluster, 3, request);
+    match block_on_timeout(rx.as_mut(), Duration::from_secs(5)) {
+        Ok(resp) => {
+            // In raftstore v1, read fails due to snapshot.
+            assert!(cluster.cfg.storage.engine == EngineType::RaftKv);
+            assert!(
+                resp.get_header()
+                    .get_error()
+                    .get_message()
+                    .contains("applying snapshot"),
+                "{:?}",
+                resp.get_header().get_error()
+            );
+        }
         Err(_) => {
-            fail::remove("region_apply_snap");
-            panic!("cannot receive response");
+            // In raftstore v2, snapshot blocks reads.
+            assert!(cluster.cfg.storage.engine == EngineType::RaftKv2);
         }
     };
     fail::remove("region_apply_snap");
-    assert!(
-        resp.get_header()
-            .get_error()
-            .get_message()
-            .contains("applying snapshot"),
-        "{:?}",
-        resp.get_header().get_error()
-    );
 }
 
 #[test]
 fn test_read_after_cleanup_range_for_snap() {
     let mut cluster = new_server_cluster(1, 3);
-    configure_for_snapshot(&mut cluster);
-    configure_for_lease_read(&mut cluster, Some(100), Some(10));
+    configure_for_snapshot(&mut cluster.cfg);
+    configure_for_lease_read(&mut cluster.cfg, Some(100), Some(10));
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -330,7 +315,7 @@ fn test_read_after_cleanup_range_for_snap() {
     request.mut_header().set_peer(p3);
     request.mut_header().set_replica_read(true);
     // Send follower read request to peer 3
-    let (cb1, rx1) = make_cb(&request);
+    let (cb1, mut rx1) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -356,16 +341,19 @@ fn test_read_after_cleanup_range_for_snap() {
     rx1.recv_timeout(Duration::from_secs(5)).unwrap();
 }
 
-/// Tests the learner of new split region will know its leader without waiting for the leader heartbeat timeout.
+/// Tests the learner of new split region will know its leader without waiting
+/// for the leader heartbeat timeout.
 ///
 /// Before https://github.com/tikv/tikv/pull/8820,
-/// the learner of a new split region may not know its leader if it applies log slowly and drops the no-op
-/// entry from the new leader, and it had to wait for a heartbeat timeout to know its leader before that it
-/// can't handle any read request.
-#[test]
+/// the learner of a new split region may not know its leader if it applies log
+/// slowly and drops the no-op entry from the new leader, and it had to wait for
+/// a heartbeat timeout to know its leader before that it can't handle any read
+/// request.
+#[test_case(test_raftstore::new_node_cluster)]
+// #[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_new_split_learner_can_not_find_leader() {
-    let mut cluster = new_node_cluster(0, 4);
-    configure_for_lease_read(&mut cluster, Some(5000), None);
+    let mut cluster = new_cluster(0, 4);
+    configure_for_lease_read(&mut cluster.cfg, Some(5000), None);
 
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -385,9 +373,10 @@ fn test_new_split_learner_can_not_find_leader() {
     let region = cluster.get_region(b"k3");
     cluster.must_split(&region, b"k3");
 
-    // This `put` will not inform learner leadership because the The learner is paused at apply split command,
-    // so the learner peer of the new split region is not create yet. Also, the leader will not send another
-    // append request before the previous one response as all peer is initiated with the `Probe` mod
+    // This `put` will not inform learner leadership because the The learner is
+    // paused at apply split command, so the learner peer of the new split region is
+    // not create yet. Also, the leader will not send another append request before
+    // the previous one response as all peer is initiated with the `Probe` mod
     cluster.must_put(b"k2", b"v2");
     assert_eq!(cluster.get(b"k2"), Some(b"v2".to_vec()));
 
@@ -399,18 +388,19 @@ fn test_new_split_learner_can_not_find_leader() {
     let new_region = cluster.get_region(b"k2");
     let learner_peer = find_peer(&new_region, 3).unwrap().clone();
     let resp_ch = async_read_on_peer(&mut cluster, learner_peer, new_region, b"k2", true, true);
-    let resp = resp_ch.recv_timeout(Duration::from_secs(3)).unwrap();
+    let resp = block_on_timeout(resp_ch, Duration::from_secs(3)).unwrap();
     let exp_value = resp.get_responses()[0].get_get().get_value();
     assert_eq!(exp_value, b"v2");
 }
 
-/// Test if the read index request can get a correct response when the commit index of leader
-/// if not up-to-date after transferring leader.
-#[test]
+/// Test if the read index request can get a correct response when the commit
+/// index of leader if not up-to-date after transferring leader.
+#[test_case(test_raftstore::new_node_cluster)]
+#[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_replica_read_after_transfer_leader() {
-    let mut cluster = new_node_cluster(0, 3);
+    let mut cluster = new_cluster(0, 3);
 
-    configure_for_lease_read(&mut cluster, Some(50), Some(100));
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(100));
 
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -456,7 +446,8 @@ fn test_replica_read_after_transfer_leader() {
 
     // Wait peer 1 and 3 to send heartbeat response to peer 2
     sleep_ms(100);
-    // Pause before collecting message to make the these message be handled in one loop
+    // Pause before collecting message to make the these message be handled in one
+    // loop
     let on_peer_collect_message_2 = "on_peer_collect_message_2";
     fail::cfg(on_peer_collect_message_2, "pause").unwrap();
 
@@ -464,7 +455,8 @@ fn test_replica_read_after_transfer_leader() {
 
     let router = cluster.sim.wl().get_router(2).unwrap();
     for raft_msg in std::mem::take(&mut *dropped_msgs.lock().unwrap()) {
-        router.send_raft_message(raft_msg).unwrap();
+        #[allow(clippy::useless_conversion)]
+        router.send_raft_message(raft_msg.into()).unwrap();
     }
 
     let new_region = cluster.get_region(b"k1");
@@ -474,19 +466,20 @@ fn test_replica_read_after_transfer_leader() {
 
     fail::remove(on_peer_collect_message_2);
 
-    let resp = resp_ch.recv_timeout(Duration::from_secs(3)).unwrap();
+    let resp = block_on_timeout(resp_ch, Duration::from_secs(3)).unwrap();
     let exp_value = resp.get_responses()[0].get_get().get_value();
     assert_eq!(exp_value, b"v2");
 }
 
-// This test is for reproducing the bug that some replica reads was sent to a leader and shared a same
-// read index because of the optimization on leader.
-#[test]
+// This test is for reproducing the bug that some replica reads was sent to a
+// leader and shared a same read index because of the optimization on leader.
+#[test_case(test_raftstore::new_node_cluster)]
+// #[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_read_index_after_transfer_leader() {
-    let mut cluster = new_node_cluster(0, 3);
+    let mut cluster = new_cluster(0, 3);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
-    configure_for_lease_read(&mut cluster, Some(50), Some(100));
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(100));
     // Setup cluster and check all peers have data.
     let region_id = cluster.run_conf_change();
     pd_client.must_add_peer(region_id, new_peer(2, 2));
@@ -513,7 +506,8 @@ fn test_read_index_after_transfer_leader() {
             async_read_index_on_peer(&mut cluster, new_peer(2, 2), region.clone(), b"k1", true);
         responses.push(resp);
     }
-    // Try to split the region to change the peer into `splitting` state then can not handle read requests.
+    // Try to split the region to change the peer into `splitting` state then can
+    // not handle read requests.
     cluster.split_region(&region, b"k2", raftstore::store::Callback::None);
     // Wait the split command be sent.
     sleep_ms(100);
@@ -527,27 +521,32 @@ fn test_read_index_after_transfer_leader() {
         let msg_type = msg.get_message().get_msg_type();
         matches!(msg_type, MessageType::MsgAppendResponse)
     });
-    // Transfer leader to peer 1, peer 2 should not change role since we added a recv filter.
+    // Transfer leader to peer 1, peer 2 should not change role since we added a
+    // recv filter.
     cluster.transfer_leader(region_id, new_peer(1, 1));
-    // Pause before collecting peer messages to make sure all messages can be handled in one batch.
+    // Pause before collecting peer messages to make sure all messages can be
+    // handled in one batch.
     let on_peer_collect_message_2 = "on_peer_collect_message_2";
     fail::cfg(on_peer_collect_message_2, "pause").unwrap();
-    // Pause apply worker to stop the split command so peer 2 would keep in `splitting` state.
+    // Pause apply worker to stop the split command so peer 2 would keep in
+    // `splitting` state.
     let on_handle_apply_2 = "on_handle_apply_2";
     fail::cfg(on_handle_apply_2, "pause").unwrap();
     // Send heartbeat and append responses to advance read index.
     let router = cluster.sim.wl().get_router(2).unwrap();
     for msg in append_msgs {
-        router.send_raft_message(msg.clone()).unwrap();
+        #[allow(clippy::useless_conversion)]
+        router.send_raft_message(msg.clone().into()).unwrap();
     }
     for msg in heartbeat_msgs {
-        router.send_raft_message(msg.clone()).unwrap();
+        #[allow(clippy::useless_conversion)]
+        router.send_raft_message(msg.clone().into()).unwrap();
     }
     fail::remove(on_peer_collect_message_2);
     // Wait for read index has been advanced.
     sleep_ms(100);
-    // Filter and send vote message, peer 2 would step down to follower and try to handle read requests
-    // as a follower.
+    // Filter and send vote message, peer 2 would step down to follower and try to
+    // handle read requests as a follower.
     let msgs = std::mem::take(&mut *dropped_msgs.lock().unwrap());
     let vote_msgs = msgs.iter().filter(|msg| {
         let msg_type = msg.get_message().get_msg_type();
@@ -557,23 +556,25 @@ fn test_read_index_after_transfer_leader() {
         )
     });
     for msg in vote_msgs {
-        router.send_raft_message(msg.clone()).unwrap();
+        #[allow(clippy::useless_conversion)]
+        router.send_raft_message(msg.clone().into()).unwrap();
     }
 
-    for resp in responses {
-        resp.recv_timeout(Duration::from_millis(200)).unwrap();
+    for mut resp in responses {
+        block_on_timeout(resp.as_mut(), Duration::from_millis(200)).unwrap();
     }
 
     cluster.sim.wl().clear_recv_filters(2);
     fail::remove(on_handle_apply_2);
 }
 
-/// Test if the read index request can get a correct response when the commit index of leader
-/// if not up-to-date after transferring leader.
-#[test]
+/// Test if the read index request can get a correct response when the commit
+/// index of leader if not up-to-date after transferring leader.
+#[test_case(test_raftstore::new_node_cluster)]
+// #[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_batch_read_index_after_transfer_leader() {
     let mut cluster = new_node_cluster(0, 3);
-    configure_for_lease_read(&mut cluster, Some(50), Some(100));
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(100));
 
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -600,7 +601,8 @@ fn test_batch_read_index_after_transfer_leader() {
 
     cluster.must_transfer_leader(1, new_peer(2, 2));
 
-    // Pause before collecting message to make the these message be handled in one loop
+    // Pause before collecting message to make the these message be handled in one
+    // loop
     let on_peer_collect_message_2 = "on_peer_collect_message_2";
     fail::cfg(on_peer_collect_message_2, "pause").unwrap();
 
@@ -608,7 +610,8 @@ fn test_batch_read_index_after_transfer_leader() {
 
     let router = cluster.sim.wl().get_router(2).unwrap();
     for raft_msg in std::mem::take(&mut *dropped_msgs.lock().unwrap()) {
-        router.send_raft_message(raft_msg).unwrap();
+        #[allow(clippy::useless_conversion)]
+        router.send_raft_message(raft_msg.into()).unwrap();
     }
 
     let mut resps = Vec::with_capacity(2);
@@ -626,10 +629,11 @@ fn test_batch_read_index_after_transfer_leader() {
 
     let resps = resps
         .into_iter()
-        .map(|x| x.recv_timeout(Duration::from_secs(5)).unwrap())
+        .map(|mut x| x.recv_timeout(Duration::from_secs(5)).unwrap())
         .collect::<Vec<_>>();
 
-    // `term` in the header is `current_term`, not term of the entry at `read_index`.
+    // `term` in the header is `current_term`, not term of the entry at
+    // `read_index`.
     let term = resps[0].get_header().get_current_term();
     assert_eq!(term, resps[1].get_header().get_current_term());
     assert_eq!(term, pd_client.get_region_last_report_term(1).unwrap());
@@ -638,15 +642,20 @@ fn test_batch_read_index_after_transfer_leader() {
         let index = resps[i].responses[0].get_read_index().read_index;
         let raft_engine = cluster.get_raft_engine(2);
         let entry = raft_engine.get_entry(1, index).unwrap().unwrap();
-        // According to Raft, a peer shouldn't be able to perform read index until it commits
-        // to the current term. So term of `read_index` must equal to the current one.
+        // According to Raft, a peer shouldn't be able to perform read index until it
+        // commits to the current term. So term of `read_index` must equal to
+        // the current one.
         assert_eq!(entry.get_term(), term);
     }
 }
 
-#[test]
+// Read index on follower must also return KeyIsLocked error.
+//
+// Note: this test case does not applicable to raftstore v2, because it no
+// longer support read index from users.
+#[test_case(test_raftstore::new_node_cluster)]
 fn test_read_index_lock_checking_on_follower() {
-    let mut cluster = new_node_cluster(0, 3);
+    let mut cluster = new_cluster(0, 3);
 
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -666,7 +675,7 @@ fn test_read_index_lock_checking_on_follower() {
     fail::cfg("before_propose_readindex", "1*pause").unwrap();
     let mut resp = async_read_index_on_peer(&mut cluster, new_peer(2, 2), r1.clone(), b"k1", true);
     for i in 0..=20 {
-        let res = resp.recv_timeout(Duration::from_millis(500));
+        let res = block_on_timeout(resp.as_mut(), Duration::from_millis(500));
         if res.is_err() {
             break;
         }
@@ -703,12 +712,12 @@ fn test_read_index_lock_checking_on_follower() {
     let guard = block_on(leader_cm.lock_key(&Key::from_raw(b"k1")));
     guard.with_lock(|l| *l = Some(lock.clone()));
 
-    // Now, the leader has been transferred to peer 3. The original read index request
-    // will be first sent to peer 1 and then redirected to peer 3.
+    // Now, the leader has been transferred to peer 3. The original read index
+    // request will be first sent to peer 1 and then redirected to peer 3.
     // We must make sure the lock check is done on peer 3.
 
     fail::remove("before_propose_readindex");
-    let resp = resp.recv_timeout(Duration::from_millis(2000)).unwrap();
+    let resp = block_on_timeout(resp.as_mut(), Duration::from_millis(2000)).unwrap();
     assert_eq!(
         &lock.into_lock_info(b"k1".to_vec()),
         resp.get_responses()[0].get_read_index().get_locked(),
@@ -717,11 +726,12 @@ fn test_read_index_lock_checking_on_follower() {
     );
 }
 
-#[test]
+#[test_case(test_raftstore::new_node_cluster)]
+#[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_read_index_lock_checking_on_false_leader() {
-    let mut cluster = new_node_cluster(0, 5);
+    let mut cluster = new_cluster(0, 5);
     // Use long election timeout and short lease.
-    configure_for_lease_read(&mut cluster, Some(50), Some(200));
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(200));
     cluster.cfg.raft_store.raft_store_max_leader_lease =
         ReadableDuration(Duration::from_millis(100));
 
@@ -781,14 +791,14 @@ fn test_read_index_lock_checking_on_false_leader() {
     let guard = block_on(leader_cm.lock_key(&Key::from_raw(b"k1")));
     guard.with_lock(|l| *l = Some(lock.clone()));
 
-    // Read index from peer 2, the read index message will be sent to the old leader peer 1.
-    // But the lease of peer 1 has expired and it cannot get majority of heartbeat.
-    // So, we cannot get the result here.
-    let resp = async_read_index_on_peer(&mut cluster, new_peer(2, 2), r1, b"k1", true);
-    assert!(resp.recv_timeout(Duration::from_millis(300)).is_err());
+    // Read index from peer 2, the read index message will be sent to the old leader
+    // peer 1. But the lease of peer 1 has expired and it cannot get majority of
+    // heartbeat. So, we cannot get the result here.
+    let mut resp = async_read_index_on_peer(&mut cluster, new_peer(2, 2), r1, b"k1", true);
+    block_on_timeout(resp.as_mut(), Duration::from_millis(300)).unwrap_err();
 
-    // Now, restore the network partition. Peer 1 should now become follower and drop its
-    // pending read index request. Peer 2 cannot get the result now.
+    // Now, restore the network partition. Peer 1 should now become follower and
+    // drop its pending read index request. Peer 2 cannot get the result now.
     let recv_filter = Box::new(
         RegionPacketFilter::new(rid, 2)
             .direction(Direction::Recv)
@@ -796,10 +806,10 @@ fn test_read_index_lock_checking_on_false_leader() {
     );
     cluster.sim.wl().add_recv_filter(2, recv_filter);
     cluster.clear_send_filters();
-    assert!(resp.recv_timeout(Duration::from_millis(300)).is_err());
+    block_on_timeout(resp.as_mut(), Duration::from_millis(300)).unwrap_err();
 
     // After cleaning all filters, peer 2 will retry and will get error.
     cluster.sim.wl().clear_recv_filters(2);
-    let resp = resp.recv_timeout(Duration::from_millis(2000)).unwrap();
+    let resp = block_on_timeout(resp.as_mut(), Duration::from_secs(2)).unwrap();
     assert!(resp.get_header().has_error());
 }

@@ -24,23 +24,25 @@ pub enum NewerTsCheckState {
     NotMetYet,
 }
 
-/// The result of `get_txn_commit_record`, which is used to get the status of a specified
-/// transaction from write cf.
+/// The result of `get_txn_commit_record`, which is used to get the status of a
+/// specified transaction from write cf.
 #[derive(Debug)]
 pub enum TxnCommitRecord {
-    /// The commit record of the given transaction is not found. But it's possible that there's
-    /// another transaction's commit record, whose `commit_ts` equals to the current transaction's
-    /// `start_ts`. That kind of record will be returned via the `overlapped_write` field.
-    /// In this case, if the current transaction is to be rolled back, the `overlapped_write` must not
-    /// be overwritten.
+    /// The commit record of the given transaction is not found. But it's
+    /// possible that there's another transaction's commit record, whose
+    /// `commit_ts` equals to the current transaction's `start_ts`. That
+    /// kind of record will be returned via the `overlapped_write` field.
+    /// In this case, if the current transaction is to be rolled back, the
+    /// `overlapped_write` must not be overwritten.
     None {
         overlapped_write: Option<OverlappedWrite>,
     },
     /// Found the transaction's write record.
     SingleRecord { commit_ts: TimeStamp, write: Write },
-    /// The transaction's status is found in another transaction's record's `overlapped_rollback`
-    /// field. This may happen when the current transaction's `start_ts` is the same as the
-    /// `commit_ts` of another transaction on this key.
+    /// The transaction's status is found in another transaction's record's
+    /// `overlapped_rollback` field. This may happen when the current
+    /// transaction's `start_ts` is the same as the `commit_ts` of another
+    /// transaction on this key.
     OverlappedRollback { commit_ts: TimeStamp },
 }
 
@@ -81,10 +83,14 @@ impl TxnCommitRecord {
         }
     }
 
-    pub fn unwrap_none(self) -> Option<OverlappedWrite> {
+    #[inline]
+    pub fn unwrap_none(self, region_id: u64) -> Option<OverlappedWrite> {
         match self {
             Self::None { overlapped_write } => overlapped_write,
-            _ => panic!("txn record found but not expected: {:?}", self),
+            _ => panic!(
+                "txn record found but not expected: {:?} [region_id={}]",
+                self, region_id
+            ),
         }
     }
 }

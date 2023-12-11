@@ -205,9 +205,11 @@
 ## Max time to handle Coprocessor requests before timeout.
 # end-point-request-max-handle-duration = "60s"
 
-## Max bytes that snapshot can be written to disk in one second.
-## It should be set based on your disk performance.
-# snap-max-write-bytes-per-sec = "100MB"
+## Max bytes that snapshot can interact with disk in one second. It should be
+## set based on your disk performance. Only write flow is considered, if
+## partiioned-raft-kv is used, read flow is also considered and it will be estimated
+## as read_size * 0.5 to get around errors from page cache.
+# snap-io-max-bytes-per-sec = "100MB"
 
 ## Whether to enable request batch.
 # enable-request-batch = true
@@ -253,6 +255,12 @@
 ## Set it to 0 will cause no space is reserved at all. It's generally used for tests.
 # reserve-space = "5GB"
 
+## Reserve some space for raft disk if raft disk is separated deployed with kv disk.
+## `max(reserve-raft-space, raft disk capacity * 5%)` will be reserved exactly.
+##
+## Set it to 0 will cause no space is reserved at all. It's generally used for tests.
+# reserve-raft-space = "1GB"
+
 ## The maximum recovery time after rocksdb detects restorable background errors. When the data belonging
 ## to the data range is damaged, it will be reported to PD through heartbeat, and PD will add `remove-peer`
 ## operator to remove this damaged peer. When the damaged peer still exists in the current store, the
@@ -265,17 +273,11 @@
 ## Set to 0 to disable this feature if you want to panic immediately when encountering such an error.
 # background-error-recovery-window = "1h"
 
-[storage.block-cache]
-## Whether to create a shared block cache for all RocksDB column families.
-##
 ## Block cache is used by RocksDB to cache uncompressed blocks. Big block cache can speed up read.
 ## It is recommended to turn on shared block cache. Since only the total cache size need to be
 ## set, it is easier to config. In most cases it should be able to auto-balance cache usage
 ## between column families with standard LRU algorithm.
-##
-## The rest of config in the storage.block-cache session is effective only when shared block cache
-## is on.
-# shared = true
+[storage.block-cache]
 
 ## Size of the shared block cache. Normally it should be tuned to 30%-50% of system's total memory.
 ## When the config is not set, it is decided by the sum of the following fields or their default
@@ -515,8 +517,8 @@
 ## Value -1 means files opened are always kept open and RocksDB will prefetch index and filter
 ## blocks into block cache at startup. So if your database has a large working set, it will take
 ## several minutes to open the DB. You may need to increase this if your database has a large
-## working set. You can estimate the number of files based on `target-file-size-base` and
-## `target_file_size_multiplier` for level-based compaction.
+## working set. You can estimate the number of files based on `target-file-size-base` for
+## level-based compaction.
 # max-open-files = 40960
 
 ## Max size of RocksDB's MANIFEST file.
@@ -558,11 +560,6 @@
 
 ## Max RocksDB WAL size in total
 # max-total-wal-size = "4GB"
-
-## RocksDB Statistics provides cumulative stats over time.
-## Turning statistics on will introduce about 5%-10% overhead for RocksDB, but it can help you to
-## know the internal status of RocksDB.
-# enable-statistics = true
 
 ## Dump statistics periodically in information logs.
 ## Same as RocksDB's default value (10 min).
@@ -631,6 +628,11 @@
 ## RocksDB log levels
 # info-log-level = "info"
 
+## Memory usage limit for Raft Engine. Undersized write buffers will be flushed to satisfy the
+## requirement.
+## No limit when not specified.
+# write-buffer-limit = "1GB"
+
 ## Options for `Titan`.
 [rocksdb.titan]
 ## Enables or disables `Titan`. Note that Titan is still an experimental feature. Once
@@ -679,7 +681,7 @@
 ## The data block size. RocksDB compresses data based on the unit of block.
 ## Similar to page in other databases, block is the smallest unit cached in block-cache. Note that
 ## the block size specified here corresponds to uncompressed data.
-# block-size = "64KB"
+# block-size = "32KB"
 
 ## If you're doing point lookups you definitely want to turn bloom filters on. We use bloom filters
 ## to avoid unnecessary disk reads. Default bits_per_key is 10, which yields ~1% false positive
@@ -803,6 +805,72 @@
 ## for the same CF.
 # compaction-guard-max-output-file-size = "128M"
 
+## Available versions:
+##
+## 0 -- This version can be read by all TiKV releases. Doesn't support changing
+## checksum type (default is CRC32).
+##
+## 1 -- Can be read by all TiKV releases. Supports non-default checksum, like
+## xxHash. It is written by RocksDB when BlockBasedTableOptions::checksum is
+## something other than kCRC32c. (version 0 is silently upconverted)
+##
+## 2 -- Can be read by all TiKV releases. Changes the way we encode compressed
+## blocks with LZ4, BZip2 and Zlib compression.
+##
+## 3 -- Can be read by TiKV's versions since 2.1. Changes the way we encode the
+## keys in index blocks.
+## This option only affects newly written tables. When reading existing tables,
+## the information about version is read from the footer.
+##
+## 4 -- Can be read by TiKV's versions since 3.0. Changes the way we encode the
+## values in index blocks.
+## This option only affects newly written tables. When reading existing tables,
+## the information about version is read from the footer.
+##
+# format-version = 2
+
+## If enabled, prepopulate warm/hot blocks (data, uncompressed dict, index and
+## filter blocks) which are already in memory into block cache at the time of
+## flush. On a flush, the block that is in memory (in memtables) get flushed
+## to the device. If using Direct IO, additional IO is incurred to read this
+## data back into memory again, which is avoided by enabling this option. This
+## further helps if the workload exhibits high temporal locality, where most
+## of the reads go to recently written data. This also helps in case of
+## Distributed FileSystem.
+##
+##   disabled:   kDisabled
+##   flush-only: kFlushOnly
+##
+# prepopulate-block-cache = "disabled"
+
+## Use the specified checksum type. Newly created table files will be
+## protected with this checksum type. Old table files will still be readable,
+## even though they have different checksum type.
+##
+##   no:       kNoChecksum
+##   crc32c:   kCRC32c
+##   xxhash:   kxxHash
+##   xxhash64: kxxHash64
+##   xxh3:     kXXH3 (supported since TiKV 6.2)
+##
+# checksum = "crc32c"
+
+## The maximum number of concurrent compaction tasks. 0 stands for no limit.
+# max-compactions = 0
+
+## SST files containing updates older than TTL will go through the compaction
+## process. This usually happens in a cascading way so that those entries
+## will be compacted to bottommost level/file. Disabled as default.
+##
+## Default: 0s.
+# ttl = "0s"
+
+## SST files older than this value will be picked up for compaction, and
+## re-written to the same level as they were before. Disabled as default.
+##
+## Default: 0s.
+# periodic-compaction-seconds = "0s"
+
 ## Options for "Default" Column Family for `Titan`.
 [rocksdb.defaultcf.titan]
 ## The smallest value to store in blob files. Value smaller than
@@ -862,7 +930,7 @@
 [rocksdb.writecf]
 ## Recommend to set it the same as `rocksdb.defaultcf.compression-per-level`.
 # compression-per-level = ["no", "no", "lz4", "lz4", "lz4", "zstd", "zstd"]
-# block-size = "64KB"
+# block-size = "32KB"
 
 ## Recommend to set it the same as `rocksdb.defaultcf.write-buffer-size`.
 # write-buffer-size = "128MB"
@@ -887,6 +955,10 @@
 # enable-compaction-guard = true
 # compaction-guard-min-output-file-size = "8M"
 # compaction-guard-max-output-file-size = "128M"
+# format-version = 2
+# prepopulate-block-cache = "disabled"
+# checksum = "crc32c"
+# max-compactions = 0
 
 [rocksdb.lockcf]
 # compression-per-level = ["no", "no", "no", "no", "no", "no", "no"]
@@ -908,6 +980,10 @@
 # dynamic-level-bytes = true
 # optimize-filters-for-hits = false
 # enable-compaction-guard = false
+# format-version = 2
+# prepopulate-block-cache = "disabled"
+# checksum = "crc32c"
+# max-compactions = 0
 
 [raftdb]
 # max-background-jobs = 4
@@ -916,7 +992,6 @@
 # max-manifest-file-size = "20MB"
 # create-if-missing = true
 
-# enable-statistics = true
 # stats-dump-period = "10m"
 
 ## Raft RocksDB WAL directory.
@@ -967,6 +1042,10 @@
 # dynamic-level-bytes = true
 # optimize-filters-for-hits = true
 # enable-compaction-guard = false
+# format-version = 2
+# prepopulate-block-cache = "disabled"
+# checksum = "crc32c"
+# max-compactions = 0
 
 [raft-engine]
 ## Determines whether to use Raft Engine to store raft logs. When it is
@@ -987,12 +1066,6 @@
 ##
 ## If you set this configuration item to `0`, compression is disabled.
 # batch-compression-threshold = "8KB"
-
-## Specifies the maximum accumulative size of buffered writes. When this
-## configuration value is exceeded, buffered writes are flushed to the disk.
-##
-## If you set this configuration item to `0`, incremental sync is disabled.
-# bytes-per-sync = "4MB"
 
 ## Specifies the maximum size of log files. When a log file is larger than this
 ## value, it is rotated.
@@ -1027,6 +1100,31 @@
 ## When it's not set, 15% of available system memory will be used.
 # memory-limit = "1GB"
 
+## Version of the log file in Raft Engine.
+##
+## Candidates:
+##   1: Can be read by TiKV release 6.1 and above.
+##   2: Can be read by TiKV release 6.3 and above. Supports log recycling.
+##
+## Default: 2.
+# format-version = 2
+
+## Whether to recycle stale log files in Raft Engine.
+## If `true`, logically purged log files will be reserved for recycling.
+## Only available for `format-version` >= 2. This option is only
+## available when TiKV >= 6.3.x.
+##
+## Default: true.
+# enable-log-recycle = true
+
+## Whether to prepare log files for recycling when start.
+## If `true`, batch empty log files will be prepared for recycling when
+## starting engine.
+## Only available for `enable-log-reycle` is true.
+##
+## Default: false
+# prefill-for-recycle = false
+
 [security]
 ## The path for TLS certificates. Empty string means disabling secure connections.
 # ca-path = ""
@@ -1042,8 +1140,9 @@
 ## Configurations for encryption at rest. Experimental.
 [security.encryption]
 ## Encryption method to use for data files.
-## Possible values are "plaintext", "aes128-ctr", "aes192-ctr" and "aes256-ctr". Value other than
-## "plaintext" means encryption is enabled, in which case master key must be specified.
+## Possible values are "plaintext", "aes128-ctr", "aes192-ctr", "aes256-ctr" and "sm4-ctr".
+## Value other than "plaintext" means encryption is enabled, in which case
+## master key must be specified.
 # data-encryption-method = "plaintext"
 
 ## Specifies how often TiKV rotates data encryption key.
@@ -1129,12 +1228,12 @@
 
 [log-backup] 
 ## Number of threads to perform backup stream tasks.
-## The default value is set to min(CPU_NUM * 0.5, 8).
+## The default value is CPU_NUM * 0.5, and limited to [2, 12].
 # num-threads = 8
 
 ## enable this feature. TiKV will starts watch related tasks in PD. and backup kv changes to storage accodring to task.
 ## The default value is false.
-# enable = false 
+# enable = true 
 
 [backup.hadoop]
 ## let TiKV know how to find the hdfs shell command.

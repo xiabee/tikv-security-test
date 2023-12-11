@@ -2,7 +2,7 @@
 
 use std::{
     path::Path,
-    sync::{Arc, Mutex, RwLock},
+    sync::{atomic::AtomicU64, Arc, Mutex, RwLock},
 };
 
 use collections::{HashMap, HashSet};
@@ -17,6 +17,7 @@ use kvproto::{
     raft_cmdpb::*,
     raft_serverpb::{self, RaftMessage},
 };
+use protobuf::Message;
 use raft::{eraftpb::MessageType, SnapshotStatus};
 use raftstore::{
     coprocessor::{config::SplitCheckConfigManager, CoprocessorHost},
@@ -29,8 +30,10 @@ use raftstore::{
     },
     Result,
 };
+use resource_control::ResourceGroupManager;
 use resource_metering::CollectorRegHandle;
 use tempfile::TempDir;
+use test_pd_client::TestPdClient;
 use tikv::{
     config::{ConfigController, Module},
     import::SstImporter,
@@ -94,7 +97,10 @@ impl Transport for ChannelTransport {
                 Some(p) => {
                     p.0.register(key.clone(), SnapEntry::Receiving);
                     let data = msg.get_message().get_snapshot().get_data();
-                    p.0.get_snapshot_for_receiving(&key, data).unwrap()
+                    let mut snapshot_data = raft_serverpb::RaftSnapshotData::default();
+                    snapshot_data.merge_from_bytes(data).unwrap();
+                    p.0.get_snapshot_for_receiving(&key, snapshot_data.take_meta())
+                        .unwrap()
                 }
                 None => return Err(box_err!("missing temp dir for store {}", to_store)),
             };
@@ -187,8 +193,8 @@ impl NodeCluster {
             .unwrap()
     }
 
-    // Set a function that will be invoked after creating each CoprocessorHost. The first argument
-    // of `op` is the node_id.
+    // Set a function that will be invoked after creating each CoprocessorHost. The
+    // first argument of `op` is the node_id.
     // Set this before invoking `run_node`.
     #[allow(clippy::type_complexity)]
     pub fn post_create_coprocessor_host(
@@ -224,16 +230,18 @@ impl Simulator for NodeCluster {
         key_manager: Option<Arc<DataKeyManager>>,
         router: RaftRouter<RocksEngine, RaftTestEngine>,
         system: RaftBatchSystem<RocksEngine, RaftTestEngine>,
+        _resource_manager: &Option<Arc<ResourceGroupManager>>,
     ) -> ServerResult<u64> {
         assert!(node_id == 0 || !self.nodes.contains_key(&node_id));
         let pd_worker = LazyWorker::new("test-pd-worker");
 
         let simulate_trans = SimulateTransport::new(self.trans.clone());
         let mut raft_store = cfg.raft_store.clone();
+        raft_store.optimize_for(false);
         raft_store
             .validate(
-                cfg.coprocessor.region_split_size,
-                cfg.coprocessor.enable_region_bucket,
+                cfg.coprocessor.region_split_size(),
+                cfg.coprocessor.enable_region_bucket(),
                 cfg.coprocessor.region_bucket_size,
             )
             .unwrap();
@@ -246,6 +254,7 @@ impl Simulator for NodeCluster {
             Arc::clone(&self.pd_client),
             Arc::default(),
             bg_worker.clone(),
+            None,
             None,
         );
 
@@ -260,10 +269,12 @@ impl Simulator for NodeCluster {
         {
             let tmp = test_util::temp_dir("test_cluster", cfg.prefer_mem);
             let snap_mgr = SnapManagerBuilder::default()
-                .max_write_bytes_per_sec(cfg.server.snap_max_write_bytes_per_sec.0 as i64)
+                .max_write_bytes_per_sec(cfg.server.snap_io_max_bytes_per_sec.0 as i64)
                 .max_total_size(cfg.server.snap_max_total_size.0)
                 .encryption_key_manager(key_manager)
                 .max_per_file_size(cfg.raft_store.max_snapshot_file_raw_size.0)
+                .enable_multi_snapshot_files(true)
+                .enable_receive_tablet_snapshot(cfg.raft_store.enable_v2_compatible_learner)
                 .build(tmp.path().to_str().unwrap());
             (snap_mgr, Some(tmp))
         } else {
@@ -290,7 +301,11 @@ impl Simulator for NodeCluster {
             Arc::new(SstImporter::new(&cfg.import, dir, None, cfg.storage.api_version()).unwrap())
         };
 
-        let local_reader = LocalReader::new(engines.kv.clone(), store_meta.clone(), router.clone());
+        let local_reader = LocalReader::new(
+            engines.kv.clone(),
+            StoreMetaDelegate::new(store_meta.clone(), engines.kv.clone()),
+            router.clone(),
+        );
         let cfg_controller = ConfigController::new(cfg.tikv.clone());
 
         let split_check_runner =
@@ -314,6 +329,8 @@ impl Simulator for NodeCluster {
             AutoSplitController::default(),
             cm,
             CollectorRegHandle::new_for_test(),
+            None,
+            Arc::new(AtomicU64::new(0)),
         )?;
         assert!(
             engines
@@ -333,10 +350,11 @@ impl Simulator for NodeCluster {
                 .map(|p| p.path().to_str().unwrap().to_owned())
         );
 
-        let region_split_size = cfg.coprocessor.region_split_size;
-        let enable_region_bucket = cfg.coprocessor.enable_region_bucket;
+        let region_split_size = cfg.coprocessor.region_split_size();
+        let enable_region_bucket = cfg.coprocessor.enable_region_bucket();
         let region_bucket_size = cfg.coprocessor.region_bucket_size;
         let mut raftstore_cfg = cfg.tikv.raft_store;
+        raftstore_cfg.optimize_for(false);
         raftstore_cfg
             .validate(region_split_size, enable_region_bucket, region_bucket_size)
             .unwrap();
@@ -433,7 +451,7 @@ impl Simulator for NodeCluster {
     }
 
     fn async_read(
-        &self,
+        &mut self,
         node_id: u64,
         batch_id: Option<ThreadReadId>,
         request: RaftCmdRequest,
@@ -491,12 +509,16 @@ impl Simulator for NodeCluster {
     }
 }
 
+// Compare to server cluster, node cluster does not have server layer and
+// storage layer.
 pub fn new_node_cluster(id: u64, count: usize) -> Cluster<NodeCluster> {
     let pd_client = Arc::new(TestPdClient::new(id, false));
     let sim = Arc::new(RwLock::new(NodeCluster::new(Arc::clone(&pd_client))));
     Cluster::new(id, count, sim, pd_client, ApiVersion::V1)
 }
 
+// This cluster does not support batch split, we expect it to transfer the
+// `BatchSplit` request to `split` request
 pub fn new_incompatible_node_cluster(id: u64, count: usize) -> Cluster<NodeCluster> {
     let pd_client = Arc::new(TestPdClient::new(id, true));
     let sim = Arc::new(RwLock::new(NodeCluster::new(Arc::clone(&pd_client))));

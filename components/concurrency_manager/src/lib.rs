@@ -58,8 +58,8 @@ impl ConcurrencyManager {
         }
     }
 
-    /// Acquires a mutex of the key and returns an RAII guard. When the guard goes
-    /// out of scope, the mutex will be unlocked.
+    /// Acquires a mutex of the key and returns an RAII guard. When the guard
+    /// goes out of scope, the mutex will be unlocked.
     ///
     /// The guard can be used to store Lock in the table. The stored lock
     /// is visible to `read_key_check` and `read_range_check`.
@@ -67,8 +67,8 @@ impl ConcurrencyManager {
         self.lock_table.lock_key(key).await
     }
 
-    /// Acquires mutexes of the keys and returns the RAII guards. The order of the
-    /// guards is the same with the given keys.
+    /// Acquires mutexes of the keys and returns the RAII guards. The order of
+    /// the guards is the same with the given keys.
     ///
     /// The guards can be used to store Lock in the table. The stored lock
     /// is visible to `read_key_check` and `read_range_check`.
@@ -124,6 +124,23 @@ impl ConcurrencyManager {
         });
         min_lock_ts
     }
+
+    pub fn global_min_lock(&self) -> Option<(TimeStamp, Key)> {
+        let mut min_lock: Option<(TimeStamp, Key)> = None;
+        // TODO: The iteration looks not so efficient. It's better to be optimized.
+        self.lock_table.for_each_kv(|key, handle| {
+            if let Some(curr_ts) = handle.with_lock(|lock| lock.as_ref().map(|l| l.ts)) {
+                if min_lock
+                    .as_ref()
+                    .map(|(ts, _)| ts > &curr_ts)
+                    .unwrap_or(true)
+                {
+                    min_lock = Some((curr_ts, key.clone()));
+                }
+            }
+        });
+        min_lock
+    }
 }
 
 #[cfg(test)]
@@ -137,7 +154,8 @@ mod tests {
         let concurrency_manager = ConcurrencyManager::new(1.into());
         let keys: Vec<_> = [b"c", b"a", b"b"]
             .iter()
-            .map(|k| Key::from_raw(*k))
+            .copied()
+            .map(|k| Key::from_raw(k))
             .collect();
         let guards = concurrency_manager.lock_keys(keys.iter()).await;
         for (key, guard) in keys.iter().zip(&guards) {
@@ -181,8 +199,9 @@ mod tests {
             vec![20, 40, 30],
             vec![30, 20, 40],
         ];
-        let keys: Vec<_> = vec![b"a", b"b", b"c"]
-            .into_iter()
+        let keys: Vec<_> = [b"a", b"b", b"c"]
+            .iter()
+            .copied()
             .map(|k| Key::from_raw(k))
             .collect();
 

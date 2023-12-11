@@ -15,6 +15,7 @@ use engine_traits::RaftEngineReadOnly;
 use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
 use test_raftstore::*;
+use test_raftstore_macro::test_case;
 use tikv_util::{config::*, time::Instant, HandyRwLock};
 
 #[test]
@@ -46,8 +47,8 @@ fn test_overlap_cleanup() {
     cluster.must_split(&region1, b"k2");
     // Wait till the snapshot of split region is applied, whose range is ["", "k2").
     must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
-    // Resume the fail point and pause it again. So only the paused snapshot is generated.
-    // And the paused snapshot's range is ["", ""), hence overlap.
+    // Resume the fail point and pause it again. So only the paused snapshot is
+    // generated. And the paused snapshot's range is ["", ""), hence overlap.
     fail::cfg(gen_snapshot_fp, "pause").unwrap();
     // Overlap snapshot should be deleted.
     assert_snapshot(&cluster.get_snap_dir(3), region_id, false);
@@ -62,7 +63,7 @@ fn test_overlap_cleanup() {
 #[test]
 fn test_server_snapshot_on_resolve_failure() {
     let mut cluster = new_server_cluster(1, 2);
-    configure_for_snapshot(&mut cluster);
+    configure_for_snapshot(&mut cluster.cfg);
 
     let on_send_store_fp = "transport_on_send_snapshot";
 
@@ -163,7 +164,7 @@ fn assert_snapshot(snap_dir: &str, region_id: u64, exist: bool) {
     let region_id = format!("{}", region_id);
     let timer = Instant::now();
     loop {
-        for p in fs::read_dir(&snap_dir).unwrap() {
+        for p in fs::read_dir(snap_dir).unwrap() {
             let name = p.unwrap().file_name().into_string().unwrap();
             let mut parts = name.split('_');
             parts.next();
@@ -186,15 +187,16 @@ fn assert_snapshot(snap_dir: &str, region_id: u64, exist: bool) {
     }
 }
 
-// A peer on store 3 is isolated and is applying snapshot. (add failpoint so it's always pending)
-// Then two conf change happens, this peer is removed and a new peer is added on store 3.
-// Then isolation clear, this peer will be destroyed because of a bigger peer id in msg.
-// In previous implementation, peer fsm can be destroyed synchronously because snapshot state is
-// pending and can be canceled, but panic may happen if the applyfsm runs very slow.
+// A peer on store 3 is isolated and is applying snapshot. (add failpoint so
+// it's always pending) Then two conf change happens, this peer is removed and a
+// new peer is added on store 3. Then isolation clear, this peer will be
+// destroyed because of a bigger peer id in msg. In previous implementation,
+// peer fsm can be destroyed synchronously because snapshot state is pending and
+// can be canceled, but panic may happen if the applyfsm runs very slow.
 #[test]
 fn test_destroy_peer_on_pending_snapshot() {
     let mut cluster = new_server_cluster(0, 3);
-    configure_for_snapshot(&mut cluster);
+    configure_for_snapshot(&mut cluster.cfg);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -252,14 +254,15 @@ fn test_destroy_peer_on_pending_snapshot() {
 }
 
 // The peer 3 in store 3 is isolated for a while and then recovered.
-// During its applying snapshot, however the peer is destroyed and thus applying snapshot is canceled.
-// And when it's destroyed (destroy is not finished either), the machine restarted.
-// After the restart, the snapshot should be applied successfully.println!
-// And new data should be written to store 3 successfully.
+// During its applying snapshot, however the peer is destroyed and thus applying
+// snapshot is canceled. And when it's destroyed (destroy is not finished
+// either), the machine restarted. After the restart, the snapshot should be
+// applied successfully.println! And new data should be written to store 3
+// successfully.
 #[test]
 fn test_destroy_peer_on_pending_snapshot_and_restart() {
     let mut cluster = new_server_cluster(0, 3);
-    configure_for_snapshot(&mut cluster);
+    configure_for_snapshot(&mut cluster.cfg);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -315,7 +318,8 @@ fn test_destroy_peer_on_pending_snapshot_and_restart() {
     must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
     // After peer 3 has applied snapshot, data should be got.
     must_get_equal(&cluster.get_engine(3), b"k119", b"v1");
-    // In the end the snapshot file should be gc-ed anyway, either by new peer or by store
+    // In the end the snapshot file should be gc-ed anyway, either by new peer or by
+    // store
     let now = Instant::now();
     loop {
         let mut snap_files = vec![];
@@ -351,12 +355,12 @@ fn test_shutdown_when_snap_gc() {
     pd_client.must_add_peer(r1, new_learner_peer(2, 2));
 
     // Snapshot directory on store 2 shouldn't be empty.
-    let snap_dir = cluster.get_snap_dir(2);
+    let snap_dir = &cluster.get_snap_dir(2);
     for i in 0..=100 {
         if i == 100 {
             panic!("store 2 snap dir must not be empty");
         }
-        let dir = fs::read_dir(&snap_dir).unwrap();
+        let dir = fs::read_dir(snap_dir).unwrap();
         if dir.count() > 0 {
             break;
         }
@@ -374,17 +378,18 @@ fn test_shutdown_when_snap_gc() {
     cluster.stop_node(2);
 
     let snap_dir = cluster.get_snap_dir(2);
-    let dir = fs::read_dir(&snap_dir).unwrap();
+    let dir = fs::read_dir(snap_dir).unwrap();
     if dir.count() == 0 {
         panic!("store 2 snap dir must not be empty");
     }
 }
 
 // Test if a peer handle the old snapshot properly.
-#[test]
+#[test_case(test_raftstore::new_node_cluster)]
+#[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_receive_old_snapshot() {
-    let mut cluster = new_node_cluster(0, 3);
-    configure_for_snapshot(&mut cluster);
+    let mut cluster = new_cluster(0, 3);
+    configure_for_snapshot(&mut cluster.cfg);
     cluster.cfg.raft_store.right_derive_when_split = true;
 
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -417,7 +422,7 @@ fn test_receive_old_snapshot() {
             .msg_type(MessageType::MsgSnapshot)
             .reserve_dropped(Arc::clone(&dropped_msgs)),
     );
-    cluster.sim.wl().add_recv_filter(2, recv_filter);
+    cluster.add_recv_filter_on_node(2, recv_filter);
     cluster.clear_send_filters();
 
     for _ in 0..20 {
@@ -437,17 +442,18 @@ fn test_receive_old_snapshot() {
         std::mem::take(guard.as_mut())
     };
 
-    cluster.sim.wl().clear_recv_filters(2);
+    cluster.clear_recv_filter_on_node(2);
 
     for i in 20..40 {
         cluster.must_put(format!("k{}", i).as_bytes(), b"v1");
     }
     must_get_equal(&cluster.get_engine(2), b"k39", b"v1");
 
-    let router = cluster.sim.wl().get_router(2).unwrap();
+    let router = cluster.get_router(2).unwrap();
     // Send the old snapshot
     for raft_msg in msgs {
-        router.send_raft_message(raft_msg).unwrap();
+        #[allow(clippy::useless_conversion)]
+        router.send_raft_message(raft_msg.into()).unwrap();
     }
 
     cluster.must_put(b"k40", b"v1");
@@ -464,8 +470,9 @@ fn test_receive_old_snapshot() {
     pd_client.must_add_peer(left.get_id(), new_peer(2, 4));
 
     cluster.must_put(b"k11", b"v1");
-    // If peer 2 handles previous old snapshot properly and does not leave over metadata
-    // in `pending_snapshot_regions`, peer 4 should be created normally.
+    // If peer 2 handles previous old snapshot properly and does not leave over
+    // metadata in `pending_snapshot_regions`, peer 4 should be created
+    // normally.
     must_get_equal(&cluster.get_engine(2), b"k11", b"v1");
 
     fail::remove(peer_2_handle_snap_mgr_gc_fp);
@@ -478,7 +485,7 @@ fn test_receive_old_snapshot() {
 #[test]
 fn test_gen_snapshot_with_no_committed_entries_ready() {
     let mut cluster = new_node_cluster(0, 3);
-    configure_for_snapshot(&mut cluster);
+    configure_for_snapshot(&mut cluster.cfg);
 
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -509,7 +516,8 @@ fn test_gen_snapshot_with_no_committed_entries_ready() {
 // 1. pause snapshot generating with a failpoint, and then add a new peer;
 // 2. append more Raft logs to the region to trigger raft log compactions;
 // 3. disable the failpoint to continue snapshot generating;
-// 4. the generated snapshot should have a larger index than the latest `truncated_idx`.
+// 4. the generated snapshot should have a larger index than the latest
+// `truncated_idx`.
 #[test]
 fn test_cancel_snapshot_generating() {
     let mut cluster = new_node_cluster(0, 5);
@@ -566,7 +574,7 @@ fn test_cancel_snapshot_generating() {
 #[test]
 fn test_snapshot_gc_after_failed() {
     let mut cluster = new_server_cluster(0, 3);
-    configure_for_snapshot(&mut cluster);
+    configure_for_snapshot(&mut cluster.cfg);
     cluster.cfg.raft_store.snap_gc_timeout = ReadableDuration::millis(300);
 
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -586,7 +594,7 @@ fn test_snapshot_gc_after_failed() {
             let mut snap_file_path = PathBuf::from(&snap_dir);
             snap_file_path.push(&f);
             let snap_file_path = snap_file_path.as_path();
-            let mut file = match File::create(&snap_file_path) {
+            let mut file = match File::create(snap_file_path) {
                 Err(why) => panic!("couldn't create {:?}: {}", snap_file_path, why),
                 Ok(file) => file,
             };
@@ -633,33 +641,31 @@ fn test_snapshot_gc_after_failed() {
     cluster.sim.wl().clear_recv_filters(3);
 }
 
-#[test]
+#[test_case(test_raftstore::new_server_cluster)]
+#[test_case(test_raftstore_v2::new_server_cluster)]
 fn test_sending_fail_with_net_error() {
-    let mut cluster = new_server_cluster(1, 2);
-    configure_for_snapshot(&mut cluster);
+    let mut cluster = new_cluster(1, 2);
+    configure_for_snapshot(&mut cluster.cfg);
     cluster.cfg.raft_store.snap_gc_timeout = ReadableDuration::millis(300);
 
-    let pd_client = Arc::clone(&cluster.pd_client);
-    // Disable default max peer count check.
+    let pd_client = cluster.pd_client.clone();
+    // Disable default max peer number check.
     pd_client.disable_default_operator();
     let r1 = cluster.run_conf_change();
     cluster.must_put(b"k1", b"v1");
     let (send_tx, send_rx) = mpsc::sync_channel(1);
     // only send one MessageType::MsgSnapshot message
-    cluster.sim.wl().add_send_filter(
-        1,
-        Box::new(
-            RegionPacketFilter::new(r1, 1)
-                .allow(1)
-                .direction(Direction::Send)
-                .msg_type(MessageType::MsgSnapshot)
-                .set_msg_callback(Arc::new(move |m: &RaftMessage| {
-                    if m.get_message().get_msg_type() == MessageType::MsgSnapshot {
-                        let _ = send_tx.send(());
-                    }
-                })),
-        ),
-    );
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(r1, 1)
+            .allow(1)
+            .direction(Direction::Send)
+            .msg_type(MessageType::MsgSnapshot)
+            .set_msg_callback(Arc::new(move |m: &RaftMessage| {
+                if m.get_message().get_msg_type() == MessageType::MsgSnapshot {
+                    let _ = send_tx.send(());
+                }
+            })),
+    ));
 
     // peer2 will interrupt in receiving snapshot
     fail::cfg("receiving_snapshot_net_error", "return()").unwrap();
@@ -670,15 +676,17 @@ fn test_sending_fail_with_net_error() {
     // need to wait receiver handle the snapshot request
     sleep_ms(100);
 
-    // peer2 will not become learner so ti will has k1 key and receiving count will zero
+    // peer2 can't receive any snapshot, so it doesn't have any key valuse.
+    // but the receiving_count should be zero if receiving snapshot is failed.
     let engine2 = cluster.get_engine(2);
     must_get_none(&engine2, b"k1");
     assert_eq!(cluster.get_snap_mgr(2).stats().receiving_count, 0);
 }
 
 /// Logs scan are now moved to raftlog gc threads. The case is to test if logs
-/// are still cleaned up when there is stale logs before first index during applying
-/// snapshot. It's expected to schedule a gc task after applying snapshot.
+/// are still cleaned up when there is stale logs before first index during
+/// applying snapshot. It's expected to schedule a gc task after applying
+/// snapshot.
 #[test]
 fn test_snapshot_clean_up_logs_with_unfinished_log_gc() {
     let mut cluster = new_node_cluster(0, 3);
@@ -691,9 +699,9 @@ fn test_snapshot_clean_up_logs_with_unfinished_log_gc() {
     // Disable default max peer number check.
     pd_client.disable_default_operator();
     cluster.run();
-    // Simulate raft log gc are pending in queue.
+    // Simulate raft log gc tasks are lost during shutdown.
     let fp = "worker_gc_raft_log";
-    fail::cfg(fp, "return(0)").unwrap();
+    fail::cfg(fp, "return").unwrap();
 
     let state = cluster.truncated_state(1, 3);
     for i in 0..30 {
@@ -730,11 +738,12 @@ fn test_snapshot_clean_up_logs_with_unfinished_log_gc() {
     assert!(dest[0].get_index() > truncated_index, "{:?}", dest);
 }
 
-/// Redo snapshot apply after restart when kvdb state is updated but raftdb state is not.
+/// Redo snapshot apply after restart when kvdb state is updated but raftdb
+/// state is not.
 #[test]
 fn test_snapshot_recover_from_raft_write_failure() {
     let mut cluster = new_server_cluster(0, 3);
-    configure_for_snapshot(&mut cluster);
+    configure_for_snapshot(&mut cluster.cfg);
     // Avoid triggering snapshot at final step.
     cluster.cfg.raft_store.raft_log_gc_count_limit = Some(10);
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -792,7 +801,7 @@ fn test_snapshot_recover_from_raft_write_failure() {
 #[test]
 fn test_snapshot_recover_from_raft_write_failure_with_uncommitted_log() {
     let mut cluster = new_server_cluster(0, 3);
-    configure_for_snapshot(&mut cluster);
+    configure_for_snapshot(&mut cluster.cfg);
     // Avoid triggering snapshot at final step.
     cluster.cfg.raft_store.raft_log_gc_count_limit = Some(10);
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -888,4 +897,54 @@ fn test_snapshot_recover_from_raft_write_failure_with_uncommitted_log() {
     for i in 20..25 {
         cluster.must_put(format!("k1{}", i).as_bytes(), b"v1");
     }
+}
+
+#[test]
+fn test_snapshot_complete_recover_raft_tick() {
+    // https://github.com/tikv/tikv/issues/14548 gives the description of what the following tests.
+    let mut cluster = test_raftstore_v2::new_node_cluster(0, 3);
+    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(50);
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(10);
+
+    cluster.run();
+
+    let region = cluster.get_region(b"k");
+    cluster.must_transfer_leader(region.get_id(), new_peer(1, 1));
+    for i in 0..200 {
+        let k = format!("k{:04}", i);
+        cluster.must_put(k.as_bytes(), b"val");
+    }
+
+    cluster.stop_node(2);
+    for i in 200..300 {
+        let k = format!("k{:04}", i);
+        cluster.must_put(k.as_bytes(), b"val");
+    }
+
+    fail::cfg("APPLY_COMMITTED_ENTRIES", "pause").unwrap();
+    fail::cfg("RESET_APPLY_INDEX_WHEN_RESTART", "return").unwrap();
+    cluster.run_node(2).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    fail::remove("APPLY_COMMITTED_ENTRIES");
+    cluster.stop_node(1);
+
+    cluster.must_put(b"k0500", b"val");
+    assert_eq!(cluster.must_get(b"k0500").unwrap(), b"val".to_vec());
+}
+
+#[test]
+/// Test a corrupted snapshot can be detected and retry to generate a new one.
+fn test_retry_corrupted_snapshot() {
+    let mut cluster = new_node_cluster(0, 3);
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    let r = cluster.run_conf_change();
+    cluster.must_put(b"k1", b"v1");
+    must_get_none(&cluster.get_engine(3), b"k1");
+    pd_client.must_add_peer(r, new_peer(2, 2));
+    fail::cfg("inject_sst_file_corruption", "return").unwrap();
+    pd_client.must_add_peer(r, new_peer(3, 3));
+
+    must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
 }

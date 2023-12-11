@@ -1,13 +1,13 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{borrow::ToOwned, lazy::SyncLazy, str, string::ToString, u64};
+use std::{borrow::ToOwned, str, string::ToString, sync::LazyLock, u64};
 
 use clap::{crate_authors, AppSettings};
 use engine_traits::CF_DEFAULT;
 use structopt::StructOpt;
 
 const RAW_KEY_HINT: &str = "Raw key (generally starts with \"z\") in escaped form";
-static VERSION_INFO: SyncLazy<String> = SyncLazy::new(|| {
+static VERSION_INFO: LazyLock<String> = LazyLock::new(|| {
     let build_timestamp = option_env!("TIKV_BUILD_TIME");
     tikv::tikv_version_info(build_timestamp)
 });
@@ -373,7 +373,8 @@ pub enum Cmd {
         /// Skip write RocksDB
         read_only: bool,
     },
-    /// Unsafely recover when the store can not start normally, this recover may lose data
+    /// Unsafely recover when the store can not start normally, this recover may
+    /// lose data
     UnsafeRecover {
         #[structopt(subcommand)]
         cmd: UnsafeRecoverCmd,
@@ -404,7 +405,9 @@ pub enum Cmd {
             default_value = crate::executor::METRICS_PROMETHEUS,
             possible_values = &["prometheus", "jemalloc", "rocksdb_raft", "rocksdb_kv"],
         )]
-        /// Set the metrics tag, one of prometheus/jemalloc/rocksdb_raft/rocksdb_kv, if not specified, print prometheus
+        /// Set the metrics tag
+        /// Options: prometheus/jemalloc/rocksdb_raft/rocksdb_kv
+        /// If not specified, print prometheus
         tag: Vec<String>,
     },
     /// Force a consistency-check for a specified region
@@ -415,10 +418,13 @@ pub enum Cmd {
     },
     /// Get all regions with corrupt raft
     BadRegions {},
-    /// Modify tikv config, eg. tikv-ctl --host ip:port modify-tikv-config -n rocksdb.defaultcf.disable-auto-compactions -v true
+    /// Modify tikv config.
+    /// Eg. tikv-ctl --host ip:port modify-tikv-config -n
+    /// rocksdb.defaultcf.disable-auto-compactions -v true
     ModifyTikvConfig {
         #[structopt(short = "n")]
-        /// The config name are same as the name used on config file, eg. raftstore.messages-per-tick, raftdb.max-background-jobs
+        /// The config name are same as the name used on config file.
+        /// eg. raftstore.messages-per-tick, raftdb.max-background-jobs
         config_name: String,
 
         #[structopt(short = "v")]
@@ -431,7 +437,8 @@ pub enum Cmd {
         /// Output meta file path
         file: String,
     },
-    /// Compact the whole cluster in a specified range in one or more column families
+    /// Compact the whole cluster in a specified range in one or more column
+    /// families
     CompactCluster {
         #[structopt(
             short = "d",
@@ -449,7 +456,8 @@ pub enum Cmd {
             default_value = CF_DEFAULT,
             possible_values = &["default", "lock", "write"],
         )]
-        /// Column family names, for kv db, combine from default/lock/write; for raft db, can only be default
+        /// Column family names, for kv db, combine from default/lock/write; for
+        /// raft db, can only be default
         cf: Vec<String>,
 
         #[structopt(
@@ -529,20 +537,52 @@ pub enum Cmd {
         #[structopt(subcommand)]
         cmd: EncryptionMetaCmd,
     },
-    /// Delete encryption keys that are no longer associated with physical files.
+    /// Delete encryption keys that are no longer associated with physical
+    /// files.
     CleanupEncryptionMeta {},
     /// Print bad ssts related infos
     BadSsts {
         #[structopt(long)]
-        /// specify manifest, if not set, it will look up manifest file in db path
+        /// specify manifest, if not set, it will look up manifest file in db
+        /// path
         manifest: Option<String>,
 
         #[structopt(long, value_delimiter = ",")]
         /// PD endpoints
         pd: String,
     },
+    /// Reset data in a TiKV to a certain version
+    ResetToVersion {
+        #[structopt(short = "v")]
+        /// The version to reset TiKV to
+        version: u64,
+    },
+    /// Control for Raft Engine
+    /// Usage: tikv-ctl raft-engine-ctl -- --help
+    RaftEngineCtl {
+        #[structopt(last = true)]
+        args: Vec<String>,
+    },
     #[structopt(external_subcommand)]
     External(Vec<String>),
+    /// Get the state of a region's RegionReadProgress.
+    GetRegionReadProgress {
+        #[structopt(short = "r", long)]
+        /// The target region id
+        region: u64,
+
+        #[structopt(long)]
+        /// When specified, prints the locks associated with the transaction
+        /// that has the smallest 'start_ts' in the resolver, which is
+        /// preventing the 'resolved_ts' from advancing.
+        log: bool,
+
+        #[structopt(long, requires = "log")]
+        /// The smallest start_ts of the target transaction. Namely, only the
+        /// transaction whose start_ts is greater than or equal to this value
+        /// can be recorded in TiKV logs.
+        min_start_ts: Option<u64>,
+    },
 }
 
 #[derive(StructOpt)]
@@ -572,7 +612,6 @@ pub enum RaftCmd {
         #[structopt(
             short = "r",
             aliases = &["region"],
-            required_unless = "all-regions",
             conflicts_with = "all-regions",
             use_delimiter = true,
             require_delimiter = true,
@@ -584,9 +623,21 @@ pub enum RaftCmd {
         // `regions` must be None when `all_regions` is present,
         // so we left `all_regions` unused.
         #[allow(dead_code)]
-        #[structopt(long, required_unless = "regions", conflicts_with = "regions")]
+        #[structopt(long, conflicts_with = "regions")]
         /// Print info for all regions
         all_regions: bool,
+
+        #[structopt(long, default_value = "")]
+        /// hex start key
+        start: String,
+
+        #[structopt(long, default_value = "")]
+        /// hex end key
+        end: String,
+
+        #[structopt(long, default_value = "16")]
+        /// Limit the number of keys to scan
+        limit: usize,
 
         #[structopt(long)]
         /// Skip tombstone regions
@@ -598,7 +649,8 @@ pub enum RaftCmd {
 pub enum FailCmd {
     /// Inject failures
     Inject {
-        /// Inject fail point and actions pairs. E.g. tikv-ctl fail inject a=off b=panic
+        /// Inject fail point and actions pairs.
+        /// E.g. tikv-ctl fail inject a=off b=panic
         args: Vec<String>,
 
         #[structopt(short = "f")]

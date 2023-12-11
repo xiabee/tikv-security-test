@@ -33,9 +33,11 @@ fn assert_same_file_name(s1: String, s2: String) {
 
 fn assert_same_files(mut files1: Vec<kvproto::brpb::File>, mut files2: Vec<kvproto::brpb::File>) {
     assert_eq!(files1.len(), files2.len());
-    // Sort here by start key in case of unordered response (by pipelined write + scan)
-    // `sort_by_key` couldn't be used here -- rustc would complain that `file.start_key.as_slice()`
-    //       may not live long enough. (Is that a bug of rustc?)
+    // Sort here by start key in case of unordered response (by pipelined write +
+    // scan).
+    // `sort_by_key` couldn't be used here -- rustc would complain that
+    // `file.start_key.as_slice()` may not live long enough. (Is that a
+    // bug of rustc?)
     files1.sort_by(|f1, f2| f1.start_key.cmp(&f2.start_key));
     files2.sort_by(|f1, f2| f1.start_key.cmp(&f2.start_key));
 
@@ -52,6 +54,11 @@ fn assert_same_files(mut files1: Vec<kvproto::brpb::File>, mut files2: Vec<kvpro
         assert_ne!(f1.cipher_iv, f2.cipher_iv);
         f1.cipher_iv = "".to_string().into_bytes();
         f2.cipher_iv = "".to_string().into_bytes();
+        // After RocksDB 6.12, each SST file writer writes its own session id to the
+        // generated file. The SHA will not never be the same.
+        // Detail: https://github.com/facebook/rocksdb/pull/6983
+        f1.sha256.clear();
+        f2.sha256.clear();
         assert_eq!(f1, f2);
     }
 }
@@ -465,7 +472,8 @@ fn test_backup_raw_meta_impl(cur_api_version: ApiVersion, dst_api_version: ApiVe
     assert_eq!(total_kvs, admin_total_kvs);
     assert_eq!(total_bytes, admin_total_bytes);
     assert_eq!(checksum, admin_checksum);
-    // assert_eq!(total_size, 1619); // the number changed when kv size change, should not be an test points.
+    // assert_eq!(total_size, 1619);
+    // the number changed when kv size change, should not be an test points.
     // please update this number (must be > 0) when the test failed
 
     suite.stop();
@@ -491,7 +499,7 @@ fn test_invalid_external_storage() {
 
     // Set backup directory read-only. TiKV fails to backup.
     let tmp = Builder::new().tempdir().unwrap();
-    let f = File::open(&tmp.path()).unwrap();
+    let f = File::open(tmp.path()).unwrap();
     let mut perms = f.metadata().unwrap().permissions();
     perms.set_readonly(true);
     f.set_permissions(perms.clone()).unwrap();
@@ -589,4 +597,34 @@ fn calculated_commit_ts_after_commit() {
         assert!(!commit_ts.is_zero());
         commit_ts
     });
+}
+
+#[test]
+fn test_backup_in_flashback() {
+    let mut suite = TestSuite::new(3, 144 * 1024 * 1024, ApiVersion::V1);
+    suite.must_kv_put(3, 1);
+    // Prepare the flashback.
+    let region = suite.cluster.get_region(b"key_0");
+    suite.cluster.must_send_wait_flashback_msg(
+        region.get_id(),
+        kvproto::raft_cmdpb::AdminCmdType::PrepareFlashback,
+    );
+    // Start the backup.
+    let tmp = Builder::new().tempdir().unwrap();
+    let backup_ts = suite.alloc_ts();
+    let storage_path = make_unique_dir(tmp.path());
+    let rx = suite.backup(
+        vec![],   // start
+        vec![],   // end
+        0.into(), // begin_ts
+        backup_ts,
+        &storage_path,
+    );
+    let resp = block_on(rx.collect::<Vec<_>>());
+    assert!(!resp[0].has_error());
+    // Finish the flashback.
+    suite.cluster.must_send_wait_flashback_msg(
+        region.get_id(),
+        kvproto::raft_cmdpb::AdminCmdType::FinishFlashback,
+    );
 }

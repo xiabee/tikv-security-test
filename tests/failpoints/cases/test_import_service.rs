@@ -19,6 +19,7 @@ use tikv_util::HandyRwLock;
 mod util;
 use self::util::{
     check_ingested_kvs, new_cluster_and_tikv_import_client, new_cluster_and_tikv_import_client_tde,
+    open_cluster_and_tikv_import_client_v2, send_upload_sst,
 };
 
 // Opening sst writer involves IO operation, it may block threads for a while.
@@ -128,8 +129,8 @@ fn test_ingest_reentrant() {
 
     let checksum2 = calc_crc32(save_path).unwrap();
     // TODO: Remove this once write_global_seqno is deprecated.
-    // Checksums are the same since the global seqno in the SST file no longer gets updated with the
-    // default setting, which is write_global_seqno=false.
+    // Checksums are the same since the global seqno in the SST file no longer gets
+    // updated with the default setting, which is write_global_seqno=false.
     assert_eq!(checksum1, checksum2);
     // Do ingest again and it can be reentrant
     let resp = import.ingest(&ingest).unwrap();
@@ -155,12 +156,13 @@ fn test_ingest_key_manager_delete_file_failed() {
 
     let deregister_fp = "key_manager_fails_before_delete_file";
     // the first delete is in check before ingest, the second is in ingest cleanup
-    // set the ingest clean up failed to trigger remove file but not remove key condition
+    // set the ingest clean up failed to trigger remove file but not remove key
+    // condition
     fail::cfg(deregister_fp, "1*off->1*return->off").unwrap();
 
-    // Do an ingest and verify the result is correct. Though the ingest succeeded, the clone file is
-    // still in the key manager
-    //TODO: how to check the key manager contains the clone key
+    // Do an ingest and verify the result is correct. Though the ingest succeeded,
+    // the clone file is still in the key manager
+    // TODO: how to check the key manager contains the clone key
     let mut ingest = IngestRequest::default();
     ingest.set_context(ctx.clone());
     ingest.set_sst(meta.clone());
@@ -178,7 +180,8 @@ fn test_ingest_key_manager_delete_file_failed() {
         .get(&node_id)
         .unwrap()
         .get_path(&meta);
-    // wait up to 5 seconds to make sure raw uploaded file is deleted by the async clean up task.
+    // wait up to 5 seconds to make sure raw uploaded file is deleted by the async
+    // clean up task.
     for _ in 0..50 {
         if !save_path.as_path().exists() {
             break;
@@ -187,7 +190,8 @@ fn test_ingest_key_manager_delete_file_failed() {
     }
     assert!(!save_path.as_path().exists());
 
-    // Do upload and ingest again, though key manager contains this file, the ingest action should success.
+    // Do upload and ingest again, though key manager contains this file, the ingest
+    // action should success.
     upload_sst(&import, &meta, &data).unwrap();
     let mut ingest = IngestRequest::default();
     ingest.set_context(ctx);
@@ -244,4 +248,48 @@ fn test_ingest_file_twice_and_conflict() {
         "The file which would be ingested doest not exist.",
         resp.get_error().get_message()
     );
+}
+
+#[test]
+fn test_ingest_sst_v2() {
+    let mut cluster = test_raftstore_v2::new_server_cluster(1, 1);
+    let (ctx, _tikv, import) = open_cluster_and_tikv_import_client_v2(None, &mut cluster);
+    let temp_dir = Builder::new().prefix("test_ingest_sst").tempdir().unwrap();
+    let sst_path = temp_dir.path().join("test.sst");
+    let sst_range = (0, 100);
+    let (mut meta, data) = gen_sst_file(sst_path, sst_range);
+
+    // No region id and epoch.
+    send_upload_sst(&import, &meta, &data).unwrap();
+    let mut ingest = IngestRequest::default();
+    ingest.set_context(ctx.clone());
+    ingest.set_sst(meta.clone());
+    meta.set_region_id(ctx.get_region_id());
+    meta.set_region_epoch(ctx.get_region_epoch().clone());
+    send_upload_sst(&import, &meta, &data).unwrap();
+    ingest.set_sst(meta);
+    let resp = import.ingest(&ingest).unwrap();
+    assert!(!resp.has_error(), "{:?}", resp.get_error());
+    fail::cfg("on_cleanup_import_sst", "return").unwrap();
+    let (tx, rx) = channel::<()>();
+    let tx = Arc::new(Mutex::new(tx));
+    fail::cfg_callback("on_cleanup_import_sst_schedule", move || {
+        tx.lock().unwrap().send(()).unwrap();
+    })
+    .unwrap();
+
+    rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    let mut count = 0;
+    for path in &cluster.paths {
+        let sst_dir = path.path().join("import-sst");
+        for entry in std::fs::read_dir(sst_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                count += 1;
+            }
+        }
+    }
+    fail::remove("on_cleanup_import_sst");
+    fail::remove("on_cleanup_import_sst_schedule");
+    assert_ne!(0, count);
 }

@@ -2,11 +2,17 @@
 
 #[path = "../mod.rs"]
 mod testsuite;
+use std::{
+    sync::{mpsc::channel, Mutex},
+    time::Duration,
+};
+
 use futures::executor::block_on;
 use kvproto::kvrpcpb::*;
 use pd_client::PdClient;
 use test_raftstore::{new_peer, sleep_ms};
 pub use testsuite::*;
+use tikv_util::config::ReadableDuration;
 use txn_types::TimeStamp;
 
 #[test]
@@ -57,6 +63,16 @@ fn test_report_min_resolved_ts() {
     fail::cfg("mock_collect_tick_interval", "return(0)").unwrap();
     fail::cfg("mock_min_resolved_ts_interval", "return(0)").unwrap();
     let mut suite = TestSuite::new(1);
+    // default config is 1s
+    assert_eq!(
+        suite
+            .cluster
+            .cfg
+            .tikv
+            .raft_store
+            .report_min_resolved_ts_interval,
+        ReadableDuration::secs(1)
+    );
     let region = suite.cluster.get_region(&[]);
     let ts1 = suite.cluster.pd_client.get_min_resolved_ts();
 
@@ -89,6 +105,7 @@ fn test_report_min_resolved_ts() {
 fn test_report_min_resolved_ts_disable() {
     fail::cfg("mock_tick_interval", "return(0)").unwrap();
     fail::cfg("mock_collect_tick_interval", "return(0)").unwrap();
+    fail::cfg("mock_min_resolved_ts_interval_disable", "return(0)").unwrap();
     let mut suite = TestSuite::new(1);
     let region = suite.cluster.get_region(&[]);
     let ts1 = suite.cluster.pd_client.get_min_resolved_ts();
@@ -113,5 +130,46 @@ fn test_report_min_resolved_ts_disable() {
     assert!(ts3 == ts1);
     fail::remove("mock_tick_interval");
     fail::remove("mock_collect_tick_interval");
+    fail::remove("mock_min_resolved_ts_interval_disable");
+    suite.stop();
+}
+
+#[test]
+fn test_pending_locks_memory_quota_exceeded() {
+    // Pause scan lock so that locks will be put in pending locks.
+    fail::cfg("resolved_ts_after_scanner_get_snapshot", "pause").unwrap();
+    // Check if memory quota exceeded is triggered.
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    fail::cfg_callback(
+        "resolved_ts_on_pending_locks_memory_quota_exceeded",
+        move || {
+            let sender = tx.lock().unwrap();
+            sender.send(()).unwrap();
+        },
+    )
+    .unwrap();
+
+    let mut suite = TestSuite::new(1);
+    let region = suite.cluster.get_region(&[]);
+
+    // Must not trigger memory quota exceeded.
+    rx.recv_timeout(Duration::from_millis(100)).unwrap_err();
+
+    // Set a small memory quota to trigger memory quota exceeded.
+    suite.must_change_memory_quota(1, 1);
+    let (k, v) = (b"k1", b"v");
+    let start_ts = block_on(suite.cluster.pd_client.get_tso()).unwrap();
+    let mut mutation = Mutation::default();
+    mutation.set_op(Op::Put);
+    mutation.key = k.to_vec();
+    mutation.value = v.to_vec();
+    suite.must_kv_prewrite(region.id, vec![mutation], k.to_vec(), start_ts, false);
+
+    // Must trigger memory quota exceeded.
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    fail::remove("resolved_ts_after_scanner_get_snapshot");
+    fail::remove("resolved_ts_on_pending_locks_memory_quota_exceeded");
     suite.stop();
 }

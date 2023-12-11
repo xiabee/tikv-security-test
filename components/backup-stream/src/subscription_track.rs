@@ -1,27 +1,65 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc};
 
-use dashmap::{mapref::one::RefMut, DashMap};
+use dashmap::{
+    mapref::{entry::Entry, one::RefMut as DashRefMut},
+    DashMap,
+};
 use kvproto::metapb::Region;
 use raftstore::coprocessor::*;
-use resolved_ts::Resolver;
-use tikv_util::{info, warn};
+use resolved_ts::{Resolver, TsSource, TxnLocks};
+use tikv_util::{info, memory::MemoryQuota, warn};
 use txn_types::TimeStamp;
 
 use crate::{debug, metrics::TRACK_REGION, utils};
 
 /// A utility to tracing the regions being subscripted.
 #[derive(Clone, Default, Debug)]
-pub struct SubscriptionTracer(Arc<DashMap<u64, RegionSubscription>>);
+pub struct SubscriptionTracer(Arc<DashMap<u64, SubscribeState>>);
 
-pub struct RegionSubscription {
-    pub meta: Region,
-    pub(crate) handle: ObserveHandle,
-    resolver: TwoPhaseResolver,
+/// The state of the subscription state machine:
+/// Initial state is `ABSENT`, the subscription isn't in the tracer.
+/// Once it becomes the leader, it would be in `PENDING` state, where we would
+/// prepare the information needed for doing initial scanning.
+/// When we are able to start execute initial scanning, it would be in `RUNNING`
+/// state, where it starts to handle events.
+/// You may notice there are also some state transforms in the
+/// [`TwoPhaseResolver`] struct, states there are sub-states of the `RUNNING`
+/// stage here.
+enum SubscribeState {
+    // NOTE: shall we add `SubscriptionHandle` here?
+    // (So we can check this when calling `remove_if`.)
+    Pending(Region),
+    Running(ActiveSubscription),
 }
 
-impl std::fmt::Debug for RegionSubscription {
+impl SubscribeState {
+    /// check whether the current state is pending.
+    fn is_pending(&self) -> bool {
+        matches!(self, SubscribeState::Pending(_))
+    }
+}
+
+impl std::fmt::Debug for SubscribeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending(arg0) => f
+                .debug_tuple("Pending")
+                .field(&utils::debug_region(arg0))
+                .finish(),
+            Self::Running(arg0) => f.debug_tuple("Running").field(arg0).finish(),
+        }
+    }
+}
+
+pub struct ActiveSubscription {
+    pub meta: Region,
+    pub(crate) handle: ObserveHandle,
+    pub(crate) resolver: TwoPhaseResolver,
+}
+
+impl std::fmt::Debug for ActiveSubscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("RegionSubscription")
             .field(&self.meta.get_id())
@@ -30,7 +68,7 @@ impl std::fmt::Debug for RegionSubscription {
     }
 }
 
-impl RegionSubscription {
+impl ActiveSubscription {
     pub fn new(region: Region, handle: ObserveHandle, start_ts: Option<TimeStamp>) -> Self {
         let resolver = TwoPhaseResolver::new(region.get_id(), start_ts);
         Self {
@@ -40,10 +78,11 @@ impl RegionSubscription {
         }
     }
 
-    pub fn stop_observing(&self) {
-        self.handle.stop_observing()
+    pub fn stop(&mut self) {
+        self.handle.stop_observing();
     }
 
+    #[cfg(test)]
     pub fn is_observing(&self) -> bool {
         self.handle.is_observing()
     }
@@ -57,101 +96,199 @@ impl RegionSubscription {
     }
 }
 
-impl SubscriptionTracer {
-    /// get the current safe point: data before this ts have already be flushed and be able to be GCed.
-    pub fn safepoint(&self) -> TimeStamp {
-        // use the current resolved_ts is safe because it is only advanced when flushing.
-        self.0
-            .iter()
-            .map(|r| r.resolver.resolved_ts())
-            .min()
-            // NOTE: Maybe use the current timestamp?
-            .unwrap_or(TimeStamp::zero())
-    }
+#[derive(PartialEq, Eq)]
+pub enum CheckpointType {
+    MinTs,
+    StartTsOfInitialScan,
+    StartTsOfTxn(Option<(TimeStamp, TxnLocks)>),
+}
 
+impl std::fmt::Debug for CheckpointType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MinTs => write!(f, "MinTs"),
+            Self::StartTsOfInitialScan => write!(f, "StartTsOfInitialScan"),
+            Self::StartTsOfTxn(arg0) => f
+                .debug_tuple("StartTsOfTxn")
+                .field(&format_args!("{:?}", arg0))
+                .finish(),
+        }
+    }
+}
+
+pub struct ResolveResult {
+    pub region: Region,
+    pub checkpoint: TimeStamp,
+    pub checkpoint_type: CheckpointType,
+}
+
+impl std::fmt::Debug for ResolveResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolveResult")
+            .field("region", &self.region.get_id())
+            .field("checkpoint", &self.checkpoint)
+            .field("checkpoint_type", &self.checkpoint_type)
+            .finish()
+    }
+}
+
+impl ResolveResult {
+    fn resolve(sub: &mut ActiveSubscription, min_ts: TimeStamp) -> Self {
+        let ts = sub.resolver.resolve(min_ts);
+        let ty = if ts == min_ts {
+            CheckpointType::MinTs
+        } else if sub.resolver.in_phase_one() {
+            CheckpointType::StartTsOfInitialScan
+        } else {
+            CheckpointType::StartTsOfTxn(sub.resolver.sample_far_lock())
+        };
+        Self {
+            region: sub.meta.clone(),
+            checkpoint: ts,
+            checkpoint_type: ty,
+        }
+    }
+}
+
+impl SubscriptionTracer {
     /// clear the current `SubscriptionTracer`.
     pub fn clear(&self) {
         self.0.retain(|_, v| {
-            v.stop_observing();
-            TRACK_REGION.with_label_values(&["dec"]).inc();
+            if let SubscribeState::Running(s) = v {
+                s.stop();
+                TRACK_REGION.dec();
+            }
             false
         });
     }
 
+    /// Add a pending region into the tracker.
+    /// A `PENDING` region is a region we are going to start subscribe however
+    /// there are still tiny impure things need to do. (e.g. getting the
+    /// checkpoint of this region.)
+    ///
+    /// This state is a placeholder for those regions: once they failed in the
+    /// impure operations, this would be the evidence proofing they were here.
+    ///
+    /// So we can do better when we are doing refreshing, say:
+    /// ```no_run
+    /// match task {
+    ///     Task::RefreshObserve(r) if is_pending(r) => { /* Execute the refresh. */ }
+    ///     Task::RefreshObserve(r) if is_absent(r) => { /* Do nothing. Maybe stale. */ }
+    /// }
+    /// ```
+    ///
+    /// We should execute the refresh when it is pending, because the start may
+    /// fail and then a refresh fires.
+    /// We should skip when we are going to refresh absent regions because there
+    /// may be some stale commands.
+    pub fn add_pending_region(&self, region: &Region) {
+        let r = self
+            .0
+            .insert(region.get_id(), SubscribeState::Pending(region.clone()));
+        if let Some(s) = r {
+            warn!(
+                "excepted state transform: running | pending -> pending";
+                "old" => ?s, utils::slog_region(region),
+            )
+        }
+    }
+
     // Register a region as tracing.
     // The `start_ts` is used to tracking the progress of initial scanning.
-    // (Note: the `None` case of `start_ts` is for testing / refresh region status when split / merge,
-    //    maybe we'd better provide some special API for those cases and remove the `Option`?)
+    // Note: the `None` case of `start_ts` is for testing / refresh region status
+    // when split / merge, maybe we'd better provide some special API for those
+    // cases and remove the `Option`?
     pub fn register_region(
         &self,
         region: &Region,
         handle: ObserveHandle,
         start_ts: Option<TimeStamp>,
     ) {
-        info!("start listen stream from store"; "observer" => ?handle, "region_id" => %region.get_id());
-        TRACK_REGION.with_label_values(&["inc"]).inc();
-        if let Some(o) = self.0.insert(
-            region.get_id(),
-            RegionSubscription::new(region.clone(), handle, start_ts),
-        ) {
-            TRACK_REGION.with_label_values(&["dec"]).inc();
-            warn!("register region which is already registered"; "region_id" => %region.get_id());
-            o.stop_observing();
+        info!("start listen stream from store"; "observer" => ?handle);
+        TRACK_REGION.inc();
+        let e = self.0.entry(region.id);
+        match e {
+            Entry::Occupied(o) => {
+                let sub = ActiveSubscription::new(region.clone(), handle, start_ts);
+                let (_, s) = o.replace_entry(SubscribeState::Running(sub));
+                if !s.is_pending() {
+                    // If there is another subscription already (perhaps repeated Start),
+                    // don't add the counter.
+                    warn!("excepted state transform: running -> running"; "old" => ?s, utils::slog_region(region));
+                    TRACK_REGION.dec();
+                }
+            }
+            Entry::Vacant(e) => {
+                warn!("excepted state transform: absent -> running"; utils::slog_region(region));
+                let sub = ActiveSubscription::new(region.clone(), handle, start_ts);
+                e.insert(SubscribeState::Running(sub));
+            }
         }
+    }
+
+    pub fn current_regions(&self) -> Vec<u64> {
+        self.0.iter().map(|s| *s.key()).collect()
     }
 
     /// try advance the resolved ts with the min ts of in-memory locks.
-    pub fn resolve_with(&self, min_ts: TimeStamp) -> TimeStamp {
+    /// returns the regions and theirs resolved ts.
+    pub fn resolve_with(
+        &self,
+        min_ts: TimeStamp,
+        regions: impl IntoIterator<Item = u64>,
+    ) -> Vec<ResolveResult> {
+        let rs = regions.into_iter().collect::<HashSet<_>>();
         self.0
             .iter_mut()
-            .map(|mut s| s.resolver.resolve(min_ts))
-            .min()
-            // If there isn't any region observed, the `min_ts` can be used as resolved ts safely.
-            .unwrap_or(min_ts)
-    }
-
-    #[inline(always)]
-    pub fn warn_if_gap_too_huge(&self, ts: TimeStamp) {
-        let gap = TimeStamp::physical_now() - ts.physical();
-        if gap >= 10 * 60 * 1000
-        /* 10 mins */
-        {
-            let far_resolver = self
-                .0
-                .iter()
-                .min_by_key(|r| r.value().resolver.resolved_ts());
-            warn!("log backup resolver ts advancing too slow";
-            "far_resolver" => %{match far_resolver {
-                Some(r) => format!("{:?}", r.value().resolver),
-                None => "BUG[NoResolverButResolvedTSDoesNotAdvance]".to_owned()
-            }},
-            "gap" => ?Duration::from_millis(gap),
-            );
-        }
+            // Don't advance the checkpoint ts of pending region.
+            .filter_map(|mut s| {
+                let region_id = *s.key();
+                match s.value_mut() {
+                SubscribeState::Running(sub) => {
+                    let contains = rs.contains(&region_id);
+                    if !contains {
+                        crate::metrics::MISC_EVENTS.skip_resolve_non_leader.inc();
+                    }
+                    contains.then(|| ResolveResult::resolve(sub, min_ts))
+                }
+                SubscribeState::Pending(r) => {warn!("pending region, skip resolving"; utils::slog_region(r)); None},
+            }
+            })
+            .collect()
     }
 
     /// try to mark a region no longer be tracked by this observer.
-    /// returns whether success (it failed if the region hasn't been observed when calling this.)
-    pub fn deregister_region(
+    /// returns whether success (it failed if the region hasn't been observed
+    /// when calling this.)
+    pub fn deregister_region_if(
         &self,
         region: &Region,
-        if_cond: impl FnOnce(&RegionSubscription, &Region) -> bool,
+        if_cond: impl FnOnce(&ActiveSubscription, &Region) -> bool,
     ) -> bool {
         let region_id = region.get_id();
-        let remove_result = self
-            .0
-            .remove_if(&region_id, |_, old_region| if_cond(old_region, region));
+        let remove_result = self.0.entry(region_id);
         match remove_result {
-            Some(o) => {
-                TRACK_REGION.with_label_values(&["dec"]).inc();
-                o.1.stop_observing();
-                info!("stop listen stream from store"; "observer" => ?o.1, "region_id"=> %region_id);
-                true
-            }
-            None => {
-                warn!("trying to deregister region not registered"; "region_id" => %region_id);
-                false
-            }
+            Entry::Vacant(_) => false,
+            Entry::Occupied(mut o) => match o.get_mut() {
+                SubscribeState::Pending(r) => {
+                    info!("remove pending subscription"; "region_id"=> %region_id, utils::slog_region(r));
+
+                    o.remove();
+                    true
+                }
+                SubscribeState::Running(s) => {
+                    if if_cond(s, region) {
+                        TRACK_REGION.dec();
+                        s.stop();
+                        info!("stop listen stream from store"; "observer" => ?s, "region_id"=> %region_id);
+
+                        o.remove();
+                        return true;
+                    }
+                    false
+                }
+            },
         }
     }
 
@@ -159,13 +296,14 @@ impl SubscriptionTracer {
     ///
     /// # return
     ///
-    /// Whether the status can be updated internally without deregister-and-register.
+    /// Whether the status can be updated internally without
+    /// deregister-and-register.
     pub fn try_update_region(&self, new_region: &Region) -> bool {
         let mut sub = match self.get_subscription_of(new_region.get_id()) {
             Some(sub) => sub,
             None => {
-                warn!("backup stream observer refreshing void subscription."; "new_region" => ?new_region);
-                return true;
+                warn!("backup stream observer refreshing pending / absent subscription."; utils::slog_region(new_region));
+                return false;
             }
         };
 
@@ -182,33 +320,89 @@ impl SubscriptionTracer {
     }
 
     /// check whether the region_id should be observed by this observer.
+    #[cfg(test)]
     pub fn is_observing(&self, region_id: u64) -> bool {
-        let mut exists = false;
-
-        // The region traced, check it whether is still be observing,
-        // if not, remove it.
-        let still_observing = self
-            .0
-            // Assuming this closure would be called iff the key exists.
-            // So we can elide a `contains` check.
-            .remove_if(&region_id, |_, o| {
-                exists = true;
-                !o.is_observing()
-            })
-            .is_none();
-        exists && still_observing
+        let sub = self.0.get_mut(&region_id);
+        match sub {
+            Some(mut s) => match s.value_mut() {
+                SubscribeState::Pending(_) => false,
+                SubscribeState::Running(s) => s.is_observing(),
+            },
+            None => false,
+        }
     }
 
     pub fn get_subscription_of(
         &self,
         region_id: u64,
-    ) -> Option<RefMut<'_, u64, RegionSubscription>> {
-        self.0.get_mut(&region_id)
+    ) -> Option<impl RefMut<Key = u64, Value = ActiveSubscription> + '_> {
+        self.0
+            .get_mut(&region_id)
+            .and_then(|x| SubscriptionRef::try_from_dash(x))
     }
 }
 
-/// This enhanced version of `Resolver` allow some unorder of lock events.  
-/// The name "2-phase" means this is used for 2 *concurrency* phases of observing a region:
+pub trait Ref {
+    type Key;
+    type Value;
+
+    fn key(&self) -> &Self::Key;
+    fn value(&self) -> &Self::Value;
+}
+
+pub trait RefMut: Ref {
+    fn value_mut(&mut self) -> &mut <Self as Ref>::Value;
+}
+
+impl<'a> Ref for SubscriptionRef<'a> {
+    type Key = u64;
+    type Value = ActiveSubscription;
+
+    fn key(&self) -> &Self::Key {
+        DashRefMut::key(&self.0)
+    }
+
+    fn value(&self) -> &Self::Value {
+        self.sub()
+    }
+}
+
+impl<'a> RefMut for SubscriptionRef<'a> {
+    fn value_mut(&mut self) -> &mut <Self as Ref>::Value {
+        self.sub_mut()
+    }
+}
+
+struct SubscriptionRef<'a>(DashRefMut<'a, u64, SubscribeState>);
+
+impl<'a> SubscriptionRef<'a> {
+    fn try_from_dash(mut d: DashRefMut<'a, u64, SubscribeState>) -> Option<Self> {
+        match d.value_mut() {
+            SubscribeState::Pending(_) => None,
+            SubscribeState::Running(_) => Some(Self(d)),
+        }
+    }
+
+    fn sub(&self) -> &ActiveSubscription {
+        match self.0.value() {
+            // Panic Safety: the constructor would prevent us from creating pending subscription
+            // ref.
+            SubscribeState::Pending(_) => unreachable!(),
+            SubscribeState::Running(s) => s,
+        }
+    }
+
+    fn sub_mut(&mut self) -> &mut ActiveSubscription {
+        match self.0.value_mut() {
+            SubscribeState::Pending(_) => unreachable!(),
+            SubscribeState::Running(s) => s,
+        }
+    }
+}
+
+/// This enhanced version of `Resolver` allow some unordered lock events.
+/// The name "2-phase" means this is used for 2 *concurrency* phases of
+/// observing a region:
 /// 1. Doing the initial scanning.
 /// 2. Listening at the incremental data.
 ///
@@ -216,29 +410,35 @@ impl SubscriptionTracer {
 /// +->(Start TS Of Task)            +->(Task registered to KV)
 /// +--------------------------------+------------------------>
 /// ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^ ^~~~~~~~~~~~~~~~~~~~~~~~~
-/// |                                 +-> Phase 2: Listening incremtnal data.
+/// |                                 +-> Phase 2: Listening incremental data.
 /// +-> Phase 1: Initial scanning scans writes between start ts and now.
 /// ```
 ///
-/// In backup-stream, we execute these two tasks parallelly. Which may make some race conditions:
-/// - When doing initial scanning, there may be a flush triggered, but the defult resolver
-///   would probably resolved to the tip of incremental events.
-/// - When doing initial scanning, we meet and track a lock already meet by the incremental events,
-///   then the default resolver cannot untrack this lock any more.
+/// In backup-stream, we execute these two tasks parallel. Which may make some
+/// race conditions:
+/// - When doing initial scanning, there may be a flush triggered, but the
+///   default resolver would probably resolved to the tip of incremental events.
+/// - When doing initial scanning, we meet and track a lock already meet by the
+///   incremental events, then the default resolver cannot untrack this lock any
+///   more.
 ///
-/// This version of resolver did some change for solve these problmes:
-/// - The resolver won't advance the resolved ts to greater than `stable_ts` if there is some. This
-///   can help us prevent resolved ts from advancing when initial scanning hasn't finished yet.
-/// - When we `untrack` a lock haven't been tracked, this would record it, and skip this lock if we want to track it then.
-///   This would be safe because:
+/// This version of resolver did some change for solve these problems:
+/// - The resolver won't advance the resolved ts to greater than `stable_ts` if
+///   there is some. This can help us prevent resolved ts from advancing when
+///   initial scanning hasn't finished yet.
+/// - When we `untrack` a lock haven't been tracked, this would record it, and
+///   skip this lock if we want to track it then. This would be safe because:
 ///   - untracking a lock not be tracked is no-op for now.
-///   - tracking a lock have already being untracked (unordered call of `track` and `untrack`) wouldn't happen at phase 2 for same region.
-///     but only when phase 1 and phase 2 happend concurrently, at that time, we wouldn't and cannot advance the resolved ts.
+///   - tracking a lock have already being untracked (unordered call of `track`
+///     and `untrack`) wouldn't happen at phase 2 for same region. but only when
+///     phase 1 and phase 2 happened concurrently, at that time, we wouldn't and
+///     cannot advance the resolved ts.
 pub struct TwoPhaseResolver {
     resolver: Resolver,
     future_locks: Vec<FutureLock>,
     /// When `Some`, is the start ts of the initial scanning.
-    /// And implies the phase 1 (initial scanning) is keep running asynchronously.
+    /// And implies the phase 1 (initial scanning) is keep running
+    /// asynchronously.
     stable_ts: Option<TimeStamp>,
 }
 
@@ -264,6 +464,14 @@ impl std::fmt::Debug for FutureLock {
 }
 
 impl TwoPhaseResolver {
+    /// try to get one of the key of the oldest lock in the resolver.
+    pub fn sample_far_lock(&self) -> Option<(TimeStamp, TxnLocks)> {
+        self.resolver
+            .locks()
+            .first_key_value()
+            .map(|(ts, txn_locks)| (*ts, txn_locks.clone()))
+    }
+
     pub fn in_phase_one(&self) -> bool {
         self.stable_ts.is_some()
     }
@@ -272,7 +480,8 @@ impl TwoPhaseResolver {
         if !self.in_phase_one() {
             warn!("backup stream tracking lock as if in phase one"; "start_ts" => %start_ts, "key" => %utils::redact(&key))
         }
-        self.resolver.track_lock(start_ts, key, None)
+        // TODO: handle memory quota exceed, for now, quota is set to usize::MAX.
+        self.resolver.track_lock(start_ts, key, None).unwrap();
     }
 
     pub fn track_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
@@ -280,7 +489,8 @@ impl TwoPhaseResolver {
             self.future_locks.push(FutureLock::Lock(key, start_ts));
             return;
         }
-        self.resolver.track_lock(start_ts, key, None)
+        // TODO: handle memory quota exceed, for now, quota is set to usize::MAX.
+        self.resolver.track_lock(start_ts, key, None).unwrap();
     }
 
     pub fn untrack_lock(&mut self, key: &[u8]) {
@@ -294,7 +504,10 @@ impl TwoPhaseResolver {
 
     fn handle_future_lock(&mut self, lock: FutureLock) {
         match lock {
-            FutureLock::Lock(key, ts) => self.resolver.track_lock(ts, key, None),
+            FutureLock::Lock(key, ts) => {
+                // TODO: handle memory quota exceed, for now, quota is set to usize::MAX.
+                self.resolver.track_lock(ts, key, None).unwrap();
+            }
             FutureLock::Unlock(key) => self.resolver.untrack_lock(&key, None),
         }
     }
@@ -304,7 +517,7 @@ impl TwoPhaseResolver {
             return min_ts.min(stable_ts);
         }
 
-        self.resolver.resolve(min_ts)
+        self.resolver.resolve(min_ts, None, TsSource::BackupStream)
     }
 
     pub fn resolved_ts(&self) -> TimeStamp {
@@ -316,8 +529,10 @@ impl TwoPhaseResolver {
     }
 
     pub fn new(region_id: u64, stable_ts: Option<TimeStamp>) -> Self {
+        // TODO: limit the memory usage of the resolver.
+        let memory_quota = Arc::new(MemoryQuota::new(std::usize::MAX));
         Self {
-            resolver: Resolver::new(region_id),
+            resolver: Resolver::new(region_id, memory_quota),
             future_locks: Default::default(),
             stable_ts,
         }
@@ -328,7 +543,18 @@ impl TwoPhaseResolver {
         for lock in std::mem::take(&mut self.future_locks).into_iter() {
             self.handle_future_lock(lock);
         }
-        self.stable_ts = None
+        let ts = self.stable_ts.take();
+        match ts {
+            Some(ts) => {
+                // advance the internal resolver.
+                // the start ts of initial scanning would be a safe ts for min ts
+                // -- because is used to be a resolved ts.
+                self.resolver.resolve(ts, None, TsSource::BackupStream);
+            }
+            None => {
+                warn!("BUG: a two-phase resolver is executing phase_one_done when not in phase one"; "resolver" => ?self)
+            }
+        }
     }
 }
 
@@ -343,9 +569,15 @@ impl std::fmt::Debug for TwoPhaseResolver {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
+    use kvproto::metapb::{Region, RegionEpoch};
+    use raftstore::coprocessor::ObserveHandle;
+    use resolved_ts::TxnLocks;
     use txn_types::TimeStamp;
 
-    use super::TwoPhaseResolver;
+    use super::{SubscriptionTracer, TwoPhaseResolver};
+    use crate::subscription_track::RefMut;
 
     #[test]
     fn test_two_phase_resolver() {
@@ -371,5 +603,88 @@ mod test {
         assert_eq!(r.resolve(ts(56)), ts(55));
         r.untrack_lock(&key[..]);
         assert_eq!(r.resolve(ts(57)), ts(57));
+    }
+
+    fn region(id: u64, version: u64, conf_version: u64) -> Region {
+        let mut r = Region::new();
+        let mut e = RegionEpoch::new();
+        e.set_version(version);
+        e.set_conf_ver(conf_version);
+        r.set_id(id);
+        r.set_region_epoch(e);
+        r
+    }
+
+    #[test]
+    fn test_delay_remove() {
+        let subs = SubscriptionTracer::default();
+        let handle = ObserveHandle::new();
+        subs.register_region(&region(1, 1, 1), handle, Some(TimeStamp::new(42)));
+        assert!(subs.get_subscription_of(1).is_some());
+        assert!(subs.is_observing(1));
+        subs.deregister_region_if(&region(1, 1, 1), |_, _| true);
+        assert!(!subs.is_observing(1));
+    }
+
+    #[test]
+    fn test_cal_checkpoint() {
+        let subs = SubscriptionTracer::default();
+        subs.register_region(
+            &region(1, 1, 1),
+            ObserveHandle::new(),
+            Some(TimeStamp::new(42)),
+        );
+        subs.register_region(&region(2, 2, 1), ObserveHandle::new(), None);
+        subs.register_region(
+            &region(3, 4, 1),
+            ObserveHandle::new(),
+            Some(TimeStamp::new(88)),
+        );
+        subs.get_subscription_of(3)
+            .unwrap()
+            .value_mut()
+            .resolver
+            .phase_one_done();
+        subs.register_region(
+            &region(4, 8, 1),
+            ObserveHandle::new(),
+            Some(TimeStamp::new(92)),
+        );
+        let mut region4_sub = subs.get_subscription_of(4).unwrap();
+        region4_sub.value_mut().resolver.phase_one_done();
+        region4_sub
+            .value_mut()
+            .resolver
+            .track_lock(TimeStamp::new(128), b"Alpi".to_vec());
+        subs.register_region(&region(5, 8, 1), ObserveHandle::new(), None);
+        subs.deregister_region_if(&region(5, 8, 1), |_, _| true);
+        drop(region4_sub);
+
+        let mut rs = subs
+            .resolve_with(TimeStamp::new(1000), vec![1, 2, 3, 4])
+            .into_iter()
+            .map(|r| (r.region, r.checkpoint, r.checkpoint_type))
+            .collect::<Vec<_>>();
+        rs.sort_by_key(|k| k.0.get_id());
+        use crate::subscription_track::CheckpointType::*;
+        assert_eq!(
+            rs,
+            vec![
+                (region(1, 1, 1), 42.into(), StartTsOfInitialScan),
+                (region(2, 2, 1), 1000.into(), MinTs),
+                (region(3, 4, 1), 1000.into(), MinTs),
+                (
+                    region(4, 8, 1),
+                    128.into(),
+                    StartTsOfTxn(Some((
+                        TimeStamp::new(128),
+                        TxnLocks {
+                            lock_count: 1,
+                            sample_lock: Some(Arc::from(b"Alpi".as_slice())),
+                        }
+                    )))
+                ),
+            ]
+        );
     }
 }

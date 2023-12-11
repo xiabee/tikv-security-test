@@ -242,9 +242,9 @@ where
 
     /// # Notes
     ///
-    /// For MAX(), MySQL currently compares ENUM and SET columns by their string value rather
-    /// than by the string's relative position in the set. This differs from how ORDER BY
-    /// compares them.
+    /// For MAX(), MySQL currently compares ENUM and SET columns by their string
+    /// value rather than by the string's relative position in the set. This
+    /// differs from how ORDER BY compares them.
     ///
     /// ref: https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_max
     #[inline]
@@ -331,9 +331,9 @@ where
 
     /// # Notes
     ///
-    /// For MAX(), MySQL currently compares ENUM and SET columns by their string value rather
-    /// than by the string's relative position in the set. This differs from how ORDER BY
-    /// compares them.
+    /// For MAX(), MySQL currently compares ENUM and SET columns by their string
+    /// value rather than by the string's relative position in the set. This
+    /// differs from how ORDER BY compares them.
     ///
     /// ref: https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_max
     #[inline]
@@ -514,10 +514,10 @@ where
                     self.extremum = value.copied()
                 }
             } else {
-                let v1 = self.extremum.map(|x| x as i64);
-                let v2 = value.map(|x| *x as i64);
+                let v1: Option<i64> = self.extremum;
+                let v2: Option<i64> = value.copied();
                 if v1.cmp(&v2) == E::ORD {
-                    self.extremum = value.copied()
+                    self.extremum = v2;
                 }
             }
         }
@@ -937,7 +937,7 @@ mod tests {
             min_state.push_result(&mut ctx, &mut aggr_result).unwrap();
         }
 
-        assert_eq!(aggr_result[0].to_int_vec(), &(*expected_res));
+        assert_eq!(aggr_result[0].to_int_vec(), expected_res);
     }
 
     #[test]

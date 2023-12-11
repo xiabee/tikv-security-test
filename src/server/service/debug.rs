@@ -1,9 +1,8 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_rocks::RocksEngine;
-use engine_traits::{Engines, MiscExt, RaftEngine};
+use std::sync::{Arc, Mutex};
+
 use futures::{
-    channel::oneshot,
     future::{Future, FutureExt, TryFutureExt},
     sink::SinkExt,
     stream::{self, TryStreamExt},
@@ -12,24 +11,13 @@ use grpcio::{
     Error as GrpcError, RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink,
     WriteFlags,
 };
-use kvproto::{
-    debugpb::{self, *},
-    raft_cmdpb::{
-        AdminCmdType, AdminRequest, RaftCmdRequest, RaftRequestHeader, RegionDetailResponse,
-        StatusCmdType, StatusRequest,
-    },
-};
-use raftstore::{
-    router::RaftStoreRouter,
-    store::msg::{Callback, RaftCmdExtraOpts},
-};
-use tikv_util::metrics;
+use kvproto::debugpb::{self, *};
+use raftstore::store::fsm::store::StoreRegionMeta;
+use tikv_kv::RaftExtension;
+use tikv_util::{future::paired_future_callback, metrics};
 use tokio::runtime::Handle;
 
-use crate::{
-    config::ConfigController,
-    server::debug::{Debugger, Error, Result},
-};
+use crate::server::debug::{Debugger, Error, Result};
 
 fn error_to_status(e: Error) -> RpcStatus {
     let (code, msg) = match e {
@@ -51,27 +39,79 @@ fn error_to_grpc_error(tag: &'static str, e: Error) -> GrpcError {
     e
 }
 
+pub type Callback<T> = Box<dyn FnOnce(T) + Send>;
+pub type ResolvedTsDiagnosisCallback = Callback<
+    Option<(
+        bool, // stopped
+        u64,  // resolved_ts
+        u64,  // tracked index
+        u64,  // num_locks
+        u64,  // num_transactions
+    )>,
+>;
+pub type ScheduleResolvedTsTask = Arc<
+    dyn Fn(
+            u64,  // region id
+            bool, // log_locks
+            u64,  // min_start_ts
+            ResolvedTsDiagnosisCallback,
+        ) -> bool
+        + Send
+        + Sync,
+>;
+
 /// Service handles the RPC messages for the `Debug` service.
-#[derive(Clone)]
-pub struct Service<ER: RaftEngine, T: RaftStoreRouter<RocksEngine>> {
+pub struct Service<T, D, S>
+where
+    T: RaftExtension + Clone,
+    D: Debugger + Clone,
+    S: StoreRegionMeta,
+{
     pool: Handle,
-    debugger: Debugger<ER>,
+    debugger: D,
     raft_router: T,
+    store_meta: Arc<Mutex<S>>,
+    resolved_ts_scheduler: ScheduleResolvedTsTask,
 }
 
-impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine>> Service<ER, T> {
-    /// Constructs a new `Service` with `Engines`, a `RaftStoreRouter` and a `GcWorker`.
+impl<T, D, S> Clone for Service<T, D, S>
+where
+    T: RaftExtension + Clone,
+    D: Debugger + Clone,
+    S: StoreRegionMeta,
+{
+    fn clone(&self) -> Self {
+        Service {
+            pool: self.pool.clone(),
+            debugger: self.debugger.clone(),
+            raft_router: self.raft_router.clone(),
+            store_meta: self.store_meta.clone(),
+            resolved_ts_scheduler: self.resolved_ts_scheduler.clone(),
+        }
+    }
+}
+
+impl<T, D, S> Service<T, D, S>
+where
+    T: RaftExtension + Clone,
+    D: Debugger + Clone,
+    S: StoreRegionMeta,
+{
+    /// Constructs a new `Service` with `Engines`, a `RaftExtension` and a
+    /// `GcWorker`.
     pub fn new(
-        engines: Engines<RocksEngine, ER>,
+        debugger: D,
         pool: Handle,
         raft_router: T,
-        cfg_controller: ConfigController,
-    ) -> Service<ER, T> {
-        let debugger = Debugger::new(engines, cfg_controller);
+        store_meta: Arc<Mutex<S>>,
+        resolved_ts_scheduler: ScheduleResolvedTsTask,
+    ) -> Self {
         Service {
             pool,
             debugger,
             raft_router,
+            store_meta,
+            resolved_ts_scheduler,
         }
     }
 
@@ -96,7 +136,12 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine>> Service<ER, T> {
     }
 }
 
-impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug for Service<ER, T> {
+impl<T, D, S> debugpb::Debug for Service<T, D, S>
+where
+    T: RaftExtension + 'static,
+    D: Debugger + Clone + Send + 'static,
+    S: StoreRegionMeta,
+{
     fn get(&mut self, ctx: RpcContext<'_>, mut req: GetRequest, sink: UnarySink<GetResponse>) {
         const TAG: &str = "debug_get";
 
@@ -362,9 +407,8 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug f
                 resp.set_store_id(debugger.get_store_ident()?.store_id);
                 resp.set_prometheus(metrics::dump(false));
                 if req.get_all() {
-                    let engines = debugger.get_engine();
-                    resp.set_rocksdb_kv(box_try!(MiscExt::dump_stats(&engines.kv)));
-                    resp.set_rocksdb_raft(box_try!(RaftEngine::dump_stats(&engines.raft)));
+                    resp.set_rocksdb_kv(debugger.dump_kv_stats()?);
+                    resp.set_rocksdb_raft(debugger.dump_raft_stats()?);
                     resp.set_jemalloc(tikv_alloc::dump_stats());
                 }
                 Ok(resp)
@@ -381,18 +425,14 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug f
         sink: UnarySink<RegionConsistencyCheckResponse>,
     ) {
         let region_id = req.get_region_id();
-        let debugger = self.debugger.clone();
-        let router1 = self.raft_router.clone();
-        let router2 = self.raft_router.clone();
-
-        let consistency_check_task = async move {
-            let store_id = debugger.get_store_ident()?.store_id;
-            let detail = region_detail(router2, region_id, store_id).await?;
-            consistency_check(router1, detail).await
+        let f = self.raft_router.check_consistency(region_id);
+        let task = async move {
+            box_try!(f.await);
+            Ok(())
         };
         let f = self
             .pool
-            .spawn(consistency_check_task)
+            .spawn(task)
             .map(|res| res.unwrap())
             .map_ok(|_| RegionConsistencyCheckResponse::default());
         self.handle_response(ctx, sink, f, "check_region_consistency");
@@ -530,78 +570,92 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> debugpb::Debug f
         self.debugger.reset_to_version(req.get_ts());
         sink.success(ResetToVersionResponse::default());
     }
-}
 
-fn region_detail<T: RaftStoreRouter<RocksEngine>>(
-    raft_router: T,
-    region_id: u64,
-    store_id: u64,
-) -> impl Future<Output = Result<RegionDetailResponse>> {
-    let mut header = RaftRequestHeader::default();
-    header.set_region_id(region_id);
-    header.mut_peer().set_store_id(store_id);
-    let mut status_request = StatusRequest::default();
-    status_request.set_cmd_type(StatusCmdType::RegionDetail);
-    let mut raft_cmd = RaftCmdRequest::default();
-    raft_cmd.set_header(header);
-    raft_cmd.set_status_request(status_request);
+    fn get_region_read_progress(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: GetRegionReadProgressRequest,
+        sink: UnarySink<GetRegionReadProgressResponse>,
+    ) {
+        let store_meta = self.store_meta.lock().unwrap();
+        let rrp = store_meta.region_read_progress();
+        let mut resp = GetRegionReadProgressResponse::default();
+        rrp.with(|registry| {
+            let region = registry.get(&req.get_region_id());
+            if let Some(r) = region {
+                resp.set_region_read_progress_exist(true);
+                resp.set_safe_ts(r.safe_ts());
+                let core = r.get_core();
+                resp.set_applied_index(core.applied_index());
+                resp.set_region_read_progress_paused(core.paused());
+                if let Some(back) = core.pending_items().back() {
+                    resp.set_pending_back_ts(back.ts);
+                    resp.set_pending_back_applied_index(back.idx);
+                }
+                if let Some(front) = core.pending_items().front() {
+                    resp.set_pending_front_ts(front.ts);
+                    resp.set_pending_front_applied_index(front.idx)
+                }
+                resp.set_read_state_ts(core.read_state().ts);
+                resp.set_read_state_apply_index(core.read_state().idx);
+                resp.set_discard(core.discarding());
+                resp.set_duration_to_last_consume_leader_ms(
+                    core.last_instant_of_consume_leader()
+                        .map(|t| t.saturating_elapsed().as_millis() as u64)
+                        .unwrap_or(u64::MAX),
+                );
+                resp.set_duration_to_last_update_safe_ts_ms(
+                    core.last_instant_of_update_ts()
+                        .map(|t| t.saturating_elapsed().as_millis() as u64)
+                        .unwrap_or(u64::MAX),
+                );
+            } else {
+                resp.set_region_read_progress_exist(false);
+            }
+        });
 
-    let (tx, rx) = oneshot::channel();
-    let cb = Callback::Read(Box::new(|resp| tx.send(resp).unwrap()));
+        // get from resolver
+        let (cb, f) = paired_future_callback();
+        if (*self.resolved_ts_scheduler)(
+            req.get_region_id(),
+            req.get_log_locks(),
+            req.get_min_start_ts(),
+            cb,
+        ) {
+            let f = async move {
+                let res = f.await;
+                match res {
+                    Err(e) => {
+                        resp.set_error("get resolved-ts info failed".to_owned());
+                        error!("tikv-ctl get resolved-ts info failed"; "err" => ?e);
+                    }
+                    Ok(Some((
+                        stopped,
+                        resolved_ts,
+                        resolver_tracked_index,
+                        num_locks,
+                        num_transactions,
+                    ))) => {
+                        resp.set_resolver_exist(true);
+                        resp.set_resolver_stopped(stopped);
+                        resp.set_resolved_ts(resolved_ts);
+                        resp.set_resolver_tracked_index(resolver_tracked_index);
+                        resp.set_num_locks(num_locks);
+                        resp.set_num_transactions(num_transactions);
+                    }
+                    Ok(None) => {
+                        resp.set_resolver_exist(false);
+                    }
+                }
 
-    async move {
-        raft_router
-            .send_command(raft_cmd, cb, RaftCmdExtraOpts::default())
-            .map_err(|e| Error::Other(Box::new(e)))?;
-
-        let mut r = rx.map_err(|e| Error::Other(Box::new(e))).await?;
-
-        if r.response.get_header().has_error() {
-            let e = r.response.get_header().get_error();
-            warn!("region_detail got error"; "err" => ?e);
-            return Err(Error::Other(e.message.clone().into()));
+                Ok(resp)
+            };
+            self.handle_response(ctx, sink, f, "debug_get_region_read_progress");
+        } else {
+            resp.set_error("resolved-ts is not enabled".to_owned());
+            let f = async move { Ok(resp) };
+            self.handle_response(ctx, sink, f, "debug_get_region_read_progress");
         }
-
-        let detail = r.response.take_status_response().take_region_detail();
-        debug!("region_detail got region detail"; "detail" => ?detail);
-        let leader_store_id = detail.get_leader().get_store_id();
-        if leader_store_id != store_id {
-            let msg = format!("Leader is on store {}", leader_store_id);
-            return Err(Error::Other(msg.into()));
-        }
-        Ok(detail)
-    }
-}
-
-fn consistency_check<T: RaftStoreRouter<RocksEngine>>(
-    raft_router: T,
-    mut detail: RegionDetailResponse,
-) -> impl Future<Output = Result<()>> {
-    let mut header = RaftRequestHeader::default();
-    header.set_region_id(detail.get_region().get_id());
-    header.set_peer(detail.take_leader());
-    let mut admin_request = AdminRequest::default();
-    admin_request.set_cmd_type(AdminCmdType::ComputeHash);
-    let mut raft_cmd = RaftCmdRequest::default();
-    raft_cmd.set_header(header);
-    raft_cmd.set_admin_request(admin_request);
-
-    let (tx, rx) = oneshot::channel();
-    let cb = Callback::Read(Box::new(|resp| tx.send(resp).unwrap()));
-
-    async move {
-        raft_router
-            .send_command(raft_cmd, cb, RaftCmdExtraOpts::default())
-            .map_err(|e| Error::Other(Box::new(e)))?;
-
-        let r = rx.map_err(|e| Error::Other(Box::new(e))).await?;
-
-        if r.response.get_header().has_error() {
-            let e = r.response.get_header().get_error();
-            warn!("consistency-check got error"; "err" => ?e);
-            return Err(Error::Other(e.message.clone().into()));
-        }
-        Ok(())
     }
 }
 

@@ -13,6 +13,7 @@
 //! inside TiKV because it needs to interact with raftstore.
 
 mod duplicate_detect;
+mod raft_writer;
 mod sst_service;
 
 use std::fmt::Debug;
@@ -29,7 +30,7 @@ pub fn make_rpc_error<E: Debug>(err: E) -> RpcStatus {
 
 #[macro_export]
 macro_rules! send_rpc_response {
-    ($res:ident, $sink:ident, $label:ident, $timer:ident) => {{
+    ($res:expr, $sink:ident, $label:ident, $timer:ident) => {{
         let res = match $res {
             Ok(resp) => {
                 IMPORT_RPC_DURATION

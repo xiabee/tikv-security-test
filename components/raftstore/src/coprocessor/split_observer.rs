@@ -10,6 +10,8 @@ use tikv_util::{box_err, box_try, codec::bytes, error, warn};
 use super::{AdminObserver, Coprocessor, ObserverContext, Result as CopResult};
 use crate::{store::util, Error};
 
+pub const NO_VALID_SPLIT_KEY: &str = "no valid key found for split.";
+
 pub fn strip_timestamp_if_exists(mut key: Vec<u8>) -> Vec<u8> {
     let mut slice = key.as_slice();
     let strip_len = match bytes::decode_bytes(&mut slice, false) {
@@ -35,6 +37,9 @@ pub fn is_valid_split_key(key: &[u8], index: usize, region: &Region) -> bool {
     }
 
     if let Err(Error::KeyNotInRegion(..)) = util::check_key_in_region_exclusive(key, region) {
+        // use this to distinguish whether the key is at the edge or outside of the
+        // region.
+        let equal_start_key = key == region.get_start_key();
         warn!(
             "skip invalid split key: key is not in region";
             "key" => log_wrappers::Value::key(key),
@@ -42,6 +47,7 @@ pub fn is_valid_split_key(key: &[u8], index: usize, region: &Region) -> bool {
             "start_key" => log_wrappers::Value::key(region.get_start_key()),
             "end_key" => log_wrappers::Value::key(region.get_end_key()),
             "index" => index,
+            "equal_start_key" => equal_start_key,
         );
         return false;
     }
@@ -90,7 +96,7 @@ impl SplitObserver {
             .collect::<Vec<_>>();
 
         if ajusted_splits.is_empty() {
-            Err("no valid key found for split.".to_owned())
+            Err(NO_VALID_SPLIT_KEY.to_owned())
         } else {
             // Rewrite the splits.
             *splits = ajusted_splits;
@@ -240,14 +246,13 @@ mod tests {
 
         let observer = SplitObserver;
 
-        let resp = observer.pre_propose_admin(&mut ctx, &mut req);
         // since no split is defined, actual coprocessor won't be invoke.
-        assert!(resp.is_ok());
+        observer.pre_propose_admin(&mut ctx, &mut req).unwrap();
         assert!(!req.has_split(), "only split req should be handle.");
 
         req = new_split_request(new_row_key(1, 2, 0));
         // For compatible reason, split should supported too.
-        assert!(observer.pre_propose_admin(&mut ctx, &mut req).is_ok());
+        observer.pre_propose_admin(&mut ctx, &mut req).unwrap();
 
         // Empty key should be skipped.
         let mut split_keys = vec![vec![]];
@@ -257,7 +262,7 @@ mod tests {
         req = new_batch_split_request(split_keys.clone());
         // Although invalid keys should be skipped, but if all keys are
         // invalid, errors should be reported.
-        assert!(observer.pre_propose_admin(&mut ctx, &mut req).is_err());
+        observer.pre_propose_admin(&mut ctx, &mut req).unwrap_err();
 
         let mut key = new_row_key(1, 2, 0);
         let mut expected_key = key[..key.len() - 8].to_vec();

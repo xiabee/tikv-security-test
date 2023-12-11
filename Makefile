@@ -51,6 +51,7 @@ ifeq ($(TIKV_FRAME_POINTER),1)
 export RUSTFLAGS := $(RUSTFLAGS) -Cforce-frame-pointers=yes
 export CFLAGS := $(CFLAGS) -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer
 export CXXFLAGS := $(CXXFLAGS) -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer
+ENABLE_FEATURES += pprof-fp
 endif
 
 # Pick an allocator
@@ -136,6 +137,7 @@ export TIKV_BUILD_GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2> /dev/
 
 export DOCKER_IMAGE_NAME ?= "pingcap/tikv"
 export DOCKER_IMAGE_TAG ?= "latest"
+export DEV_DOCKER_IMAGE_NAME ?= "pingcap/tikv_dev"
 
 # Turn on cargo pipelining to add more build parallelism. This has shown decent
 # speedups in TiKV.
@@ -181,7 +183,6 @@ dev: format clippy
 
 build: export TIKV_PROFILE=debug
 ifeq ($(TIKV_FRAME_POINTER),1)
-build: ENABLE_FEATURES += pprof-fp
 build:
 	rustup component add rust-src
 	cargo build --no-default-features --features "${ENABLE_FEATURES}" \
@@ -190,7 +191,6 @@ build:
 		--target "${TIKV_BUILD_RUSTC_TARGET}" \
 		--out-dir "${CARGO_TARGET_DIR}/debug"
 else
-build: ENABLE_FEATURES += pprof-dwarf
 build:
 	cargo build --no-default-features --features "${ENABLE_FEATURES}"
 endif
@@ -207,7 +207,6 @@ endif
 # enabled (the "sse" option)
 release: export TIKV_PROFILE=release
 ifeq ($(TIKV_FRAME_POINTER),1)
-release: ENABLE_FEATURES += pprof-fp
 release:
 	rustup component add rust-src
 	cargo build --release --no-default-features --features "${ENABLE_FEATURES}" \
@@ -216,7 +215,6 @@ release:
 		--target "${TIKV_BUILD_RUSTC_TARGET}" \
 		--out-dir "${CARGO_TARGET_DIR}/release"
 else
-release: ENABLE_FEATURES += pprof-dwarf
 release:
 	cargo build --release --no-default-features --features "${ENABLE_FEATURES}"
 endif
@@ -314,6 +312,14 @@ run:
 # Run tests under a variety of conditions. This should pass before
 # submitting pull requests.
 test:
+	./scripts/test-all -- --nocapture
+
+# Run tests with nextest.
+ifndef CUSTOM_TEST_COMMAND
+test_with_nextest: export CUSTOM_TEST_COMMAND=nextest run
+endif
+test_with_nextest: export RUSTDOCFLAGS="-Z unstable-options --persist-doctests"
+test_with_nextest:
 	./scripts/test-all
 
 ## Static analysis
@@ -325,11 +331,11 @@ unset-override:
 
 pre-format: unset-override
 	@rustup component add rustfmt
-	@cargo install -q cargo-sort 
+	@which cargo-sort &> /dev/null || cargo install -q cargo-sort 
 
 format: pre-format
 	@cargo fmt
-	@cargo sort -w ./Cargo.toml ./*/Cargo.toml components/*/Cargo.toml cmd/*/Cargo.toml >/dev/null 
+	@cargo sort -w -c &>/dev/null || cargo sort -w >/dev/null
 
 doc:
 	@cargo doc --workspace --document-private-items \
@@ -342,6 +348,7 @@ pre-clippy: unset-override
 clippy: pre-clippy
 	@./scripts/check-redact-log
 	@./scripts/check-docker-build
+	@./scripts/check-license
 	@./scripts/clippy-all
 
 pre-audit:
@@ -390,6 +397,14 @@ docker:
 		--build-arg GIT_BRANCH=${TIKV_BUILD_GIT_BRANCH} \
 		.
 
+docker_test:
+	docker build -f Dockerfile.test \
+		-t ${DEV_DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+		. 
+	docker run -i -v $(shell pwd):/tikv \
+		${DEV_DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+		make test
+	
 ## The driver for script/run-cargo.sh
 ## ----------------------------------
 
@@ -410,11 +425,6 @@ endif
 
 export X_CARGO_ARGS:=${CARGO_ARGS}
 
-ifeq ($(TIKV_FRAME_POINTER),1)
-x-build-dist: ENABLE_FEATURES += pprof-fp
-else
-x-build-dist: ENABLE_FEATURES += pprof-dwarf
-endif
 x-build-dist: export X_CARGO_CMD=build
 x-build-dist: export X_CARGO_FEATURES=${ENABLE_FEATURES}
 x-build-dist: export X_CARGO_RELEASE=1

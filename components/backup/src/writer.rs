@@ -1,12 +1,11 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{fmt::Display, io::Read, sync::Arc};
+use std::{fmt::Display, io::Read};
 
 use encryption::{EncrypterReader, Iv};
-use engine_rocks::{raw::DB, RocksEngine, RocksSstWriter, RocksSstWriterBuilder};
 use engine_traits::{
-    CfName, ExternalSstFileInfo, SstCompressionType, SstWriter, SstWriterBuilder, CF_DEFAULT,
-    CF_WRITE,
+    CfName, ExternalSstFileInfo, KvEngine, SstCompressionType, SstExt, SstWriter, SstWriterBuilder,
+    CF_DEFAULT, CF_WRITE,
 };
 use external_storage_export::{ExternalStorage, UnpinReader};
 use file_system::Sha256Reader;
@@ -26,9 +25,8 @@ use crate::{backup_file_name, metrics::*, utils::KeyValueCodec, Error, Result};
 
 #[derive(Debug, Clone, Copy)]
 /// CfNameWrap wraps the CfName type.
-/// For removing the 'static lifetime bound in the async function,
-/// which doesn't compile due to 'captures lifetime that does not appear in bounds' :(.
-/// see https://github.com/rust-lang/rust/issues/63033
+/// For removing the 'static lifetime bound in the async function, which doesn't
+/// compile due to 'captures lifetime that does not appear in bounds', see https://github.com/rust-lang/rust/issues/63033
 /// FIXME: remove this.
 pub struct CfNameWrap(pub &'static str);
 
@@ -50,16 +48,16 @@ impl From<CfNameWrap> for CfName {
     }
 }
 
-struct Writer {
-    writer: RocksSstWriter,
+struct Writer<W: SstWriter + 'static> {
+    writer: W,
     total_kvs: u64,
     total_bytes: u64,
     checksum: u64,
     digest: crc64fast::Digest,
 }
 
-impl Writer {
-    fn new(writer: RocksSstWriter) -> Self {
+impl<W: SstWriter + 'static> Writer<W> {
+    fn new(writer: W) -> Self {
         Writer {
             writer,
             total_kvs: 0,
@@ -99,9 +97,7 @@ impl Writer {
         Ok(())
     }
 
-    // FIXME: we cannot get sst_info in [save_and_build_file], which may cause the !Send type
-    // [RocksEnternalSstFileInfo] sent between threads.
-    fn finish_read(writer: RocksSstWriter) -> Result<(u64, impl Read)> {
+    fn finish_read(writer: W) -> Result<(u64, impl Read)> {
         let (sst_info, sst_reader) = writer.finish_read()?;
         Ok((sst_info.file_size(), sst_reader))
     }
@@ -164,28 +160,28 @@ impl Writer {
     }
 }
 
-pub struct BackupWriterBuilder {
+pub struct BackupWriterBuilder<EK: KvEngine> {
     store_id: u64,
     limiter: Limiter,
     region: Region,
-    db: Arc<DB>,
+    db: EK,
     compression_type: Option<SstCompressionType>,
     compression_level: i32,
     sst_max_size: u64,
     cipher: CipherInfo,
 }
 
-impl BackupWriterBuilder {
+impl<EK: KvEngine> BackupWriterBuilder<EK> {
     pub fn new(
         store_id: u64,
         limiter: Limiter,
         region: Region,
-        db: Arc<DB>,
+        db: EK,
         compression_type: Option<SstCompressionType>,
         compression_level: i32,
         sst_max_size: u64,
         cipher: CipherInfo,
-    ) -> BackupWriterBuilder {
+    ) -> BackupWriterBuilder<EK> {
         Self {
             store_id,
             limiter,
@@ -198,7 +194,7 @@ impl BackupWriterBuilder {
         }
     }
 
-    pub fn build(&self, start_key: Vec<u8>, storage_name: &str) -> Result<BackupWriter> {
+    pub fn build(&self, start_key: Vec<u8>, storage_name: &str) -> Result<BackupWriter<EK>> {
         let key = file_system::sha256(&start_key).ok().map(hex::encode);
         let store_id = self.store_id;
         let name = backup_file_name(store_id, &self.region, key, storage_name);
@@ -215,37 +211,37 @@ impl BackupWriterBuilder {
 }
 
 /// A writer writes txn entries into SST files.
-pub struct BackupWriter {
+pub struct BackupWriter<EK: KvEngine> {
     name: String,
-    default: Writer,
-    write: Writer,
+    default: Writer<<EK as SstExt>::SstWriter>,
+    write: Writer<<EK as SstExt>::SstWriter>,
     limiter: Limiter,
     sst_max_size: u64,
     cipher: CipherInfo,
 }
 
-impl BackupWriter {
+impl<EK: KvEngine> BackupWriter<EK> {
     /// Create a new BackupWriter.
     pub fn new(
-        db: Arc<DB>,
+        db: EK,
         name: &str,
         compression_type: Option<SstCompressionType>,
         compression_level: i32,
         limiter: Limiter,
         sst_max_size: u64,
         cipher: CipherInfo,
-    ) -> Result<BackupWriter> {
-        let default = RocksSstWriterBuilder::new()
+    ) -> Result<BackupWriter<EK>> {
+        let default = <EK as SstExt>::SstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(CF_DEFAULT)
-            .set_db(RocksEngine::from_ref(&db))
+            .set_db(&db)
             .set_compression_type(compression_type)
             .set_compression_level(compression_level)
             .build(name)?;
-        let write = RocksSstWriterBuilder::new()
+        let write = <EK as SstExt>::SstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(CF_WRITE)
-            .set_db(RocksEngine::from_ref(&db))
+            .set_db(&db)
             .set_compression_type(compression_type)
             .set_compression_level(compression_level)
             .build(name)?;
@@ -339,19 +335,19 @@ impl BackupWriter {
 }
 
 /// A writer writes Raw kv into SST files.
-pub struct BackupRawKvWriter {
+pub struct BackupRawKvWriter<EK: KvEngine> {
     name: String,
     cf: CfName,
-    writer: Writer,
+    writer: Writer<<EK as SstExt>::SstWriter>,
     limiter: Limiter,
     cipher: CipherInfo,
     codec: KeyValueCodec,
 }
 
-impl BackupRawKvWriter {
+impl<EK: KvEngine> BackupRawKvWriter<EK> {
     /// Create a new BackupRawKvWriter.
     pub fn new(
-        db: Arc<DB>,
+        db: EK,
         name: &str,
         cf: CfNameWrap,
         limiter: Limiter,
@@ -359,11 +355,11 @@ impl BackupRawKvWriter {
         compression_level: i32,
         cipher: CipherInfo,
         codec: KeyValueCodec,
-    ) -> Result<BackupRawKvWriter> {
-        let writer = RocksSstWriterBuilder::new()
+    ) -> Result<BackupRawKvWriter<EK>> {
+        let writer = <EK as SstExt>::SstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(cf.into())
-            .set_db(RocksEngine::from_ref(&db))
+            .set_db(&db)
             .set_compression_type(compression_type)
             .set_compression_level(compression_level)
             .build(name)?;
@@ -431,9 +427,9 @@ mod tests {
 
     use engine_traits::Iterable;
     use kvproto::encryptionpb;
-    use raftstore::store::util::new_peer;
     use tempfile::TempDir;
     use tikv::storage::TestEngineBuilder;
+    use tikv_util::store::new_peer;
     use txn_types::OldValue;
 
     use super::*;
@@ -444,7 +440,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let rocks = TestEngineBuilder::new()
             .path(temp.path())
-            .cfs(&[engine_traits::CF_DEFAULT, engine_traits::CF_WRITE])
+            .cfs([engine_traits::CF_DEFAULT, engine_traits::CF_WRITE])
             .build()
             .unwrap();
         let db = rocks.get_rocksdb();
@@ -458,7 +454,7 @@ mod tests {
         }
         for (cf, kv) in kvs {
             let mut map = BTreeMap::new();
-            db.scan_cf(
+            db.scan(
                 cf,
                 keys::DATA_MIN_KEY,
                 keys::DATA_MAX_KEY,
@@ -481,7 +477,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let rocks = TestEngineBuilder::new()
             .path(temp.path())
-            .cfs(&[
+            .cfs([
                 engine_traits::CF_DEFAULT,
                 engine_traits::CF_LOCK,
                 engine_traits::CF_WRITE,
@@ -498,7 +494,7 @@ mod tests {
         r.set_id(1);
         r.mut_peers().push(new_peer(1, 1));
         let mut writer = BackupWriter::new(
-            db.get_sync_db(),
+            db.clone(),
             "foo",
             None,
             0,
@@ -516,7 +512,7 @@ mod tests {
 
         // Test write only txn.
         let mut writer = BackupWriter::new(
-            db.get_sync_db(),
+            db.clone(),
             "foo1",
             None,
             0,
@@ -555,7 +551,7 @@ mod tests {
 
         // Test write and default.
         let mut writer = BackupWriter::new(
-            db.get_sync_db(),
+            db,
             "foo2",
             None,
             0,

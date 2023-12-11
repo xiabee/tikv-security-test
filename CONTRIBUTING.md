@@ -19,6 +19,7 @@ To build TiKV you'll need to at least have the following installed:
 * `make` - Build tool (run common workflows)
 * `cmake` - Build tool (required for gRPC)
 * `awk` - Pattern scanning/processing language
+* [`protoc`](https://github.com/protocolbuffers/protobuf/releases) - Google protocol buffer compiler
 * C++ compiler - gcc 5+ (required for gRPC)
 
 If you are targeting platforms other than x86_64/aarch64 Linux or macOS, you'll also need:
@@ -77,6 +78,12 @@ make test
 env EXTRA_CARGO_ARGS=$TESTNAME make test
 ```
 
+Alternatively, you can use [nextest](https://github.com/nextest-rs/nextest) to run tests:
+
+```bash
+env EXTRA_CARGO_ARGS=$TESTNAME make test_with_nextest
+```
+
 TiKV follows the Rust community coding style. We use Rustfmt and [Clippy](https://github.com/Manishearth/rust-clippy) to automatically format and lint our code. Using these tools is checked in our CI. These are as part of `make dev`, you can also run them alone:
 
 ```bash
@@ -86,9 +93,23 @@ make format
 make clippy
 ```
 
-See the [style doc](https://github.com/rust-lang/rfcs/blob/master/style-guide/README.md) and the [API guidelines](https://rust-lang-nursery.github.io/api-guidelines/) for details on the conventions.
+See the [style doc](https://github.com/rust-lang/fmt-rfcs/blob/master/guide/guide.md) and the [API guidelines](https://rust-lang-nursery.github.io/api-guidelines/) for details on the conventions.
 
 Please follow this style to make TiKV easy to review, maintain, and develop.
+
+### Run test in docker
+
+Alternatively, you can run test in a docker environment. Simply running the following command, it will build the pingcap/tikv_dev image and run the tikv unittests. And you may re-use the pingcap/tikv_dev image directly for ad-hoc test.
+
+```bash
+make docker_test
+```
+
+Note that you may find many messages below, which in fact are not errors. They're emitted by rustc or cargo.
+
+```bash
+<jemalloc>: Invalid conf pair: prof:true
+```
 
 ### Build issues
 
@@ -109,13 +130,13 @@ To run TiKV as an actual key-value store, you will need to run it as a cluster (
 
 Use [PD](https://github.com/tikv/pd) to manage the cluster (even if just one node on a single machine). 
 
-Instructions are in our [docs](https://tikv.org/docs/dev/tasks/deploy/binary/) (if you build TiKV from source, you could skip `1. Download package` and `tikv-server` is in directory `/target`).
+Instructions are in our [docs](https://tikv.org/docs/latest/deploy/install/test/#install-binary-manually) (if you build TiKV from source, you could skip `1. Download package` and `tikv-server` is in directory `/target`).
 
 Tips: It's recommended to increase the open file limit above 82920. WSL2 users may refer to [the comment](https://github.com/Microsoft/WSL/issues/1688#issuecomment-532767317) if having difficulty in changing the `ulimit`.
 
 ### Configuration
 
-Read our configuration guide to learn about various [configuration options](https://tikv.org/docs/dev/tasks/configure/introduction/). There is also a [configuration template](./etc/config-template.toml).
+Read our configuration guide to learn about various [configuration options](https://tikv.org/docs/latest/deploy/configure/introduction/). There is also a [configuration template](./etc/config-template.toml).
 
 ## Contribution flow
 
@@ -127,7 +148,7 @@ This is a rough outline of what a contributor's workflow looks like:
 - Write code, add test cases, and commit your work (see below for message format).
 - Run tests and make sure all tests pass.
 - Push your changes to a branch in your fork of the repository and submit a pull request.
-  * Make sure mention the issue, which is created at step 1, in the commit meesage.
+  * Make sure to mention the issue, which is created at step 1, in the commit message.
 - Your PR will be reviewed and may be requested some changes.
   * Once you've made changes, your PR must be re-reviewed and approved.
   * If the PR becomes out of date, you can use GitHub's 'update branch' button.

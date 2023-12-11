@@ -11,7 +11,7 @@ use kvproto::{
 use raft::eraftpb::MessageType;
 use raftstore::store::msg::*;
 use test_raftstore::*;
-use tikv_util::{config::ReadableDuration, time::Instant};
+use tikv_util::{config::ReadableDuration, future::block_on_timeout, time::Instant};
 
 fn assert_disk_full(resp: &RaftCmdResponse) {
     assert!(resp.get_header().get_error().has_disk_full());
@@ -67,7 +67,7 @@ fn ensure_disk_usage_is_reported<T: Simulator>(
     let peer = new_peer(store_id, peer_id);
     let key = region.get_start_key();
     let ch = async_read_on_peer(cluster, peer, region.clone(), key, true, true);
-    assert!(ch.recv_timeout(Duration::from_secs(1)).is_ok());
+    block_on_timeout(ch, Duration::from_secs(1)).unwrap();
 }
 
 fn test_disk_full_leader_behaviors(usage: DiskUsage) {
@@ -86,7 +86,7 @@ fn test_disk_full_leader_behaviors(usage: DiskUsage) {
 
     // Test new normal proposals won't be allowed when disk is full.
     let old_last_index = cluster.raft_local_state(1, 1).last_index;
-    let rx = cluster.async_put(b"k2", b"v2").unwrap();
+    let mut rx = cluster.async_put(b"k2", b"v2").unwrap();
     assert_disk_full(&rx.recv_timeout(Duration::from_secs(2)).unwrap());
     let new_last_index = cluster.raft_local_state(1, 1).last_index;
     assert_eq!(old_last_index, new_last_index);
@@ -299,22 +299,24 @@ fn test_majority_disk_full() {
     }
 
     // Normal proposals will be rejected because of majority peers' disk full.
-    let ch = cluster.async_put(b"k2", b"v2").unwrap();
+    let mut ch = cluster.async_put(b"k2", b"v2").unwrap();
     let resp = ch.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(disk_full_stores(&resp), vec![2, 3]);
 
-    // Proposals with special `DiskFullOpt`s can be accepted even if all peers are disk full.
+    // Proposals with special `DiskFullOpt`s can be accepted even if all peers are
+    // disk full.
     fail::cfg(get_fp(DiskUsage::AlmostFull, 1), "return").unwrap();
     let reqs = vec![new_put_cmd(b"k3", b"v3")];
     let put = new_request(1, epoch.clone(), reqs, false);
     let mut opts = RaftCmdExtraOpts::default();
     opts.disk_full_opt = DiskFullOpt::AllowedOnAlmostFull;
-    let ch = cluster.async_request_with_opts(put, opts).unwrap();
+    let mut ch = cluster.async_request_with_opts(put, opts).unwrap();
     let resp = ch.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(!resp.get_header().has_error());
 
-    // Reset disk full status for peer 2 and 3. 2 follower reads must success because the leader
-    // will continue to append entries to followers after the new disk usages are reported.
+    // Reset disk full status for peer 2 and 3. 2 follower reads must success
+    // because the leader will continue to append entries to followers after the
+    // new disk usages are reported.
     for i in 1..3 {
         fail::remove(get_fp(DiskUsage::AlmostFull, i + 1));
         ensure_disk_usage_is_reported(&mut cluster, i + 1, i + 1, &region);
@@ -327,13 +329,13 @@ fn test_majority_disk_full() {
         ensure_disk_usage_is_reported(&mut cluster, i + 1, i + 1, &region);
     }
 
-    // Proposals with special `DiskFullOpt`s will still be rejected if majority peers are already
-    // disk full.
+    // Proposals with special `DiskFullOpt`s will still be rejected if majority
+    // peers are already disk full.
     let reqs = vec![new_put_cmd(b"k3", b"v3")];
     let put = new_request(1, epoch.clone(), reqs, false);
     let mut opts = RaftCmdExtraOpts::default();
     opts.disk_full_opt = DiskFullOpt::AllowedOnAlmostFull;
-    let ch = cluster.async_request_with_opts(put, opts).unwrap();
+    let mut ch = cluster.async_request_with_opts(put, opts).unwrap();
     let resp = ch.recv_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(disk_full_stores(&resp), vec![2, 3]);
 
@@ -346,13 +348,13 @@ fn test_majority_disk_full() {
     cluster.pd_client.must_remove_peer(1, new_peer(2, 2));
 
     // After the last configuration change is applied, the raft group will be like
-    // `[(1, DiskUsage::AlmostFull), (3, DiskUsage::AlreadyFull)]`. So no more proposals
-    // should be allowed.
+    // `[(1, DiskUsage::AlmostFull), (3, DiskUsage::AlreadyFull)]`. So no more
+    // proposals should be allowed.
     let reqs = vec![new_put_cmd(b"k4", b"v4")];
     let put = new_request(1, epoch, reqs, false);
     let mut opts = RaftCmdExtraOpts::default();
     opts.disk_full_opt = DiskFullOpt::AllowedOnAlmostFull;
-    let ch = cluster.async_request_with_opts(put, opts).unwrap();
+    let mut ch = cluster.async_request_with_opts(put, opts).unwrap();
     let resp = ch.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(disk_full_stores(&resp), vec![3]);
 
@@ -383,7 +385,8 @@ fn test_disk_full_followers_with_hibernate_regions() {
     fail::remove(get_fp(DiskUsage::AlmostFull, 2));
     thread::sleep(tick_dur * 2);
 
-    // The leader should know peer 2's disk usage changes, because it's keeping to tick.
+    // The leader should know peer 2's disk usage changes, because it's keeping to
+    // tick.
     cluster.must_put(b"k2", b"v2");
     must_get_equal(&cluster.get_engine(2), b"k2", b"v2");
 }

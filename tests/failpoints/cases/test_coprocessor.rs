@@ -11,7 +11,7 @@ use kvproto::{
 use more_asserts::{assert_ge, assert_le};
 use protobuf::Message;
 use test_coprocessor::*;
-use test_raftstore::{must_get_equal, new_peer, new_server_cluster};
+use test_raftstore_macro::test_case;
 use test_storage::*;
 use tidb_query_datatype::{
     codec::{datum, Datum},
@@ -25,7 +25,7 @@ use txn_types::{Key, Lock, LockType};
 fn test_deadline() {
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &[]);
-    let req = DAGSelect::from(&product).build();
+    let req = DagSelect::from(&product).build();
 
     fail::cfg("deadline_check_fail", "return()").unwrap();
     let resp = handle_request(&endpoint, req);
@@ -35,10 +35,11 @@ fn test_deadline() {
 
 #[test]
 fn test_deadline_2() {
-    // It should not even take any snapshots when request is outdated from the beginning.
+    // It should not even take any snapshots when request is outdated from the
+    // beginning.
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &[]);
-    let req = DAGSelect::from(&product).build();
+    let req = DagSelect::from(&product).build();
 
     fail::cfg("rockskv_async_snapshot", "panic").unwrap();
     fail::cfg("deadline_check_fail", "return()").unwrap();
@@ -67,7 +68,7 @@ fn test_deadline_3() {
         };
         init_data_with_details(Context::default(), engine, &product, &data, true, &cfg)
     };
-    let req = DAGSelect::from(&product).build();
+    let req = DagSelect::from(&product).build();
 
     fail::cfg("kv_cursor_seek", "sleep(2000)").unwrap();
     fail::cfg("copr_batch_initial_size", "return(1)").unwrap();
@@ -88,7 +89,7 @@ fn test_deadline_3() {
 fn test_parse_request_failed() {
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &[]);
-    let req = DAGSelect::from(&product).build();
+    let req = DagSelect::from(&product).build();
 
     fail::cfg("coprocessor_parse_request", "return()").unwrap();
     let resp = handle_request(&endpoint, req);
@@ -101,7 +102,7 @@ fn test_parse_request_failed_2() {
     // It should not even take any snapshots when parse failed.
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &[]);
-    let req = DAGSelect::from(&product).build();
+    let req = DagSelect::from(&product).build();
 
     fail::cfg("rockskv_async_snapshot", "panic").unwrap();
     fail::cfg("coprocessor_parse_request", "return()").unwrap();
@@ -114,7 +115,7 @@ fn test_parse_request_failed_2() {
 fn test_readpool_full() {
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &[]);
-    let req = DAGSelect::from(&product).build();
+    let req = DagSelect::from(&product).build();
 
     fail::cfg("future_pool_spawn_full", "return()").unwrap();
     let resp = handle_request(&endpoint, req);
@@ -126,7 +127,7 @@ fn test_readpool_full() {
 fn test_snapshot_failed() {
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &[]);
-    let req = DAGSelect::from(&product).build();
+    let req = DagSelect::from(&product).build();
 
     fail::cfg("rockskv_async_snapshot", "return()").unwrap();
     let resp = handle_request(&endpoint, req);
@@ -137,10 +138,10 @@ fn test_snapshot_failed() {
 #[test]
 fn test_snapshot_failed_2() {
     let product = ProductTable::new();
-    let (_, endpoint) = init_with_data(&product, &[]);
-    let req = DAGSelect::from(&product).build();
+    let (store, endpoint) = init_with_data(&product, &[]);
+    let req = DagSelect::from(&product).build();
 
-    fail::cfg("rockskv_async_snapshot_not_leader", "return()").unwrap();
+    store.get_engine().trigger_not_leader();
     let resp = handle_request(&endpoint, req);
 
     assert!(resp.get_region_error().has_not_leader());
@@ -152,7 +153,7 @@ fn test_storage_error() {
 
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &data);
-    let req = DAGSelect::from(&product).build();
+    let req = DagSelect::from(&product).build();
 
     fail::cfg("kv_cursor_seek", "return()").unwrap();
     let resp = handle_request(&endpoint, req);
@@ -177,7 +178,7 @@ fn test_region_error_in_scan() {
         init_data_with_engine_and_commit(ctx.clone(), raft_engine, &product, &data, true);
 
     fail::cfg("region_snapshot_seek", "return()").unwrap();
-    let req = DAGSelect::from(&product).build_with(ctx, &[0]);
+    let req = DagSelect::from(&product).build_with(ctx, &[0]);
     let resp = handle_request(&endpoint, req);
 
     assert!(
@@ -198,7 +199,8 @@ fn test_paging_scan() {
 
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &data);
-    // set batch size and grow size to 1, so that only 1 row will be scanned in each batch.
+    // set batch size and grow size to 1, so that only 1 row will be scanned in each
+    // batch.
     fail::cfg("copr_batch_initial_size", "return(1)").unwrap();
     fail::cfg("copr_batch_grow_size", "return(1)").unwrap();
     for desc in [false, true] {
@@ -208,7 +210,7 @@ fn test_paging_scan() {
                 exp.reverse();
             }
 
-            let req = DAGSelect::from(&product)
+            let req = DagSelect::from(&product)
                 .paging_size(paging_size as u64)
                 .desc(desc)
                 .build();
@@ -217,7 +219,7 @@ fn test_paging_scan() {
             select_resp.merge_from_bytes(resp.get_data()).unwrap();
 
             let mut row_count = 0;
-            let spliter = DAGChunkSpliter::new(select_resp.take_chunks().into(), 3);
+            let spliter = DagChunkSpliter::new(select_resp.take_chunks().into(), 3);
             for (row, (id, name, cnt)) in spliter.zip(exp) {
                 let name_datum = name.unwrap().as_bytes().into();
                 let expected_encoded = datum::encode_value(
@@ -249,6 +251,26 @@ fn test_paging_scan() {
             assert_ge!(res_end_key, end_key.get_start());
             assert_le!(res_end_key, end_key.get_end());
         }
+
+        // test limit with early return
+        let req = DagSelect::from(&product)
+            .paging_size(2)
+            .limit(1)
+            .desc(desc)
+            .build();
+        let resp = handle_request(&endpoint, req);
+        assert!(resp.range.is_none());
+        assert!(resp.range.is_none());
+
+        let agg_req = DagSelect::from(&product)
+            .count(&product["count"])
+            .group_by(&[&product["name"]])
+            .output_offsets(Some(vec![0, 1]))
+            .desc(desc)
+            .paging_size(2)
+            .build();
+        let resp = handle_request(&endpoint, agg_req);
+        assert!(resp.range.is_some());
     }
 }
 
@@ -263,129 +285,90 @@ fn test_paging_scan_multi_ranges() {
     ];
     let product = ProductTable::new();
     let (_, endpoint) = init_with_data(&product, &data);
-    // set batch size and grow size to 1, so that only 1 row will be scanned in each batch.
+    // set batch size and grow size to 1, so that only 1 row will be scanned in each
+    // batch.
     fail::cfg("copr_batch_initial_size", "return(1)").unwrap();
     fail::cfg("copr_batch_grow_size", "return(1)").unwrap();
 
     // test multi ranges with gap
-    for desc in [true] {
-        let paging_size = 3;
-        let mut exp = [data[0], data[1], data[3], data[4]];
-        if desc {
-            exp.reverse();
+    for desc in [true, false] {
+        for paging_size in [3, 5] {
+            let mut exp = [data[0], data[1], data[3], data[4]];
+            if desc {
+                exp.reverse();
+            }
+
+            let builder = DagSelect::from(&product)
+                .paging_size(paging_size)
+                .desc(desc);
+            let mut range1 = builder.key_ranges[0].clone();
+            range1.set_end(product.get_record_range_one(data[1].0).get_end().into());
+            let mut range2 = builder.key_ranges[0].clone();
+            range2.set_start(product.get_record_range_one(data[3].0).get_start().into());
+            let key_ranges = vec![range1.clone(), range2.clone()];
+
+            let req = builder.key_ranges(key_ranges).build();
+            let resp = handle_request(&endpoint, req);
+            let mut select_resp = SelectResponse::default();
+            select_resp.merge_from_bytes(resp.get_data()).unwrap();
+
+            let mut row_count = 0;
+            let spliter = DagChunkSpliter::new(select_resp.take_chunks().into(), 3);
+            for (row, (id, name, cnt)) in spliter.zip(exp) {
+                let name_datum = name.unwrap().as_bytes().into();
+                let expected_encoded = datum::encode_value(
+                    &mut EvalContext::default(),
+                    &[Datum::I64(id), name_datum, Datum::I64(cnt)],
+                )
+                .unwrap();
+                let result_encoded =
+                    datum::encode_value(&mut EvalContext::default(), &row).unwrap();
+                assert_eq!(result_encoded, &*expected_encoded);
+                row_count += 1;
+            }
+            let exp_len = if paging_size <= 4 {
+                paging_size
+            } else {
+                exp.len() as u64
+            };
+            assert_eq!(row_count, exp_len);
+
+            let res_range = resp.get_range();
+
+            let (res_start_key, res_end_key) = match desc {
+                true => (res_range.get_end(), res_range.get_start()),
+                false => (res_range.get_start(), res_range.get_end()),
+            };
+            if paging_size != 5 {
+                let start_key = match desc {
+                    true => range2.get_end(),
+                    false => range1.get_start(),
+                };
+                let end_id = match desc {
+                    true => data[1].0,
+                    false => data[3].0,
+                };
+                let end_key = product.get_record_range_one(end_id);
+                assert_eq!(res_start_key, start_key);
+                assert_ge!(res_end_key, end_key.get_start());
+                assert_le!(res_end_key, end_key.get_end());
+            } else {
+                // drained.
+                assert!(res_start_key.is_empty());
+                assert!(res_end_key.is_empty());
+            }
         }
-
-        let builder = DAGSelect::from(&product)
-            .paging_size(paging_size)
-            .desc(desc);
-        let mut range1 = builder.key_ranges[0].clone();
-        range1.set_end(product.get_record_range_one(data[1].0).get_end().into());
-        let mut range2 = builder.key_ranges[0].clone();
-        range2.set_start(product.get_record_range_one(data[3].0).get_start().into());
-        let key_ranges = vec![range1.clone(), range2.clone()];
-
-        let req = builder.key_ranges(key_ranges).build();
-        let resp = handle_request(&endpoint, req);
-        let mut select_resp = SelectResponse::default();
-        select_resp.merge_from_bytes(resp.get_data()).unwrap();
-
-        let mut row_count = 0;
-        let spliter = DAGChunkSpliter::new(select_resp.take_chunks().into(), 3);
-        for (row, (id, name, cnt)) in spliter.zip(exp) {
-            let name_datum = name.unwrap().as_bytes().into();
-            let expected_encoded = datum::encode_value(
-                &mut EvalContext::default(),
-                &[Datum::I64(id), name_datum, Datum::I64(cnt)],
-            )
-            .unwrap();
-            let result_encoded = datum::encode_value(&mut EvalContext::default(), &row).unwrap();
-            assert_eq!(result_encoded, &*expected_encoded);
-            row_count += 1;
-        }
-        assert_eq!(row_count, paging_size);
-
-        let res_range = resp.get_range();
-        let (res_start_key, res_end_key) = match desc {
-            true => (res_range.get_end(), res_range.get_start()),
-            false => (res_range.get_start(), res_range.get_end()),
-        };
-        let start_key = match desc {
-            true => range2.get_end(),
-            false => range1.get_start(),
-        };
-        let end_id = match desc {
-            true => data[1].0,
-            false => data[3].0,
-        };
-        let end_key = product.get_record_range_one(end_id);
-        assert_eq!(res_start_key, start_key);
-        assert_ge!(res_end_key, end_key.get_start());
-        assert_le!(res_end_key, end_key.get_end());
-    }
-
-    // test drained
-    for desc in [false, true] {
-        let paging_size = 5;
-        let mut exp = [data[0], data[1], data[3], data[4]];
-        if desc {
-            exp.reverse();
-        }
-
-        let builder = DAGSelect::from(&product)
-            .paging_size(paging_size)
-            .desc(desc);
-        let mut range1 = builder.key_ranges[0].clone();
-        range1.set_end(product.get_record_range_one(data[1].0).get_end().into());
-        let mut range2 = builder.key_ranges[0].clone();
-        range2.set_start(product.get_record_range_one(data[3].0).get_start().into());
-        let key_ranges = vec![range1.clone(), range2.clone()];
-
-        let req = builder.key_ranges(key_ranges).build();
-        let resp = handle_request(&endpoint, req);
-        let mut select_resp = SelectResponse::default();
-        select_resp.merge_from_bytes(resp.get_data()).unwrap();
-
-        let mut row_count = 0;
-        let spliter = DAGChunkSpliter::new(select_resp.take_chunks().into(), 3);
-        for (row, (id, name, cnt)) in spliter.zip(exp) {
-            let name_datum = name.unwrap().as_bytes().into();
-            let expected_encoded = datum::encode_value(
-                &mut EvalContext::default(),
-                &[Datum::I64(id), name_datum, Datum::I64(cnt)],
-            )
-            .unwrap();
-            let result_encoded = datum::encode_value(&mut EvalContext::default(), &row).unwrap();
-            assert_eq!(result_encoded, &*expected_encoded);
-            row_count += 1;
-        }
-        assert_eq!(row_count, exp.len());
-
-        let res_range = resp.get_range();
-        let (res_start_key, res_end_key) = match desc {
-            true => (res_range.get_end(), res_range.get_start()),
-            false => (res_range.get_start(), res_range.get_end()),
-        };
-        let start_key = match desc {
-            true => range2.get_end(),
-            false => range1.get_start(),
-        };
-        let end_key = match desc {
-            true => product.get_record_range_one(i64::MIN),
-            false => product.get_record_range_one(i64::MAX),
-        };
-        assert_eq!(res_start_key, start_key);
-        assert_eq!(res_end_key, end_key.get_start(), "{}", desc);
     }
 }
 
-#[test]
+// TODO: #[test_case(test_raftstore_v2::must_new_cluster_and_kv_client_mul)]
+#[test_case(test_raftstore::must_new_cluster_and_kv_client_mul)]
 fn test_read_index_lock_checking_on_follower() {
-    let mut cluster = new_server_cluster(0, 2);
-
+    let (mut cluster, _client, _ctx) = new_cluster(2);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
-    let rid = cluster.run_conf_change();
+    let rid = 1;
     cluster.must_put(b"k1", b"v1");
     pd_client.must_add_peer(rid, new_peer(2, 2));
     must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
@@ -406,7 +389,7 @@ fn test_read_index_lock_checking_on_follower() {
     ctx.set_replica_read(true);
 
     let product = ProductTable::new();
-    let mut req = DAGSelect::from(&product).build();
+    let mut req = DagSelect::from(&product).build();
     req.set_context(ctx);
     req.set_start_ts(100);
 
