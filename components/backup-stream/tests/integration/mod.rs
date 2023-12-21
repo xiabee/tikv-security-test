@@ -5,6 +5,7 @@
 
 #[path = "../suite.rs"]
 mod suite;
+pub use suite::*;
 
 mod all {
     use std::time::{Duration, Instant};
@@ -16,31 +17,31 @@ mod all {
     use futures::{Stream, StreamExt};
     use pd_client::PdClient;
     use test_raftstore::IsolationFilterFactory;
-    use tikv::config::BackupStreamConfig;
     use tikv_util::{box_err, defer, info, HandyRwLock};
     use tokio::time::timeout;
     use txn_types::{Key, TimeStamp};
 
-    use super::suite::{
+    use crate::{
         make_record_key, make_split_key_at_record, mutation, run_async_test, SuiteBuilder,
     };
 
     #[test]
     fn with_split() {
-        let mut suite = SuiteBuilder::new_named("with_split").build();
-        let (round1, round2) = run_async_test(async {
+        let mut suite = super::SuiteBuilder::new_named("with_split").build();
+        run_async_test(async {
             let round1 = suite.write_records(0, 128, 1).await;
             suite.must_split(&make_split_key_at_record(1, 42));
             suite.must_register_task(1, "test_with_split");
             let round2 = suite.write_records(256, 128, 1).await;
-            (round1, round2)
+            suite.force_flush_files("test_with_split");
+            suite.wait_for_flush();
+            suite
+                .check_for_write_records(
+                    suite.flushed_files.path(),
+                    round1.union(&round2).map(Vec::as_slice),
+                )
+                .await;
         });
-        suite.force_flush_files("test_with_split");
-        suite.wait_for_flush();
-        suite.check_for_write_records(
-            suite.flushed_files.path(),
-            round1.union(&round2).map(Vec::as_slice),
-        );
         suite.cluster.shutdown();
     }
 
@@ -61,8 +62,8 @@ mod all {
     ///   scanning get the snapshot.
     #[test]
     fn with_split_txn() {
-        let mut suite = SuiteBuilder::new_named("split_txn").build();
-        let (commit_ts, start_ts, keys) = run_async_test(async {
+        let mut suite = super::SuiteBuilder::new_named("split_txn").build();
+        run_async_test(async {
             let start_ts = suite.cluster.pd_client.get_tso().await.unwrap();
             let keys = (1..1960).map(|i| make_record_key(1, i)).collect::<Vec<_>>();
             suite.must_kv_prewrite(
@@ -75,32 +76,33 @@ mod all {
                 start_ts,
             );
             let commit_ts = suite.cluster.pd_client.get_tso().await.unwrap();
-            (commit_ts, start_ts, keys)
+            suite.commit_keys(keys[1913..].to_vec(), start_ts, commit_ts);
+            suite.must_register_task(1, "test_split_txn");
+            suite.commit_keys(keys[..1913].to_vec(), start_ts, commit_ts);
+            suite.force_flush_files("test_split_txn");
+            suite.wait_for_flush();
+            let keys_encoded = keys
+                .iter()
+                .map(|v| {
+                    Key::from_raw(v.as_slice())
+                        .append_ts(commit_ts)
+                        .into_encoded()
+                })
+                .collect::<Vec<_>>();
+            suite
+                .check_for_write_records(
+                    suite.flushed_files.path(),
+                    keys_encoded.iter().map(Vec::as_slice),
+                )
+                .await;
         });
-        suite.commit_keys(keys[1913..].to_vec(), start_ts, commit_ts);
-        suite.must_register_task(1, "test_split_txn");
-        suite.commit_keys(keys[..1913].to_vec(), start_ts, commit_ts);
-        suite.force_flush_files("test_split_txn");
-        suite.wait_for_flush();
-        let keys_encoded = keys
-            .iter()
-            .map(|v| {
-                Key::from_raw(v.as_slice())
-                    .append_ts(commit_ts)
-                    .into_encoded()
-            })
-            .collect::<Vec<_>>();
-        suite.check_for_write_records(
-            suite.flushed_files.path(),
-            keys_encoded.iter().map(Vec::as_slice),
-        );
         suite.cluster.shutdown();
     }
 
     #[test]
     /// This case tests whether the backup can continue when the leader failes.
     fn leader_down() {
-        let mut suite = SuiteBuilder::new_named("leader_down").build();
+        let mut suite = super::SuiteBuilder::new_named("leader_down").build();
         suite.must_register_task(1, "test_leader_down");
         suite.sync();
         let round1 = run_async_test(suite.write_records(0, 128, 1));
@@ -109,10 +111,10 @@ mod all {
         let round2 = run_async_test(suite.write_records(256, 128, 1));
         suite.force_flush_files("test_leader_down");
         suite.wait_for_flush();
-        suite.check_for_write_records(
+        run_async_test(suite.check_for_write_records(
             suite.flushed_files.path(),
             round1.union(&round2).map(Vec::as_slice),
-        );
+        ));
         suite.cluster.shutdown();
     }
 
@@ -120,7 +122,9 @@ mod all {
     /// This case tests whether the checkpoint ts (next backup ts) can be
     /// advanced correctly when async commit is enabled.
     fn async_commit() {
-        let mut suite = SuiteBuilder::new_named("async_commit").nodes(3).build();
+        let mut suite = super::SuiteBuilder::new_named("async_commit")
+            .nodes(3)
+            .build();
         run_async_test(async {
             suite.must_register_task(1, "test_async_commit");
             suite.sync();
@@ -141,7 +145,9 @@ mod all {
 
     #[test]
     fn fatal_error() {
-        let mut suite = SuiteBuilder::new_named("fatal_error").nodes(3).build();
+        let mut suite = super::SuiteBuilder::new_named("fatal_error")
+            .nodes(3)
+            .build();
         suite.must_register_task(1, "test_fatal_error");
         suite.sync();
         run_async_test(suite.write_records(0, 1, 1));
@@ -160,7 +166,7 @@ mod all {
         let err = run_async_test(
             suite
                 .get_meta_cli()
-                .get_last_error_of("test_fatal_error", *victim),
+                .get_last_error("test_fatal_error", *victim),
         )
         .unwrap()
         .unwrap();
@@ -187,7 +193,9 @@ mod all {
 
     #[test]
     fn region_checkpoint_info() {
-        let mut suite = SuiteBuilder::new_named("checkpoint_info").nodes(1).build();
+        let mut suite = super::SuiteBuilder::new_named("checkpoint_info")
+            .nodes(1)
+            .build();
         suite.must_register_task(1, "checkpoint_info");
         suite.must_split(&make_split_key_at_record(1, 42));
         run_async_test(suite.write_records(0, 128, 1));
@@ -307,7 +315,7 @@ mod all {
 
     #[test]
     fn subscribe_flushing() {
-        let mut suite = SuiteBuilder::new_named("sub_flush").build();
+        let mut suite = super::SuiteBuilder::new_named("sub_flush").build();
         let stream = suite.flush_stream(true);
         for i in 1..10 {
             let split_key = make_split_key_at_record(1, i * 20);
@@ -344,15 +352,15 @@ mod all {
         }
         assert_eq!(items.last().unwrap().end_key, Vec::<u8>::default());
 
-        suite.check_for_write_records(
+        run_async_test(suite.check_for_write_records(
             suite.flushed_files.path(),
             round1.union(&round2).map(|x| x.as_slice()),
-        );
+        ));
     }
 
     #[test]
     fn resolved_follower() {
-        let mut suite = SuiteBuilder::new_named("r").build();
+        let mut suite = super::SuiteBuilder::new_named("r").build();
         let round1 = run_async_test(suite.write_records(0, 128, 1));
         suite.must_register_task(1, "r");
         suite.run(|| Task::RegionCheckpointsOp(RegionCheckpointOperation::PrepareMinTsForResolve));
@@ -370,24 +378,24 @@ mod all {
             .schedule(Task::ForceFlush("r".to_owned()))
             .unwrap();
         suite.sync();
-        std::thread::sleep(Duration::from_secs(2));
-        suite.check_for_write_records(
+        std::thread::sleep(Duration::from_secs(1));
+        run_async_test(suite.check_for_write_records(
             suite.flushed_files.path(),
             round1.iter().map(|x| x.as_slice()),
-        );
+        ));
         assert!(suite.global_checkpoint() > 256);
         suite.force_flush_files("r");
         suite.wait_for_flush();
         assert!(suite.global_checkpoint() > 512);
-        suite.check_for_write_records(
+        run_async_test(suite.check_for_write_records(
             suite.flushed_files.path(),
             round1.union(&round2).map(|x| x.as_slice()),
-        );
+        ));
     }
 
     #[test]
     fn network_partition() {
-        let mut suite = SuiteBuilder::new_named("network_partition")
+        let mut suite = super::SuiteBuilder::new_named("network_partition")
             .nodes(3)
             .build();
         let stream = suite.flush_stream(true);
@@ -424,30 +432,9 @@ mod all {
             ts,
             cps
         );
-        suite.check_for_write_records(
+        run_async_test(suite.check_for_write_records(
             suite.flushed_files.path(),
             round1.iter().map(|k| k.as_slice()),
-        )
-    }
-
-    #[test]
-    fn update_config() {
-        let suite = SuiteBuilder::new_named("network_partition")
-            .nodes(1)
-            .build();
-        let mut basic_config = BackupStreamConfig::default();
-        basic_config.initial_scan_concurrency = 4;
-        suite.run(|| Task::ChangeConfig(basic_config.clone()));
-        suite.wait_with(|e| {
-            assert_eq!(e.initial_scan_semaphore.available_permits(), 4,);
-            true
-        });
-
-        basic_config.initial_scan_concurrency = 16;
-        suite.run(|| Task::ChangeConfig(basic_config.clone()));
-        suite.wait_with(|e| {
-            assert_eq!(e.initial_scan_semaphore.available_permits(), 16,);
-            true
-        });
+        ))
     }
 }

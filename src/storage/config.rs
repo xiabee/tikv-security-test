@@ -2,7 +2,7 @@
 
 //! Storage configuration.
 
-use std::{cmp::max, error::Error, path::Path};
+use std::{cmp::max, error::Error};
 
 use engine_rocks::raw::{Cache, LRUCacheOptions, MemoryAllocator};
 use file_system::{IoPriority, IoRateLimitMode, IoRateLimiter, IoType};
@@ -14,7 +14,7 @@ use tikv_util::{
     sys::SysQuota,
 };
 
-use crate::config::{DEFAULT_ROCKSDB_SUB_DIR, DEFAULT_TABLET_SUB_DIR, MIN_BLOCK_CACHE_SHARD_SIZE};
+use crate::config::{BLOCK_CACHE_RATE, MIN_BLOCK_CACHE_SHARD_SIZE};
 
 pub const DEFAULT_DATA_DIR: &str = "./";
 const DEFAULT_GC_RATIO_THRESHOLD: f64 = 1.1;
@@ -31,33 +31,12 @@ const DEFAULT_SCHED_PENDING_WRITE_MB: u64 = 100;
 const DEFAULT_RESERVED_SPACE_GB: u64 = 5;
 const DEFAULT_RESERVED_RAFT_SPACE_GB: u64 = 1;
 
-// In tests, we've observed 1.2M entries in the TxnStatusCache. We
-// conservatively set the limit to 5M entries in total.
-// As TxnStatusCache have 128 slots by default. We round it to 5.12M.
-// This consumes at most around 300MB memory theoretically, but usually it's
-// much less as it's hard to see the capacity being used up.
-const DEFAULT_TXN_STATUS_CACHE_CAPACITY: usize = 40_000 * 128;
-
-// Block cache capacity used when TikvConfig isn't validated. It should only
-// occur in tests.
-const FALLBACK_BLOCK_CACHE_CAPACITY: ReadableSize = ReadableSize::mb(128);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum EngineType {
-    RaftKv,
-    #[serde(alias = "partitioned-raft-kv")]
-    RaftKv2,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
     #[online_config(skip)]
     pub data_dir: String,
-    #[online_config(skip)]
-    pub engine: EngineType,
     // Replaced by `GcConfig.ratio_threshold`. Keep it for backward compatibility.
     #[online_config(skip)]
     pub gc_ratio_threshold: f64,
@@ -83,8 +62,6 @@ pub struct Config {
     pub background_error_recovery_window: ReadableDuration,
     /// Interval to check TTL for all SSTs,
     pub ttl_check_poll_interval: ReadableDuration,
-    #[online_config(skip)]
-    pub txn_status_cache_capacity: usize,
     #[online_config(submodule)]
     pub flow_control: FlowControlConfig,
     #[online_config(submodule)]
@@ -98,7 +75,6 @@ impl Default for Config {
         let cpu_num = SysQuota::cpu_cores_quota();
         Config {
             data_dir: DEFAULT_DATA_DIR.to_owned(),
-            engine: EngineType::RaftKv,
             gc_ratio_threshold: DEFAULT_GC_RATIO_THRESHOLD,
             max_key_size: DEFAULT_MAX_KEY_SIZE,
             scheduler_concurrency: DEFAULT_SCHED_CONCURRENCY,
@@ -114,7 +90,6 @@ impl Default for Config {
             api_version: 1,
             enable_ttl: false,
             ttl_check_poll_interval: ReadableDuration::hours(12),
-            txn_status_cache_capacity: DEFAULT_TXN_STATUS_CACHE_CAPACITY,
             flow_control: FlowControlConfig::default(),
             block_cache: BlockCacheConfig::default(),
             io_rate_limit: IoRateLimitConfig::default(),
@@ -124,43 +99,10 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn validate_engine_type(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn validate(&mut self) -> Result<(), Box<dyn Error>> {
         if self.data_dir != DEFAULT_DATA_DIR {
             self.data_dir = config::canonicalize_path(&self.data_dir)?
         }
-
-        let v1_kv_db_path =
-            config::canonicalize_sub_path(&self.data_dir, DEFAULT_ROCKSDB_SUB_DIR).unwrap();
-        let v2_tablet_path =
-            config::canonicalize_sub_path(&self.data_dir, DEFAULT_TABLET_SUB_DIR).unwrap();
-
-        let kv_data_exists = Path::new(&v1_kv_db_path).exists();
-        let v2_tablet_exists = Path::new(&v2_tablet_path).exists();
-        if kv_data_exists && v2_tablet_exists {
-            return Err("Both raft-kv and partitioned-raft-kv's data folders exist".into());
-        }
-
-        // v1's data exists, but the engine type is v2
-        if kv_data_exists && self.engine == EngineType::RaftKv2 {
-            info!(
-                "TiKV has data for raft-kv engine but the engine type in config is partitioned-raft-kv. Ignore the config and keep raft-kv instead"
-            );
-            self.engine = EngineType::RaftKv;
-        }
-
-        // if v2's data exists, but the engine type is v1
-        if v2_tablet_exists && self.engine == EngineType::RaftKv {
-            info!(
-                "TiKV has data for partitioned-raft-kv engine but the engine type in config is raft-kv. Ignore the config and keep partitioned-raft-kv instead"
-            );
-            self.engine = EngineType::RaftKv2;
-        }
-        Ok(())
-    }
-
-    pub fn validate(&mut self) -> Result<(), Box<dyn Error>> {
-        self.validate_engine_type()?;
-
         if self.scheduler_concurrency > MAX_SCHED_CONCURRENCY {
             warn!(
                 "TiKV has optimized latch since v4.0, so it is not necessary to set large schedule \
@@ -252,7 +194,7 @@ impl Default for FlowControlConfig {
 #[serde(rename_all = "kebab-case")]
 pub struct BlockCacheConfig {
     #[online_config(skip)]
-    pub shared: Option<bool>,
+    pub shared: bool,
     pub capacity: Option<ReadableSize>,
     #[online_config(skip)]
     pub num_shard_bits: i32,
@@ -267,7 +209,7 @@ pub struct BlockCacheConfig {
 impl Default for BlockCacheConfig {
     fn default() -> BlockCacheConfig {
         BlockCacheConfig {
-            shared: None,
+            shared: true,
             capacity: None,
             num_shard_bits: 6,
             strict_capacity_limit: false,
@@ -287,11 +229,17 @@ impl BlockCacheConfig {
         }
     }
 
-    pub fn build_shared_cache(&self) -> Cache {
-        if self.shared == Some(false) {
-            warn!("storage.block-cache.shared is deprecated, cache is always shared.");
+    pub fn build_shared_cache(&self) -> Option<Cache> {
+        if !self.shared {
+            return None;
         }
-        let capacity = self.capacity.unwrap_or(FALLBACK_BLOCK_CACHE_CAPACITY).0 as usize;
+        let capacity = match self.capacity {
+            None => {
+                let total_mem = SysQuota::memory_limit_in_bytes();
+                ((total_mem as f64) * BLOCK_CACHE_RATE) as usize
+            }
+            Some(c) => c.0 as usize,
+        };
         let mut cache_opts = LRUCacheOptions::new();
         cache_opts.set_capacity(capacity);
         cache_opts.set_num_shard_bits(self.adjust_shard_bits(capacity) as c_int);
@@ -300,7 +248,7 @@ impl BlockCacheConfig {
         if let Some(allocator) = self.new_memory_allocator() {
             cache_opts.set_memory_allocator(allocator);
         }
-        Cache::new_lru_cache(cache_opts)
+        Some(Cache::new_lru_cache(cache_opts))
     }
 
     fn new_memory_allocator(&self) -> Option<MemoryAllocator> {
@@ -395,7 +343,6 @@ impl IoRateLimitConfig {
         limiter.set_io_priority(IoType::Gc, self.gc_priority);
         limiter.set_io_priority(IoType::Import, self.import_priority);
         limiter.set_io_priority(IoType::Export, self.export_priority);
-        limiter.set_io_priority(IoType::RewriteLog, self.compaction_priority);
         limiter.set_io_priority(IoType::Other, self.other_priority);
         limiter
     }
@@ -431,8 +378,6 @@ impl IoRateLimitConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
     #[test]
@@ -449,38 +394,6 @@ mod tests {
 
         cfg.scheduler_worker_pool_size = max_pool_size + 1;
         cfg.validate().unwrap_err();
-    }
-
-    #[test]
-    fn test_validate_engine_type_config() {
-        let mut cfg = Config::default();
-        cfg.engine = EngineType::RaftKv;
-        cfg.validate().unwrap();
-        assert_eq!(cfg.engine, EngineType::RaftKv);
-
-        cfg.engine = EngineType::RaftKv2;
-        cfg.validate().unwrap();
-        assert_eq!(cfg.engine, EngineType::RaftKv2);
-
-        let v1_kv_db_path =
-            config::canonicalize_sub_path(&cfg.data_dir, DEFAULT_ROCKSDB_SUB_DIR).unwrap();
-        fs::create_dir_all(&v1_kv_db_path).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.engine, EngineType::RaftKv);
-        fs::remove_dir_all(&v1_kv_db_path).unwrap();
-
-        let v2_tablet_path =
-            config::canonicalize_sub_path(&cfg.data_dir, DEFAULT_TABLET_SUB_DIR).unwrap();
-        fs::create_dir_all(&v2_tablet_path).unwrap();
-        cfg.engine = EngineType::RaftKv;
-        cfg.validate().unwrap();
-        assert_eq!(cfg.engine, EngineType::RaftKv2);
-
-        // both v1 and v2 data exists, throw error
-        fs::create_dir_all(&v1_kv_db_path).unwrap();
-        cfg.validate().unwrap_err();
-        fs::remove_dir_all(&v1_kv_db_path).unwrap();
-        fs::remove_dir_all(&v2_tablet_path).unwrap();
     }
 
     #[test]

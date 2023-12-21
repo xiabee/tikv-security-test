@@ -30,10 +30,7 @@ use raft::{
     Error as RaftError, GetEntriesContext, RaftState, Ready, Storage, StorageError,
 };
 use tikv_util::{
-    box_err, box_try, debug, defer, error, info,
-    store::find_peer_by_id,
-    time::{Instant, UnixSecs},
-    warn,
+    box_err, box_try, debug, defer, error, info, store::find_peer_by_id, time::Instant, warn,
     worker::Scheduler,
 };
 
@@ -186,9 +183,7 @@ fn init_raft_state<EK: KvEngine, ER: RaftEngine>(
         raft_state.last_index = RAFT_INIT_LOG_INDEX;
         raft_state.mut_hard_state().set_term(RAFT_INIT_LOG_TERM);
         raft_state.mut_hard_state().set_commit(RAFT_INIT_LOG_INDEX);
-        let mut lb = engines.raft.log_batch(0);
-        lb.put_raft_state(region.get_id(), &raft_state)?;
-        engines.raft.consume(&mut lb, true)?;
+        engines.raft.put_raft_state(region.get_id(), &raft_state)?;
     }
     Ok(raft_state)
 }
@@ -372,7 +367,7 @@ where
 
     #[inline]
     pub fn raw_snapshot(&self) -> EK::Snapshot {
-        self.engines.kv.snapshot(None)
+        self.engines.kv.snapshot()
     }
 
     #[inline]
@@ -452,11 +447,6 @@ where
     /// Gets a snapshot. Returns `SnapshotTemporarilyUnavailable` if there is no
     /// available snapshot.
     pub fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
-        fail_point!("ignore generate snapshot", self.peer_id == 1, |_| {
-            Err(raft::Error::Store(
-                raft::StorageError::SnapshotTemporarilyUnavailable,
-            ))
-        });
         if self.peer.as_ref().unwrap().is_witness {
             // witness could be the leader for a while, do not generate snapshot now
             return Err(raft::Error::Store(
@@ -465,18 +455,6 @@ where
         }
 
         if find_peer_by_id(&self.region, to).map_or(false, |p| p.is_witness) {
-            // Although we always sending snapshot task behind apply task to get latest
-            // snapshot, we can't use `last_applying_idx` here, as below the judgment
-            // condition will generate an witness snapshot directly, the new non-witness
-            // will ingore this mismatch snapshot and can't request snapshot successfully
-            // again.
-            if self.applied_index() < request_index {
-                // It may be a request from non-witness. In order to avoid generating mismatch
-                // snapshots, wait for apply non-witness to complete
-                return Err(raft::Error::Store(
-                    raft::StorageError::SnapshotTemporarilyUnavailable,
-                ));
-            }
             // generate an empty snapshot for witness directly
             return Ok(util::new_empty_snapshot(
                 self.region.clone(),
@@ -527,12 +505,7 @@ where
             panic!("{} unexpected state: {:?}", self.tag, *snap_state);
         }
 
-        let max_snap_try_cnt = (|| {
-            fail_point!("ignore_snap_try_cnt", |_| usize::MAX);
-            MAX_SNAP_TRY_CNT
-        })();
-
-        if *tried_cnt >= max_snap_try_cnt {
+        if *tried_cnt >= MAX_SNAP_TRY_CNT {
             let cnt = *tried_cnt;
             *tried_cnt = 0;
             return Err(raft::Error::Store(box_err!(
@@ -691,7 +664,6 @@ where
             "peer_id" => self.peer_id,
             "region" => ?region,
             "state" => ?self.apply_state(),
-            "for_witness" => for_witness,
         );
 
         Ok((region, for_witness))
@@ -1066,7 +1038,6 @@ pub fn do_snapshot<E>(
     last_applied_state: RaftApplyState,
     for_balance: bool,
     allow_multi_files_snapshot: bool,
-    start: UnixSecs,
 ) -> raft::Result<Snapshot>
 where
     E: KvEngine,
@@ -1124,7 +1095,6 @@ where
         region_state.get_region(),
         allow_multi_files_snapshot,
         for_balance,
-        start,
     )?;
     snapshot.set_data(snap_data.write_to_bytes()?.into());
 
@@ -1607,7 +1577,7 @@ pub mod tests {
             .unwrap()
             .unwrap();
         gen_task.generate_and_schedule_snapshot::<KvTestEngine>(
-            engines.kv.clone().snapshot(None),
+            engines.kv.clone().snapshot(),
             entry.get_term(),
             apply_state,
             sched,
@@ -1632,7 +1602,6 @@ pub mod tests {
         let td = Builder::new().prefix("tikv-store-test").tempdir().unwrap();
         let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
-        mgr.init().unwrap();
         let mut worker = Worker::new("region-worker").lazy_build("region-worker");
         let sched = worker.scheduler();
         let (dummy_scheduler, _) = dummy_scheduler();
@@ -1769,7 +1738,6 @@ pub mod tests {
         let td = Builder::new().prefix("tikv-store-test").tempdir().unwrap();
         let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
         let mut mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
-        mgr.init().unwrap();
         mgr.set_enable_multi_snapshot_files(true);
         mgr.set_max_per_file_size(500);
         let mut worker = Worker::new("region-worker").lazy_build("region-worker");
@@ -1841,7 +1809,6 @@ pub mod tests {
         let td = Builder::new().prefix("tikv-store-test").tempdir().unwrap();
         let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
-        mgr.init().unwrap();
         let mut worker = Worker::new("region-worker").lazy_build("region-worker");
         let sched = worker.scheduler();
         let (dummy_scheduler, _) = dummy_scheduler();
@@ -1921,7 +1888,6 @@ pub mod tests {
         let td1 = Builder::new().prefix("tikv-store-test").tempdir().unwrap();
         let snap_dir = Builder::new().prefix("snap").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
-        mgr.init().unwrap();
         let mut worker = LazyWorker::new("snap-manager");
         let sched = worker.scheduler();
         let (dummy_scheduler, _) = dummy_scheduler();
@@ -2114,35 +2080,32 @@ pub mod tests {
         let initial_state = s.initial_state().unwrap();
         assert_eq!(initial_state.hard_state, *raft_state.get_hard_state());
 
-        let mut lb = engines.raft.log_batch(4096);
         // last_index < commit_index is invalid.
         raft_state.set_last_index(11);
-        lb.append(1, None, vec![new_entry(11, RAFT_INIT_LOG_TERM)])
+        engines
+            .raft
+            .append(1, vec![new_entry(11, RAFT_INIT_LOG_TERM)])
             .unwrap();
         raft_state.mut_hard_state().set_commit(12);
-        lb.put_raft_state(1, &raft_state).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.put_raft_state(1, &raft_state).unwrap();
         assert!(build_storage().is_err());
 
         raft_state.set_last_index(20);
         let entries = (12..=20)
             .map(|index| new_entry(index, RAFT_INIT_LOG_TERM))
             .collect();
-        lb.append(1, None, entries).unwrap();
-        lb.put_raft_state(1, &raft_state).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.append(1, entries).unwrap();
+        engines.raft.put_raft_state(1, &raft_state).unwrap();
         s = build_storage().unwrap();
         let initial_state = s.initial_state().unwrap();
         assert_eq!(initial_state.hard_state, *raft_state.get_hard_state());
 
         // Missing last log is invalid.
         raft_state.set_last_index(21);
-        lb.put_raft_state(1, &raft_state).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.put_raft_state(1, &raft_state).unwrap();
         assert!(build_storage().is_err());
         raft_state.set_last_index(20);
-        lb.put_raft_state(1, &raft_state).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.put_raft_state(1, &raft_state).unwrap();
 
         // applied_index > commit_index is invalid.
         let mut apply_state = RaftApplyState::default();
@@ -2159,8 +2122,7 @@ pub mod tests {
         assert!(build_storage().is_err());
 
         // It should not recover if corresponding log doesn't exist.
-        engines.raft.gc(1, 14, 15, &mut lb).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.gc(1, 14, 15).unwrap();
         apply_state.set_commit_index(14);
         apply_state.set_commit_term(RAFT_INIT_LOG_TERM);
         engines
@@ -2172,9 +2134,8 @@ pub mod tests {
         let entries = (14..=20)
             .map(|index| new_entry(index, RAFT_INIT_LOG_TERM))
             .collect();
-        engines.raft.gc(1, 0, 21, &mut lb).unwrap();
-        lb.append(1, None, entries).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.gc(1, 0, 21).unwrap();
+        engines.raft.append(1, entries).unwrap();
         raft_state.mut_hard_state().set_commit(14);
         s = build_storage().unwrap();
         let initial_state = s.initial_state().unwrap();
@@ -2185,28 +2146,27 @@ pub mod tests {
             .map(|index| new_entry(index, RAFT_INIT_LOG_TERM))
             .collect();
         entries[0].set_term(RAFT_INIT_LOG_TERM - 1);
-        lb.append(1, None, entries).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.append(1, entries).unwrap();
         assert!(build_storage().is_err());
 
         // hard state term miss match is invalid.
         let entries = (14..=20)
             .map(|index| new_entry(index, RAFT_INIT_LOG_TERM))
             .collect();
-        lb.append(1, None, entries).unwrap();
+        engines.raft.append(1, entries).unwrap();
         raft_state.mut_hard_state().set_term(RAFT_INIT_LOG_TERM - 1);
-        lb.put_raft_state(1, &raft_state).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.put_raft_state(1, &raft_state).unwrap();
         assert!(build_storage().is_err());
 
         // last index < recorded_commit_index is invalid.
-        engines.raft.gc(1, 0, 21, &mut lb).unwrap();
+        engines.raft.gc(1, 0, 21).unwrap();
         raft_state.mut_hard_state().set_term(RAFT_INIT_LOG_TERM);
         raft_state.set_last_index(13);
-        lb.append(1, None, vec![new_entry(13, RAFT_INIT_LOG_TERM)])
+        engines
+            .raft
+            .append(1, vec![new_entry(13, RAFT_INIT_LOG_TERM)])
             .unwrap();
-        lb.put_raft_state(1, &raft_state).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        engines.raft.put_raft_state(1, &raft_state).unwrap();
         assert!(build_storage().is_err());
     }
 

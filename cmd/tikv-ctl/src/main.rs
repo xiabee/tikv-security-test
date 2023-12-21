@@ -1,7 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 #![feature(once_cell)]
-#![feature(let_chains)]
 
 #[macro_use]
 extern crate log;
@@ -20,12 +19,12 @@ use std::{
 };
 
 use collections::HashMap;
-use crypto::fips;
 use encryption_export::{
-    create_backend, data_key_manager_from_config, DataKeyManager, DecrypterReader, Iv,
+    create_backend, data_key_manager_from_config, from_engine_encryption_method, DataKeyManager,
+    DecrypterReader, Iv,
 };
 use engine_rocks::get_env;
-use engine_traits::Peekable;
+use engine_traits::{EncryptionKeyManager, Peekable, TabletFactory};
 use file_system::calc_crc32;
 use futures::{executor::block_on, future::try_join_all};
 use gag::BufferRedirect;
@@ -48,7 +47,6 @@ use structopt::{clap::ErrorKind, StructOpt};
 use tikv::{
     config::TikvConfig,
     server::{debug::BottommostLevelCompaction, KvEngineFactoryBuilder},
-    storage::config::EngineType,
 };
 use tikv_util::{escape, run_and_wait_child_process, sys::thread::StdThreadBuildWrapper, unescape};
 use txn_types::Key;
@@ -61,16 +59,10 @@ mod fork_readonly_tikv;
 mod util;
 
 fn main() {
-    // OpenSSL FIPS mode should be enabled at the very start.
-    fips::maybe_enable();
-
     let opt = Opt::from_args();
 
     // Initialize logger.
     init_ctl_logger(&opt.log_level);
-
-    // Print OpenSSL FIPS mode status.
-    fips::log_status();
 
     // Initialize configuration and security manager.
     let cfg_path = opt.config.as_ref();
@@ -121,9 +113,6 @@ fn main() {
             }
         }
         Cmd::RaftEngineCtl { args } => {
-            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
-                return;
-            }
             let key_manager =
                 data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
                     .expect("data_key_manager_from_config should success");
@@ -145,9 +134,6 @@ fn main() {
             dump_snap_meta_file(path);
         }
         Cmd::DecryptFile { file, out_file } => {
-            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
-                return;
-            }
             let message =
                 "This action will expose sensitive data as plaintext on persistent storage";
             if !warning_prompt(message) {
@@ -172,7 +158,7 @@ fn main() {
             let infile1 = Path::new(infile).canonicalize().unwrap();
             let file_info = key_manager.get_file(infile1.to_str().unwrap()).unwrap();
 
-            let mthd = file_info.method;
+            let mthd = from_engine_encryption_method(file_info.method);
             if mthd == EncryptionMethod::Plaintext {
                 println!(
                     "{} is not encrypted, skip to decrypt it into {}",
@@ -196,36 +182,28 @@ fn main() {
             io::copy(&mut reader, &mut outf).unwrap();
             println!("crc32: {}", calc_crc32(outfile).unwrap());
         }
-        Cmd::EncryptionMeta { cmd: subcmd } => {
-            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
-                return;
-            }
-            match subcmd {
-                EncryptionMetaCmd::DumpKey { ids } => {
-                    let message = "This action will expose encryption key(s) as plaintext. Do not output the \
+        Cmd::EncryptionMeta { cmd: subcmd } => match subcmd {
+            EncryptionMetaCmd::DumpKey { ids } => {
+                let message = "This action will expose encryption key(s) as plaintext. Do not output the \
                     result in file on disk.";
-                    if !warning_prompt(message) {
-                        return;
-                    }
-                    DataKeyManager::dump_key_dict(
-                        create_backend(&cfg.security.encryption.master_key)
-                            .expect("encryption-meta master key creation"),
-                        &cfg.storage.data_dir,
-                        ids,
-                    )
-                    .unwrap();
+                if !warning_prompt(message) {
+                    return;
                 }
-                EncryptionMetaCmd::DumpFile { path } => {
-                    let path = path
-                        .map(|path| fs::canonicalize(path).unwrap().to_str().unwrap().to_owned());
-                    DataKeyManager::dump_file_dict(&cfg.storage.data_dir, path.as_deref()).unwrap();
-                }
+                DataKeyManager::dump_key_dict(
+                    create_backend(&cfg.security.encryption.master_key)
+                        .expect("encryption-meta master key creation"),
+                    &cfg.storage.data_dir,
+                    ids,
+                )
+                .unwrap();
             }
-        }
+            EncryptionMetaCmd::DumpFile { path } => {
+                let path =
+                    path.map(|path| fs::canonicalize(path).unwrap().to_str().unwrap().to_owned());
+                DataKeyManager::dump_file_dict(&cfg.storage.data_dir, path.as_deref()).unwrap();
+            }
+        },
         Cmd::CleanupEncryptionMeta {} => {
-            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
-                return;
-            }
             let key_manager =
                 match data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
                     .expect("data_key_manager_from_config should success")
@@ -300,7 +278,7 @@ fn main() {
                 }
             }
         }
-        Cmd::ReuseReadonlyRemains {
+        Cmd::ForkReadonlyTikv {
             data_dir,
             agent_dir,
             snaps,
@@ -323,14 +301,6 @@ fn main() {
                 .exit();
             }
             cfg.storage.data_dir = data_dir;
-            if cfg.storage.engine == EngineType::RaftKv2 {
-                clap::Error {
-                    message: String::from("storage.engine can only be raftkv"),
-                    kind: ErrorKind::InvalidValue,
-                    info: None,
-                }
-                .exit();
-            }
             if cfg.raft_engine.config().enable_log_recycle {
                 clap::Error {
                     message: String::from("raft-engine.enable-log-recycle can only be false"),
@@ -379,7 +349,7 @@ fn main() {
             let end_key = from_hex(&end).unwrap();
             let pd_client = get_pd_rpc_client(opt.pd, Arc::clone(&mgr));
             flashback_whole_cluster(
-                &pd_client,
+                pd_client,
                 &cfg,
                 Arc::clone(&mgr),
                 regions.unwrap_or_default(),
@@ -402,8 +372,9 @@ fn main() {
                 .exit();
             }
 
-            cfg.rocksdb.paranoid_checks = Some(!opt.skip_paranoid_checks);
-            let debug_executor = new_debug_executor(&cfg, data_dir, host, Arc::clone(&mgr));
+            let skip_paranoid_checks = opt.skip_paranoid_checks;
+            let debug_executor =
+                new_debug_executor(&cfg, data_dir, skip_paranoid_checks, host, Arc::clone(&mgr));
 
             match cmd {
                 Cmd::Print { cf, key } => {
@@ -810,7 +781,8 @@ fn compact_whole_cluster(
         let h = thread::Builder::new()
             .name(format!("compact-{}", addr))
             .spawn_wrapper(move || {
-                let debug_executor = new_debug_executor(&cfg, None, Some(&addr), mgr);
+                tikv_alloc::add_thread_memory_accessor();
+                let debug_executor = new_debug_executor(&cfg, None, false, Some(&addr), mgr);
                 for cf in cfs {
                     debug_executor.compact(
                         Some(&addr),
@@ -822,6 +794,7 @@ fn compact_whole_cluster(
                         bottommost,
                     );
                 }
+                tikv_alloc::remove_thread_memory_accessor();
             })
             .unwrap();
         handles.push(h);
@@ -834,7 +807,7 @@ const FLASHBACK_TIMEOUT: u64 = 1800; // 1800s
 const WAIT_APPLY_FLASHBACK_STATE: u64 = 100; // 100ms
 
 fn flashback_whole_cluster(
-    pd_client: &RpcClient,
+    pd_client: RpcClient,
     cfg: &TikvConfig,
     mgr: Arc<SecurityManager>,
     region_ids: Vec<u64>,
@@ -846,7 +819,6 @@ fn flashback_whole_cluster(
         "flashback whole cluster with version {} from {:?} to {:?}",
         version, start_key, end_key
     );
-    let pd_client = pd_client.clone();
     let cfg = cfg.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("flashback")
@@ -869,7 +841,7 @@ fn flashback_whole_cluster(
                 let addr = pd_client.get_store(s.get_id()).unwrap().address;
                 let cfg_inner = cfg.clone();
                 let mgr = Arc::clone(&mgr);
-                let debug_executor = new_debug_executor(&cfg_inner, None, Some(&addr), mgr);
+                let debug_executor = new_debug_executor(&cfg_inner, None,false, Some(&addr), mgr);
                 (s.get_id(), debug_executor)
             } )
             .collect::<HashMap<_, _>>());
@@ -1077,21 +1049,20 @@ fn read_fail_file(path: &str) -> Vec<(String, String)> {
     list
 }
 
-fn build_rocks_opts(cfg: &TikvConfig) -> engine_rocks::RocksDbOptions {
+fn run_ldb_command(args: Vec<String>, cfg: &TikvConfig) {
     let key_manager = data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
         .unwrap()
         .map(Arc::new);
     let env = get_env(key_manager, None /* io_rate_limiter */).unwrap();
-    let resource = cfg.rocksdb.build_resources(env, cfg.storage.engine);
-    cfg.rocksdb.build_opt(&resource, cfg.storage.engine)
-}
+    let mut opts = cfg.rocksdb.build_opt();
+    opts.set_env(env);
 
-fn run_ldb_command(args: Vec<String>, cfg: &TikvConfig) {
-    engine_rocks::raw::run_ldb_tool(&args, &build_rocks_opts(cfg));
+    engine_rocks::raw::run_ldb_tool(&args, &opts);
 }
 
 fn run_sst_dump_command(args: Vec<String>, cfg: &TikvConfig) {
-    engine_rocks::raw::run_sst_dump_tool(&args, &build_rocks_opts(cfg));
+    let opts = cfg.rocksdb.build_opt();
+    engine_rocks::raw::run_sst_dump_tool(&args, &opts);
 }
 
 fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, cfg: &TikvConfig) {
@@ -1110,7 +1081,7 @@ fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, 
 
     let stderr = BufferRedirect::stderr().unwrap();
     let stdout = BufferRedirect::stdout().unwrap();
-    let opts = build_rocks_opts(cfg);
+    let opts = cfg.rocksdb.build_opt();
 
     match run_and_wait_child_process(|| engine_rocks::raw::run_sst_dump_tool(&args, &opts)) {
         Ok(code) => {
@@ -1328,33 +1299,16 @@ fn flush_std_buffer_to_log(
 }
 
 fn read_cluster_id(config: &TikvConfig) -> Result<u64, String> {
-    let key_manager =
-        data_key_manager_from_config(&config.security.encryption, &config.storage.data_dir)
-            .unwrap()
-            .map(Arc::new);
-    let env = get_env(key_manager.clone(), None /* io_rate_limiter */).unwrap();
-    let cache = config.storage.block_cache.build_shared_cache();
-    let kv_engine = KvEngineFactoryBuilder::new(env, config, cache, key_manager)
+    let env = config
+        .build_shared_rocks_env(None, None)
+        .map_err(|e| format!("build_shared_rocks_env fail: {}", e))?;
+    let kv_engine = KvEngineFactoryBuilder::new(env, config, &config.storage.data_dir)
         .build()
-        .create_shared_db(&config.storage.data_dir)
+        .create_shared_db()
         .map_err(|e| format!("create_shared_db fail: {}", e))?;
     let ident = kv_engine
         .get_msg::<StoreIdent>(keys::STORE_IDENT_KEY)
         .unwrap()
         .unwrap();
     Ok(ident.cluster_id)
-}
-
-fn validate_storage_data_dir(config: &mut TikvConfig, data_dir: Option<String>) -> bool {
-    if let Some(data_dir) = data_dir {
-        if !Path::new(&data_dir).exists() {
-            eprintln!("--data-dir {:?} not exists", data_dir);
-            return false;
-        }
-        config.storage.data_dir = data_dir;
-    } else if config.storage.data_dir.is_empty() {
-        eprintln!("--data-dir or data-dir in the config file should not be empty");
-        return false;
-    }
-    true
 }

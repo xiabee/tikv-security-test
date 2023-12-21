@@ -8,7 +8,11 @@ use std::sync::{
 
 use crossbeam::channel::{SendError, TrySendError};
 use dashmap::DashMap;
-use tikv_util::{debug, info, time::Instant, Either};
+use tikv_util::{
+    debug, info,
+    time::{duration_to_sec, Instant},
+    Either,
+};
 
 use crate::{
     fsm::{Fsm, FsmScheduler},
@@ -259,7 +263,7 @@ where
         self.normals.iter().for_each(|mailbox| {
             let _ = mailbox.force_send(msg_gen(), &self.normal_scheduler);
         });
-        BROADCAST_NORMAL_DURATION.observe(timer.saturating_elapsed_secs());
+        BROADCAST_NORMAL_DURATION.observe(duration_to_sec(timer.saturating_elapsed()));
     }
 
     /// Try to notify all FSMs that the cluster is being shutdown.

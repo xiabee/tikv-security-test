@@ -28,7 +28,7 @@ mod metadata;
 use self::metadata::*;
 
 mod kms;
-pub use self::kms::KmsBackend;
+pub use self::kms::{DataKeyPair, EncryptedKey, KmsBackend, KmsProvider};
 
 #[derive(Default, Debug, Clone)]
 pub struct PlaintextBackend {}
@@ -74,7 +74,7 @@ pub mod tests {
 
     use lazy_static::lazy_static;
 
-    use super::{Backend, *};
+    use super::*;
     use crate::*;
 
     #[derive(Debug)]

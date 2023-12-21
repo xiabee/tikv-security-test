@@ -82,7 +82,6 @@ pub fn check_intersect_of_range(key_range: &KeyRange, key_range_limit: &KeyRange
 
 #[cfg(test)]
 mod tests {
-    use kvproto::kvrpcpb::KeyRange;
     use raftstore::store::util::build_key_range;
 
     use super::*;

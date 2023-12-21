@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use api_version::{ApiV1, KvFormat};
 use async_trait::async_trait;
 use codec::{number::NumberCodec, prelude::NumberDecoder};
 use itertools::izip;
@@ -31,13 +30,11 @@ use DecodeHandleStrategy::*;
 use super::util::scan_executor::*;
 use crate::interface::*;
 
-pub struct BatchIndexScanExecutor<S: Storage, F: KvFormat>(
-    ScanExecutor<S, IndexScanExecutorImpl, F>,
-);
+pub struct BatchIndexScanExecutor<S: Storage>(ScanExecutor<S, IndexScanExecutorImpl>);
 
 // We assign a dummy type `Box<dyn Storage<Statistics = ()>>` so that we can
 // omit the type when calling `check_supported`.
-impl BatchIndexScanExecutor<Box<dyn Storage<Statistics = ()>>, ApiV1> {
+impl BatchIndexScanExecutor<Box<dyn Storage<Statistics = ()>>> {
     /// Checks whether this executor can be used.
     #[inline]
     pub fn check_supported(descriptor: &IndexScan) -> Result<()> {
@@ -45,7 +42,7 @@ impl BatchIndexScanExecutor<Box<dyn Storage<Statistics = ()>>, ApiV1> {
     }
 }
 
-impl<S: Storage, F: KvFormat> BatchIndexScanExecutor<S, F> {
+impl<S: Storage> BatchIndexScanExecutor<S> {
     pub fn new(
         storage: S,
         config: Arc<EvalConfig>,
@@ -157,7 +154,7 @@ impl<S: Storage, F: KvFormat> BatchIndexScanExecutor<S, F> {
 }
 
 #[async_trait]
-impl<S: Storage, F: KvFormat> BatchExecutor for BatchIndexScanExecutor<S, F> {
+impl<S: Storage> BatchExecutor for BatchIndexScanExecutor<S> {
     type StorageStats = S::Statistics;
 
     #[inline]
@@ -444,12 +441,10 @@ impl IndexScanExecutorImpl {
         Ok(())
     }
 
-    // Process index values that are in old collation, when
-    // `new_collations_enabled_on_first_bootstrap` = true also will access this
-    // function.
-    // NOTE: We should extract the index columns from the key first,
-    // and extract the handles from value if there is no handle in the key.
-    // Otherwise, extract the handles from the key.
+    // Process index values that are in old collation.
+    // NOTE: We should extract the index columns from the key first, and extract the
+    // handles from value if there is no handle in the key. Otherwise, extract the
+    // handles from the key.
     fn process_old_collation_kv(
         &mut self,
         mut key_payload: &[u8],
@@ -481,11 +476,9 @@ impl IndexScanExecutorImpl {
             }
             DecodeCommonHandle => {
                 // Otherwise, if the handle is common handle, we extract it from the key.
-                let end_index =
-                    columns.columns_len() - self.pid_column_cnt - self.physical_table_id_column_cnt;
                 Self::extract_columns_from_datum_format(
                     &mut key_payload,
-                    &mut columns[self.columns_id_without_handle.len()..end_index],
+                    &mut columns[self.columns_id_without_handle.len()..],
                 )?;
             }
         }
@@ -982,7 +975,7 @@ mod tests {
                 range
             }];
 
-            let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+            let mut executor = BatchIndexScanExecutor::new(
                 store.clone(),
                 Arc::new(EvalConfig::default()),
                 vec![columns_info[0].clone(), columns_info[1].clone()],
@@ -1035,7 +1028,7 @@ mod tests {
                 range
             }];
 
-            let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+            let mut executor = BatchIndexScanExecutor::new(
                 store.clone(),
                 Arc::new(EvalConfig::default()),
                 vec![
@@ -1099,7 +1092,7 @@ mod tests {
                 range
             }];
 
-            let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+            let mut executor = BatchIndexScanExecutor::new(
                 store.clone(),
                 Arc::new(EvalConfig::default()),
                 vec![columns_info[1].clone(), columns_info[0].clone()],
@@ -1140,7 +1133,7 @@ mod tests {
                 range
             }];
 
-            let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+            let mut executor = BatchIndexScanExecutor::new(
                 store.clone(),
                 Arc::new(EvalConfig::default()),
                 vec![
@@ -1192,7 +1185,7 @@ mod tests {
                 range
             }];
 
-            let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+            let mut executor = BatchIndexScanExecutor::new(
                 store,
                 Arc::new(EvalConfig::default()),
                 vec![
@@ -1269,7 +1262,7 @@ mod tests {
                 range
             }];
 
-            let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+            let mut executor = BatchIndexScanExecutor::new(
                 store.clone(),
                 Arc::new(EvalConfig::default()),
                 vec![
@@ -1326,7 +1319,7 @@ mod tests {
                 range
             }];
 
-            let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+            let mut executor = BatchIndexScanExecutor::new(
                 store,
                 Arc::new(EvalConfig::default()),
                 vec![
@@ -1440,7 +1433,7 @@ mod tests {
         let mut value = value_prefix.clone();
         value.extend(restore_data);
         let store = FixtureStorage::from(vec![(key.clone(), value)]);
-        let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+        let mut executor = BatchIndexScanExecutor::new(
             store,
             Arc::new(EvalConfig::default()),
             columns_info.clone(),
@@ -1483,7 +1476,7 @@ mod tests {
 
         let value = value_prefix;
         let store = FixtureStorage::from(vec![(key, value)]);
-        let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+        let mut executor = BatchIndexScanExecutor::new(
             store,
             Arc::new(EvalConfig::default()),
             columns_info,
@@ -1579,7 +1572,7 @@ mod tests {
         }];
 
         let store = FixtureStorage::from(vec![(key, vec![])]);
-        let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+        let mut executor = BatchIndexScanExecutor::new(
             store,
             Arc::new(EvalConfig::default()),
             columns_info,
@@ -1679,7 +1672,7 @@ mod tests {
         }];
 
         let store = FixtureStorage::from(vec![(key, value)]);
-        let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+        let mut executor = BatchIndexScanExecutor::new(
             store,
             Arc::new(EvalConfig::default()),
             columns_info,
@@ -1773,7 +1766,7 @@ mod tests {
         }];
 
         let store = FixtureStorage::from(vec![(key, value)]);
-        let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+        let mut executor = BatchIndexScanExecutor::new(
             store,
             Arc::new(EvalConfig::default()),
             columns_info,
@@ -1866,7 +1859,7 @@ mod tests {
         }];
 
         let store = FixtureStorage::from(vec![(key, value)]);
-        let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+        let mut executor = BatchIndexScanExecutor::new(
             store,
             Arc::new(EvalConfig::default()),
             columns_info,
@@ -1992,7 +1985,7 @@ mod tests {
         let mut value = value_prefix;
         value.extend(restore_data);
         let store = FixtureStorage::from(vec![(key, value)]);
-        let mut executor = BatchIndexScanExecutor::<_, ApiV1>::new(
+        let mut executor = BatchIndexScanExecutor::new(
             store,
             Arc::new(EvalConfig::default()),
             columns_info,
@@ -3296,78 +3289,6 @@ mod tests {
         assert_eq!(
             columns[9].raw().last().unwrap().read_datum().unwrap(),
             Datum::Bytes("A ".as_bytes().to_vec())
-        );
-    }
-
-    #[test]
-    fn test_common_handle_with_physical_table_id() {
-        // CREATE TABLE `tcommonhash` (
-        //     `a` int(11) NOT NULL,
-        //     `b` int(11) DEFAULT NULL,
-        //     `c` int(11) NOT NULL,
-        //     `d` int(11) NOT NUL,
-        //     PRIMARY KEY (`a`,`c`,`d`) /*T![clustered_index] CLUSTERED */,
-        //     KEY `idx_bc` (`b`,`c`)
-        //  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
-        // insert into tcommonhash values (1, 2, 3, 1);
-
-        // idx_bc
-        let mut idx_exe = IndexScanExecutorImpl {
-            context: Default::default(),
-            schema: vec![
-                FieldTypeTp::Long.into(),
-                FieldTypeTp::Long.into(),
-                FieldTypeTp::Long.into(),
-                FieldTypeTp::Long.into(),
-                FieldTypeTp::Long.into(),
-                // EXTRA_PHYSICAL_TABLE_ID_COL
-                FieldTypeTp::Long.into(),
-            ],
-            columns_id_without_handle: vec![2, 3],
-            columns_id_for_common_handle: vec![1, 3, 4],
-            decode_handle_strategy: DecodeHandleStrategy::DecodeCommonHandle,
-            pid_column_cnt: 0,
-            physical_table_id_column_cnt: 1,
-            index_version: -1,
-        };
-        let mut columns = idx_exe.build_column_vec(10);
-        idx_exe
-            .process_kv_pair(
-                &[
-                    0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5c, 0x5f, 0x69, 0x80, 0x0, 0x0,
-                    0x0, 0x0, 0x0, 0x0, 0x2, 0x3, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x3,
-                    0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x3, 0x3, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0,
-                    0x0, 0x1, 0x3, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x3, 0x3, 0x80, 0x0, 0x0,
-                    0x0, 0x0, 0x0, 0x0, 0x1,
-                ],
-                &[0x0, 0x7d, 0x1],
-                &mut columns,
-            )
-            .unwrap();
-        assert_eq!(
-            columns[0].raw().last().unwrap().read_datum().unwrap(),
-            Datum::I64(2)
-        );
-        assert_eq!(
-            columns[1].raw().last().unwrap().read_datum().unwrap(),
-            Datum::I64(3)
-        );
-        assert_eq!(
-            columns[2].raw().last().unwrap().read_datum().unwrap(),
-            Datum::I64(1)
-        );
-        assert_eq!(
-            columns[3].raw().last().unwrap().read_datum().unwrap(),
-            Datum::I64(3)
-        );
-        assert_eq!(
-            columns[4].raw().last().unwrap().read_datum().unwrap(),
-            Datum::I64(1)
-        );
-        assert_eq!(
-            // physical table id
-            columns[5].mut_decoded().to_int_vec()[0].unwrap(),
-            92
         );
     }
 

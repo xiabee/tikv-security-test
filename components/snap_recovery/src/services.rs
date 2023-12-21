@@ -19,7 +19,7 @@ use engine_rocks::{
     util::get_cf_handle,
     RocksEngine,
 };
-use engine_traits::{CfNamesExt, CfOptionsExt, Engines, KvEngine, RaftEngine};
+use engine_traits::{CfNamesExt, CfOptionsExt, Engines, Peekable, RaftEngine};
 use futures::{
     channel::mpsc,
     executor::{ThreadPool, ThreadPoolBuilder},
@@ -67,16 +67,11 @@ pub enum Error {
     #[error("{0:?}")]
     Other(#[from] Box<dyn StdError + Sync + Send>),
 }
-
 /// Service handles the recovery messages from backup restore.
 #[derive(Clone)]
-pub struct RecoveryService<EK, ER>
-where
-    EK: KvEngine<DiskEngine = RocksEngine>,
-    ER: RaftEngine,
-{
-    engines: Engines<EK, ER>,
-    router: RaftRouter<EK, ER>,
+pub struct RecoveryService<ER: RaftEngine> {
+    engines: Engines<RocksEngine, ER>,
+    router: RaftRouter<RocksEngine, ER>,
     threads: ThreadPool,
 
     /// The handle to last call of recover region RPC.
@@ -118,31 +113,29 @@ impl RecoverRegionState {
     }
 }
 
-impl<EK, ER> RecoveryService<EK, ER>
-where
-    EK: KvEngine<DiskEngine = RocksEngine>,
-    ER: RaftEngine,
-{
+impl<ER: RaftEngine> RecoveryService<ER> {
     /// Constructs a new `Service` with `Engines`, a `RaftStoreRouter` and a
     /// `thread pool`.
-    pub fn new(engines: Engines<EK, ER>, router: RaftRouter<EK, ER>) -> RecoveryService<EK, ER> {
+    pub fn new(
+        engines: Engines<RocksEngine, ER>,
+        router: RaftRouter<RocksEngine, ER>,
+    ) -> RecoveryService<ER> {
         let props = tikv_util::thread_group::current_properties();
         let threads = ThreadPoolBuilder::new()
             .pool_size(4)
             .name_prefix("recovery-service")
-            .with_sys_and_custom_hooks(
-                move || {
-                    tikv_util::thread_group::set_properties(props.clone());
-                },
-                || {},
-            )
+            .after_start_wrapper(move || {
+                tikv_util::thread_group::set_properties(props.clone());
+                tikv_alloc::add_thread_memory_accessor();
+            })
+            .before_stop_wrapper(|| tikv_alloc::remove_thread_memory_accessor())
             .create()
             .unwrap();
 
         // config rocksdb l0 to optimize the restore
         // also for massive data applied during the restore, it easy to reach the write
         // stop
-        let db: &RocksEngine = engines.kv.get_disk_engine();
+        let db = engines.kv.clone();
         for cf_name in db.cf_names() {
             Self::set_db_options(cf_name, db.clone()).expect("set db option failure");
         }
@@ -224,7 +217,7 @@ where
     // a new wait apply syncer share with all regions,
     // when all region reached the target index, share reference decreased to 0,
     // trigger closure to send finish info back.
-    pub fn wait_apply_last(router: RaftRouter<EK, ER>, sender: SyncSender<u64>) {
+    pub fn wait_apply_last(router: RaftRouter<RocksEngine, ER>, sender: SyncSender<u64>) {
         let wait_apply = SnapshotRecoveryWaitApplySyncer::new(0, sender);
         router.broadcast_normal(|| {
             PeerMsg::SignificantMsg(SignificantMsg::SnapshotRecoveryWaitApply(
@@ -246,7 +239,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
             .name(format!("compact-{}", cf))
             .spawn_wrapper(move || {
                 info!("recovery starts manual compact"; "cf" => cf.clone());
-
+                tikv_alloc::add_thread_memory_accessor();
                 let db = kv_db.as_inner();
                 let handle = get_cf_handle(db, cf.as_str()).unwrap();
                 let mut compact_opts = CompactOptions::new();
@@ -254,6 +247,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
                 compact_opts.set_exclusive_manual_compaction(false);
                 compact_opts.set_bottommost_level_compaction(DBBottommostLevelCompaction::Skip);
                 db.compact_range_cf_opt(handle, &compact_opts, None, None);
+                tikv_alloc::remove_thread_memory_accessor();
 
                 info!("recovery finishes manual compact"; "cf" => cf);
             })
@@ -267,11 +261,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
     Ok(())
 }
 
-impl<EK, ER> RecoverData for RecoveryService<EK, ER>
-where
-    EK: KvEngine<DiskEngine = RocksEngine>,
-    ER: RaftEngine,
-{
+impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
     // 1. br start to ready region meta
     fn read_region_meta(
         &mut self,
@@ -454,14 +444,10 @@ where
         // implement a resolve/delete data funciton
         let resolved_ts = req.get_resolved_ts();
         let (tx, rx) = mpsc::unbounded();
-        let resolver = DataResolverManager::new(
-            self.engines.kv.get_disk_engine().clone(),
-            tx,
-            resolved_ts.into(),
-        );
+        let resolver = DataResolverManager::new(self.engines.kv.clone(), tx, resolved_ts.into());
         info!("start to resolve kv data");
         resolver.start();
-        let db = self.engines.kv.get_disk_engine().clone();
+        let db = self.engines.kv.clone();
         let store_id = self.get_store_id();
         let send_task = async move {
             let id = store_id?;

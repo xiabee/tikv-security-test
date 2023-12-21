@@ -6,8 +6,9 @@ use hyper::{body, Client, StatusCode, Uri};
 use raftstore::store::region_meta::RegionMeta;
 use security::SecurityConfig;
 use service::service_manager::GrpcServiceManager;
-use test_raftstore::new_server_cluster;
+use test_raftstore::{new_server_cluster, Simulator};
 use tikv::{config::ConfigController, server::status_server::StatusServer};
+use tikv_util::HandyRwLock;
 
 async fn check(authority: SocketAddr, region_id: u64) -> Result<(), Box<dyn Error>> {
     let client = Client::new();
@@ -39,13 +40,14 @@ fn test_region_meta_endpoint() {
     let peer = region.get_peers().get(0);
     assert!(peer.is_some());
     let store_id = peer.unwrap().get_store_id();
-    let router = cluster.raft_extension(store_id);
+    let router = cluster.sim.rl().get_router(store_id);
+    assert!(router.is_some());
     let mut status_server = StatusServer::new(
         1,
         ConfigController::default(),
         Arc::new(SecurityConfig::default()),
-        router,
-        None,
+        router.unwrap(),
+        std::env::temp_dir(),
         GrpcServiceManager::dummy(),
     )
     .unwrap();

@@ -16,9 +16,6 @@
 //! Please read the engine_trait crate docs before hacking.
 
 #![cfg_attr(test, feature(test))]
-#![feature(let_chains)]
-#![feature(option_get_or_insert_default)]
-#![feature(path_file_prefix)]
 
 #[allow(unused_extern_crates)]
 extern crate tikv_alloc;
@@ -107,21 +104,17 @@ pub mod file_system;
 
 mod raft_engine;
 
-pub use rocksdb::{
-    set_perf_flags, set_perf_level, PerfContext, PerfFlag, PerfFlags, PerfLevel,
-    Statistics as RocksStatistics,
-};
+pub use rocksdb::{set_perf_flags, set_perf_level, PerfContext, PerfFlag, PerfFlags, PerfLevel};
 
 pub mod flow_control_factors;
-use ::encryption::DataKeyManager;
 pub use flow_control_factors::*;
 
 pub mod raw;
 
 pub fn get_env(
-    key_manager: Option<std::sync::Arc<DataKeyManager>>,
+    key_manager: Option<std::sync::Arc<::encryption::DataKeyManager>>,
     limiter: Option<std::sync::Arc<::file_system::IoRateLimiter>>,
 ) -> engine_traits::Result<std::sync::Arc<raw::Env>> {
     let env = encryption::get_env(None /* base_env */, key_manager)?;
-    file_system::get_env(env, limiter)
+    file_system::get_env(Some(env), limiter)
 }

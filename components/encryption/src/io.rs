@@ -82,10 +82,6 @@ impl<R> DecrypterReader<R> {
             iv,
         )?))
     }
-
-    pub fn inner(&self) -> &R {
-        &self.0.reader
-    }
 }
 
 impl<R: Read> Read for DecrypterReader<R> {
@@ -390,18 +386,7 @@ pub fn create_aes_ctr_crypter(
         EncryptionMethod::Aes128Ctr => OCipher::aes_128_ctr(),
         EncryptionMethod::Aes192Ctr => OCipher::aes_192_ctr(),
         EncryptionMethod::Aes256Ctr => OCipher::aes_256_ctr(),
-        EncryptionMethod::Sm4Ctr => {
-            #[cfg(feature = "sm4")]
-            {
-                OCipher::sm4_ctr()
-            }
-            #[cfg(not(feature = "sm4"))]
-            {
-                return Err(box_err!(
-                    "sm4-ctr is not supported by dynamically linked openssl"
-                ));
-            }
-        }
+        EncryptionMethod::Sm4Ctr => OCipher::sm4_ctr(),
     };
     let crypter = OCrypter::new(cipher, mode, key, Some(iv.as_slice()))?;
     Ok((cipher, crypter))
@@ -554,10 +539,17 @@ mod tests {
     use std::{cmp::min, io::Cursor};
 
     use byteorder::{BigEndian, ByteOrder};
-    use openssl::rand;
+    use rand::{rngs::OsRng, RngCore};
 
     use super::*;
-    use crate::manager::generate_data_key;
+    use crate::crypter;
+
+    fn generate_data_key(method: EncryptionMethod) -> Vec<u8> {
+        let key_length = crypter::get_method_key_length(method);
+        let mut key = vec![0; key_length];
+        OsRng.fill_bytes(&mut key);
+        key
+    }
 
     struct DecoratedCursor {
         cursor: Cursor<Vec<u8>>,
@@ -621,7 +613,7 @@ mod tests {
             EncryptionMethod::Sm4Ctr,
         ];
         let ivs = [
-            Iv::new_ctr().unwrap(),
+            Iv::new_ctr(),
             // Iv overflow
             Iv::from_slice(&{
                 let mut v = vec![0; 16];
@@ -638,10 +630,10 @@ mod tests {
         ];
         for method in methods {
             for iv in ivs {
-                let (_, key) = generate_data_key(method).unwrap();
+                let key = generate_data_key(method);
 
                 let mut plaintext = vec![0; 1024];
-                rand::rand_bytes(&mut plaintext).unwrap();
+                OsRng.fill_bytes(&mut plaintext);
                 let mut encrypter = EncrypterWriter::new(
                     DecoratedCursor::new(plaintext.clone(), 1),
                     method,
@@ -697,12 +689,12 @@ mod tests {
             EncryptionMethod::Sm4Ctr,
         ];
         let mut plaintext = vec![0; 10240];
-        rand::rand_bytes(&mut plaintext).unwrap();
+        OsRng.fill_bytes(&mut plaintext);
         let offsets = [1024, 1024 + 1, 10240 - 1, 10240, 10240 + 1];
         let sizes = [1024, 10240];
         for method in methods {
-            let (_, key) = generate_data_key(method).unwrap();
-            let iv = Iv::new_ctr().unwrap();
+            let key = generate_data_key(method);
+            let iv = Iv::new_ctr();
             let encrypter =
                 EncrypterReader::new(DecoratedCursor::new(plaintext.clone(), 1), method, &key, iv)
                     .unwrap();
@@ -734,13 +726,13 @@ mod tests {
             EncryptionMethod::Sm4Ctr,
         ];
         let mut plaintext = vec![0; 10240];
-        rand::rand_bytes(&mut plaintext).unwrap();
+        OsRng.fill_bytes(&mut plaintext);
         let offsets = [1024, 1024 + 1, 10240 - 1];
         let sizes = [1024, 8000];
         let written = vec![0; 10240];
         for method in methods {
-            let (_, key) = generate_data_key(method).unwrap();
-            let iv = Iv::new_ctr().unwrap();
+            let key = generate_data_key(method);
+            let iv = Iv::new_ctr();
             let encrypter =
                 EncrypterWriter::new(DecoratedCursor::new(written.clone(), 1), method, &key, iv)
                     .unwrap();
@@ -780,12 +772,12 @@ mod tests {
             EncryptionMethod::Aes256Ctr,
             EncryptionMethod::Sm4Ctr,
         ];
-        let iv = Iv::new_ctr().unwrap();
+        let iv = Iv::new_ctr();
         let mut plain_text = vec![0; 10240];
-        rand::rand_bytes(&mut plain_text).unwrap();
+        OsRng.fill_bytes(&mut plain_text);
 
         for method in methods {
-            let (_, key) = generate_data_key(method).unwrap();
+            let key = generate_data_key(method);
             // encrypt plaintext into encrypt_text
             let read_once = 16;
             let mut encrypt_reader = EncrypterReader::new(

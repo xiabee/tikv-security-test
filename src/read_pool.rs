@@ -1,33 +1,27 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    convert::TryFrom,
     future::Future,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc::SyncSender,
-        Arc, Mutex,
-    },
+    sync::{mpsc::SyncSender, Arc, Mutex},
     time::Duration,
 };
 
 use file_system::{set_io_type, IoType};
 use futures::{channel::oneshot, future::TryFutureExt};
-use kvproto::{errorpb, kvrpcpb::CommandPri};
+use kvproto::kvrpcpb::CommandPri;
 use online_config::{ConfigChange, ConfigManager, ConfigValue, Result as CfgResult};
-use prometheus::{core::Metric, Histogram, IntCounter, IntGauge};
-use resource_control::{
-    with_resource_limiter, ControlledFuture, ResourceController, ResourceLimiter,
-};
+use prometheus::{IntCounter, IntGauge};
 use thiserror::Error;
 use tikv_util::{
-    resource_control::TaskMetadata,
     sys::{cpu_time::ProcessStat, SysQuota},
     time::Instant,
     worker::{Runnable, RunnableWithTimer, Scheduler, Worker},
-    yatp_pool::{self, CleanupMethod, FuturePool, PoolTicker, YatpPoolBuilder},
+    yatp_pool::{self, FuturePool, PoolTicker, YatpPoolBuilder},
 };
-use yatp::{metrics::MULTILEVEL_LEVEL_ELAPSED, queue::Extras};
+use tracker::TrackedFuture;
+use yatp::{
+    metrics::MULTILEVEL_LEVEL_ELAPSED, pool::Remote, queue::Extras, task::future::TaskCell,
+};
 
 use self::metrics::*;
 use crate::{
@@ -53,11 +47,11 @@ pub enum ReadPool {
         read_pool_low: FuturePool,
     },
     Yatp {
-        pool: FuturePool,
-        // deprecated. will remove in the v8.x.
+        pool: yatp::ThreadPool<TaskCell>,
         running_tasks: IntGauge,
-        resource_ctl: Option<Arc<ResourceController>>,
-        time_slice_inspector: Arc<TimeSliceInspector>,
+        running_threads: IntGauge,
+        max_tasks: usize,
+        pool_size: usize,
     },
 }
 
@@ -76,13 +70,15 @@ impl ReadPool {
             ReadPool::Yatp {
                 pool,
                 running_tasks,
-                resource_ctl,
-                time_slice_inspector,
+                running_threads,
+                max_tasks,
+                pool_size,
             } => ReadPoolHandle::Yatp {
-                remote: pool.clone(),
+                remote: pool.remote().clone(),
                 running_tasks: running_tasks.clone(),
-                resource_ctl: resource_ctl.clone(),
-                time_slice_inspector: time_slice_inspector.clone(),
+                running_threads: running_threads.clone(),
+                max_tasks: *max_tasks,
+                pool_size: *pool_size,
             },
         }
     }
@@ -96,22 +92,16 @@ pub enum ReadPoolHandle {
         read_pool_low: FuturePool,
     },
     Yatp {
-        remote: FuturePool,
+        remote: Remote<TaskCell>,
         running_tasks: IntGauge,
-        resource_ctl: Option<Arc<ResourceController>>,
-        time_slice_inspector: Arc<TimeSliceInspector>,
+        running_threads: IntGauge,
+        max_tasks: usize,
+        pool_size: usize,
     },
 }
 
 impl ReadPoolHandle {
-    pub fn spawn<F>(
-        &self,
-        f: F,
-        priority: CommandPri,
-        task_id: u64,
-        metadata: TaskMetadata<'_>,
-        resource_limiter: Option<Arc<ResourceLimiter>>,
-    ) -> Result<(), ReadPoolError>
+    pub fn spawn<F>(&self, f: F, priority: CommandPri, task_id: u64) -> Result<(), ReadPoolError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -132,46 +122,33 @@ impl ReadPoolHandle {
             ReadPoolHandle::Yatp {
                 remote,
                 running_tasks,
-                resource_ctl,
+                max_tasks,
                 ..
             } => {
                 let running_tasks = running_tasks.clone();
+                // Note that the running task number limit is not strict.
+                // If several tasks are spawned at the same time while the running task number
+                // is close to the limit, they may all pass this check and the number of running
+                // tasks may exceed the limit.
+                if running_tasks.get() as usize >= *max_tasks {
+                    return Err(ReadPoolError::UnifiedReadPoolFull);
+                }
+
                 running_tasks.inc();
                 let fixed_level = match priority {
                     CommandPri::High => Some(0),
                     CommandPri::Normal => None,
                     CommandPri::Low => Some(2),
                 };
-                let group_name = metadata.group_name().to_owned();
-                let mut extras = Extras::new_multilevel(task_id, fixed_level);
-                extras.set_metadata(metadata.to_vec());
-                let running_tasks1 = running_tasks.clone();
-                if let Some(resource_ctl) = resource_ctl {
-                    let fut = with_resource_limiter(
-                        ControlledFuture::new(
-                            async move {
-                                f.await;
-                                running_tasks.dec();
-                            },
-                            resource_ctl.clone(),
-                            group_name,
-                        ),
-                        resource_limiter,
-                    );
-                    remote.spawn_with_extras(fut, extras).map_err(|e| {
-                        running_tasks1.dec();
-                        e
-                    })?;
-                } else {
-                    let fut = async move {
+                let extras = Extras::new_multilevel(task_id, fixed_level);
+                let task_cell = TaskCell::new(
+                    TrackedFuture::new(async move {
                         f.await;
                         running_tasks.dec();
-                    };
-                    remote.spawn_with_extras(fut, extras).map_err(|e| {
-                        running_tasks1.dec();
-                        e
-                    })?;
-                }
+                    }),
+                    extras,
+                );
+                remote.spawn(task_cell);
             }
         }
         Ok(())
@@ -182,8 +159,6 @@ impl ReadPoolHandle {
         f: F,
         priority: CommandPri,
         task_id: u64,
-        metadata: TaskMetadata<'_>,
-        resource_limiter: Option<Arc<ResourceLimiter>>,
     ) -> impl Future<Output = Result<T, ReadPoolError>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -197,8 +172,6 @@ impl ReadPoolHandle {
             },
             priority,
             task_id,
-            metadata,
-            resource_limiter,
         );
         async move {
             res?;
@@ -211,7 +184,7 @@ impl ReadPoolHandle {
             ReadPoolHandle::FuturePools {
                 read_pool_normal, ..
             } => read_pool_normal.get_pool_size(),
-            ReadPoolHandle::Yatp { remote, .. } => remote.get_pool_size(),
+            ReadPoolHandle::Yatp { pool_size, .. } => *pool_size,
         }
     }
 
@@ -221,10 +194,10 @@ impl ReadPoolHandle {
                 read_pool_normal, ..
             } => read_pool_normal.get_running_task_count() / read_pool_normal.get_pool_size(),
             ReadPoolHandle::Yatp {
-                remote,
                 running_tasks,
+                pool_size,
                 ..
-            } => running_tasks.get() as usize / remote.get_pool_size(),
+            } => running_tasks.get() as usize / *pool_size,
         }
     }
 
@@ -233,144 +206,21 @@ impl ReadPoolHandle {
             ReadPoolHandle::FuturePools { .. } => {
                 unreachable!()
             }
-            ReadPoolHandle::Yatp { remote, .. } => {
-                remote.scale_pool_size(max_thread_count);
-            }
-        }
-    }
-
-    pub fn set_max_tasks_per_worker(&self, tasks_per_thread: usize) {
-        match self {
-            ReadPoolHandle::FuturePools { .. } => {
-                unreachable!()
-            }
-            ReadPoolHandle::Yatp { remote, .. } => {
-                remote.set_max_tasks_per_worker(tasks_per_thread);
-            }
-        }
-    }
-
-    pub fn get_ewma_time_slice(&self) -> Option<Duration> {
-        match self {
-            ReadPoolHandle::FuturePools { .. } => None,
             ReadPoolHandle::Yatp {
-                time_slice_inspector,
+                remote,
+                running_threads,
+                max_tasks,
+                pool_size,
                 ..
-            } => Some(time_slice_inspector.get_ewma_time_slice()),
+            } => {
+                remote.scale_workers(max_thread_count);
+                *max_tasks = max_tasks
+                    .saturating_div(*pool_size)
+                    .saturating_mul(max_thread_count);
+                running_threads.set(max_thread_count as i64);
+                *pool_size = max_thread_count;
+            }
         }
-    }
-
-    pub fn update_ewma_time_slice(&self) {
-        if let ReadPoolHandle::Yatp {
-            time_slice_inspector,
-            ..
-        } = self
-        {
-            time_slice_inspector.update();
-        }
-    }
-
-    pub fn get_estimated_wait_duration(&self) -> Option<Duration> {
-        self.get_ewma_time_slice()
-            .map(|s| s * (self.get_queue_size_per_worker() as u32))
-    }
-
-    pub fn check_busy_threshold(
-        &self,
-        busy_threshold: Duration,
-    ) -> Result<(), errorpb::ServerIsBusy> {
-        if busy_threshold.is_zero() {
-            return Ok(());
-        }
-        let estimated_wait = match self.get_estimated_wait_duration() {
-            Some(estimated_wait) if estimated_wait > busy_threshold => estimated_wait,
-            _ => return Ok(()),
-        };
-        // TODO: Get applied_index from the raftstore and check memory locks. Then, we
-        // can skip read index in replica read. But now the difficulty is that we don't
-        // have access to the the local reader in gRPC threads.
-        let mut busy_err = errorpb::ServerIsBusy::default();
-        busy_err.set_reason("estimated wait time exceeds threshold".to_owned());
-        busy_err.estimated_wait_ms = u32::try_from(estimated_wait.as_millis()).unwrap_or(u32::MAX);
-        warn!("Already many pending tasks in the read queue, task is rejected";
-            "busy_threshold" => ?&busy_threshold,
-            "busy_err" => ?&busy_err,
-        );
-        Err(busy_err)
-    }
-}
-
-pub const UPDATE_EWMA_TIME_SLICE_INTERVAL: Duration = Duration::from_millis(200);
-
-pub struct TimeSliceInspector {
-    // `atomic_ewma_nanos` is a mirror of `inner.ewma` provided for fast access. It is updated in
-    // the `update` method.
-    atomic_ewma_nanos: AtomicU64,
-    inner: Mutex<TimeSliceInspectorInner>,
-}
-
-struct TimeSliceInspectorInner {
-    time_slice_hist: [Histogram; 3],
-    ewma: Duration,
-
-    last_sum: Duration,
-    last_count: u64,
-}
-
-impl TimeSliceInspector {
-    pub fn new(name: &str) -> Self {
-        let time_slice_hist = [
-            yatp::metrics::TASK_POLL_DURATION.with_label_values(&[name, "0"]),
-            yatp::metrics::TASK_POLL_DURATION.with_label_values(&[name, "1"]),
-            yatp::metrics::TASK_POLL_DURATION.with_label_values(&[name, "2"]),
-        ];
-        let inner = TimeSliceInspectorInner {
-            time_slice_hist,
-            ewma: Duration::default(),
-            last_sum: Duration::default(),
-            last_count: 0,
-        };
-        Self {
-            atomic_ewma_nanos: AtomicU64::default(),
-            inner: Mutex::new(inner),
-        }
-    }
-
-    pub fn update(&self) {
-        // new_ewma = WEIGHT * new_val + (1 - WEIGHT) * old_ewma
-        const WEIGHT: f64 = 0.3;
-        // If the accumulated time slice is less than 100ms, the EWMA is not updated.
-        const MIN_TIME_DIFF: Duration = Duration::from_millis(100);
-
-        let mut inner = self.inner.lock().unwrap();
-        let mut new_sum = Duration::default();
-        let mut new_count = 0;
-        // Now, we simplify the problem by merging samples from all levels. If we want
-        // more accurate answer in the future, calculate for each level separately.
-        for hist in &inner.time_slice_hist {
-            // Call `metric` to get a consistent snapshot of sum and count.
-            let metric_proto = hist.metric();
-            let hist_proto = metric_proto.get_histogram();
-            new_sum += Duration::from_secs_f64(hist_proto.get_sample_sum());
-            new_count += hist_proto.get_sample_count();
-        }
-        let time_diff = new_sum.saturating_sub(inner.last_sum);
-        let count_diff = new_count.saturating_sub(inner.last_count);
-        if time_diff < MIN_TIME_DIFF || count_diff == 0 {
-            return;
-        }
-        let new_val = time_diff / ((new_count - inner.last_count) as u32);
-        let new_ewma = new_val.mul_f64(WEIGHT) + inner.ewma.mul_f64(1.0 - WEIGHT);
-        inner.ewma = new_ewma;
-        inner.last_sum = new_sum;
-        inner.last_count = new_count;
-
-        self.atomic_ewma_nanos
-            .store(new_ewma.as_nanos() as u64, Ordering::Release);
-    }
-
-    pub fn get_ewma_time_slice(&self) -> Duration {
-        Duration::from_nanos(self.atomic_ewma_nanos.load(Ordering::Acquire))
     }
 }
 
@@ -394,6 +244,8 @@ impl<R: FlowStatsReporter> ReporterTicker<R> {
 
 #[cfg(test)]
 fn get_unified_read_pool_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!(
         "unified-read-pool-test-{}",
@@ -406,40 +258,16 @@ fn get_unified_read_pool_name() -> String {
     "unified-read-pool".to_string()
 }
 
-#[inline]
 pub fn build_yatp_read_pool<E: Engine, R: FlowStatsReporter>(
     config: &UnifiedReadPoolConfig,
     reporter: R,
     engine: E,
-    resource_ctl: Option<Arc<ResourceController>>,
-    cleanup_method: CleanupMethod,
-    enable_task_wait_metrics: bool,
 ) -> ReadPool {
     let unified_read_pool_name = get_unified_read_pool_name();
-    build_yatp_read_pool_with_name(
-        config,
-        reporter,
-        engine,
-        resource_ctl,
-        cleanup_method,
-        unified_read_pool_name,
-        enable_task_wait_metrics,
-    )
-}
-
-pub fn build_yatp_read_pool_with_name<E: Engine, R: FlowStatsReporter>(
-    config: &UnifiedReadPoolConfig,
-    reporter: R,
-    engine: E,
-    resource_ctl: Option<Arc<ResourceController>>,
-    cleanup_method: CleanupMethod,
-    unified_read_pool_name: String,
-    enable_task_wait_metrics: bool,
-) -> ReadPool {
+    let mut builder = YatpPoolBuilder::new(ReporterTicker { reporter });
     let raftkv = Arc::new(Mutex::new(engine));
-    let builder = YatpPoolBuilder::new(ReporterTicker { reporter })
+    let pool = builder
         .name_prefix(&unified_read_pool_name)
-        .cleanup_method(cleanup_method)
         .stack_size(config.stack_size.0 as usize)
         .thread_count(
             config.min_thread_count,
@@ -452,11 +280,6 @@ pub fn build_yatp_read_pool_with_name<E: Engine, R: FlowStatsReporter>(
                 config.max_thread_count,
             ),
         )
-        .max_tasks(
-            config
-                .max_tasks_per_worker
-                .saturating_mul(config.max_thread_count),
-        )
         .after_start(move || {
             let engine = raftkv.lock().unwrap().clone();
             set_tls_engine(engine);
@@ -465,20 +288,17 @@ pub fn build_yatp_read_pool_with_name<E: Engine, R: FlowStatsReporter>(
         .before_stop(|| unsafe {
             destroy_tls_engine::<E>();
         })
-        .enable_task_wait_metrics(enable_task_wait_metrics);
-
-    let pool = if let Some(ref r) = resource_ctl {
-        builder.build_priority_future_pool(r.clone())
-    } else {
-        builder.build_multi_level_future_pool()
-    };
-    let time_slice_inspector = Arc::new(TimeSliceInspector::new(&unified_read_pool_name));
+        .build_multi_level_pool();
     ReadPool::Yatp {
         pool,
         running_tasks: UNIFIED_READ_POOL_RUNNING_TASKS
             .with_label_values(&[&unified_read_pool_name]),
-        resource_ctl,
-        time_slice_inspector,
+        running_threads: UNIFIED_READ_POOL_RUNNING_THREADS
+            .with_label_values(&[&unified_read_pool_name]),
+        max_tasks: config
+            .max_tasks_per_worker
+            .saturating_mul(config.max_thread_count),
+        pool_size: config.max_thread_count,
     }
 }
 
@@ -571,9 +391,6 @@ impl Runnable for ReadPoolConfigRunner {
                     self.cur_thread_count = self.core_thread_count;
                 }
             }
-            Task::MaxTasksPerWorker(s) => {
-                self.handle.set_max_tasks_per_worker(s);
-            }
         }
     }
 }
@@ -658,7 +475,6 @@ impl ReadPoolConfigRunner {
 enum Task {
     PoolSize(usize),
     AutoAdjust(bool),
-    MaxTasksPerWorker(usize),
 }
 
 impl std::fmt::Display for Task {
@@ -666,7 +482,6 @@ impl std::fmt::Display for Task {
         match self {
             Task::PoolSize(s) => write!(f, "PoolSize({})", *s),
             Task::AutoAdjust(s) => write!(f, "AutoAdjust({})", *s),
-            Task::MaxTasksPerWorker(s) => write!(f, "MaxTasksPerWorker({})", *s),
         }
     }
 }
@@ -719,10 +534,6 @@ impl ConfigManager for ReadPoolConfigManager {
             if let Some(ConfigValue::Bool(b)) = unified.get("auto_adjust_pool_size") {
                 self.scheduler.schedule(Task::AutoAdjust(*b))?;
             }
-            if let Some(ConfigValue::Usize(max_tasks)) = unified.get("max_tasks_per_worker") {
-                self.scheduler
-                    .schedule(Task::MaxTasksPerWorker(*max_tasks))?;
-            }
         }
         info!(
             "readpool config changed";
@@ -754,6 +565,12 @@ mod metrics {
             &["name"]
         )
         .unwrap();
+        pub static ref UNIFIED_READ_POOL_RUNNING_THREADS: IntGaugeVec = register_int_gauge_vec!(
+            "tikv_unified_read_pool_thread_count",
+            "The number of running threads in the unified read pool",
+            &["name"]
+        )
+        .unwrap();
     }
 }
 
@@ -762,10 +579,7 @@ mod tests {
     use std::{thread, time::Duration};
 
     use futures::channel::oneshot;
-    use futures_executor::block_on;
-    use kvproto::kvrpcpb::ResourceControlContext;
     use raftstore::store::{ReadStats, WriteStats};
-    use resource_control::ResourceGroupManager;
 
     use super::*;
     use crate::storage::TestEngineBuilder;
@@ -789,16 +603,7 @@ mod tests {
         // max running tasks number should be 2*1 = 2
 
         let engine = TestEngineBuilder::new().build().unwrap();
-        let name = "test-yatp-full";
-        let pool = build_yatp_read_pool_with_name(
-            &config,
-            DummyReporter,
-            engine,
-            None,
-            CleanupMethod::InPlace,
-            name.to_owned(),
-            false,
-        );
+        let pool = build_yatp_read_pool(&config, DummyReporter, engine);
 
         let gen_task = || {
             let (tx, rx) = oneshot::channel::<()>();
@@ -814,30 +619,18 @@ mod tests {
         let (task3, _tx3) = gen_task();
         let (task4, _tx4) = gen_task();
 
-        handle
-            .spawn(task1, CommandPri::Normal, 1, TaskMetadata::default(), None)
-            .unwrap();
-        handle
-            .spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task1, CommandPri::Normal, 1).unwrap();
+        handle.spawn(task2, CommandPri::Normal, 2).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None) {
-            Err(ReadPoolError::FuturePoolFull(..)) => {}
+        match handle.spawn(task3, CommandPri::Normal, 3) {
+            Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
         tx1.send(()).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        handle
-            .spawn(task4, CommandPri::Normal, 4, TaskMetadata::default(), None)
-            .unwrap();
-        assert_eq!(
-            UNIFIED_READ_POOL_RUNNING_TASKS
-                .with_label_values(&[name])
-                .get(),
-            2
-        );
+        handle.spawn(task4, CommandPri::Normal, 4).unwrap();
     }
 
     #[test]
@@ -851,14 +644,7 @@ mod tests {
         // max running tasks number should be 2*1 = 2
 
         let engine = TestEngineBuilder::new().build().unwrap();
-        let pool = build_yatp_read_pool(
-            &config,
-            DummyReporter,
-            engine,
-            None,
-            CleanupMethod::InPlace,
-            false,
-        );
+        let pool = build_yatp_read_pool(&config, DummyReporter, engine);
 
         let gen_task = || {
             let (tx, rx) = oneshot::channel::<()>();
@@ -875,29 +661,23 @@ mod tests {
         let (task4, _tx4) = gen_task();
         let (task5, _tx5) = gen_task();
 
-        handle
-            .spawn(task1, CommandPri::Normal, 1, TaskMetadata::default(), None)
-            .unwrap();
-        handle
-            .spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task1, CommandPri::Normal, 1).unwrap();
+        handle.spawn(task2, CommandPri::Normal, 2).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None) {
-            Err(ReadPoolError::FuturePoolFull(..)) => {}
+        match handle.spawn(task3, CommandPri::Normal, 3) {
+            Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
 
         handle.scale_pool_size(3);
         assert_eq!(handle.get_normal_pool_size(), 3);
 
-        handle
-            .spawn(task4, CommandPri::Normal, 4, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task4, CommandPri::Normal, 4).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task5, CommandPri::Normal, 5, TaskMetadata::default(), None) {
-            Err(ReadPoolError::FuturePoolFull(..)) => {}
+        match handle.spawn(task5, CommandPri::Normal, 5) {
+            Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
     }
@@ -910,17 +690,10 @@ mod tests {
             max_tasks_per_worker: 1,
             ..Default::default()
         };
-        // max running tasks number for each priority should be 2*1 = 2
+        // max running tasks number should be 2*1 = 2
 
         let engine = TestEngineBuilder::new().build().unwrap();
-        let pool = build_yatp_read_pool(
-            &config,
-            DummyReporter,
-            engine,
-            None,
-            CleanupMethod::InPlace,
-            false,
-        );
+        let pool = build_yatp_read_pool(&config, DummyReporter, engine);
 
         let gen_task = || {
             let (tx, rx) = oneshot::channel::<()>();
@@ -937,27 +710,14 @@ mod tests {
         let (task4, _tx4) = gen_task();
         let (task5, _tx5) = gen_task();
 
-        handle
-            .spawn(task1, CommandPri::Normal, 1, TaskMetadata::default(), None)
-            .unwrap();
-        handle
-            .spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task1, CommandPri::Normal, 1).unwrap();
+        handle.spawn(task2, CommandPri::Normal, 2).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None) {
-            Err(ReadPoolError::FuturePoolFull(..)) => {}
+        match handle.spawn(task3, CommandPri::Normal, 3) {
+            Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
-
-        // spawn a high-priority task, should not return Full error.
-        let (task_high, tx_h) = gen_task();
-        let mut ctx = ResourceControlContext::default();
-        ctx.override_priority = 16; // high priority
-        let metadata = TaskMetadata::from_ctx(&ctx);
-        let f = handle.spawn_handle(task_high, CommandPri::Normal, 6, metadata, None);
-        tx_h.send(()).unwrap();
-        block_on(f).unwrap();
 
         tx1.send(()).unwrap();
         tx2.send(()).unwrap();
@@ -966,125 +726,12 @@ mod tests {
         handle.scale_pool_size(1);
         assert_eq!(handle.get_normal_pool_size(), 1);
 
-        handle
-            .spawn(task4, CommandPri::Normal, 4, TaskMetadata::default(), None)
-            .unwrap();
+        handle.spawn(task4, CommandPri::Normal, 4).unwrap();
 
         thread::sleep(Duration::from_millis(300));
-        match handle.spawn(task5, CommandPri::Normal, 5, TaskMetadata::default(), None) {
-            Err(ReadPoolError::FuturePoolFull(..)) => {}
+        match handle.spawn(task5, CommandPri::Normal, 5) {
+            Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
-        }
-    }
-
-    #[test]
-    fn test_time_slice_inspector_ewma() {
-        const MARGIN: f64 = 1e-5; // 10us
-
-        let name = "test_time_slice_inspector_ewma";
-        let inspector = TimeSliceInspector::new(name);
-        let hist = yatp::metrics::TASK_POLL_DURATION.with_label_values(&[name, "0"]);
-
-        // avg: 0.055, prev_ewma: 0 => new_ewma = 0.0165
-        for i in 1..=10 {
-            hist.observe(i as f64 * 0.01);
-        }
-        inspector.update();
-        let ewma = inspector.get_ewma_time_slice().as_secs_f64();
-        assert!((ewma - 0.0165).abs() < MARGIN);
-
-        // avg: 0.0125, prev_ewma: 0.0165 => new_ewma = 0.0153
-        for i in 5..=20 {
-            hist.observe(i as f64 * 0.001);
-        }
-        inspector.update();
-        let ewma = inspector.get_ewma_time_slice().as_secs_f64();
-        assert!((ewma - 0.0153).abs() < MARGIN);
-
-        // sum: 55ms, don't update ewma
-        for i in 1..=10 {
-            hist.observe(i as f64 * 0.001);
-        }
-        inspector.update();
-        let ewma = inspector.get_ewma_time_slice().as_secs_f64();
-        assert!((ewma - 0.0153).abs() < MARGIN);
-
-        // avg: 0.00786, prev_ewma: 0.0153 => new_ewma = 0.01307
-        for i in 5..=15 {
-            hist.observe(i as f64 * 0.001);
-        }
-        inspector.update();
-        let ewma = inspector.get_ewma_time_slice().as_secs_f64();
-        assert!((ewma - 0.01307).abs() < MARGIN);
-    }
-
-    #[test]
-    fn test_yatp_task_poll_duration_metric() {
-        let count_metric = |name: &str| -> u64 {
-            let mut sum = 0;
-            for i in 0..=2 {
-                let hist =
-                    yatp::metrics::TASK_POLL_DURATION.with_label_values(&[name, &format!("{}", i)]);
-                sum += hist.get_sample_count();
-            }
-            sum
-        };
-
-        for control in [false, true] {
-            let name = format!("test_yatp_task_poll_duration_metric_{}", control);
-            let resource_manager = if control {
-                let resource_manager = ResourceGroupManager::default();
-                let resource_ctl = resource_manager.derive_controller(name.clone(), true);
-                Some(resource_ctl)
-            } else {
-                None
-            };
-            let config = UnifiedReadPoolConfig {
-                min_thread_count: 1,
-                max_thread_count: 2,
-                max_tasks_per_worker: 1,
-                ..Default::default()
-            };
-
-            let engine = TestEngineBuilder::new().build().unwrap();
-
-            let pool = build_yatp_read_pool_with_name(
-                &config,
-                DummyReporter,
-                engine,
-                resource_manager,
-                CleanupMethod::InPlace,
-                name.clone(),
-                false,
-            );
-
-            let gen_task = || {
-                let (tx, rx) = oneshot::channel::<()>();
-                let task = async move {
-                    // sleep the thread 100ms to trigger flushing the metrics.
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let _ = rx.await;
-                };
-                (task, tx)
-            };
-
-            let handle = pool.handle();
-            let (task1, tx1) = gen_task();
-            let (task2, tx2) = gen_task();
-
-            handle
-                .spawn(task1, CommandPri::Normal, 1, TaskMetadata::default(), None)
-                .unwrap();
-            handle
-                .spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None)
-                .unwrap();
-
-            tx1.send(()).unwrap();
-            tx2.send(()).unwrap();
-
-            thread::sleep(Duration::from_millis(300));
-            assert_eq!(count_metric(&name), 2);
-            drop(pool);
         }
     }
 }

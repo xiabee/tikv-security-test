@@ -48,7 +48,6 @@ fn test_memory_usage() {
                     10.into(),
                     1,
                     20.into(),
-                    false,
                 );
 
                 // Key already exists

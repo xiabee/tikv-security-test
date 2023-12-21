@@ -18,12 +18,14 @@ use std::{
 use async_compression::{tokio::write::ZstdEncoder, Level};
 use engine_rocks::ReadPerfInstant;
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-use futures::{ready, task::Poll, FutureExt};
+use futures::{channel::mpsc, executor::block_on, ready, task::Poll, FutureExt, StreamExt};
 use kvproto::{
     brpb::CompressionType,
     metapb::Region,
     raft_cmdpb::{CmdType, Request},
 };
+use raft::StateRole;
+use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
 use tikv::storage::CfStatistics;
 use tikv_util::{
     box_err,
@@ -31,6 +33,7 @@ use tikv_util::{
         self_thread_inspector, IoStat, ThreadInspector, ThreadInspectorImpl as OsInspector,
     },
     time::Instant,
+    warn,
     worker::Scheduler,
     Either,
 };
@@ -74,6 +77,65 @@ pub fn cf_name(s: &str) -> CfName {
 
 pub fn redact(key: &impl AsRef<[u8]>) -> log_wrappers::Value<'_> {
     log_wrappers::Value::key(key.as_ref())
+}
+
+/// RegionPager seeks regions with leader role in the range.
+pub struct RegionPager<P> {
+    regions: P,
+    start_key: Vec<u8>,
+    end_key: Vec<u8>,
+    reach_last_region: bool,
+}
+
+impl<P: RegionInfoProvider> RegionPager<P> {
+    pub fn scan_from(regions: P, start_key: Vec<u8>, end_key: Vec<u8>) -> Self {
+        Self {
+            regions,
+            start_key,
+            end_key,
+            reach_last_region: false,
+        }
+    }
+
+    pub fn next_page(&mut self, size: usize) -> Result<Vec<RegionInfo>> {
+        if self.start_key >= self.end_key || self.reach_last_region {
+            return Ok(vec![]);
+        }
+
+        let (mut tx, rx) = mpsc::channel(size);
+        let end_key = self.end_key.clone();
+        self.regions
+            .seek_region(
+                &self.start_key,
+                Box::new(move |i| {
+                    let r = i
+                        .filter(|r| r.role == StateRole::Leader)
+                        .take(size)
+                        .take_while(|r| r.region.start_key < end_key)
+                        .try_for_each(|r| tx.try_send(r.clone()));
+                    if let Err(_err) = r {
+                        warn!("failed to scan region and send to initlizer")
+                    }
+                }),
+            )
+            .map_err(|err| {
+                Error::Other(box_err!(
+                    "failed to seek region for start key {}: {}",
+                    redact(&self.start_key),
+                    err
+                ))
+            })?;
+        let collected_regions = block_on(rx.collect::<Vec<_>>());
+        self.start_key = collected_regions
+            .last()
+            .map(|region| region.region.end_key.to_owned())
+            // no leader region found.
+            .unwrap_or_default();
+        if self.start_key.is_empty() {
+            self.reach_last_region = true;
+        }
+        Ok(collected_regions)
+    }
 }
 
 /// StopWatch is a utility for record time cost in multi-stage tasks.
@@ -383,6 +445,15 @@ pub struct CallbackWaitGroup {
     on_finish_all: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
+/// A shortcut for making an opaque future type for return type or argument
+/// type, which is sendable and not borrowing any variables.  
+///
+/// `fut![T]` == `impl Future<Output = T> + Send + 'static`
+#[macro_export(crate)]
+macro_rules! future {
+    ($t:ty) => { impl core::future::Future<Output = $t> + Send + 'static };
+}
+
 impl CallbackWaitGroup {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -536,18 +607,18 @@ pub fn is_overlapping(range: (&[u8], &[u8]), range2: (&[u8], &[u8])) -> bool {
 }
 
 /// read files asynchronously in sequence
-pub struct FilesReader<R> {
-    files: Vec<R>,
+pub struct FilesReader {
+    files: Vec<File>,
     index: usize,
 }
 
-impl<R> FilesReader<R> {
-    pub fn new(files: Vec<R>) -> Self {
+impl FilesReader {
+    pub fn new(files: Vec<File>) -> Self {
         FilesReader { files, index: 0 }
     }
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for FilesReader<R> {
+impl AsyncRead for FilesReader {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -573,7 +644,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for FilesReader<R> {
 #[async_trait::async_trait]
 pub trait CompressionWriter: AsyncWrite + Sync + Send {
     /// call the `File.sync_all()` to flush immediately to disk.
-    async fn done(&mut self) -> Result<()>;
+    async fn done(mut self: Pin<&mut Self>) -> Result<()>;
 }
 
 /// a writer dispatcher for different compression type.
@@ -582,11 +653,11 @@ pub trait CompressionWriter: AsyncWrite + Sync + Send {
 pub async fn compression_writer_dispatcher(
     local_path: impl AsRef<Path>,
     compression_type: CompressionType,
-) -> Result<Box<dyn CompressionWriter + Unpin>> {
+) -> Result<Pin<Box<dyn CompressionWriter>>> {
     let inner = BufWriter::with_capacity(128 * 1024, File::create(local_path.as_ref()).await?);
     match compression_type {
-        CompressionType::Unknown => Ok(Box::new(NoneCompressionWriter::new(inner))),
-        CompressionType::Zstd => Ok(Box::new(ZstdCompressionWriter::new(inner))),
+        CompressionType::Unknown => Ok(Box::pin(NoneCompressionWriter::new(inner))),
+        CompressionType::Zstd => Ok(Box::pin(ZstdCompressionWriter::new(inner))),
         _ => Err(Error::Other(box_err!(format!(
             "the compression type is unimplemented, compression type id {:?}",
             compression_type
@@ -626,7 +697,7 @@ impl AsyncWrite for NoneCompressionWriter {
 
 #[async_trait::async_trait]
 impl CompressionWriter for NoneCompressionWriter {
-    async fn done(&mut self) -> Result<()> {
+    async fn done(mut self: Pin<&mut Self>) -> Result<()> {
         let bufwriter = &mut self.inner;
         bufwriter.flush().await?;
         bufwriter.get_ref().sync_all().await?;
@@ -635,27 +706,19 @@ impl CompressionWriter for NoneCompressionWriter {
 }
 
 /// use zstd compression algorithm
-pub struct ZstdCompressionWriter<R> {
-    inner: ZstdEncoder<R>,
+pub struct ZstdCompressionWriter {
+    inner: ZstdEncoder<BufWriter<File>>,
 }
 
-impl<R: AsyncWrite> ZstdCompressionWriter<R> {
-    pub fn new(inner: R) -> Self {
+impl ZstdCompressionWriter {
+    pub fn new(inner: BufWriter<File>) -> Self {
         ZstdCompressionWriter {
             inner: ZstdEncoder::with_quality(inner, Level::Fastest),
         }
     }
-
-    pub fn get_ref(&self) -> &R {
-        self.inner.get_ref()
-    }
-
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut()
-    }
 }
 
-impl<R: AsyncWrite + Unpin> AsyncWrite for ZstdCompressionWriter<R> {
+impl AsyncWrite for ZstdCompressionWriter {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -675,12 +738,13 @@ impl<R: AsyncWrite + Unpin> AsyncWrite for ZstdCompressionWriter<R> {
 }
 
 #[async_trait::async_trait]
-impl<R: AsyncWrite + Sync + Send + Unpin> CompressionWriter for ZstdCompressionWriter<R> {
-    async fn done(&mut self) -> Result<()> {
+impl CompressionWriter for ZstdCompressionWriter {
+    async fn done(mut self: Pin<&mut Self>) -> Result<()> {
         let encoder = &mut self.inner;
         encoder.shutdown().await?;
         let bufwriter = encoder.get_mut();
         bufwriter.flush().await?;
+        bufwriter.get_ref().sync_all().await?;
         Ok(())
     }
 }
@@ -765,15 +829,6 @@ impl<'a> slog::KV for SlogRegion<'a> {
         )?;
         Ok(())
     }
-}
-
-/// A shortcut for making an opaque future type for return type or argument
-/// type, which is sendable and not borrowing any variables.  
-///
-/// `future![T]` == `impl Future<Output = T> + Send + 'static`
-#[macro_export]
-macro_rules! future {
-    ($t:ty) => { impl core::future::Future<Output = $t> + Send + 'static };
 }
 
 pub fn debug_iter<D: std::fmt::Debug>(t: impl Iterator<Item = D>) -> impl std::fmt::Debug {
@@ -996,7 +1051,7 @@ mod test {
 
         let (items, size) = super::with_record_read_throughput(|| {
             let mut items = vec![];
-            let snap = engine.snapshot(None);
+            let snap = engine.snapshot();
             snap.scan(CF_DEFAULT, b"", b"", false, |k, v| {
                 items.push((k.to_owned(), v.to_owned()));
                 Ok(true)
@@ -1077,7 +1132,7 @@ mod test {
             .await
             .unwrap();
         writer.write_all(content.as_bytes()).await.unwrap();
-        writer.done().await.unwrap();
+        writer.as_mut().done().await.unwrap();
 
         let mut reader = BufReader::new(File::open(path1).await.unwrap());
         let mut read_content = String::new();
@@ -1090,7 +1145,7 @@ mod test {
             .await
             .unwrap();
         writer.write_all(content.as_bytes()).await.unwrap();
-        writer.done().await.unwrap();
+        writer.as_mut().done().await.unwrap();
 
         use async_compression::tokio::bufread::ZstdDecoder;
         let mut reader = ZstdDecoder::new(BufReader::new(File::open(path2).await.unwrap()));
