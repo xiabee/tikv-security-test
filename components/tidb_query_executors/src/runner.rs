@@ -2,7 +2,9 @@
 
 use std::{convert::TryFrom, sync::Arc};
 
+use api_version::KvFormat;
 use fail::fail_point;
+use itertools::Itertools;
 use kvproto::coprocessor::KeyRange;
 use protobuf::Message;
 use tidb_query_common::{
@@ -158,6 +160,9 @@ impl BatchExecutorsRunner<()> {
                 ExecType::TypeExpand => {
                     other_err!("Expand executor not implemented");
                 }
+                ExecType::TypeExpand2 => {
+                    other_err!("Expand2 executor not implemented");
+                }
             }
         }
 
@@ -173,7 +178,7 @@ fn is_arrow_encodable(schema: &[FieldType]) -> bool {
 }
 
 #[allow(clippy::explicit_counter_loop)]
-pub fn build_executors<S: Storage + 'static>(
+pub fn build_executors<S: Storage + 'static, F: KvFormat>(
     executor_descriptors: Vec<tipb::Executor>,
     storage: S,
     ranges: Vec<KeyRange>,
@@ -201,7 +206,7 @@ pub fn build_executors<S: Storage + 'static>(
             let primary_prefix_column_ids = descriptor.take_primary_prefix_column_ids();
 
             Box::new(
-                BatchTableScanExecutor::new(
+                BatchTableScanExecutor::<_, F>::new(
                     storage,
                     config.clone(),
                     columns_info,
@@ -221,7 +226,7 @@ pub fn build_executors<S: Storage + 'static>(
             let columns_info = descriptor.take_columns().into();
             let primary_column_ids_len = descriptor.take_primary_column_ids().len();
             Box::new(
-                BatchIndexScanExecutor::new(
+                BatchIndexScanExecutor::<_, F>::new(
                     storage,
                     config.clone(),
                     columns_info,
@@ -327,14 +332,39 @@ pub fn build_executors<S: Storage + 'static>(
             ExecType::TypeLimit => {
                 EXECUTOR_COUNT_METRICS.batch_limit.inc();
 
-                Box::new(
-                    BatchLimitExecutor::new(
-                        executor,
-                        ed.get_limit().get_limit() as usize,
-                        is_src_scan_executor,
-                    )?
-                    .collect_summary(summary_slot_index),
-                )
+                let mut d = ed.take_limit();
+
+                // If there is partition_by field in Limit, we treat it as a
+                // partitionTopN without order_by.
+                // todo: refine those logics.
+                let partition_by = d
+                    .take_partition_by()
+                    .into_iter()
+                    .map(|mut item| item.take_expr())
+                    .collect_vec();
+
+                if partition_by.is_empty() {
+                    Box::new(
+                        BatchLimitExecutor::new(
+                            executor,
+                            d.get_limit() as usize,
+                            is_src_scan_executor,
+                        )?
+                        .collect_summary(summary_slot_index),
+                    )
+                } else {
+                    Box::new(
+                        BatchPartitionTopNExecutor::new(
+                            config.clone(),
+                            executor,
+                            partition_by,
+                            vec![],
+                            vec![],
+                            d.get_limit() as usize,
+                        )?
+                        .collect_summary(summary_slot_index),
+                    )
+                }
             }
             ExecType::TypeTopN => {
                 EXECUTOR_COUNT_METRICS.batch_top_n.inc();
@@ -347,17 +377,36 @@ pub fn build_executors<S: Storage + 'static>(
                     order_exprs_def.push(item.take_expr());
                     order_is_desc.push(item.get_desc());
                 }
+                let partition_by = d
+                    .take_partition_by()
+                    .into_iter()
+                    .map(|mut item| item.take_expr())
+                    .collect_vec();
 
-                Box::new(
-                    BatchTopNExecutor::new(
-                        config.clone(),
-                        executor,
-                        order_exprs_def,
-                        order_is_desc,
-                        d.get_limit() as usize,
-                    )?
-                    .collect_summary(summary_slot_index),
-                )
+                if partition_by.is_empty() {
+                    Box::new(
+                        BatchTopNExecutor::new(
+                            config.clone(),
+                            executor,
+                            order_exprs_def,
+                            order_is_desc,
+                            d.get_limit() as usize,
+                        )?
+                        .collect_summary(summary_slot_index),
+                    )
+                } else {
+                    Box::new(
+                        BatchPartitionTopNExecutor::new(
+                            config.clone(),
+                            executor,
+                            partition_by,
+                            order_exprs_def,
+                            order_is_desc,
+                            d.get_limit() as usize,
+                        )?
+                        .collect_summary(summary_slot_index),
+                    )
+                }
             }
             _ => {
                 return Err(other_err!(
@@ -373,7 +422,7 @@ pub fn build_executors<S: Storage + 'static>(
 }
 
 impl<SS: 'static> BatchExecutorsRunner<SS> {
-    pub fn from_request<S: Storage<Statistics = SS> + 'static>(
+    pub fn from_request<S: Storage<Statistics = SS> + 'static, F: KvFormat>(
         mut req: DagRequest,
         ranges: Vec<KeyRange>,
         storage: S,
@@ -389,7 +438,7 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
         config.paging_size = paging_size;
         let config = Arc::new(config);
 
-        let out_most_executor = build_executors(
+        let out_most_executor = build_executors::<_, F>(
             req.take_executors().into(),
             storage,
             ranges,

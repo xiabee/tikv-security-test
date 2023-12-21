@@ -10,7 +10,6 @@ use engine_traits::{CompactedEvent, KvEngine, Snapshot};
 use futures::channel::mpsc::UnboundedSender;
 use kvproto::{
     brpb::CheckAdminResponse,
-    import_sstpb::SstMeta,
     kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp},
     metapb,
     metapb::RegionEpoch,
@@ -22,15 +21,16 @@ use kvproto::{
 #[cfg(any(test, feature = "testexport"))]
 use pd_client::BucketMeta;
 use raft::SnapshotStatus;
+use resource_control::ResourceMetered;
 use smallvec::{smallvec, SmallVec};
 use tikv_util::{deadline::Deadline, escape, memory::HeapSize, time::Instant};
-use tracker::{get_tls_tracker_token, TrackerToken, GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN};
+use tracker::{get_tls_tracker_token, TrackerToken};
 
 use super::{local_metrics::TimeTracker, region_meta::RegionMeta, FetchedLogs, RegionSnapshot};
 use crate::store::{
     fsm::apply::{CatchUpLogs, ChangeObserver, TaskRes as ApplyTaskRes},
     metrics::RaftEventDurationType,
-    peer::{
+    unsafe_recovery::{
         SnapshotRecoveryWaitApplySyncer, UnsafeRecoveryExecutePlanSyncer,
         UnsafeRecoveryFillOutReportSyncer, UnsafeRecoveryForceLeaderSyncer,
         UnsafeRecoveryWaitApplySyncer,
@@ -137,16 +137,7 @@ where
         proposed_cb: Option<ExtCallback>,
         committed_cb: Option<ExtCallback>,
     ) -> Self {
-        let tracker_token = get_tls_tracker_token();
-        let now = std::time::Instant::now();
-        let tracker = if tracker_token == INVALID_TRACKER_TOKEN {
-            TimeTracker::Instant(now)
-        } else {
-            GLOBAL_TRACKERS.with_tracker(tracker_token, |tracker| {
-                tracker.metrics.write_instant = Some(now);
-            });
-            TimeTracker::Tracker(tracker_token)
-        };
+        let tracker = TimeTracker::default();
 
         Callback::Write {
             cb,
@@ -217,7 +208,7 @@ pub trait ReadCallback: ErrorCallback {
     type Response;
 
     fn set_result(self, result: Self::Response);
-    fn read_tracker(&self) -> Option<&TrackerToken>;
+    fn read_tracker(&self) -> Option<TrackerToken>;
 }
 
 pub trait WriteCallback: ErrorCallback {
@@ -225,8 +216,16 @@ pub trait WriteCallback: ErrorCallback {
 
     fn notify_proposed(&mut self);
     fn notify_committed(&mut self);
-    fn write_trackers(&self) -> Option<&SmallVec<[TimeTracker; 4]>>;
-    fn write_trackers_mut(&mut self) -> Option<&mut SmallVec<[TimeTracker; 4]>>;
+
+    type TimeTrackerListRef<'a>: IntoIterator<Item = &'a TimeTracker>
+    where
+        Self: 'a;
+    fn write_trackers(&self) -> Self::TimeTrackerListRef<'_>;
+
+    type TimeTrackerListMut<'a>: IntoIterator<Item = &'a mut TimeTracker>
+    where
+        Self: 'a;
+    fn write_trackers_mut(&mut self) -> Self::TimeTrackerListMut<'_>;
     fn set_result(self, result: Self::Response);
 }
 
@@ -257,9 +256,9 @@ impl<S: Snapshot> ReadCallback for Callback<S> {
         self.invoke_read(result);
     }
 
-    fn read_tracker(&self) -> Option<&TrackerToken> {
+    fn read_tracker(&self) -> Option<TrackerToken> {
         let Callback::Read { tracker, .. } = self else { return None; };
-        Some(tracker)
+        Some(*tracker)
     }
 }
 
@@ -276,16 +275,24 @@ impl<S: Snapshot> WriteCallback for Callback<S> {
         self.invoke_committed();
     }
 
+    type TimeTrackerListRef<'a> = impl IntoIterator<Item = &'a TimeTracker>;
     #[inline]
-    fn write_trackers(&self) -> Option<&SmallVec<[TimeTracker; 4]>> {
-        let Callback::Write { trackers, .. } = self else { return None; };
-        Some(trackers)
+    fn write_trackers(&self) -> Self::TimeTrackerListRef<'_> {
+        let trackers = match self {
+            Callback::Write { trackers, .. } => Some(trackers),
+            _ => None,
+        };
+        trackers.into_iter().flatten()
     }
 
+    type TimeTrackerListMut<'a> = impl IntoIterator<Item = &'a mut TimeTracker>;
     #[inline]
-    fn write_trackers_mut(&mut self) -> Option<&mut SmallVec<[TimeTracker; 4]>> {
-        let Callback::Write { trackers, .. } = self else { return None; };
-        Some(trackers)
+    fn write_trackers_mut(&mut self) -> Self::TimeTrackerListMut<'_> {
+        let trackers = match self {
+            Callback::Write { trackers, .. } => Some(trackers),
+            _ => None,
+        };
+        trackers.into_iter().flatten()
     }
 
     #[inline]
@@ -296,7 +303,7 @@ impl<S: Snapshot> WriteCallback for Callback<S> {
 
 impl<C> WriteCallback for Vec<C>
 where
-    C: WriteCallback,
+    C: WriteCallback + 'static,
     C::Response: Clone,
 {
     type Response = C::Response;
@@ -315,14 +322,16 @@ where
         }
     }
 
+    type TimeTrackerListRef<'a> = impl Iterator<Item = &'a TimeTracker> + 'a;
     #[inline]
-    fn write_trackers(&self) -> Option<&SmallVec<[TimeTracker; 4]>> {
-        None
+    fn write_trackers(&self) -> Self::TimeTrackerListRef<'_> {
+        self.iter().flat_map(|c| c.write_trackers())
     }
 
+    type TimeTrackerListMut<'a> = impl Iterator<Item = &'a mut TimeTracker> + 'a;
     #[inline]
-    fn write_trackers_mut(&mut self) -> Option<&mut SmallVec<[TimeTracker; 4]>> {
-        None
+    fn write_trackers_mut(&mut self) -> Self::TimeTrackerListMut<'_> {
+        self.iter_mut().flat_map(|c| c.write_trackers_mut())
     }
 
     #[inline]
@@ -375,6 +384,8 @@ pub enum PeerTick {
     ReportBuckets = 9,
     CheckLongUncommitted = 10,
     CheckPeersAvailability = 11,
+    RequestSnapshot = 12,
+    RequestVoterReplicatedIndex = 13,
 }
 
 impl PeerTick {
@@ -395,6 +406,8 @@ impl PeerTick {
             PeerTick::ReportBuckets => "report_buckets",
             PeerTick::CheckLongUncommitted => "check_long_uncommitted",
             PeerTick::CheckPeersAvailability => "check_peers_availability",
+            PeerTick::RequestSnapshot => "request_snapshot",
+            PeerTick::RequestVoterReplicatedIndex => "request_voter_replicated_index",
         }
     }
 
@@ -412,6 +425,8 @@ impl PeerTick {
             PeerTick::ReportBuckets,
             PeerTick::CheckLongUncommitted,
             PeerTick::CheckPeersAvailability,
+            PeerTick::RequestSnapshot,
+            PeerTick::RequestVoterReplicatedIndex,
         ];
         TICKS
     }
@@ -420,11 +435,14 @@ impl PeerTick {
 #[derive(Debug, Clone, Copy)]
 pub enum StoreTick {
     CompactCheck,
+    PeriodicFullCompact,
+    LoadMetricsWindow,
     PdStoreHeartbeat,
     SnapGc,
     CompactLockCf,
     ConsistencyCheck,
     CleanupImportSst,
+    PdReportMinResolvedTs,
 }
 
 impl StoreTick {
@@ -432,11 +450,14 @@ impl StoreTick {
     pub fn tag(self) -> RaftEventDurationType {
         match self {
             StoreTick::CompactCheck => RaftEventDurationType::compact_check,
+            StoreTick::PeriodicFullCompact => RaftEventDurationType::periodic_full_compact,
             StoreTick::PdStoreHeartbeat => RaftEventDurationType::pd_store_heartbeat,
             StoreTick::SnapGc => RaftEventDurationType::snap_gc,
             StoreTick::CompactLockCf => RaftEventDurationType::compact_lock_cf,
             StoreTick::ConsistencyCheck => RaftEventDurationType::consistency_check,
             StoreTick::CleanupImportSst => RaftEventDurationType::cleanup_import_sst,
+            StoreTick::LoadMetricsWindow => RaftEventDurationType::load_metrics_window,
+            StoreTick::PdReportMinResolvedTs => RaftEventDurationType::pd_report_min_resolved_ts,
         }
     }
 }
@@ -491,7 +512,7 @@ where
         store_id: u64,
         group_id: u64,
     },
-    /// Capture the changes of the region.
+    /// Capture changes of a region.
     CaptureChange {
         cmd: ChangeObserver,
         region_epoch: RegionEpoch,
@@ -542,12 +563,14 @@ pub enum CasualMessage<EK: KvEngine> {
     /// Approximate size of target region. This message can only be sent by
     /// split-check thread.
     RegionApproximateSize {
-        size: u64,
+        size: Option<u64>,
+        splitable: Option<bool>,
     },
 
     /// Approximate key count of target region.
     RegionApproximateKeys {
-        keys: u64,
+        keys: Option<u64>,
+        splitable: Option<bool>,
     },
     CompactionDeclinedBytes {
         bytes: u64,
@@ -632,11 +655,19 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
                 KeysInfoFormatter(split_keys.iter()),
                 source,
             ),
-            CasualMessage::RegionApproximateSize { size } => {
-                write!(fmt, "Region's approximate size [size: {:?}]", size)
+            CasualMessage::RegionApproximateSize { size, splitable } => {
+                write!(
+                    fmt,
+                    "Region's approximate size [size: {:?}], [splitable: {:?}]",
+                    size, splitable
+                )
             }
-            CasualMessage::RegionApproximateKeys { keys } => {
-                write!(fmt, "Region's approximate keys [keys: {:?}]", keys)
+            CasualMessage::RegionApproximateKeys { keys, splitable } => {
+                write!(
+                    fmt,
+                    "Region's approximate keys [keys: {:?}], [splitable: {:?}",
+                    keys, splitable
+                )
             }
             CasualMessage::CompactionDeclinedBytes { bytes } => {
                 write!(fmt, "compaction declined bytes {}", bytes)
@@ -725,7 +756,7 @@ pub enum PeerMsg<EK: KvEngine> {
     /// Raft message is the message sent between raft nodes in the same
     /// raft group. Messages need to be redirected to raftstore if target
     /// peer doesn't exist.
-    RaftMessage(InspectedRaftMessage),
+    RaftMessage(InspectedRaftMessage, Option<Instant>),
     /// Raft command is the command that is expected to be proposed by the
     /// leader of the target raft group. If it's failed to be sent, callback
     /// usually needs to be called before dropping in case of resource leak.
@@ -758,10 +789,12 @@ pub enum PeerMsg<EK: KvEngine> {
     Destroy(u64),
 }
 
+impl<EK: KvEngine> ResourceMetered for PeerMsg<EK> {}
+
 impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PeerMsg::RaftMessage(_) => write!(fmt, "Raft Message"),
+            PeerMsg::RaftMessage(..) => write!(fmt, "Raft Message"),
             PeerMsg::RaftCommand(_) => write!(fmt, "Raft Command"),
             PeerMsg::Tick(tick) => write! {
                 fmt,
@@ -806,10 +839,6 @@ where
 {
     RaftMessage(InspectedRaftMessage),
 
-    ValidateSstResult {
-        invalid_ssts: Vec<SstMeta>,
-    },
-
     // Clear region size and keys for all regions in the range, so we can force them to
     // re-calculate their size later.
     ClearRegionSizeInRange {
@@ -853,6 +882,8 @@ where
     },
 }
 
+impl<EK: KvEngine> ResourceMetered for StoreMsg<EK> {}
+
 impl<EK> fmt::Debug for StoreMsg<EK>
 where
     EK: KvEngine,
@@ -864,7 +895,6 @@ where
                 write!(fmt, "Store {}  is unreachable", store_id)
             }
             StoreMsg::CompactedEvent(ref event) => write!(fmt, "CompactedEvent cf {}", event.cf()),
-            StoreMsg::ValidateSstResult { .. } => write!(fmt, "Validate SST Result"),
             StoreMsg::ClearRegionSizeInRange {
                 ref start_key,
                 ref end_key,

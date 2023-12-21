@@ -3,6 +3,7 @@
 use std::{sync::Arc, thread, time::Duration};
 
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
+use engine_rocks::RocksEngine;
 use futures::executor::block_on;
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::{
@@ -14,7 +15,7 @@ use test_raftstore::*;
 use tikv_util::{time::Instant, HandyRwLock};
 
 struct TestSuite {
-    pub cluster: Cluster<ServerCluster>,
+    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
     api_version: ApiVersion,
 }
 
@@ -24,7 +25,7 @@ impl TestSuite {
         // Disable background renew by setting `renew_interval` to 0, to make timestamp
         // allocation predictable.
         configure_for_causal_ts(&mut cluster, "0s", 100);
-        configure_for_merge(&mut cluster);
+        configure_for_merge(&mut cluster.cfg);
         cluster.run();
         cluster.pd_client.disable_default_operator();
 
@@ -276,7 +277,7 @@ fn test_region_merge() {
     suite.stop();
 }
 
-// Verify the raw key guard correctness in apiv2
+// Verify the raw key guard correctness in APIv2.
 #[test]
 fn test_raw_put_key_guard() {
     let mut suite = TestSuite::new(3, ApiVersion::V2);
@@ -296,12 +297,19 @@ fn test_raw_put_key_guard() {
 
     let copy_test_key = test_key.clone();
     let copy_test_value = test_value.clone();
-    let apply_wait_timeout = 2000; // ms, assume send request and apply can be finished in 2s.
     fail::cfg(pause_write_fp, "pause").unwrap();
     let handle = thread::spawn(move || {
         must_raw_put(&client, ctx, copy_test_key, copy_test_value);
     });
-    thread::sleep(Duration::from_millis(apply_wait_timeout));
+
+    // Wait for global_min_lock_ts.
+    sleep_ms(500);
+    let start = Instant::now();
+    while leader_cm.global_min_lock_ts().is_none()
+        && start.saturating_elapsed() < Duration::from_secs(5)
+    {
+        sleep_ms(200);
+    }
 
     // Before raw_put finish, min_ts should be the ts of "key guard" of the raw_put
     // request.
