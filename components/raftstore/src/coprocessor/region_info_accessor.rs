@@ -46,26 +46,11 @@ use super::{
 /// `RaftStoreEvent` Represents events dispatched from raftstore coprocessor.
 #[derive(Debug)]
 pub enum RaftStoreEvent {
-    CreateRegion {
-        region: Region,
-        role: StateRole,
-    },
-    UpdateRegion {
-        region: Region,
-        role: StateRole,
-    },
-    DestroyRegion {
-        region: Region,
-    },
-    RoleChange {
-        region: Region,
-        role: StateRole,
-        initialized: bool,
-    },
-    UpdateRegionBuckets {
-        region: Region,
-        buckets: usize,
-    },
+    CreateRegion { region: Region, role: StateRole },
+    UpdateRegion { region: Region, role: StateRole },
+    DestroyRegion { region: Region },
+    RoleChange { region: Region, role: StateRole },
+    UpdateRegionBuckets { region: Region, buckets: usize },
 }
 
 impl RaftStoreEvent {
@@ -206,11 +191,7 @@ impl RoleObserver for RegionEventListener {
     fn on_role_change(&self, context: &mut ObserverContext<'_>, role_change: &RoleChange) {
         let region = context.region().clone();
         let role = role_change.state;
-        let event = RaftStoreEvent::RoleChange {
-            region,
-            role,
-            initialized: role_change.initialized,
-        };
+        let event = RaftStoreEvent::RoleChange { region, role };
         self.scheduler
             .schedule(RegionInfoQuery::RaftStoreEvent(event))
             .unwrap();
@@ -445,10 +426,7 @@ impl RegionCollector {
             // They are impossible to equal, or they cannot overlap.
             assert_ne!(
                 region.get_region_epoch().get_version(),
-                current_region.get_region_epoch().get_version(),
-                "{:?} vs {:?}",
-                region,
-                current_region,
+                current_region.get_region_epoch().get_version()
             );
             // Remove it since it's a out-of-date region info.
             if clear_regions_in_range {
@@ -514,10 +492,6 @@ impl RegionCollector {
                 // epoch is properly set and an Update message was sent.
                 return;
             }
-            if let RaftStoreEvent::RoleChange { initialized, .. } = &event && !initialized {
-                // Ignore uninitialized peers.
-                return;
-            }
             if !self.check_region_range(region, true) {
                 debug!(
                     "Received stale event";
@@ -537,7 +511,7 @@ impl RegionCollector {
             RaftStoreEvent::DestroyRegion { region } => {
                 self.handle_destroy_region(region);
             }
-            RaftStoreEvent::RoleChange { region, role, .. } => {
+            RaftStoreEvent::RoleChange { region, role } => {
                 self.handle_role_change(region, role);
             }
             RaftStoreEvent::UpdateRegionBuckets { region, buckets } => {
@@ -1014,16 +988,10 @@ mod tests {
         }
     }
 
-    fn must_change_role(
-        c: &mut RegionCollector,
-        region: &Region,
-        role: StateRole,
-        initialized: bool,
-    ) {
+    fn must_change_role(c: &mut RegionCollector, region: &Region, role: StateRole) {
         c.handle_raftstore_event(RaftStoreEvent::RoleChange {
             region: region.clone(),
             role,
-            initialized,
         });
 
         if let Some(r) = c.regions.get(&region.get_id()) {
@@ -1069,12 +1037,6 @@ mod tests {
         c.handle_raftstore_event(RaftStoreEvent::RoleChange {
             region: new_region(1, b"k1", b"k2", 0),
             role: StateRole::Leader,
-            initialized: true,
-        });
-        c.handle_raftstore_event(RaftStoreEvent::RoleChange {
-            region: new_region(1, b"", b"", 3),
-            role: StateRole::Leader,
-            initialized: false,
         });
 
         check_collection(&c, &[]);
@@ -1236,15 +1198,9 @@ mod tests {
             &mut c,
             &new_region(1, b"k0", b"k1", 2),
             StateRole::Candidate,
-            true,
         );
         must_create_region(&mut c, &new_region(5, b"k99", b"", 2), StateRole::Follower);
-        must_change_role(
-            &mut c,
-            &new_region(2, b"k2", b"k8", 2),
-            StateRole::Leader,
-            true,
-        );
+        must_change_role(&mut c, &new_region(2, b"k2", b"k8", 2), StateRole::Leader);
         must_update_region(&mut c, &new_region(2, b"k3", b"k7", 3), StateRole::Leader);
         // test region buckets update
         must_update_region_buckets(&mut c, &new_region(2, b"k3", b"k7", 3), 4);
@@ -1387,12 +1343,7 @@ mod tests {
         // which haven't been handled.
         must_create_region(&mut c, &new_region(4, b"k5", b"k9", 2), StateRole::Follower);
         must_update_region(&mut c, &new_region(2, b"k1", b"k9", 1), StateRole::Follower);
-        must_change_role(
-            &mut c,
-            &new_region(2, b"k1", b"k9", 1),
-            StateRole::Leader,
-            true,
-        );
+        must_change_role(&mut c, &new_region(2, b"k1", b"k9", 1), StateRole::Leader);
         must_update_region(&mut c, &new_region(2, b"k1", b"k5", 2), StateRole::Leader);
         // TODO: In fact, region 2's role should be follower. However because it's
         // previous state was removed while creating updating region 4, it can't be
@@ -1413,12 +1364,7 @@ mod tests {
         // handled.
         must_update_region(&mut c, &new_region(2, b"k1", b"k9", 3), StateRole::Leader);
         must_update_region(&mut c, &new_region(4, b"k5", b"k9", 2), StateRole::Follower);
-        must_change_role(
-            &mut c,
-            &new_region(4, b"k5", b"k9", 2),
-            StateRole::Leader,
-            true,
-        );
+        must_change_role(&mut c, &new_region(4, b"k5", b"k9", 2), StateRole::Leader);
         must_destroy_region(&mut c, new_region(4, b"k5", b"k9", 2));
         check_collection(
             &c,

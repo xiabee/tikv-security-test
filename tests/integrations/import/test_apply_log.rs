@@ -1,3 +1,5 @@
+use std::iter::IntoIterator;
+
 use engine_traits::CF_DEFAULT;
 use external_storage_export::LocalStorage;
 use kvproto::import_sstpb::ApplyRequest;
@@ -64,7 +66,12 @@ fn test_apply_twice() {
     req.set_metas(vec![sst_meta.clone()].into());
     req.set_storage_backend(util::local_storage(&tmp));
     import.apply(&req).unwrap();
-    util::check_applied_kvs_cf(&tikv, &ctx, CF_DEFAULT, default_fst.iter().copied());
+    util::check_applied_kvs_cf(
+        &tikv,
+        &ctx,
+        CF_DEFAULT,
+        IntoIterator::into_iter(default_fst),
+    );
 
     util::register_range_for(&mut sst_meta, b"k1", b"k1a");
     req.set_rewrite_rules(vec![util::rewrite_for(&mut sst_meta, b"k", b"z")].into());

@@ -33,7 +33,7 @@ use pd_client::PdClient;
 use raftstore::{
     coprocessor::{CoprocessorHost, RegionInfoAccessor},
     errors::Error as RaftError,
-    router::{CdcRaftRouter, LocalReadRouter, RaftStoreRouter, ServerRaftStoreRouter},
+    router::{LocalReadRouter, RaftStoreRouter, ServerRaftStoreRouter},
     store::{
         fsm::{store::StoreMeta, ApplyRouter, RaftBatchSystem, RaftRouter},
         msg::RaftCmdExtraOpts,
@@ -42,7 +42,6 @@ use raftstore::{
     },
     Result,
 };
-use resource_control::ResourceGroupManager;
 use resource_metering::{CollectorRegHandle, ResourceTagFactory};
 use security::SecurityManager;
 use tempfile::TempDir;
@@ -53,22 +52,22 @@ use tikv::{
     import::{ImportSstService, SstImporter},
     read_pool::ReadPool,
     server::{
-        debug::DebuggerImpl,
+        create_raft_storage,
+        debug::Debugger,
         gc_worker::GcWorker,
         load_statistics::ThreadLoadPool,
         lock_manager::LockManager,
         raftkv::ReplicaReadLockChecker,
         resolve::{self, StoreAddrResolver},
         service::DebugService,
-        tablet_snap::NoSnapshotCache,
         ConnectionBuilder, Error, Node, PdStoreAddrResolver, RaftClient, RaftKv,
         Result as ServerResult, Server, ServerTransport,
     },
     storage::{
         self,
-        kv::{FakeExtension, LocalTablets, SnapContext},
+        kv::{FakeExtension, SnapContext},
         txn::flow_controller::{EngineFlowController, FlowController},
-        Engine, Storage,
+        Engine,
     },
 };
 use tikv_util::{
@@ -268,7 +267,6 @@ impl ServerCluster {
         key_manager: Option<Arc<DataKeyManager>>,
         router: RaftRouter<RocksEngine, RaftTestEngine>,
         system: RaftBatchSystem<RocksEngine, RaftTestEngine>,
-        resource_manager: &Option<Arc<ResourceGroupManager>>,
     ) -> ServerResult<u64> {
         let (tmp_str, tmp) = if node_id == 0 || !self.snap_paths.contains_key(&node_id) {
             let p = test_util::temp_dir("test_cluster", cfg.prefer_mem);
@@ -357,7 +355,7 @@ impl ServerCluster {
             let rts_endpoint = resolved_ts::Endpoint::new(
                 &cfg.resolved_ts,
                 rts_worker.scheduler(),
-                CdcRaftRouter(raft_router),
+                raft_router,
                 store_meta.clone(),
                 self.pd_client.clone(),
                 concurrency_manager.clone(),
@@ -405,9 +403,9 @@ impl ServerCluster {
             cfg.quota.max_delay_duration,
             cfg.quota.enable_auto_tune,
         ));
-        let extension = engine.raft_extension();
-        let store = Storage::<_, _, F>::from_engine(
-            engine.clone(),
+        let extension = engine.raft_extension().clone();
+        let store = create_raft_storage::<_, _, _, F, _>(
+            engine,
             &cfg.storage,
             storage_read_pool.handle(),
             lock_mgr.clone(),
@@ -419,9 +417,6 @@ impl ServerCluster {
             quota_limiter.clone(),
             self.pd_client.feature_gate().clone(),
             self.get_causal_ts_provider(node_id),
-            resource_manager
-                .as_ref()
-                .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
         )?;
         self.storages.insert(node_id, raft_engine);
 
@@ -443,8 +438,8 @@ impl ServerCluster {
         let import_service = ImportSstService::new(
             cfg.import.clone(),
             cfg.raft_store.raft_entry_max_size,
-            engine,
-            LocalTablets::Singleton(engines.kv.clone()),
+            sim_router.clone(),
+            engines.kv.clone(),
             Arc::clone(&importer),
         );
 
@@ -455,12 +450,11 @@ impl ServerCluster {
         let (resolver, state) =
             resolve::new_resolver(Arc::clone(&self.pd_client), &bg_worker, extension.clone());
         let snap_mgr = SnapManagerBuilder::default()
-            .max_write_bytes_per_sec(cfg.server.snap_io_max_bytes_per_sec.0 as i64)
+            .max_write_bytes_per_sec(cfg.server.snap_max_write_bytes_per_sec.0 as i64)
             .max_total_size(cfg.server.snap_max_total_size.0)
             .encryption_key_manager(key_manager)
             .max_per_file_size(cfg.raft_store.max_snapshot_file_raw_size.0)
             .enable_multi_snapshot_files(true)
-            .enable_receive_tablet_snapshot(cfg.raft_store.enable_v2_compatible_learner)
             .build(tmp_str);
         self.snap_mgrs.insert(node_id, snap_mgr.clone());
         let server_cfg = Arc::new(VersionTrack::new(cfg.server.clone()));
@@ -489,7 +483,11 @@ impl ServerCluster {
                 .unwrap(),
         );
 
-        let debugger = DebuggerImpl::new(engines.clone(), ConfigController::default());
+        let debugger = Debugger::new(
+            engines.clone(),
+            ConfigController::new(cfg.tikv.clone()),
+            Some(store.clone()),
+        );
         let debug_thread_handle = debug_thread_pool.handle().clone();
         let debug_service = DebugService::new(
             debugger,
@@ -502,11 +500,10 @@ impl ServerCluster {
         let apply_router = system.apply_router();
         // Create node.
         let mut raft_store = cfg.raft_store.clone();
-        raft_store.optimize_for(false);
         raft_store
             .validate(
-                cfg.coprocessor.region_split_size(),
-                cfg.coprocessor.enable_region_bucket(),
+                cfg.coprocessor.region_split_size,
+                cfg.coprocessor.enable_region_bucket,
                 cfg.coprocessor.region_bucket_size,
             )
             .unwrap();
@@ -534,14 +531,13 @@ impl ServerCluster {
                 copr.clone(),
                 copr_v2.clone(),
                 resolver.clone(),
-                tikv_util::Either::Left(snap_mgr.clone()),
+                snap_mgr.clone(),
                 gc_worker.clone(),
                 check_leader_scheduler.clone(),
                 self.env.clone(),
                 None,
                 debug_thread_pool.clone(),
                 health_service.clone(),
-                resource_manager.clone(),
             )
             .unwrap();
             svr.register_service(create_import_sst(import_service.clone()));
@@ -628,9 +624,7 @@ impl ServerCluster {
             )
             .unwrap();
 
-        server
-            .start(server_cfg, security_mgr, NoSnapshotCache)
-            .unwrap();
+        server.start(server_cfg, security_mgr).unwrap();
 
         self.metas.insert(
             node_id,
@@ -666,7 +660,6 @@ impl Simulator for ServerCluster {
         key_manager: Option<Arc<DataKeyManager>>,
         router: RaftRouter<RocksEngine, RaftTestEngine>,
         system: RaftBatchSystem<RocksEngine, RaftTestEngine>,
-        resource_manager: &Option<Arc<ResourceGroupManager>>,
     ) -> ServerResult<u64> {
         dispatch_api_version!(
             cfg.storage.api_version(),
@@ -678,7 +671,6 @@ impl Simulator for ServerCluster {
                 key_manager,
                 router,
                 system,
-                resource_manager,
             )
         )
     }
@@ -827,27 +819,6 @@ impl Cluster<ServerCluster> {
         }
         panic!("failed to get snapshot of region {}", region_id);
     }
-
-    pub fn raft_extension(&self, node_id: u64) -> SimulateRaftExtension {
-        self.sim.rl().storages[&node_id].raft_extension()
-    }
-
-    pub fn get_addr(&self, node_id: u64) -> String {
-        self.sim.rl().get_addr(node_id)
-    }
-
-    pub fn register_hook(
-        &self,
-        node_id: u64,
-        register: Box<dyn Fn(&mut CoprocessorHost<RocksEngine>)>,
-    ) {
-        self.sim
-            .wl()
-            .coprocessor_hooks
-            .entry(node_id)
-            .or_default()
-            .push(register);
-    }
 }
 
 pub fn new_server_cluster(id: u64, count: usize) -> Cluster<ServerCluster> {
@@ -928,6 +899,20 @@ pub fn must_new_cluster_and_debug_client() -> (Cluster<ServerCluster>, DebugClie
     (cluster, client, leader.get_store_id())
 }
 
+pub fn must_new_cluster_kv_client_and_debug_client()
+-> (Cluster<ServerCluster>, TikvClient, DebugClient, Context) {
+    let (cluster, leader, ctx) = must_new_cluster_mul(1);
+
+    let env = Arc::new(Environment::new(1));
+    let channel =
+        ChannelBuilder::new(env).connect(&cluster.sim.rl().get_addr(leader.get_store_id()));
+
+    let kv_client = TikvClient::new(channel.clone());
+    let debug_client = DebugClient::new(channel);
+
+    (cluster, kv_client, debug_client, ctx)
+}
+
 pub fn must_new_and_configure_cluster_and_kv_client(
     configure: impl FnMut(&mut Cluster<ServerCluster>),
 ) -> (Cluster<ServerCluster>, TikvClient, Context) {
@@ -939,42 +924,4 @@ pub fn must_new_and_configure_cluster_and_kv_client(
     let client = TikvClient::new(channel);
 
     (cluster, client, ctx)
-}
-
-pub fn setup_cluster() -> (Cluster<ServerCluster>, TikvClient, String, Context) {
-    let mut cluster = new_server_cluster(0, 3);
-    cluster.run();
-
-    let region_id = 1;
-    let leader = cluster.leader_of_region(region_id).unwrap();
-    let leader_addr = cluster.sim.rl().get_addr(leader.get_store_id());
-    let region = cluster.get_region(b"k1");
-    let follower = region
-        .get_peers()
-        .iter()
-        .find(|p| **p != leader)
-        .unwrap()
-        .clone();
-    let follower_addr = cluster.sim.rl().get_addr(follower.get_store_id());
-    let epoch = cluster.get_region_epoch(region_id);
-    let mut ctx = Context::default();
-    ctx.set_region_id(region_id);
-    ctx.set_peer(leader);
-    ctx.set_region_epoch(epoch);
-
-    let env = Arc::new(Environment::new(1));
-    let channel = ChannelBuilder::new(env).connect(&follower_addr);
-    let client = TikvClient::new(channel);
-
-    // Verify not setting forwarding header will result in store not match.
-    let mut put_req = kvproto::kvrpcpb::RawPutRequest::default();
-    put_req.set_context(ctx.clone());
-    let put_resp = client.raw_put(&put_req).unwrap();
-    assert!(
-        put_resp.get_region_error().has_store_not_match(),
-        "{:?}",
-        put_resp
-    );
-    assert!(put_resp.error.is_empty(), "{:?}", put_resp);
-    (cluster, client, leader_addr, ctx)
 }

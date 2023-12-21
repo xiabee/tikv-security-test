@@ -7,8 +7,6 @@
 #![feature(box_patterns)]
 #![feature(hash_drain_filter)]
 #![feature(let_chains)]
-#![feature(assert_matches)]
-#![feature(type_alias_impl_trait)]
 #![recursion_limit = "256"]
 
 #[cfg(test)]

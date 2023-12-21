@@ -1,6 +1,6 @@
 [package]
 name = "tikv"
-version = "7.1.2"
+version = "6.5.6"
 authors = ["The TiKV Authors"]
 description = "A distributed transactional key-value database powered by Rust and Raft"
 license = "Apache-2.0"
@@ -13,7 +13,6 @@ publish = false
 
 [features]
 default = ["test-engine-kv-rocksdb", "test-engine-raft-raft-engine", "cloud-aws", "cloud-gcp", "cloud-azure"]
-trace-tablet-lifetime = ["engine_rocks/trace-lifetime"]
 tcmalloc = ["tikv_alloc/tcmalloc"]
 jemalloc = ["tikv_alloc/jemalloc", "engine_rocks/jemalloc"]
 mimalloc = ["tikv_alloc/mimalloc"]
@@ -39,7 +38,7 @@ cloud-azure = [
   "encryption_export/cloud-azure",
   "sst_importer/cloud-azure",
 ]
-testexport = ["raftstore/testexport", "api_version/testexport", "causal_ts/testexport", "engine_traits/testexport", "engine_rocks/testexport", "engine_panic/testexport"]
+testexport = ["raftstore/testexport", "api_version/testexport", "causal_ts/testexport"]
 test-engine-kv-rocksdb = [
   "engine_test/test-engine-kv-rocksdb"
 ]
@@ -118,7 +117,7 @@ match-template = "0.0.1"
 memory_trace_macros = { workspace = true }
 mime = "0.3.13"
 more-asserts = "0.2"
-mur3 = "0.1"
+murmur3 = "0.5.1"
 nom = { version = "5.1.0", default-features = false, features = ["std"] }
 notify = "4"
 num-traits = "0.2.14"
@@ -137,10 +136,8 @@ protobuf = { version = "2.8", features = ["bytes"] }
 raft = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
 raft_log_engine = { workspace = true }
 raftstore = { workspace = true, features = ["engine_rocks"] }
-raftstore-v2 = { workspace = true }
 rand = "0.7.3"
 regex = "1.3"
-resource_control = { workspace = true }
 resource_metering = { workspace = true }
 rev_lines = "0.2.1"
 seahash = "4.1.0"
@@ -151,13 +148,13 @@ serde_derive = "1.0"
 serde_ignored = "0.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 service = { workspace = true }
-slog = { workspace = true }
-slog-global = { workspace = true }
+slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debug"] }
+slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
 smallvec = "1.4"
 sst_importer = { workspace = true }
 strum = { version = "0.20", features = ["derive"] }
 sync_wrapper = "0.1.1"
-sysinfo = "0.26"
+sysinfo = "0.16"
 tempfile = "3.0"
 thiserror = "1.0"
 tidb_query_aggr = { workspace = true }
@@ -186,7 +183,6 @@ api_version = { workspace = true, features = ["testexport"] }
 example_coprocessor_plugin = { workspace = true } # should be a binary dependency
 hyper-openssl = "0.9"
 panic_hook = { workspace = true }
-raftstore = { workspace = true, features = ["testexport"] }
 reqwest = { version = "0.11", features = ["blocking"] }
 test_sst_importer = { workspace = true }
 test_util = { workspace = true }
@@ -216,7 +212,11 @@ fs2 = { git = "https://github.com/tabokie/fs2-rs", branch = "tikv" }
 # Remove this when a new version is release. We need to solve rust-lang/cmake-rs#143.
 cmake = { git = "https://github.com/rust-lang/cmake-rs" }
 
-sysinfo ={ git = "https://github.com/tikv/sysinfo", branch = "0.26-fix-cpu" }
+# TODO: remove this after crossbeam-deque is updated to the next release version.
+# This is a workaround for cargo can't resolving the this patch in yatp.
+crossbeam-deque = { git = "https://github.com/crossbeam-rs/crossbeam", rev = "41ed3d948720f26149b2ebeaf58fe8a193134056" }
+
+sysinfo ={ git = "https://github.com/tikv/sysinfo", branch = "0.16.4-fix-cpu" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procinfo = { git = "https://github.com/tikv/procinfo-rs", rev = "6599eb9dca74229b2c1fcc44118bef7eff127128" }
@@ -269,7 +269,6 @@ members = [
   "components/raftstore",
   "components/raftstore-v2",
   "components/resolved_ts",
-  "components/resource_control",
   "components/resource_metering",
   "components/security",
   "components/server",
@@ -282,8 +281,6 @@ members = [
   "components/test_pd",
   "components/test_pd_client",
   "components/test_raftstore",
-  "components/test_raftstore-v2",
-  "components/test_raftstore_macro",
   "components/test_sst_importer",
   "components/test_storage",
   "components/test_util",
@@ -345,9 +342,8 @@ pd_client = { path = "components/pd_client" }
 profiler = { path = "components/profiler" }
 raft_log_engine = { path = "components/raft_log_engine" }
 raftstore = { path = "components/raftstore", default-features = false }
-raftstore-v2 = { path = "components/raftstore-v2", default-features = false }
+raftstore_v2 = { path = "components/raftstore-v2", default-features = false }
 resolved_ts = { path = "components/resolved_ts" }
-resource_control = { path = "components/resource_control" }
 resource_metering = { path = "components/resource_metering" }
 security = { path = "components/security" }
 server = { path = "components/server" }
@@ -360,8 +356,6 @@ example_coprocessor_plugin = { path = "components/test_coprocessor_plugin/exampl
 test_pd = { path = "components/test_pd" }
 test_pd_client = { path = "components/test_pd_client" }
 test_raftstore = { path = "components/test_raftstore", default-features = false }
-test_raftstore-v2 = { path = "components/test_raftstore-v2", default-features = false }
-test_raftstore_macro = { path = "components/test_raftstore_macro" }
 test_sst_importer = { path = "components/test_sst_importer" }
 test_storage = { path = "components/test_storage", default-features = false }
 test_util = { path = "components/test_util" }
@@ -382,12 +376,10 @@ txn_types = { path = "components/txn_types" }
 grpcio = { version = "0.10.4", default-features = false, features = ["openssl-vendored", "protobuf-codec", "nightly"] }
 grpcio-health = { version = "0.10.4", default-features = false, features = ["protobuf-codec"] }
 tipb = { git = "https://github.com/pingcap/tipb.git" }
-kvproto = { git = "https://github.com/pingcap/kvproto.git", branch = "release-7.1" }
+kvproto = { git = "https://github.com/pingcap/kvproto.git", branch = "release-6.5" }
 yatp = { git = "https://github.com/tikv/yatp.git", branch = "master" }
 tokio-timer = { git = "https://github.com/tikv/tokio", branch = "tokio-timer-hotfix" }
 tokio-executor = { git = "https://github.com/tikv/tokio", branch = "tokio-timer-hotfix" }
-slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debug"] }
-slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
 
 [profile.dev.package.grpcio-sys]
 debug = false

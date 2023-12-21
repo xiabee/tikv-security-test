@@ -5,40 +5,6 @@ use prometheus::*;
 use prometheus_static_metric::*;
 
 make_static_metric! {
-    pub label_enum PDRequestEventType {
-        get_region,
-        get_region_by_id,
-        get_region_leader_by_id,
-        scatter_region,
-        get_store,
-        get_store_async,
-        put_store,
-        get_all_stores,
-        get_store_and_stats,
-        store_global_config,
-        load_global_config,
-        watch_global_config,
-        bootstrap_cluster,
-        is_cluster_bootstrapped,
-        get_cluster_config,
-        ask_split,
-        ask_batch_split,
-        report_batch_split,
-        get_gc_safe_point,
-        update_service_safe_point,
-        min_resolved_ts,
-        get_operator,
-        alloc_id,
-        is_recovering_marked,
-        store_heartbeat,
-        tso,
-        get_members,
-
-        meta_storage_put,
-        meta_storage_get,
-        meta_storage_watch,
-    }
-
     pub label_enum PDReconnectEventKind {
         success,
         failure,
@@ -47,23 +13,18 @@ make_static_metric! {
         try_connect,
     }
 
-    pub struct PDRequestEventHistogramVec: Histogram {
-        "type" => PDRequestEventType,
-    }
     pub struct PDReconnectEventCounterVec: IntCounter {
         "type" => PDReconnectEventKind,
     }
 }
 
 lazy_static! {
-    pub static ref PD_REQUEST_HISTOGRAM_VEC: PDRequestEventHistogramVec =
-        register_static_histogram_vec!(
-            PDRequestEventHistogramVec,
-            "tikv_pd_request_duration_seconds",
-            "Bucketed histogram of PD requests duration",
-            &["type"]
-        )
-        .unwrap();
+    pub static ref PD_REQUEST_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
+        "tikv_pd_request_duration_seconds",
+        "Bucketed histogram of PD requests duration",
+        &["type"]
+    )
+    .unwrap();
     pub static ref PD_HEARTBEAT_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
         "tikv_pd_heartbeat_message_total",
         "Total number of PD heartbeat messages.",

@@ -69,13 +69,6 @@ impl CachedEntries {
         }
     }
 
-    pub fn iter_entries(&self, mut f: impl FnMut(&Entry)) {
-        let entries = self.entries.lock().unwrap();
-        for entry in &entries.0 {
-            f(entry);
-        }
-    }
-
     /// Take cached entries and dangle size for them. `dangle` means not in
     /// entry cache.
     pub fn take_entries(&self) -> (Vec<Entry>, usize) {
@@ -960,12 +953,7 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
                 .raft_engine
                 .get_entry(self.region_id, idx)
                 .unwrap()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "region_id={}, peer_id={}, idx={idx}",
-                        self.region_id, self.peer_id
-                    )
-                })
+                .unwrap()
                 .get_term())
         }
     }
@@ -1087,8 +1075,9 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
 
         self.cache.append(self.region_id, self.peer_id, &entries);
 
+        task.entries = entries;
         // Delete any previously appended log entries which never committed.
-        task.set_append(Some(prev_last_index + 1), entries);
+        task.cut_logs = Some((last_index + 1, prev_last_index + 1));
 
         self.raft_state.set_last_index(last_index);
         self.last_term = last_term;
@@ -1248,10 +1237,6 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
             let drain_to = if half { cache_len / 2 } else { cache_len - 1 };
             let idx = cache.cache[drain_to].index;
             let mem_size_change = cache.compact_to(idx + 1);
-            RAFT_ENTRIES_EVICT_BYTES.inc_by(mem_size_change);
-        } else if !half {
-            let cache = &mut self.cache;
-            let mem_size_change = cache.compact_to(u64::MAX);
             RAFT_ENTRIES_EVICT_BYTES.inc_by(mem_size_change);
         }
     }
