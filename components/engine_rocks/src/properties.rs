@@ -9,7 +9,7 @@ use std::{
 };
 
 use api_version::{ApiV2, KeyMode, KvFormat};
-use engine_traits::{raw_ttl::ttl_current_ts, MvccProperties, Range};
+use engine_traits::{raw_ttl::ttl_current_ts, MvccProperties, Range, RangeStats};
 use rocksdb::{
     DBEntryType, TablePropertiesCollector, TablePropertiesCollectorFactory, TitanBlobIndex,
     UserCollectedProperties,
@@ -144,10 +144,7 @@ pub struct RangeProperties {
 
 impl RangeProperties {
     pub fn get(&self, key: &[u8]) -> &RangeOffsets {
-        let idx = self
-            .offsets
-            .binary_search_by_key(&key, |&(ref k, _)| k)
-            .unwrap();
+        let idx = self.offsets.binary_search_by_key(&key, |(k, _)| k).unwrap();
         &self.offsets[idx].1
     }
 
@@ -205,11 +202,11 @@ impl RangeProperties {
         if start == end {
             return (0, 0);
         }
-        let start_offset = match self.offsets.binary_search_by_key(&start, |&(ref k, _)| k) {
+        let start_offset = match self.offsets.binary_search_by_key(&start, |(k, _)| k) {
             Ok(idx) => Some(idx),
             Err(next_idx) => next_idx.checked_sub(1),
         };
-        let end_offset = match self.offsets.binary_search_by_key(&end, |&(ref k, _)| k) {
+        let end_offset = match self.offsets.binary_search_by_key(&end, |(k, _)| k) {
             Ok(idx) => Some(idx),
             Err(next_idx) => next_idx.checked_sub(1),
         };
@@ -225,10 +222,7 @@ impl RangeProperties {
         start_key: &[u8],
         end_key: &[u8],
     ) -> Vec<(Vec<u8>, RangeOffsets)> {
-        let start_offset = match self
-            .offsets
-            .binary_search_by_key(&start_key, |&(ref k, _)| k)
-        {
+        let start_offset = match self.offsets.binary_search_by_key(&start_key, |(k, _)| k) {
             Ok(idx) => {
                 if idx == self.offsets.len() - 1 {
                     return vec![];
@@ -239,7 +233,7 @@ impl RangeProperties {
             Err(next_idx) => next_idx,
         };
 
-        let end_offset = match self.offsets.binary_search_by_key(&end_key, |&(ref k, _)| k) {
+        let end_offset = match self.offsets.binary_search_by_key(&end_key, |(k, _)| k) {
             Ok(idx) => {
                 if idx == 0 {
                     return vec![];
@@ -533,12 +527,12 @@ impl TablePropertiesCollectorFactory<MvccPropertiesCollector>
     }
 }
 
-pub fn get_range_entries_and_versions(
+pub fn get_range_stats(
     engine: &crate::RocksEngine,
     cf: &str,
     start: &[u8],
     end: &[u8],
-) -> Option<(u64, u64)> {
+) -> Option<RangeStats> {
     let range = Range::new(start, end);
     let collection = match engine.get_properties_of_tables_in_range(cf, &[range]) {
         Ok(v) => v,
@@ -560,8 +554,11 @@ pub fn get_range_entries_and_versions(
         num_entries += v.num_entries();
         props.add(&mvcc);
     }
-
-    Some((num_entries, props.num_versions))
+    Some(RangeStats {
+        num_entries,
+        num_versions: props.num_versions,
+        num_rows: props.num_rows,
+    })
 }
 
 #[cfg(test)]
@@ -776,10 +773,9 @@ mod tests {
 
         let start_keys = keys::data_key(&[]);
         let end_keys = keys::data_end_key(&[]);
-        let (entries, versions) =
-            get_range_entries_and_versions(&db, CF_WRITE, &start_keys, &end_keys).unwrap();
-        assert_eq!(entries, (cases.len() * 2) as u64);
-        assert_eq!(versions, cases.len() as u64);
+        let range_stats = get_range_stats(&db, CF_WRITE, &start_keys, &end_keys).unwrap();
+        assert_eq!(range_stats.num_entries, (cases.len() * 2) as u64);
+        assert_eq!(range_stats.num_versions, cases.len() as u64);
     }
 
     #[test]
@@ -867,7 +863,7 @@ mod tests {
 
         let mut collector = MvccPropertiesCollector::new(KeyMode::Txn);
         b.iter(|| {
-            for &(ref k, ref v) in &entries {
+            for (k, v) in &entries {
                 collector.add(k, v, DBEntryType::Put, 0, 0);
             }
         });

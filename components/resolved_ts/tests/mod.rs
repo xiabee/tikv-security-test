@@ -4,6 +4,7 @@ use std::{sync::*, time::Duration};
 
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
+use engine_rocks::RocksEngine;
 use futures::{executor::block_on, stream, SinkExt};
 use grpcio::{ChannelBuilder, ClientUnaryReceiver, Environment, Result, WriteFlags};
 use kvproto::{
@@ -13,7 +14,7 @@ use kvproto::{
     tikvpb::TikvClient,
 };
 use online_config::ConfigValue;
-use raftstore::coprocessor::CoprocessorHost;
+use raftstore::{coprocessor::CoprocessorHost, router::CdcRaftRouter};
 use resolved_ts::{Observer, Task};
 use test_raftstore::*;
 use tikv::config::ResolvedTsConfig;
@@ -26,7 +27,7 @@ pub fn init() {
 }
 
 pub struct TestSuite {
-    pub cluster: Cluster<ServerCluster>,
+    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
     pub endpoints: HashMap<u64, LazyWorker<Task>>,
     pub obs: HashMap<u64, Observer>,
     tikv_cli: HashMap<u64, TikvClient>,
@@ -40,11 +41,14 @@ impl TestSuite {
     pub fn new(count: usize) -> Self {
         let mut cluster = new_server_cluster(1, count);
         // Increase the Raft tick interval to make this test case running reliably.
-        configure_for_lease_read(&mut cluster, Some(100), None);
+        configure_for_lease_read(&mut cluster.cfg, Some(100), None);
         Self::with_cluster(count, cluster)
     }
 
-    pub fn with_cluster(count: usize, mut cluster: Cluster<ServerCluster>) -> Self {
+    pub fn with_cluster(
+        count: usize,
+        mut cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    ) -> Self {
         init();
         let pd_cli = cluster.pd_client.clone();
         let mut endpoints = HashMap::default();
@@ -62,6 +66,9 @@ impl TestSuite {
             obs.insert(id, rts_ob.clone());
             sim.coprocessor_hooks.entry(id).or_default().push(Box::new(
                 move |host: &mut CoprocessorHost<_>| {
+                    // Migrated to 2021 migration. This let statement is probably not needed, see
+                    //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+                    let _ = &rts_ob;
                     rts_ob.register_to(host);
                 },
             ));
@@ -81,7 +88,7 @@ impl TestSuite {
             let rts_endpoint = resolved_ts::Endpoint::new(
                 &cfg,
                 worker.scheduler(),
-                raft_router,
+                CdcRaftRouter(raft_router),
                 cluster.store_metas[id].clone(),
                 pd_cli.clone(),
                 cm.clone(),
@@ -119,8 +126,21 @@ impl TestSuite {
             );
             c
         };
+        self.must_schedule_task(store_id, Task::ChangeConfig { change });
+    }
+
+    pub fn must_change_memory_quota(&self, store_id: u64, bytes: u64) {
+        let change = {
+            let mut c = std::collections::HashMap::default();
+            c.insert("memory_quota".to_owned(), ConfigValue::Size(bytes));
+            c
+        };
+        self.must_schedule_task(store_id, Task::ChangeConfig { change });
+    }
+
+    pub fn must_schedule_task(&self, store_id: u64, task: Task) {
         let scheduler = self.endpoints.get(&store_id).unwrap().scheduler();
-        scheduler.schedule(Task::ChangeConfig { change }).unwrap();
+        scheduler.schedule(task).unwrap();
     }
 
     pub fn must_kv_prewrite(

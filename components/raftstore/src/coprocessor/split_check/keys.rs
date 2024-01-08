@@ -1,10 +1,5 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    marker::PhantomData,
-    sync::{Arc, Mutex},
-};
-
 use engine_traits::{KvEngine, Range};
 use error_code::ErrorCodeExt;
 use kvproto::{metapb::Region, pdpb::CheckPolicy};
@@ -19,7 +14,7 @@ use super::{
     size::get_approximate_split_keys,
     Host,
 };
-use crate::store::{CasualMessage, CasualRouter};
+use crate::coprocessor::dispatcher::StoreHandle;
 
 pub struct Checker {
     max_keys_count: u64,
@@ -116,29 +111,19 @@ where
 }
 
 #[derive(Clone)]
-pub struct KeysCheckObserver<C, E> {
-    router: Arc<Mutex<C>>,
-    _phantom: PhantomData<E>,
+pub struct KeysCheckObserver<C> {
+    router: C,
 }
 
-impl<C: CasualRouter<E>, E> KeysCheckObserver<C, E>
-where
-    E: KvEngine,
-{
-    pub fn new(router: C) -> KeysCheckObserver<C, E> {
-        KeysCheckObserver {
-            router: Arc::new(Mutex::new(router)),
-            _phantom: PhantomData,
-        }
+impl<C: StoreHandle> KeysCheckObserver<C> {
+    pub fn new(router: C) -> KeysCheckObserver<C> {
+        KeysCheckObserver { router }
     }
 }
 
-impl<C: Send, E: Send> Coprocessor for KeysCheckObserver<C, E> {}
+impl<C: Send> Coprocessor for KeysCheckObserver<C> {}
 
-impl<C: CasualRouter<E> + Send, E> SplitCheckObserver<E> for KeysCheckObserver<C, E>
-where
-    E: KvEngine,
-{
+impl<C: StoreHandle, E: KvEngine> SplitCheckObserver<E> for KeysCheckObserver<C> {
     fn add_checker(
         &self,
         ctx: &mut ObserverContext<'_>,
@@ -172,17 +157,11 @@ where
             }
         };
 
-        let res = CasualMessage::RegionApproximateKeys { keys: region_keys };
-        if let Err(e) = self.router.lock().unwrap().send(region_id, res) {
-            warn!(
-                "failed to send approximate region keys";
-                "region_id" => region_id,
-                "err" => %e,
-                "error_code" => %e.error_code(),
-            );
-        }
+        self.router
+            .update_approximate_keys(region_id, Some(region_keys), None);
 
         REGION_KEYS_HISTOGRAM.observe(region_keys as f64);
+
         // if bucket checker using scan is added, to utilize the scan,
         // add keys checker as well for free
         // It has the assumption that the size's checker is before the keys's check in
@@ -253,8 +232,8 @@ mod tests {
         *,
     };
     use crate::{
-        coprocessor::{Config, CoprocessorHost},
-        store::{CasualMessage, SplitCheckRunner, SplitCheckTask},
+        coprocessor::{dispatcher::SchedTask, Config, CoprocessorHost},
+        store::{SplitCheckRunner, SplitCheckTask},
     };
 
     fn put_data(engine: &impl KvEngine, mut start_idx: u64, end_idx: u64, fill_short_value: bool) {
@@ -322,12 +301,28 @@ mod tests {
             None,
         ));
         // keys has not reached the max_keys 100 yet.
-        match rx.try_recv() {
-            Ok((region_id, CasualMessage::RegionApproximateSize { .. }))
-            | Ok((region_id, CasualMessage::RegionApproximateKeys { .. })) => {
-                assert_eq!(region_id, region.get_id());
+        let mut recv_cnt = 0;
+        loop {
+            match rx.try_recv() {
+                Ok(SchedTask::UpdateApproximateSize {
+                    region_id,
+                    splitable,
+                    ..
+                })
+                | Ok(SchedTask::UpdateApproximateKeys {
+                    region_id,
+                    splitable,
+                    ..
+                }) => {
+                    assert_eq!(region_id, region.get_id());
+                    assert!(splitable.is_none());
+                    recv_cnt += 1;
+                    if recv_cnt == 2 {
+                        break;
+                    }
+                }
+                others => panic!("expect recv empty, but got {:?}", others),
             }
-            others => panic!("expect recv empty, but got {:?}", others),
         }
 
         put_data(&engine, 90, 160, true);
@@ -426,12 +421,28 @@ mod tests {
             None,
         ));
         // keys has not reached the max_keys 100 yet.
-        match rx.try_recv() {
-            Ok((region_id, CasualMessage::RegionApproximateSize { .. }))
-            | Ok((region_id, CasualMessage::RegionApproximateKeys { .. })) => {
-                assert_eq!(region_id, region.get_id());
+        let mut recv_cnt = 0;
+        loop {
+            match rx.try_recv() {
+                Ok(SchedTask::UpdateApproximateSize {
+                    region_id,
+                    splitable,
+                    ..
+                })
+                | Ok(SchedTask::UpdateApproximateKeys {
+                    region_id,
+                    splitable,
+                    ..
+                }) => {
+                    assert_eq!(region_id, region.get_id());
+                    assert!(splitable.is_none());
+                    recv_cnt += 1;
+                    if recv_cnt == 2 {
+                        break;
+                    }
+                }
+                others => panic!("expect recv empty, but got {:?}", others),
             }
-            others => panic!("expect recv empty, but got {:?}", others),
         }
 
         put_data(&engine, 90, 160, true);
@@ -578,7 +589,7 @@ mod tests {
             region_max_keys: Some(159),
             region_split_keys: Some(80),
             batch_split_limit: 5,
-            enable_region_bucket: true,
+            enable_region_bucket: Some(true),
             // need check split region buckets, but region size does not exceed the split threshold
             region_bucket_size: ReadableSize(100),
             ..Default::default()
@@ -599,8 +610,8 @@ mod tests {
         ));
         // keys has not reached the max_keys 100 yet.
         match rx.try_recv() {
-            Ok((region_id, CasualMessage::RegionApproximateSize { .. }))
-            | Ok((region_id, CasualMessage::RegionApproximateKeys { .. })) => {
+            Ok(SchedTask::UpdateApproximateSize { region_id, .. })
+            | Ok(SchedTask::UpdateApproximateKeys { region_id, .. }) => {
                 assert_eq!(region_id, region.get_id());
             }
             others => panic!("expect recv empty, but got {:?}", others),
@@ -613,7 +624,7 @@ mod tests {
         // The split by keys should still work. But if the bug in on_kv() in size.rs
         // exists, it will result in split by keys failed.
         cfg.region_max_size = Some(ReadableSize(region_size * 6 / 5));
-        cfg.region_split_size = ReadableSize(region_size * 4 / 5);
+        cfg.region_split_size = Some(ReadableSize(region_size * 4 / 5));
         runnable = SplitCheckRunner::new(engine, tx.clone(), CoprocessorHost::new(tx, cfg));
         runnable.run(SplitCheckTask::split_check(
             region.clone(),

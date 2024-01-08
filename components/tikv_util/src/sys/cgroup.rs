@@ -184,7 +184,7 @@ fn is_cgroup2_unified_mode() -> Result<bool, String> {
 // The format is "<id>:<hierarchy>:<path>". For example,
 // "10:cpuset:/test-cpuset".
 //
-// Note: path may contain ":" in some envrionments.
+// Note: path may contains ":" in some envrionment.
 fn parse_proc_cgroup_v1(lines: &str) -> HashMap<String, String> {
     let mut subsystems = HashMap::new();
     for line in lines.lines().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -564,7 +564,6 @@ mod tests {
             ("-18446744073709551610", None), // Raise InvalidDigit instead of NegOverflow.
             ("0.1", None),
         ];
-        println!("{:?}", "-18446744073709551610".parse::<u64>());
         for (content, expect) in cases.into_iter() {
             let limit = parse_memory_max(content);
             assert_eq!(limit, expect);
