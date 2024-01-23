@@ -203,19 +203,6 @@ pub struct CopLocalMetrics {
     local_read_stats: ReadStats,
 }
 
-impl CopLocalMetrics {
-    #[cfg(test)]
-    pub fn local_read_stats(&self) -> &ReadStats {
-        &self.local_read_stats
-    }
-
-    #[cfg(test)]
-    pub fn clear(&mut self) {
-        self.local_read_stats.region_infos.clear();
-        self.local_read_stats.region_buckets.clear();
-    }
-}
-
 thread_local! {
     pub static TLS_COP_METRICS: RefCell<CopLocalMetrics> = RefCell::new(
         CopLocalMetrics {
@@ -285,7 +272,7 @@ pub fn tls_collect_scan_details(cmd: ReqTag, stats: &Statistics) {
         m.borrow_mut()
             .local_scan_details
             .entry(cmd)
-            .or_default()
+            .or_insert_with(Default::default)
             .add(stats);
     });
 }

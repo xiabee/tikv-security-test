@@ -12,8 +12,7 @@ use concurrency_manager::ConcurrencyManager;
 use engine_rocks::RocksEngine;
 use futures::executor::block_on;
 use grpcio::{
-    CallOption, ChannelBuilder, ClientDuplexReceiver, ClientDuplexSender, ClientUnaryReceiver,
-    Environment, MetadataBuilder,
+    ChannelBuilder, ClientDuplexReceiver, ClientDuplexSender, ClientUnaryReceiver, Environment,
 };
 use kvproto::{
     cdcpb::{create_change_data, ChangeDataClient, ChangeDataEvent, ChangeDataRequest},
@@ -21,9 +20,9 @@ use kvproto::{
     tikvpb::TikvClient,
 };
 use online_config::OnlineConfig;
-use raftstore::{coprocessor::CoprocessorHost, router::CdcRaftRouter};
+use raftstore::coprocessor::CoprocessorHost;
 use test_raftstore::*;
-use tikv::{config::CdcConfig, server::DEFAULT_CLUSTER_ID, storage::kv::LocalTablets};
+use tikv::{config::CdcConfig, server::DEFAULT_CLUSTER_ID};
 use tikv_util::{
     config::ReadableDuration,
     memory::MemoryQuota,
@@ -50,6 +49,7 @@ impl ClientReceiver {
         std::mem::replace(&mut *self.receiver.lock().unwrap(), rx)
     }
 }
+
 #[allow(clippy::type_complexity)]
 pub fn new_event_feed(
     client: &ChangeDataClient,
@@ -58,37 +58,7 @@ pub fn new_event_feed(
     ClientReceiver,
     Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
 ) {
-    create_event_feed(client, false)
-}
-
-#[allow(clippy::type_complexity)]
-pub fn new_event_feed_v2(
-    client: &ChangeDataClient,
-) -> (
-    ClientDuplexSender<ChangeDataRequest>,
-    ClientReceiver,
-    Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
-) {
-    create_event_feed(client, true)
-}
-
-#[allow(clippy::type_complexity)]
-fn create_event_feed(
-    client: &ChangeDataClient,
-    stream_multiplexing: bool,
-) -> (
-    ClientDuplexSender<ChangeDataRequest>,
-    ClientReceiver,
-    Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
-) {
-    let (req_tx, resp_rx) = if stream_multiplexing {
-        let mut metadata = MetadataBuilder::with_capacity(1);
-        metadata.add_str("features", "stream-multiplexing").unwrap();
-        let opt = CallOption::default().headers(metadata.build());
-        client.event_feed_v2_opt(opt).unwrap()
-    } else {
-        client.event_feed().unwrap()
-    };
+    let (req_tx, resp_rx) = client.event_feed().unwrap();
     let event_feed_wrap = Arc::new(Mutex::new(Some(resp_rx)));
     let event_feed_wrap_clone = event_feed_wrap.clone();
 
@@ -130,7 +100,7 @@ fn create_event_feed(
 }
 
 pub struct TestSuiteBuilder {
-    cluster: Option<Cluster<RocksEngine, ServerCluster<RocksEngine>>>,
+    cluster: Option<Cluster<ServerCluster>>,
     memory_quota: Option<usize>,
 }
 
@@ -143,10 +113,7 @@ impl TestSuiteBuilder {
     }
 
     #[must_use]
-    pub fn cluster(
-        mut self,
-        cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
-    ) -> TestSuiteBuilder {
+    pub fn cluster(mut self, cluster: Cluster<ServerCluster>) -> TestSuiteBuilder {
         self.cluster = Some(cluster);
         self
     }
@@ -163,7 +130,7 @@ impl TestSuiteBuilder {
 
     pub fn build_with_cluster_runner<F>(self, mut runner: F) -> TestSuite
     where
-        F: FnMut(&mut Cluster<RocksEngine, ServerCluster<RocksEngine>>),
+        F: FnMut(&mut Cluster<ServerCluster>),
     {
         init();
         let memory_quota = self.memory_quota.unwrap_or(usize::MAX);
@@ -217,12 +184,11 @@ impl TestSuiteBuilder {
             let mut cdc_endpoint = cdc::Endpoint::new(
                 DEFAULT_CLUSTER_ID,
                 &cfg,
-                false,
                 cluster.cfg.storage.api_version(),
                 pd_cli.clone(),
                 worker.scheduler(),
-                CdcRaftRouter(raft_router),
-                LocalTablets::Singleton(cluster.engines[id].kv.clone()),
+                raft_router,
+                cluster.engines[id].kv.clone(),
                 cdc_ob,
                 cluster.store_metas[id].clone(),
                 cm.clone(),
@@ -252,7 +218,7 @@ impl TestSuiteBuilder {
 }
 
 pub struct TestSuite {
-    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    pub cluster: Cluster<ServerCluster>,
     pub endpoints: HashMap<u64, LazyWorker<Task>>,
     pub obs: HashMap<u64, CdcObserver>,
     tikv_cli: HashMap<u64, TikvClient>,
@@ -272,7 +238,7 @@ impl TestSuite {
     pub fn new(count: usize, api_version: ApiVersion) -> TestSuite {
         let mut cluster = new_server_cluster_with_api_ver(1, count, api_version);
         // Increase the Raft tick interval to make this test case running reliably.
-        configure_for_lease_read(&mut cluster.cfg, Some(100), None);
+        configure_for_lease_read(&mut cluster, Some(100), None);
         // Disable background renew to make timestamp predictable.
         configure_for_causal_ts(&mut cluster, "0s", 1);
 

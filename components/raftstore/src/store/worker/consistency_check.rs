@@ -9,8 +9,8 @@ use tikv_util::{error, info, warn, worker::Runnable};
 
 use super::metrics::*;
 use crate::{
-    coprocessor::{dispatcher::StoreHandle, CoprocessorHost},
-    store::metrics::*,
+    coprocessor::CoprocessorHost,
+    store::{metrics::*, CasualMessage, CasualRouter},
 };
 
 /// Consistency checking task.
@@ -44,12 +44,12 @@ impl<S: Snapshot> Display for Task<S> {
     }
 }
 
-pub struct Runner<EK: KvEngine, C: StoreHandle> {
+pub struct Runner<EK: KvEngine, C: CasualRouter<EK>> {
     router: C,
     coprocessor_host: CoprocessorHost<EK>,
 }
 
-impl<EK: KvEngine, C: StoreHandle> Runner<EK, C> {
+impl<EK: KvEngine, C: CasualRouter<EK>> Runner<EK, C> {
     pub fn new(router: C, cop_host: CoprocessorHost<EK>) -> Runner<EK, C> {
         Runner {
             router,
@@ -85,8 +85,18 @@ impl<EK: KvEngine, C: StoreHandle> Runner<EK, C> {
         for (ctx, sum) in hashes {
             let mut checksum = Vec::with_capacity(4);
             checksum.write_u32::<BigEndian>(sum).unwrap();
-            self.router
-                .update_compute_hash_result(region.get_id(), index, ctx, checksum);
+            let msg = CasualMessage::ComputeHashResult {
+                index,
+                context: ctx,
+                hash: checksum,
+            };
+            if let Err(e) = self.router.send(region.get_id(), msg) {
+                warn!(
+                    "failed to send hash compute result";
+                    "region_id" => region.get_id(),
+                    "err" => %e,
+                );
+            }
         }
 
         timer.observe_duration();
@@ -96,7 +106,7 @@ impl<EK: KvEngine, C: StoreHandle> Runner<EK, C> {
 impl<EK, C> Runnable for Runner<EK, C>
 where
     EK: KvEngine,
-    C: StoreHandle,
+    C: CasualRouter<EK>,
 {
     type Task = Task<EK::Snapshot>;
 
@@ -114,7 +124,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{assert_matches::assert_matches, sync::mpsc, time::Duration};
+    use std::{sync::mpsc, time::Duration};
 
     use byteorder::{BigEndian, WriteBytesExt};
     use engine_test::kv::{new_engine, KvTestEngine};
@@ -125,8 +135,7 @@ mod tests {
 
     use super::*;
     use crate::coprocessor::{
-        dispatcher::SchedTask, BoxConsistencyCheckObserver, ConsistencyCheckMethod,
-        RawConsistencyCheckObserver,
+        BoxConsistencyCheckObserver, ConsistencyCheckMethod, RawConsistencyCheckObserver,
     };
 
     #[test]
@@ -162,14 +171,27 @@ mod tests {
             index: 10,
             context: vec![ConsistencyCheckMethod::Raw as u8],
             region: region.clone(),
-            snap: db.snapshot(None),
+            snap: db.snapshot(),
         });
         let mut checksum_bytes = vec![];
         checksum_bytes.write_u32::<BigEndian>(sum).unwrap();
 
         let res = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_matches!(res, SchedTask::UpdateComputeHashResult { region_id, index, hash, context} if
-            region_id == region.get_id() && index == 10 && context == vec![0] && hash == checksum_bytes
-        );
+        match res {
+            (
+                region_id,
+                CasualMessage::ComputeHashResult {
+                    index,
+                    hash,
+                    context,
+                },
+            ) => {
+                assert_eq!(region_id, region.get_id());
+                assert_eq!(index, 10);
+                assert_eq!(context, vec![0]);
+                assert_eq!(hash, checksum_bytes);
+            }
+            e => panic!("unexpected {:?}", e),
+        }
     }
 }

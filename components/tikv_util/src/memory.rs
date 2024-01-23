@@ -36,7 +36,7 @@ pub trait HeapSize {
 
 impl HeapSize for [u8] {
     fn heap_size(&self) -> usize {
-        std::mem::size_of_val(self)
+        self.len() * mem::size_of::<u8>()
     }
 }
 
@@ -88,32 +88,6 @@ impl_display_as_debug!(MemoryQuotaExceeded);
 pub struct MemoryQuota {
     in_use: AtomicUsize,
     capacity: AtomicUsize,
-}
-
-pub struct OwnedAllocated {
-    allocated: usize,
-    from: Arc<MemoryQuota>,
-}
-
-impl OwnedAllocated {
-    pub fn new(target: Arc<MemoryQuota>) -> Self {
-        Self {
-            allocated: 0,
-            from: target,
-        }
-    }
-
-    pub fn alloc(&mut self, bytes: usize) -> Result<(), MemoryQuotaExceeded> {
-        self.from.alloc(bytes)?;
-        self.allocated += bytes;
-        Ok(())
-    }
-}
-
-impl Drop for OwnedAllocated {
-    fn drop(&mut self) {
-        self.from.free(self.allocated)
-    }
 }
 
 impl MemoryQuota {
@@ -171,6 +145,32 @@ impl MemoryQuota {
                 Err(current) => in_use_bytes = current,
             }
         }
+    }
+}
+
+pub struct OwnedAllocated {
+    allocated: usize,
+    from: Arc<MemoryQuota>,
+}
+
+impl OwnedAllocated {
+    pub fn new(target: Arc<MemoryQuota>) -> Self {
+        Self {
+            allocated: 0,
+            from: target,
+        }
+    }
+
+    pub fn alloc(&mut self, bytes: usize) -> Result<(), MemoryQuotaExceeded> {
+        self.from.alloc(bytes)?;
+        self.allocated += bytes;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedAllocated {
+    fn drop(&mut self) {
+        self.from.free(self.allocated)
     }
 }
 

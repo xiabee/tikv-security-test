@@ -13,7 +13,7 @@ use kvproto::{
     metapb::{self, Peer},
     pdpb::QueryKind,
 };
-use pd_client::{BucketMeta, BucketStat};
+use pd_client::{merge_bucket_stats, new_bucket_stats, BucketMeta, BucketStat};
 use rand::Rng;
 use resource_metering::RawRecords;
 use tikv_util::{
@@ -178,7 +178,7 @@ impl Samples {
     // evaluate the samples according to the given key range, it will update the
     // sample's left, right and contained counter.
     fn evaluate(&mut self, key_range: &KeyRange) {
-        for sample in self.0.iter_mut() {
+        for mut sample in self.0.iter_mut() {
             let order_start = if key_range.start_key.is_empty() {
                 Ordering::Greater
             } else {
@@ -285,7 +285,7 @@ impl Recorder {
     }
 
     fn update_peer(&mut self, peer: &Peer) {
-        if self.peer != *peer && peer.get_id() != 0 {
+        if self.peer != *peer {
             self.peer = peer.clone();
         }
     }
@@ -450,27 +450,31 @@ impl ReadStats {
             .or_insert_with(|| RegionInfo::new(num));
         region_info.flow.add(write);
         region_info.flow.add(data);
-        // the bucket of the follower only have the version info and not needs to be
-        // recorded the hot bucket.
-        if let Some(buckets) = buckets
-            && !buckets.sizes.is_empty()
-        {
-            let bucket_stat = self
-                .region_buckets
-                .entry(region_id)
-                .and_modify(|current| {
-                    if current.meta < *buckets {
-                        let mut new = BucketStat::from_meta(buckets.clone());
-                        std::mem::swap(current, &mut new);
-                        current.merge(&new);
-                    }
-                })
-                .or_insert_with(|| BucketStat::from_meta(buckets.clone()));
+        if let Some(buckets) = buckets {
+            let bucket_stat = self.region_buckets.entry(region_id).or_insert_with(|| {
+                let stats = new_bucket_stats(buckets);
+                BucketStat::new(buckets.clone(), stats)
+            });
+            if bucket_stat.meta < *buckets {
+                let stats = new_bucket_stats(buckets);
+                let mut new = BucketStat::new(buckets.clone(), stats);
+                merge_bucket_stats(
+                    &new.meta.keys,
+                    &mut new.stats,
+                    &bucket_stat.meta.keys,
+                    &bucket_stat.stats,
+                );
+                *bucket_stat = new;
+            }
             let mut delta = metapb::BucketStats::default();
             delta.set_read_bytes(vec![(write.read_bytes + data.read_bytes) as u64]);
             delta.set_read_keys(vec![(write.read_keys + data.read_keys) as u64]);
-            bucket_stat.add_flows(
-                &[start.unwrap_or_default(), end.unwrap_or_default()],
+            let start = start.unwrap_or_default();
+            let end = end.unwrap_or_default();
+            merge_bucket_stats(
+                &bucket_stat.meta.keys,
+                &mut bucket_stat.stats,
+                &[start, end],
                 &delta,
             );
         }
@@ -498,7 +502,10 @@ pub struct WriteStats {
 
 impl WriteStats {
     pub fn add_query_num(&mut self, region_id: u64, kind: QueryKind) {
-        let query_stats = self.region_infos.entry(region_id).or_default();
+        let query_stats = self
+            .region_infos
+            .entry(region_id)
+            .or_insert_with(QueryStats::default);
         query_stats.add_query_num(kind, 1);
     }
 
@@ -607,7 +614,7 @@ impl AutoSplitController {
     }
 
     fn should_check_region_cpu(&self) -> bool {
-        self.cfg.region_cpu_overload_threshold_ratio() > 0.0
+        self.cfg.region_cpu_overload_threshold_ratio > 0.0
     }
 
     fn is_grpc_poll_busy(&self, avg_grpc_thread_usage: f64) -> bool {
@@ -642,7 +649,7 @@ impl AutoSplitController {
             return false;
         }
         region_cpu_usage / unified_read_pool_thread_usage
-            >= self.cfg.region_cpu_overload_threshold_ratio()
+            >= self.cfg.region_cpu_overload_threshold_ratio
     }
 
     // collect the read stats from read_stats_vec and dispatch them to a Region
@@ -786,9 +793,9 @@ impl AutoSplitController {
             debug!("load base split params";
                 "region_id" => region_id,
                 "qps" => qps,
-                "qps_threshold" => self.cfg.qps_threshold(),
+                "qps_threshold" => self.cfg.qps_threshold,
                 "byte" => byte,
-                "byte_threshold" => self.cfg.byte_threshold(),
+                "byte_threshold" => self.cfg.byte_threshold,
                 "cpu_usage" => cpu_usage,
                 "is_region_busy" => is_region_busy,
             );
@@ -799,8 +806,8 @@ impl AutoSplitController {
 
             // 1. If the QPS or the byte does not meet the threshold, skip.
             // 2. If the Unified Read Pool or the region is not hot enough, skip.
-            if qps < self.cfg.qps_threshold()
-                && byte < self.cfg.byte_threshold()
+            if qps < self.cfg.qps_threshold
+                && byte < self.cfg.byte_threshold
                 && (!is_unified_read_pool_busy || !is_region_busy)
             {
                 self.recorders.remove_entry(&region_id);
@@ -844,7 +851,6 @@ impl AutoSplitController {
                         "qps" => qps,
                         "byte" => byte,
                         "cpu_usage" => cpu_usage,
-                        "peer" => ?recorder.peer,
                     );
                     self.recorders.remove(&region_id);
                 } else if is_unified_read_pool_busy && is_region_busy {
@@ -917,13 +923,13 @@ impl AutoSplitController {
     pub fn refresh_and_check_cfg(&mut self) -> SplitConfigChange {
         let mut cfg_change = SplitConfigChange::Noop;
         if let Some(incoming) = self.cfg_tracker.any_new() {
-            if self.cfg.region_cpu_overload_threshold_ratio() <= 0.0
-                && incoming.region_cpu_overload_threshold_ratio() > 0.0
+            if self.cfg.region_cpu_overload_threshold_ratio <= 0.0
+                && incoming.region_cpu_overload_threshold_ratio > 0.0
             {
                 cfg_change = SplitConfigChange::UpdateRegionCpuCollector(true);
             }
-            if self.cfg.region_cpu_overload_threshold_ratio() > 0.0
-                && incoming.region_cpu_overload_threshold_ratio() <= 0.0
+            if self.cfg.region_cpu_overload_threshold_ratio > 0.0
+                && incoming.region_cpu_overload_threshold_ratio <= 0.0
             {
                 cfg_change = SplitConfigChange::UpdateRegionCpuCollector(false);
             }
@@ -943,12 +949,12 @@ impl AutoSplitController {
 mod tests {
     use online_config::{ConfigChange, ConfigManager, ConfigValue};
     use resource_metering::{RawRecord, TagInfos};
-    use tikv_util::config::{ReadableSize, VersionTrack};
+    use tikv_util::config::VersionTrack;
     use txn_types::Key;
 
     use super::*;
     use crate::store::worker::split_config::{
-        BIG_REGION_CPU_OVERLOAD_THRESHOLD_RATIO, DEFAULT_SAMPLE_NUM,
+        DEFAULT_SAMPLE_NUM, REGION_CPU_OVERLOAD_THRESHOLD_RATIO,
     };
 
     enum Position {
@@ -988,8 +994,8 @@ mod tests {
 
     #[test]
     fn test_prefix_sum() {
-        let v = [1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let expect = [1, 3, 6, 10, 15, 21, 28, 36, 45];
+        let v = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expect = vec![1, 3, 6, 10, 15, 21, 28, 36, 45];
         let pre = prefix_sum(v.iter(), |x| *x);
         for i in 0..v.len() {
             assert_eq!(expect[i], pre[i]);
@@ -1193,7 +1199,7 @@ mod tests {
     fn check_split_key(mode: &[u8], qps_stats: Vec<ReadStats>, split_keys: Vec<&[u8]>) {
         let mode = String::from_utf8(Vec::from(mode)).unwrap();
         let mut hub = AutoSplitController::default();
-        hub.cfg.qps_threshold = Some(1);
+        hub.cfg.qps_threshold = 1;
         hub.cfg.sample_threshold = 0;
 
         for i in 0..10 {
@@ -1226,7 +1232,7 @@ mod tests {
     ) {
         let mode = String::from_utf8(Vec::from(mode)).unwrap();
         let mut hub = AutoSplitController::default();
-        hub.cfg.qps_threshold = Some(1);
+        hub.cfg.qps_threshold = 1;
         hub.cfg.sample_threshold = 0;
 
         for i in 0..10 {
@@ -1291,7 +1297,7 @@ mod tests {
     #[test]
     fn test_sample_key_num() {
         let mut hub = AutoSplitController::default();
-        hub.cfg.qps_threshold = Some(2000);
+        hub.cfg.qps_threshold = 2000;
         hub.cfg.sample_num = 2000;
         hub.cfg.sample_threshold = 0;
 
@@ -1608,8 +1614,7 @@ mod tests {
 
     #[test]
     fn test_refresh_and_check_cfg() {
-        let mut split_config = SplitConfig::default();
-        split_config.optimize_for(ReadableSize::mb(5000));
+        let split_config = SplitConfig::default();
         let mut split_cfg_manager =
             SplitConfigManager::new(Arc::new(VersionTrack::new(split_config)));
         let mut auto_split_controller =
@@ -1621,8 +1626,8 @@ mod tests {
         assert_eq!(
             auto_split_controller
                 .cfg
-                .region_cpu_overload_threshold_ratio(),
-            BIG_REGION_CPU_OVERLOAD_THRESHOLD_RATIO
+                .region_cpu_overload_threshold_ratio,
+            REGION_CPU_OVERLOAD_THRESHOLD_RATIO
         );
         // Set to zero.
         dispatch_split_cfg_change(
@@ -1637,7 +1642,7 @@ mod tests {
         assert_eq!(
             auto_split_controller
                 .cfg
-                .region_cpu_overload_threshold_ratio(),
+                .region_cpu_overload_threshold_ratio,
             0.0
         );
         assert_eq!(
@@ -1648,7 +1653,7 @@ mod tests {
         dispatch_split_cfg_change(
             &mut split_cfg_manager,
             "region_cpu_overload_threshold_ratio",
-            ConfigValue::F64(0.1),
+            ConfigValue::F64(REGION_CPU_OVERLOAD_THRESHOLD_RATIO),
         );
         assert_eq!(
             auto_split_controller.refresh_and_check_cfg(),
@@ -1657,8 +1662,8 @@ mod tests {
         assert_eq!(
             auto_split_controller
                 .cfg
-                .region_cpu_overload_threshold_ratio(),
-            0.1
+                .region_cpu_overload_threshold_ratio,
+            REGION_CPU_OVERLOAD_THRESHOLD_RATIO
         );
         assert_eq!(
             auto_split_controller.refresh_and_check_cfg(),

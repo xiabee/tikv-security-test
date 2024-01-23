@@ -10,21 +10,19 @@ use pd_client::PdClient;
 use raft::StateRole;
 use raftstore::{
     coprocessor::{ObserveHandle, RegionInfoProvider},
-    router::CdcHandle,
-    store::fsm::ChangeObserver,
+    store::{fsm::ChangeObserver, SignificantRouter},
 };
+use resolved_ts::LeadershipResolver;
 use tikv::storage::Statistics;
 use tikv_util::{
     box_err, debug, info, sys::thread::ThreadBuildWrapper, time::Instant, warn, worker::Scheduler,
 };
 use tokio::sync::mpsc::{channel, error::SendError, Receiver, Sender};
-use tracing::instrument;
-use tracing_active_tree::root;
 use txn_types::TimeStamp;
 
 use crate::{
     annotate,
-    endpoint::{BackupStreamResolver, ObserveOp},
+    endpoint::ObserveOp,
     errors::{Error, Result},
     event_loader::InitialDataLoader,
     future,
@@ -139,7 +137,7 @@ trait InitialScan: Clone + Sync + Send + 'static {
 impl<E, RT> InitialScan for InitialDataLoader<E, RT>
 where
     E: KvEngine,
-    RT: CdcHandle<E> + Sync + 'static,
+    RT: SignificantRouter<E> + Sync + Clone + 'static,
 {
     async fn do_initial_scan(
         &self,
@@ -178,7 +176,6 @@ where
 
 impl ScanCmd {
     /// execute the initial scanning via the specificated [`InitialDataLoader`].
-    #[instrument(skip_all)]
     async fn exec_by(&self, initial_scan: impl InitialScan) -> Result<()> {
         let Self {
             region,
@@ -198,7 +195,6 @@ impl ScanCmd {
     }
 
     /// execute the command, when meeting error, retrying.
-    #[instrument(skip_all)]
     async fn exec_by_with_retry(self, init: impl InitialScan) {
         let mut retry_time = INITIAL_SCAN_FAILURE_MAX_RETRY_TIME;
         loop {
@@ -236,9 +232,7 @@ async fn scan_executor_loop(init: impl InitialScan, mut cmds: Receiver<ScanCmd>)
         }
 
         let init = init.clone();
-        let id = cmd.region.id;
-        let handle_id = cmd.handle.id;
-        tokio::task::spawn(root!("exec_initial_scan"; async move {
+        tokio::task::spawn(async move {
             metrics::PENDING_INITIAL_SCAN_LEN
                 .with_label_values(&["executing"])
                 .inc();
@@ -246,7 +240,7 @@ async fn scan_executor_loop(init: impl InitialScan, mut cmds: Receiver<ScanCmd>)
             metrics::PENDING_INITIAL_SCAN_LEN
                 .with_label_values(&["executing"])
                 .dec();
-        }; region = id, handle = ?handle_id));
+        });
     }
 }
 
@@ -257,9 +251,9 @@ fn spawn_executors(
 ) -> ScanPoolHandle {
     let (tx, rx) = tokio::sync::mpsc::channel(MESSAGE_BUFFER_SIZE);
     let pool = create_scan_pool(number);
-    pool.spawn(root!("scan_executor_loop"; async move {
+    pool.spawn(async move {
         scan_executor_loop(init, rx).await;
-    }));
+    });
     ScanPoolHandle { tx, _pool: pool }
 }
 
@@ -330,12 +324,10 @@ where
 /// Create a pool for doing initial scanning.
 fn create_scan_pool(num_threads: usize) -> ScanPool {
     tokio::runtime::Builder::new_multi_thread()
-        .with_sys_and_custom_hooks(
-            move || {
-                file_system::set_io_type(file_system::IoType::Replication);
-            },
-            || {},
-        )
+        .after_start_wrapper(move || {
+            file_system::set_io_type(file_system::IoType::Replication);
+        })
+        .before_stop_wrapper(|| {})
         .thread_name("log-backup-scan")
         .enable_time()
         .worker_threads(num_threads)
@@ -355,19 +347,18 @@ where
     ///
     /// a two-tuple, the first is the handle to the manager, the second is the
     /// operator loop future.
-    pub fn start<E, HInit, HChkLd>(
+    pub fn start<E, HInit>(
         initial_loader: InitialDataLoader<E, HInit>,
         regions: R,
         observer: BackupStreamObserver,
         meta_cli: MetadataClient<S>,
         pd_client: Arc<PDC>,
         scan_pool_size: usize,
-        resolver: BackupStreamResolver<HChkLd, E>,
+        leader_checker: LeadershipResolver,
     ) -> (Self, future![()])
     where
         E: KvEngine,
-        HInit: CdcHandle<E> + Sync + 'static,
-        HChkLd: CdcHandle<E> + 'static,
+        HInit: SignificantRouter<E> + Clone + Sync + 'static,
     {
         let (tx, rx) = channel(MESSAGE_BUFFER_SIZE);
         let scan_pool_handle = spawn_executors(initial_loader.clone(), scan_pool_size);
@@ -383,7 +374,7 @@ where
             scan_pool_handle: Arc::new(scan_pool_handle),
             scans: CallbackWaitGroup::new(),
         };
-        let fut = op.clone().region_operator_loop(rx, resolver);
+        let fut = op.clone().region_operator_loop(rx, leader_checker);
         (op, fut)
     }
 
@@ -403,15 +394,11 @@ where
     }
 
     /// the handler loop.
-    #[instrument(skip_all)]
-    async fn region_operator_loop<E, RT>(
+    async fn region_operator_loop(
         self,
         mut message_box: Receiver<ObserveOp>,
-        mut resolver: BackupStreamResolver<RT, E>,
-    ) where
-        E: KvEngine,
-        RT: CdcHandle<E> + 'static,
-    {
+        mut leader_checker: LeadershipResolver,
+    ) {
         while let Some(op) = message_box.recv().await {
             // Skip some trivial resolve commands.
             if !matches!(op, ObserveOp::ResolveRegions { .. }) {
@@ -478,7 +465,9 @@ where
                         warn!("waiting for initial scanning done timed out, forcing progress!"; 
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
-                    let regions = resolver.resolve(self.subs.current_regions(), min_ts).await;
+                    let regions = leader_checker
+                        .resolve(self.subs.current_regions(), min_ts)
+                        .await;
                     let cps = self.subs.resolve_with(min_ts, regions);
                     let min_region = cps.iter().min_by_key(|rs| rs.checkpoint);
                     // If there isn't any region observed, the `min_ts` can be used as resolved ts
@@ -539,7 +528,6 @@ where
         }
     }
 
-    #[instrument(skip_all)]
     async fn try_start_observe(&self, region: &Region, handle: ObserveHandle) -> Result<()> {
         match self.find_task_by_region(region) {
             None => {
@@ -567,7 +555,6 @@ where
         Ok(())
     }
 
-    #[instrument(skip_all)]
     async fn start_observe(&self, region: Region) {
         self.start_observe_with_failure_count(region, 0).await
     }
@@ -578,7 +565,7 @@ where
         self.subs.add_pending_region(&region);
         if let Err(err) = self.try_start_observe(&region, handle.clone()).await {
             warn!("failed to start observe, would retry"; "err" => %err, utils::slog_region(&region));
-            tokio::spawn(root!("retry_start_observe"; async move {
+            tokio::spawn(async move {
                 #[cfg(not(feature = "failpoints"))]
                 let delay = backoff_for_start_observe(has_failed_for);
                 #[cfg(feature = "failpoints")]
@@ -602,7 +589,7 @@ where
                         has_failed_for: has_failed_for + 1
                     })
                 )
-            }));
+            });
         }
     }
 
@@ -677,7 +664,6 @@ where
         Ok(())
     }
 
-    #[instrument(skip_all)]
     async fn get_last_checkpoint_of(&self, task: &str, region: &Region) -> Result<TimeStamp> {
         fail::fail_point!("get_last_checkpoint_of", |hint| Err(Error::Other(
             box_err!(
@@ -698,7 +684,6 @@ where
         Ok(cp.ts)
     }
 
-    #[instrument(skip_all)]
     async fn spawn_scan(&self, cmd: ScanCmd) {
         // we should not spawn initial scanning tasks to the tokio blocking pool
         // because it is also used for converting sync File I/O to async. (for now!)
@@ -713,7 +698,6 @@ where
         }
     }
 
-    #[instrument(skip_all)]
     async fn observe_over_with_initial_data_from_checkpoint(
         &self,
         region: &Region,

@@ -6,8 +6,7 @@ use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 use raftstore::{
     coprocessor::ObserveHandle,
-    router::CdcHandle,
-    store::{fsm::ChangeObserver, Callback},
+    store::{fsm::ChangeObserver, Callback, SignificantMsg, SignificantRouter},
 };
 use tikv::storage::{
     kv::StatisticsSummary,
@@ -22,8 +21,6 @@ use tikv_util::{
     worker::Scheduler,
 };
 use tokio::sync::Semaphore;
-use tracing::instrument;
-use tracing_active_tree::frame;
 use txn_types::{Key, Lock, TimeStamp};
 
 use crate::{
@@ -35,7 +32,7 @@ use crate::{
     utils, Task,
 };
 
-const MAX_GET_SNAPSHOT_RETRY: usize = 5;
+const MAX_GET_SNAPSHOT_RETRY: usize = 3;
 
 struct ScanResult {
     more: bool,
@@ -203,7 +200,7 @@ pub struct InitialDataLoader<E: KvEngine, H> {
 impl<E, H> InitialDataLoader<E, H>
 where
     E: KvEngine,
-    H: CdcHandle<E> + Sync,
+    H: SignificantRouter<E> + Sync,
 {
     pub fn new(
         sink: Router,
@@ -226,7 +223,6 @@ where
         }
     }
 
-    #[instrument(skip_all)]
     pub async fn capture_change(
         &self,
         region: &Region,
@@ -236,25 +232,27 @@ where
             tikv_util::future::paired_future_callback::<std::result::Result<_, Error>>();
 
         self.cdc_handle
-            .capture_change(
+            .significant_send(
                 region.get_id(),
-                region.get_region_epoch().clone(),
-                cmd,
-                Callback::read(Box::new(|snapshot| {
-                    if snapshot.response.get_header().has_error() {
-                        callback(Err(Error::RaftRequest(
-                            snapshot.response.get_header().get_error().clone(),
-                        )));
-                        return;
-                    }
-                    if let Some(snap) = snapshot.snapshot {
-                        callback(Ok(snap));
-                        return;
-                    }
-                    callback(Err(Error::Other(box_err!(
-                        "PROBABLY BUG: the response contains neither error nor snapshot"
-                    ))))
-                })),
+                SignificantMsg::CaptureChange {
+                    region_epoch: region.get_region_epoch().clone(),
+                    cmd,
+                    callback: Callback::read(Box::new(|snapshot| {
+                        if snapshot.response.get_header().has_error() {
+                            callback(Err(Error::RaftRequest(
+                                snapshot.response.get_header().get_error().clone(),
+                            )));
+                            return;
+                        }
+                        if let Some(snap) = snapshot.snapshot {
+                            callback(Ok(snap));
+                            return;
+                        }
+                        callback(Err(Error::Other(box_err!(
+                            "PROBABLY BUG: the response contains neither error nor snapshot"
+                        ))))
+                    })),
+                },
             )
             .context(format_args!(
                 "failed to register the observer to region {}",
@@ -279,7 +277,6 @@ where
         Ok(snap)
     }
 
-    #[instrument(skip_all)]
     pub async fn observe_over_with_retry(
         &self,
         region: &Region,
@@ -377,7 +374,6 @@ where
         f(v.value_mut().resolver())
     }
 
-    #[instrument(skip_all)]
     async fn scan_and_async_send(
         &self,
         region: &Region,
@@ -435,7 +431,6 @@ where
         }
     }
 
-    #[instrument(skip_all)]
     pub async fn do_initial_scan(
         &self,
         region: &Region,
@@ -444,14 +439,16 @@ where
         start_ts: TimeStamp,
         snap: impl Snapshot,
     ) -> Result<Statistics> {
+        let tr = self.tracing.clone();
         let region_id = region.get_id();
 
         let mut join_handles = Vec::with_capacity(8);
 
-        let permit = frame!(self.concurrency_limit.acquire())
+        let permit = self
+            .concurrency_limit
+            .acquire()
             .await
             .expect("BUG: semaphore closed");
-
         // It is ok to sink more data than needed. So scan to +inf TS for convenance.
         let event_loader = EventLoader::load_from(snap, start_ts, TimeStamp::max(), region)?;
         let stats = self
@@ -459,11 +456,11 @@ where
             .await?;
         drop(permit);
 
-        frame!(futures::future::try_join_all(join_handles))
+        futures::future::try_join_all(join_handles)
             .await
             .map_err(|err| annotate!(err, "tokio runtime failed to join consuming threads"))?;
 
-        self.with_resolver(region, &handle, |r| {
+        Self::with_resolver_by(&tr, region, &handle, |r| {
             r.phase_one_done();
             Ok(())
         })

@@ -67,7 +67,6 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Cleanup {
             true,
         )?);
 
-        let new_acquired_locks = txn.take_new_locks();
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
         write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
@@ -77,10 +76,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Cleanup {
             pr: ProcessResult::Res,
             lock_info: vec![],
             released_locks,
-            new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
-            known_txn_status: vec![],
         })
     }
 }

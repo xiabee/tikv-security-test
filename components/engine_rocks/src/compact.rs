@@ -24,7 +24,7 @@ impl CompactExt for RocksEngine {
         Ok(false)
     }
 
-    fn compact_range_cf(
+    fn compact_range(
         &self,
         cf: &str,
         start_key: Option<&[u8]>,
@@ -40,6 +40,18 @@ impl CompactExt for RocksEngine {
         compact_opts.set_exclusive_manual_compaction(exclusive_manual);
         compact_opts.set_max_subcompactions(max_subcompactions as i32);
         db.compact_range_cf_opt(handle, &compact_opts, start_key, end_key);
+        Ok(())
+    }
+
+    fn compact_files_in_range(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        output_level: Option<i32>,
+    ) -> Result<()> {
+        for cf_name in self.cf_names() {
+            self.compact_files_in_range_cf(cf_name, start, end, output_level)?;
+        }
         Ok(())
     }
 
@@ -120,10 +132,6 @@ impl CompactExt for RocksEngine {
 
         db.compact_files_cf(handle, &opts, &files, output_level)
             .map_err(r2e)
-    }
-
-    fn check_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
-        self.as_inner().check_in_range(start, end).map_err(r2e)
     }
 }
 

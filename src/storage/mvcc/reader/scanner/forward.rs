@@ -5,7 +5,7 @@ use std::{borrow::Cow, cmp::Ordering};
 
 use engine_traits::CF_DEFAULT;
 use kvproto::kvrpcpb::{ExtraOp, IsolationLevel, WriteConflictReason};
-use txn_types::{Key, LastChange, Lock, LockType, OldValue, TimeStamp, Value, WriteRef, WriteType};
+use txn_types::{Key, Lock, LockType, OldValue, TimeStamp, Value, WriteRef, WriteType};
 
 use super::ScannerConfig;
 use crate::storage::{
@@ -472,22 +472,17 @@ impl<S: Snapshot> ScanPolicy<S> for LatestKvPolicy {
                 }
                 WriteType::Delete => break None,
                 WriteType::Lock | WriteType::Rollback => {
-                    match write.last_change {
-                        LastChange::NotExist => {
-                            break None;
-                        }
-                        LastChange::Exist {
-                            last_change_ts,
-                            estimated_versions_to_last_change,
-                        } if estimated_versions_to_last_change >= SEEK_BOUND => {
-                            // Seek to the expected version directly.
-                            let key_with_ts = current_user_key.clone().append_ts(last_change_ts);
-                            cursors.write.seek(&key_with_ts, &mut statistics.write)?;
-                        }
-                        _ => {
-                            // Continue iterate next `write`.
-                            cursors.write.next(&mut statistics.write);
-                        }
+                    if write.versions_to_last_change > 0 && write.last_change_ts.is_zero() {
+                        break None;
+                    }
+                    if write.versions_to_last_change < SEEK_BOUND {
+                        // Continue iterate next `write`.
+                        cursors.write.next(&mut statistics.write);
+                    } else {
+                        // Seek to the expected version directly.
+                        let commit_ts = write.last_change_ts;
+                        let key_with_ts = current_user_key.clone().append_ts(commit_ts);
+                        cursors.write.seek(&key_with_ts, &mut statistics.write)?;
                     }
                 }
             }
@@ -882,8 +877,6 @@ where
 }
 
 pub mod test_util {
-    use txn_types::LastChange;
-
     use super::*;
     use crate::storage::{
         mvcc::Write,
@@ -903,7 +896,7 @@ pub mod test_util {
         pub for_update_ts: TimeStamp,
         pub old_value: OldValue,
         pub last_change_ts: TimeStamp,
-        pub estimated_versions_to_last_change: u64,
+        pub versions_to_last_change: u64,
     }
 
     impl Default for EntryBuilder {
@@ -917,7 +910,7 @@ pub mod test_util {
                 for_update_ts: 0.into(),
                 old_value: OldValue::None,
                 last_change_ts: TimeStamp::zero(),
-                estimated_versions_to_last_change: 0,
+                versions_to_last_change: 0,
             }
         }
     }
@@ -954,10 +947,10 @@ pub mod test_util {
         pub fn last_change(
             &mut self,
             last_change_ts: TimeStamp,
-            estimated_versions_to_last_change: u64,
+            versions_to_last_change: u64,
         ) -> &mut Self {
             self.last_change_ts = last_change_ts;
-            self.estimated_versions_to_last_change = estimated_versions_to_last_change;
+            self.versions_to_last_change = versions_to_last_change;
             self
         }
         pub fn build_commit(&self, wt: WriteType, is_short_value: bool) -> TxnEntry {
@@ -978,9 +971,8 @@ pub mod test_util {
                     None,
                 )
             };
-            let write_value = Write::new(wt, self.start_ts, short).set_last_change(
-                LastChange::from_parts(self.last_change_ts, self.estimated_versions_to_last_change),
-            );
+            let write_value = Write::new(wt, self.start_ts, short)
+                .set_last_change(self.last_change_ts, self.versions_to_last_change);
             TxnEntry::Commit {
                 default: (key, value),
                 write: (write_key.into_encoded(), write_value.as_ref().to_bytes()),
@@ -1015,12 +1007,8 @@ pub mod test_util {
                 self.for_update_ts,
                 0,
                 0.into(),
-                false,
             )
-            .set_last_change(LastChange::from_parts(
-                self.last_change_ts,
-                self.estimated_versions_to_last_change,
-            ));
+            .set_last_change(self.last_change_ts, self.versions_to_last_change);
             TxnEntry::Prewrite {
                 default: (key, value),
                 lock: (lock_key.into_encoded(), lock_value.to_bytes()),
@@ -1636,7 +1624,7 @@ mod latest_kv_tests {
         must_prewrite_put(&mut engine, b"k4", b"v41", b"k4", 3);
         must_commit(&mut engine, b"k4", 3, 7);
 
-        for start_ts in (10..30).step_by(2) {
+        for start_ts in (10..30).into_iter().step_by(2) {
             must_prewrite_lock(&mut engine, b"k1", b"k1", start_ts);
             must_commit(&mut engine, b"k1", start_ts, start_ts + 1);
             must_prewrite_lock(&mut engine, b"k3", b"k1", start_ts);
@@ -2151,7 +2139,6 @@ mod delta_entry_tests {
 
     use super::{super::ScannerBuilder, test_util::*, *};
     use crate::storage::{mvcc::tests::write, txn::tests::*, Engine, Modify, TestEngineBuilder};
-
     /// Check whether everything works as usual when `Delta::get()` goes out of
     /// bound.
     #[test]
