@@ -121,7 +121,8 @@ impl<E: KvEngine> CmdObserver<E> for CdcObserver {
         // Create a snapshot here for preventing the old value was GC-ed.
         // TODO: only need it after enabling old value, may add a flag to indicate
         // whether to get it.
-        let snapshot = RegionSnapshot::from_snapshot(Arc::new(engine.snapshot()), Arc::new(region));
+        let snapshot =
+            RegionSnapshot::from_snapshot(Arc::new(engine.snapshot(None)), Arc::new(region));
         let get_old_value = move |key,
                                   query_ts,
                                   old_value_cache: &mut OldValueCache,
@@ -278,6 +279,8 @@ mod tests {
                 leader_id: 2,
                 prev_lead_transferee: raft::INVALID_ID,
                 vote: raft::INVALID_ID,
+                initialized: true,
+                peer_id: raft::INVALID_ID,
             },
         );
         match rx.recv_timeout(Duration::from_millis(10)).unwrap().unwrap() {
@@ -305,6 +308,8 @@ mod tests {
                 leader_id: raft::INVALID_ID,
                 prev_lead_transferee: 3,
                 vote: 3,
+                initialized: true,
+                peer_id: raft::INVALID_ID,
             },
         );
         match rx.recv_timeout(Duration::from_millis(10)).unwrap().unwrap() {

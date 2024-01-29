@@ -7,12 +7,8 @@ use futures::{channel::oneshot::Receiver, compat::Future01CompatExt, FutureExt};
 use kvproto::metapb::Region;
 use raftstore::{
     coprocessor::ObserveHandle,
-    router::RaftStoreRouter,
-    store::{
-        fsm::ChangeObserver,
-        msg::{Callback, SignificantMsg},
-        RegionSnapshot,
-    },
+    router::CdcHandle,
+    store::{fsm::ChangeObserver, msg::Callback, RegionSnapshot},
 };
 use tikv::storage::{
     kv::{ScanMode as MvccScanMode, Snapshot},
@@ -35,7 +31,7 @@ use crate::{
 
 const DEFAULT_SCAN_BATCH_SIZE: usize = 128;
 const GET_SNAPSHOT_RETRY_TIME: u32 = 3;
-const GET_SNAPSHOT_RETRY_BACKOFF_STEP: Duration = Duration::from_millis(25);
+const GET_SNAPSHOT_RETRY_BACKOFF_STEP: Duration = Duration::from_millis(100);
 
 pub struct ScanTask {
     pub handle: ObserveHandle,
@@ -87,30 +83,29 @@ pub enum ScanEntries {
 #[derive(Clone)]
 pub struct ScannerPool<T, E> {
     workers: Arc<Runtime>,
-    raft_router: T,
+    cdc_handle: T,
     _phantom: PhantomData<E>,
 }
 
-impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
-    pub fn new(count: usize, raft_router: T) -> Self {
+impl<T: 'static + CdcHandle<E>, E: KvEngine> ScannerPool<T, E> {
+    pub fn new(count: usize, cdc_handle: T) -> Self {
         let workers = Arc::new(
             Builder::new_multi_thread()
                 .thread_name("inc-scan")
                 .worker_threads(count)
-                .after_start_wrapper(|| {})
-                .before_stop_wrapper(|| {})
+                .with_sys_hooks()
                 .build()
                 .unwrap(),
         );
         Self {
             workers,
-            raft_router,
-            _phantom: PhantomData::default(),
+            cdc_handle,
+            _phantom: PhantomData,
         }
     }
 
     pub fn spawn_task(&self, mut task: ScanTask, concurrency_semaphore: Arc<Semaphore>) {
-        let raft_router = self.raft_router.clone();
+        let cdc_handle = self.cdc_handle.clone();
         let fut = async move {
             tikv_util::defer!({
                 RTS_SCAN_TASKS.with_label_values(&["finish"]).inc();
@@ -136,7 +131,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
                 return;
             }
             fail::fail_point!("resolved_ts_before_scanner_get_snapshot");
-            let snap = match Self::get_snapshot(&mut task, raft_router).await {
+            let snap = match Self::get_snapshot(&mut task, cdc_handle).await {
                 Ok(snap) => snap,
                 Err(e) => {
                     warn!("resolved_ts scan get snapshot failed"; "err" => ?e);
@@ -175,14 +170,16 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
 
     async fn get_snapshot(
         task: &mut ScanTask,
-        raft_router: T,
+        cdc_handle: T,
     ) -> Result<RegionSnapshot<E::Snapshot>> {
         let mut last_err = None;
         for retry_times in 0..=GET_SNAPSHOT_RETRY_TIME {
             if retry_times != 0 {
                 let mut backoff = GLOBAL_TIMER_HANDLE
                     .delay(
-                        std::time::Instant::now() + retry_times * GET_SNAPSHOT_RETRY_BACKOFF_STEP,
+                        std::time::Instant::now()
+                            + GET_SNAPSHOT_RETRY_BACKOFF_STEP
+                                .mul_f64(10_f64.powi(retry_times as i32 - 1)),
                     )
                     .compat()
                     .fuse();
@@ -198,14 +195,12 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
             }
             let (cb, fut) = tikv_util::future::paired_future_callback();
             let change_cmd = ChangeObserver::from_rts(task.region.id, task.handle.clone());
-            raft_router
-                .significant_send(
+            cdc_handle
+                .capture_change(
                     task.region.id,
-                    SignificantMsg::CaptureChange {
-                        cmd: change_cmd,
-                        region_epoch: task.region.get_region_epoch().clone(),
-                        callback: Callback::read(Box::new(cb)),
-                    },
+                    task.region.get_region_epoch().clone(),
+                    change_cmd,
+                    Callback::read(Box::new(cb)),
                 )
                 .map_err(|e| Error::Other(box_err!("{:?}", e)))?;
             let mut resp = box_try!(fut.await);
@@ -234,10 +229,10 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> ScannerPool<T, E> {
         _checkpoint_ts: TimeStamp,
     ) -> Result<(Vec<(Key, Lock)>, bool)> {
         let (locks, has_remaining) = reader
-            .scan_locks(
+            .scan_locks_from_storage(
                 start,
                 None,
-                |lock| matches!(lock.lock_type, LockType::Put | LockType::Delete),
+                |_, lock| matches!(lock.lock_type, LockType::Put | LockType::Delete),
                 DEFAULT_SCAN_BATCH_SIZE,
             )
             .map_err(|e| Error::Other(box_err!("{:?}", e)))?;

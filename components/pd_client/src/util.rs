@@ -22,11 +22,15 @@ use grpcio::{
     Environment, Error::RpcFailure, MetadataBuilder, Result as GrpcResult, RpcStatusCode,
 };
 use kvproto::{
+    meta_storagepb::MetaStorageClient as MetaStorageStub,
     metapb::BucketStats,
     pdpb::{
         ErrorType, GetMembersRequest, GetMembersResponse, Member, PdClient as PdClientStub,
         RegionHeartbeatRequest, RegionHeartbeatResponse, ReportBucketsRequest,
         ReportBucketsResponse, ResponseHeader,
+    },
+    resource_manager::{
+        ResourceManagerClient as ResourceManagerStub, TokenBucketsRequest, TokenBucketsResponse,
     },
 };
 use security::SecurityManager;
@@ -49,7 +53,6 @@ const MAX_RETRY_DURATION: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(3);
 
 // FIXME: Use a request-independent way to handle reconnection.
-const GLOBAL_RECONNECT_INTERVAL: Duration = Duration::from_millis(100); // 0.1s
 pub const REQUEST_RECONNECT_INTERVAL: Duration = Duration::from_secs(1); // 1s
 
 #[derive(Clone)]
@@ -105,6 +108,13 @@ pub struct Inner {
     pub pending_heartbeat: Arc<AtomicU64>,
     pub pending_buckets: Arc<AtomicU64>,
     pub tso: TimestampOracle,
+    pub meta_storage: MetaStorageStub,
+
+    pub rg_sender: Either<
+        Option<ClientDuplexSender<TokenBucketsRequest>>,
+        UnboundedSender<TokenBucketsRequest>,
+    >,
+    pub rg_resp: Option<ClientDuplexReceiver<TokenBucketsResponse>>,
 
     last_try_reconnect: Instant,
     bo: ExponentialBackoff,
@@ -171,6 +181,7 @@ impl Client {
         target: TargetInfo,
         tso: TimestampOracle,
         enable_forwarding: bool,
+        retry_interval: Duration,
     ) -> Client {
         if !target.direct_connected() {
             REQUEST_FORWARDED_GAUGE_VEC
@@ -183,6 +194,16 @@ impl Client {
         let (buckets_tx, buckets_resp) = client_stub
             .report_buckets_opt(target.call_option())
             .unwrap_or_else(|e| panic!("fail to request PD {} err {:?}", "report_buckets", e));
+        let meta_storage =
+            kvproto::meta_storagepb::MetaStorageClient::new(client_stub.client.channel().clone());
+        let resource_manager = kvproto::resource_manager::ResourceManagerClient::new(
+            client_stub.client.channel().clone(),
+        );
+        let (rg_sender, rg_rx) = resource_manager
+            .acquire_token_buckets_opt(target.call_option())
+            .unwrap_or_else(|e| {
+                panic!("fail to request PD {} err {:?}", "acquire_token_buckets", e)
+            });
         Client {
             timer: GLOBAL_TIMER_HANDLE.clone(),
             inner: RwLock::new(Inner {
@@ -199,8 +220,11 @@ impl Client {
                 pending_heartbeat: Arc::default(),
                 pending_buckets: Arc::default(),
                 last_try_reconnect: Instant::now(),
-                bo: ExponentialBackoff::new(GLOBAL_RECONNECT_INTERVAL),
+                bo: ExponentialBackoff::new(retry_interval),
                 tso,
+                meta_storage,
+                rg_sender: Either::Left(Some(rg_sender)),
+                rg_resp: Some(rg_rx),
             }),
             feature_gate: FeatureGate::default(),
             enable_forwarding,
@@ -241,9 +265,24 @@ impl Client {
         inner.buckets_sender = Either::Left(Some(buckets_tx));
         inner.buckets_resp = Some(buckets_resp);
 
+        inner.meta_storage = MetaStorageStub::new(client_stub.client.channel().clone());
+        let resource_manager = ResourceManagerStub::new(client_stub.client.channel().clone());
         inner.client_stub = client_stub;
         inner.members = members;
         inner.tso = tso;
+
+        let (rg_tx, rg_rx) = resource_manager
+            .acquire_token_buckets_opt(target.call_option())
+            .unwrap_or_else(|e| {
+                panic!("fail to request PD {} err {:?}", "acquire_token_buckets", e)
+            });
+        info!("acquire_token_buckets sender and receiver are stale, refreshing ...");
+        // Try to cancel an unused token buckets sender.
+        if let Either::Left(Some(ref mut r)) = inner.rg_sender {
+            r.cancel();
+        }
+        inner.rg_sender = Either::Left(Some(rg_tx));
+        inner.rg_resp = Some(rg_rx);
         if let Some(ref on_reconnect) = inner.on_reconnect {
             on_reconnect();
         }
@@ -397,7 +436,7 @@ impl Client {
     }
 }
 
-/// The context of sending requets.
+/// The context of sending request.
 pub struct Request<Req, F> {
     remain_request_count: usize,
     request_sent: usize,
@@ -622,7 +661,7 @@ impl PdConnector {
             .unwrap_or_else(|e| panic!("fail to request PD {} err {:?}", "get_members", e))
             .await;
         PD_REQUEST_HISTOGRAM_VEC
-            .with_label_values(&["get_members"])
+            .get_members
             .observe(timer.saturating_elapsed_secs());
         match response {
             Ok(resp) => Ok((client, resp)),
@@ -847,7 +886,7 @@ impl PdConnector {
                             })
                             .await;
                         PD_REQUEST_HISTOGRAM_VEC
-                            .with_label_values(&["get_members"])
+                            .get_members
                             .observe(timer.saturating_elapsed_secs());
                         match response {
                             Ok(_) => return Ok(Some((client, target))),
@@ -909,6 +948,7 @@ pub fn check_resp_header(header: &ResponseHeader) -> Result<()> {
         ErrorType::GlobalConfigNotFound => {
             Err(Error::GlobalConfigNotFound(err.get_message().to_owned()))
         }
+        ErrorType::DataCompacted => Err(Error::DataCompacted(err.get_message().to_owned())),
         ErrorType::Ok => Ok(()),
         ErrorType::DuplicatedEntry | ErrorType::EntryNotFound => Err(box_err!(err.get_message())),
         ErrorType::Unknown => Err(box_err!(err.get_message())),

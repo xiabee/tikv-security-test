@@ -28,7 +28,10 @@ use crate::storage::{
 command! {
     FlashbackToVersion:
         cmd_ty => (),
-        display => "kv::command::flashback_to_version -> {} | {} {} | {:?}", (version, start_ts, commit_ts, ctx),
+        display => {
+            "kv::command::flashback_to_version -> {} | {} {} | {:?}",
+            (version, start_ts, commit_ts, ctx),
+        }
         content => {
             start_ts: TimeStamp,
             commit_ts: TimeStamp,
@@ -182,8 +185,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for FlashbackToVersion {
             })(),
             lock_info: vec![],
             released_locks: ReleasedLocks::new(),
+            new_acquired_locks: vec![],
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
+            known_txn_status: vec![],
         })
     }
 }

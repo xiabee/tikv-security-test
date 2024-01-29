@@ -24,7 +24,10 @@ command! {
     /// This should be following a [`Prewrite`](Command::Prewrite) on the given key.
     Rollback:
         cmd_ty => (),
-        display => "kv::command::rollback keys({:?}) @ {} | {:?}", (keys, start_ts, ctx),
+        display => {
+            "kv::command::rollback keys({:?}) @ {} | {:?}",
+            (keys, start_ts, ctx),
+        }
         content => {
             keys: Vec<Key>,
             /// The transaction timestamp.
@@ -58,6 +61,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Rollback {
             released_locks.push(released_lock);
         }
 
+        let new_acquired_locks = txn.take_new_locks();
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
         write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
@@ -67,8 +71,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Rollback {
             pr: ProcessResult::Res,
             lock_info: vec![],
             released_locks,
+            new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
+            known_txn_status: vec![],
         })
     }
 }

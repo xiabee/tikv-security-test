@@ -5,10 +5,9 @@ use std::{
     cell::RefCell,
     cmp,
     collections::VecDeque,
-    fmt, mem,
+    mem,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc::SyncSender,
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -20,8 +19,8 @@ use bytes::Bytes;
 use collections::{HashMap, HashSet};
 use crossbeam::{atomic::AtomicCell, channel::TrySendError};
 use engine_traits::{
-    Engines, KvEngine, PerfContext, RaftEngine, Snapshot, WriteBatch, WriteOptions, CF_DEFAULT,
-    CF_LOCK, CF_WRITE,
+    CacheRange, Engines, KvEngine, PerfContext, RaftEngine, Snapshot, SnapshotContext, WriteBatch,
+    WriteOptions, CF_DEFAULT, CF_LOCK, CF_WRITE,
 };
 use error_code::ErrorCodeExt;
 use fail::fail_point;
@@ -29,9 +28,9 @@ use getset::{Getters, MutGetters};
 use keys::{enc_end_key, enc_start_key};
 use kvproto::{
     errorpb,
-    kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp, LockInfo},
+    kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp},
     metapb::{self, PeerRole},
-    pdpb::{self, PeerStats},
+    pdpb::PeerStats,
     raft_cmdpb::{
         self, AdminCmdType, AdminResponse, CmdType, CommitMergeRequest, PutRequest, RaftCmdRequest,
         RaftCmdResponse, Request, TransferLeaderRequest, TransferLeaderResponse,
@@ -44,7 +43,7 @@ use kvproto::{
     },
 };
 use parking_lot::RwLockUpgradableReadGuard;
-use pd_client::{BucketStat, INVALID_ID};
+use pd_client::INVALID_ID;
 use protobuf::Message;
 use raft::{
     self,
@@ -72,15 +71,16 @@ use uuid::Uuid;
 
 use super::{
     cmd_resp,
-    local_metrics::{RaftMetrics, TimeTracker},
+    local_metrics::{IoType, RaftMetrics},
     metrics::*,
     peer_storage::{write_peer_state, CheckApplyingSnapStatus, HandleReadyResult, PeerStorage},
     read_queue::{ReadIndexQueue, ReadIndexRequest},
     transport::Transport,
     util::{
-        self, check_region_epoch, is_initial_msg, AdminCmdEpochState, ChangePeerI, ConfChangeKind,
-        Lease, LeaseState, NORMAL_REQ_CHECK_CONF_VER, NORMAL_REQ_CHECK_VER,
+        self, check_req_region_epoch, is_initial_msg, AdminCmdEpochState, ChangePeerI,
+        ConfChangeKind, Lease, LeaseState, NORMAL_REQ_CHECK_CONF_VER, NORMAL_REQ_CHECK_VER,
     },
+    worker::BucketStatsInfo,
     DestroyPeerJob, LocalReadContext,
 };
 use crate::{
@@ -94,15 +94,16 @@ use crate::{
         async_io::{read::ReadTask, write::WriteMsg, write_router::WriteRouter},
         fsm::{
             apply::{self, CatchUpLogs},
-            store::{PollContext, RaftRouter},
+            store::PollContext,
             Apply, ApplyMetrics, ApplyTask, Proposal,
         },
         hibernate_state::GroupState,
         memory::{needs_evict_entry_cache, MEMTRACE_RAFT_ENTRIES},
-        msg::{CasualMessage, ErrorCallback, PeerMsg, RaftCommand, SignificantMsg, StoreMsg},
+        msg::{CasualMessage, ErrorCallback, RaftCommand},
         peer_storage::HandleSnapshotResult,
         snapshot_backup::{AbortReason, SnapshotBrState},
         txn_ext::LocksStatus,
+        unsafe_recovery::{ForceLeaderState, UnsafeRecoveryState},
         util::{admin_cmd_epoch_lookup, RegionReadProgress},
         worker::{
             CleanupTask, CompactTask, HeartbeatTask, RaftlogGcTask, ReadDelegate, ReadExecutor,
@@ -148,16 +149,16 @@ impl<C: WriteCallback> ProposalQueue<C> {
 
     /// Find the trackers of given index.
     /// Caller should check if term is matched before using trackers.
-    fn find_trackers(&self, index: u64) -> Option<(u64, &SmallVec<[TimeTracker; 4]>)> {
+    pub fn find_trackers(&self, index: u64) -> Option<(u64, C::TimeTrackerListRef<'_>)> {
         self.queue
             .binary_search_by_key(&index, |p: &Proposal<_>| p.index)
             .ok()
-            .and_then(|i| {
-                self.queue[i]
-                    .cb
-                    .write_trackers()
-                    .map(|ts| (self.queue[i].term, ts))
-            })
+            .map(|i| (self.queue[i].term, self.queue[i].cb.write_trackers()))
+    }
+
+    #[inline]
+    pub fn queue_mut(&mut self) -> &mut VecDeque<Proposal<C>> {
+        &mut self.queue
     }
 
     pub fn find_propose_time(&self, term: u64, index: u64) -> Option<Timespec> {
@@ -207,7 +208,7 @@ impl<C: WriteCallback> ProposalQueue<C> {
     }
 
     #[inline]
-    fn oldest(&self) -> Option<&Proposal<C>> {
+    pub fn oldest(&self) -> Option<&Proposal<C>> {
         self.queue.front()
     }
 
@@ -231,7 +232,7 @@ impl<C: WriteCallback> ProposalQueue<C> {
         }
     }
 
-    fn back(&self) -> Option<&Proposal<C>> {
+    pub fn back(&self) -> Option<&Proposal<C>> {
         self.queue.back()
     }
 }
@@ -244,6 +245,7 @@ bitflags! {
         const SPLIT          = 0b0000_0010;
         const PREPARE_MERGE  = 0b0000_0100;
         const COMMIT_MERGE   = 0b0000_1000;
+        const ROLLBACK_MERGE = 0b0001_0000;
     }
 }
 
@@ -493,98 +495,18 @@ pub struct ReadyResult {
     pub has_write_ready: bool,
 }
 
-#[derive(Debug)]
-/// ForceLeader process would be:
-/// - If it's hibernated, enter wait ticks state, and wake up the peer
-/// - Enter pre force leader state, become candidate and send request vote to
-///   all peers
-/// - Wait for the responses of the request vote, no reject should be received.
-/// - Enter force leader state, become leader without leader lease
-/// - Execute recovery plan(some remove-peer commands)
-/// - After the plan steps are all applied, exit force leader state
-pub enum ForceLeaderState {
-    WaitTicks {
-        syncer: UnsafeRecoveryForceLeaderSyncer,
-        failed_stores: HashSet<u64>,
-        ticks: usize,
-    },
-    PreForceLeader {
-        syncer: UnsafeRecoveryForceLeaderSyncer,
-        failed_stores: HashSet<u64>,
-    },
-    ForceLeader {
-        time: TiInstant,
-        failed_stores: HashSet<u64>,
-    },
-}
-
-// Following shared states are used while reporting to PD for unsafe recovery
-// and shared among all the regions per their life cycle.
-// The work flow is like:
-// 1. report phase
-//   - start_unsafe_recovery_report
-//      - broadcast wait-apply commands
-//      - wait for all the peers' apply indices meet their targets
-//      - broadcast fill out report commands
-//      - wait for all the peers fill out the reports for themselves
-//      - send a store report (through store heartbeat)
-// 2. force leader phase
-//   - dispatch force leader commands
-//     - wait for all the peers that received the command become force leader
-//     - start_unsafe_recovery_report
-// 3. plan execution phase
-//   - dispatch recovery plans
-//     - wait for all the creates, deletes and demotes to finish, for the
-//       demotes, procedures are:
-//       - exit joint state if it is already in joint state
-//       - demote failed voters, and promote self to be a voter if it is a
-//         learner
-//       - exit joint state
-//     - start_unsafe_recovery_report
-//
-// Intends to use RAII to sync unsafe recovery procedures between peers, in
-// addition to that, it uses a closure to avoid having a raft router as a member
-// variable, which is statically dispatched, thus needs to propagate the
-// generics everywhere.
-pub struct InvokeClosureOnDrop(Box<dyn Fn() + Send + Sync>);
-
-impl fmt::Debug for InvokeClosureOnDrop {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "InvokeClosureOnDrop")
-    }
-}
-
-impl Drop for InvokeClosureOnDrop {
-    fn drop(&mut self) {
-        self.0();
-    }
-}
-
-pub fn start_unsafe_recovery_report<EK: KvEngine, ER: RaftEngine>(
-    router: &RaftRouter<EK, ER>,
-    report_id: u64,
-    exit_force_leader: bool,
-) {
-    let wait_apply =
-        UnsafeRecoveryWaitApplySyncer::new(report_id, router.clone(), exit_force_leader);
-    router.broadcast_normal(|| {
-        PeerMsg::SignificantMsg(SignificantMsg::UnsafeRecoveryWaitApply(wait_apply.clone()))
-    });
-}
-
 // Propose a read index request to the raft group, return the request id and
 // whether this request had dropped silently
 // #[RaftstoreCommon], copied from Peer::propose_read_index
 pub fn propose_read_index<T: raft::Storage>(
     raft_group: &mut RawNode<T>,
     request: Option<&raft_cmdpb::ReadIndexRequest>,
-    locked: Option<&LockInfo>,
 ) -> (Uuid, bool) {
     let last_pending_read_count = raft_group.raft.pending_read_count();
     let last_ready_read_count = raft_group.raft.ready_read_count();
 
     let id = Uuid::new_v4();
-    raft_group.read_index(ReadIndexContext::fields_to_bytes(id, request, locked));
+    raft_group.read_index(ReadIndexContext::fields_to_bytes(id, request, None));
 
     let pending_read_count = raft_group.raft.pending_read_count();
     let ready_read_count = raft_group.raft.ready_read_count();
@@ -629,7 +551,7 @@ pub fn can_amend_read<C>(
             if let Some(read) = last_pending_read {
                 let is_read_index_request = req
                     .get_requests()
-                    .get(0)
+                    .first()
                     .map(|req| req.has_read_index())
                     .unwrap_or_default();
                 // A read index request or a read with addition request always needs the
@@ -651,226 +573,116 @@ pub fn can_amend_read<C>(
     false
 }
 
-#[derive(Clone, Debug)]
-pub struct UnsafeRecoveryForceLeaderSyncer(Arc<InvokeClosureOnDrop>);
+/// The SplitCheckTrigger maintains the internal status to determine
+/// if a split check task should be triggered.
+#[derive(Default, Debug)]
+pub struct SplitCheckTrigger {
+    /// An inaccurate difference in region size since last reset.
+    /// It is used to decide whether split check is needed.
+    size_diff_hint: u64,
+    /// An inaccurate difference in region size after compaction.
+    /// It is used to trigger check split to update approximate size and keys
+    /// after space reclamation of deleted entries.
+    pub compaction_declined_bytes: u64,
+    /// Approximate size of the region.
+    pub approximate_size: Option<u64>,
+    may_split_size: Option<bool>,
+    /// Approximate keys of the region.
+    pub approximate_keys: Option<u64>,
+    may_split_keys: Option<bool>,
+    /// Whether this region has scheduled a split check task. If we just
+    /// splitted  the region or ingested one file which may be overlapped
+    /// with the existed data, reset the flag so that the region can be
+    /// splitted again.
+    may_skip_split_check: bool,
+}
 
-impl UnsafeRecoveryForceLeaderSyncer {
-    pub fn new(report_id: u64, router: RaftRouter<impl KvEngine, impl RaftEngine>) -> Self {
-        let thread_safe_router = Mutex::new(router);
-        let inner = InvokeClosureOnDrop(Box::new(move || {
-            info!("Unsafe recovery, force leader finished."; "report_id" => report_id);
-            let router_ptr = thread_safe_router.lock().unwrap();
-            start_unsafe_recovery_report(&*router_ptr, report_id, false);
-        }));
-        UnsafeRecoveryForceLeaderSyncer(Arc::new(inner))
+impl SplitCheckTrigger {
+    pub fn should_skip(&self, threshold: u64) -> bool {
+        self.may_skip_split_check
+            && self.compaction_declined_bytes < threshold
+            && self.size_diff_hint < threshold
     }
-}
 
-#[derive(Clone, Debug)]
-pub struct UnsafeRecoveryExecutePlanSyncer {
-    _closure: Arc<InvokeClosureOnDrop>,
-    pub(self) time: TiInstant,
-    pub(self) abort: Arc<Mutex<bool>>,
-}
-
-impl UnsafeRecoveryExecutePlanSyncer {
-    pub fn new(report_id: u64, router: RaftRouter<impl KvEngine, impl RaftEngine>) -> Self {
-        let thread_safe_router = Mutex::new(router);
-        let abort = Arc::new(Mutex::new(false));
-        let abort_clone = abort.clone();
-        let closure = InvokeClosureOnDrop(Box::new(move || {
-            if *abort_clone.lock().unwrap() {
-                warn!("Unsafe recovery, plan execution aborted"; "report_id" => report_id);
-                return;
-            }
-            info!("Unsafe recovery, plan execution finished"; "report_id" => report_id);
-            let router_ptr = thread_safe_router.lock().unwrap();
-            start_unsafe_recovery_report(&*router_ptr, report_id, true);
-        }));
-        UnsafeRecoveryExecutePlanSyncer {
-            _closure: Arc::new(closure),
-            time: TiInstant::now(),
-            abort,
+    pub fn post_triggered(&mut self) {
+        self.size_diff_hint = 0;
+        self.compaction_declined_bytes = 0;
+        // The task is scheduled, the next tick may skip it only when the size and keys
+        // are small.
+        // If either size or keys are big enough to do a split,
+        // keep split check tick until split is done
+        if !matches!(self.may_split_size, Some(true)) && !matches!(self.may_split_keys, Some(true))
+        {
+            self.may_skip_split_check = true;
         }
     }
 
-    pub fn abort(&self) {
-        *self.abort.lock().unwrap() = true;
+    pub fn post_split(&mut self) {
+        self.size_diff_hint = 0;
+        self.may_split_keys = None;
+        self.may_split_size = None;
+        // It's not correct anymore, so set it to false to schedule a split check task.
+        self.may_skip_split_check = false;
     }
-}
-// Syncer only send to leader in 2nd BR restore
-#[derive(Clone, Debug)]
-pub struct SnapshotRecoveryWaitApplySyncer {
-    _closure: Arc<InvokeClosureOnDrop>,
-    abort: Arc<Mutex<bool>>,
-}
 
-impl SnapshotRecoveryWaitApplySyncer {
-    pub fn new(region_id: u64, sender: SyncSender<u64>) -> Self {
-        let thread_safe_router = Mutex::new(sender);
-        let abort = Arc::new(Mutex::new(false));
-        let abort_clone = abort.clone();
-        let closure = InvokeClosureOnDrop(Box::new(move || {
-            info!("region {} wait apply finished", region_id);
-            if *abort_clone.lock().unwrap() {
-                warn!("wait apply aborted");
-                return;
-            }
-            let router_ptr = thread_safe_router.lock().unwrap();
+    pub fn add_size_diff(&mut self, size_diff: i64) {
+        let diff = self.size_diff_hint as i64 + size_diff;
+        self.size_diff_hint = cmp::max(diff, 0) as u64;
+    }
 
-            _ = router_ptr.send(region_id).map_err(|_| {
-                warn!("reply waitapply states failure.");
-            });
-        }));
-        SnapshotRecoveryWaitApplySyncer {
-            _closure: Arc::new(closure),
-            abort,
+    pub fn reset_skip_check(&mut self) {
+        self.may_skip_split_check = false;
+    }
+
+    pub fn on_clear_region_size(&mut self) {
+        self.approximate_size = None;
+        self.approximate_keys = None;
+        self.may_split_size = None;
+        self.may_split_keys = None;
+        self.may_skip_split_check = false;
+    }
+
+    pub fn on_approximate_region_size(&mut self, size: Option<u64>, splitable: Option<bool>) {
+        // If size is none, it means no estimated size
+        if size.is_some() {
+            self.approximate_size = size;
+        }
+
+        if splitable.is_some() {
+            self.may_split_size = splitable;
+        }
+
+        // If the region is truly splitable,
+        // may_skip_split_check should be false
+        if matches!(splitable, Some(true)) {
+            self.may_skip_split_check = false;
         }
     }
 
-    pub fn abort(&self) {
-        *self.abort.lock().unwrap() = true;
-    }
-}
+    pub fn on_approximate_region_keys(&mut self, keys: Option<u64>, splitable: Option<bool>) {
+        // if keys is none, it means no estimated keys
+        if keys.is_some() {
+            self.approximate_keys = keys;
+        }
 
-#[derive(Clone, Debug)]
-pub struct UnsafeRecoveryWaitApplySyncer {
-    _closure: Arc<InvokeClosureOnDrop>,
-    pub(self) time: TiInstant,
-    pub(self) abort: Arc<Mutex<bool>>,
-}
+        if splitable.is_some() {
+            self.may_split_keys = splitable;
+        }
 
-impl UnsafeRecoveryWaitApplySyncer {
-    pub fn new(
-        report_id: u64,
-        router: RaftRouter<impl KvEngine, impl RaftEngine>,
-        exit_force_leader: bool,
-    ) -> Self {
-        let thread_safe_router = Mutex::new(router);
-        let abort = Arc::new(Mutex::new(false));
-        let abort_clone = abort.clone();
-        let closure = InvokeClosureOnDrop(Box::new(move || {
-            if *abort_clone.lock().unwrap() {
-                warn!("Unsafe recovery, wait apply aborted"; "report_id" => report_id);
-                return;
-            }
-            info!("Unsafe recovery, wait apply finished"; "report_id" => report_id);
-            let router_ptr = thread_safe_router.lock().unwrap();
-            if exit_force_leader {
-                (*router_ptr).broadcast_normal(|| {
-                    PeerMsg::SignificantMsg(SignificantMsg::ExitForceLeaderState)
-                });
-            }
-            let fill_out_report =
-                UnsafeRecoveryFillOutReportSyncer::new(report_id, (*router_ptr).clone());
-            (*router_ptr).broadcast_normal(|| {
-                PeerMsg::SignificantMsg(SignificantMsg::UnsafeRecoveryFillOutReport(
-                    fill_out_report.clone(),
-                ))
-            });
-        }));
-        UnsafeRecoveryWaitApplySyncer {
-            _closure: Arc::new(closure),
-            time: TiInstant::now(),
-            abort,
+        // If the region is truly splitable,
+        // may_skip_split_check should be false
+        if matches!(splitable, Some(true)) {
+            self.may_skip_split_check = false;
         }
     }
 
-    pub fn abort(&self) {
-        *self.abort.lock().unwrap() = true;
-    }
-}
+    pub fn on_ingest_sst_result(&mut self, size: u64, keys: u64) {
+        self.approximate_size = Some(self.approximate_size.unwrap_or_default() + size);
+        self.approximate_keys = Some(self.approximate_keys.unwrap_or_default() + keys);
 
-#[derive(Clone, Debug)]
-pub struct UnsafeRecoveryFillOutReportSyncer {
-    _closure: Arc<InvokeClosureOnDrop>,
-    reports: Arc<Mutex<Vec<pdpb::PeerReport>>>,
-}
-
-impl UnsafeRecoveryFillOutReportSyncer {
-    pub fn new(report_id: u64, router: RaftRouter<impl KvEngine, impl RaftEngine>) -> Self {
-        let thread_safe_router = Mutex::new(router);
-        let reports = Arc::new(Mutex::new(vec![]));
-        let reports_clone = reports.clone();
-        let closure = InvokeClosureOnDrop(Box::new(move || {
-            info!("Unsafe recovery, peer reports collected"; "report_id" => report_id);
-            let mut store_report = pdpb::StoreReport::default();
-            {
-                let mut reports_ptr = reports_clone.lock().unwrap();
-                store_report.set_peer_reports(mem::take(&mut *reports_ptr).into());
-            }
-            store_report.set_step(report_id);
-            let router_ptr = thread_safe_router.lock().unwrap();
-            if let Err(e) = (*router_ptr).send_control(StoreMsg::UnsafeRecoveryReport(store_report))
-            {
-                error!("Unsafe recovery, fail to schedule reporting"; "err" => ?e, "report_id" => report_id);
-            }
-        }));
-        UnsafeRecoveryFillOutReportSyncer {
-            _closure: Arc::new(closure),
-            reports,
-        }
-    }
-
-    pub fn report_for_self(&self, report: pdpb::PeerReport) {
-        let mut reports_ptr = self.reports.lock().unwrap();
-        (*reports_ptr).push(report);
-    }
-}
-
-#[derive(Debug)]
-pub enum UnsafeRecoveryState {
-    // Stores the state that is necessary for the wait apply stage of unsafe recovery process.
-    // This state is set by the peer fsm. Once set, it is checked every time this peer applies a
-    // new entry or a snapshot, if the target index is met, this state is reset / droppeds. The
-    // syncer holds a reference counted inner object that is shared among all the peers, whose
-    // destructor triggers the next step of unsafe recovery report process.
-    WaitApply {
-        target_index: u64,
-        syncer: UnsafeRecoveryWaitApplySyncer,
-    },
-    DemoteFailedVoters {
-        syncer: UnsafeRecoveryExecutePlanSyncer,
-        failed_voters: Vec<metapb::Peer>,
-        target_index: u64,
-        // Failed regions may be stuck in joint state, if that is the case, we need to ask the
-        // region to exit joint state before proposing the demotion.
-        demote_after_exit: bool,
-    },
-    Destroy(UnsafeRecoveryExecutePlanSyncer),
-    // DemoteFailedVoter may fail due to some reasons. It's just a marker to avoid exiting force
-    // leader state
-    Failed,
-}
-
-impl UnsafeRecoveryState {
-    pub fn check_timeout(&self, timeout: Duration) -> bool {
-        let time = match self {
-            UnsafeRecoveryState::WaitApply { syncer, .. } => syncer.time,
-            UnsafeRecoveryState::DemoteFailedVoters { syncer, .. }
-            | UnsafeRecoveryState::Destroy(syncer) => syncer.time,
-            UnsafeRecoveryState::Failed => return false,
-        };
-        time.saturating_elapsed() >= timeout
-    }
-
-    pub fn is_abort(&self) -> bool {
-        let abort = match &self {
-            UnsafeRecoveryState::WaitApply { syncer, .. } => &syncer.abort,
-            UnsafeRecoveryState::DemoteFailedVoters { syncer, .. }
-            | UnsafeRecoveryState::Destroy(syncer) => &syncer.abort,
-            UnsafeRecoveryState::Failed => return true,
-        };
-        *abort.lock().unwrap()
-    }
-
-    pub fn abort(&mut self) {
-        match self {
-            UnsafeRecoveryState::WaitApply { syncer, .. } => syncer.abort(),
-            UnsafeRecoveryState::DemoteFailedVoters { syncer, .. }
-            | UnsafeRecoveryState::Destroy(syncer) => syncer.abort(),
-            UnsafeRecoveryState::Failed => (),
-        }
+        // The ingested file may be overlapped with the data in engine, so we need to
+        // check it again to get the accurate value.
+        self.may_skip_split_check = false;
     }
 }
 
@@ -930,6 +742,24 @@ where
     /// the same time period.
     pub wait_data: bool,
 
+    /// When the witness becomes non-witness, it need to actively request a
+    /// snapshot from the leader, but the request may fail, so we need to save
+    /// the request index for retrying.
+    pub request_index: u64,
+
+    /// It's used to identify the situation where the region worker is
+    /// generating and sending snapshots when the newly elected leader by Raft
+    /// applies the switch witness cmd which commited before the election. This
+    /// flag will prevent immediate data clearing and will be cleared after
+    /// the successful transfer of leadership.
+    pub delay_clean_data: bool,
+
+    /// When the witness becomes non-witness, it need to actively request a
+    /// snapshot from the leader, In order to avoid log lag, we need to reject
+    /// the leader's `MsgAppend` request unless the `term` of the `last index`
+    /// is less than the peer's current `term`.
+    pub should_reject_msgappend: bool,
+
     /// Force leader state is only used in online recovery when the majority of
     /// peers are missing. In this state, it forces one peer to become leader
     /// out of accordance with Raft election rule, and forbids any
@@ -945,25 +775,10 @@ where
     pub peers_start_pending_time: Vec<(u64, Instant)>,
     /// A inaccurate cache about which peer is marked as down.
     down_peer_ids: Vec<u64>,
-
-    /// An inaccurate difference in region size since last reset.
-    /// It is used to decide whether split check is needed.
-    pub size_diff_hint: u64,
+    /// the split check trigger
+    pub split_check_trigger: SplitCheckTrigger,
     /// The count of deleted keys since last reset.
     delete_keys_hint: u64,
-    /// An inaccurate difference in region size after compaction.
-    /// It is used to trigger check split to update approximate size and keys
-    /// after space reclamation of deleted entries.
-    pub compaction_declined_bytes: u64,
-    /// Approximate size of the region.
-    pub approximate_size: Option<u64>,
-    /// Approximate keys of the region.
-    pub approximate_keys: Option<u64>,
-    /// Whether this region has scheduled a split check task. If we just
-    /// splitted  the region or ingested one file which may be overlapped
-    /// with the existed data, reset the flag so that the region can be
-    /// splitted again.
-    pub may_skip_split_check: bool,
 
     /// The state for consistency check.
     pub consistency_state: ConsistencyState,
@@ -975,6 +790,15 @@ where
     /// The index of last compacted raft log. It is used for the next compact
     /// log task.
     pub last_compacted_idx: u64,
+    /// Record the time of the last raft log compact, the witness should query
+    /// the leader periodically whether `voter_replicated_index` is updated
+    /// if CompactLog admin command isn't triggered for a while.
+    pub last_compacted_time: Instant,
+    /// When the peer is witness, and there is any voter lagging behind, the
+    /// log truncation of the witness shouldn't be triggered even if it's
+    /// force mode, and this item will be set to `true`, after all pending
+    /// compact cmds have been handled, it will be set to `false`.
+    pub has_pending_compact_cmd: bool,
     /// The index of the latest urgent proposal index.
     last_urgent_proposal_idx: u64,
     /// The index of the latest committed split command.
@@ -1060,9 +884,8 @@ where
     persisted_number: u64,
     /// The context of applying snapshot.
     apply_snap_ctx: Option<ApplySnapshotContext>,
-    /// region buckets.
-    pub region_buckets: Option<BucketStat>,
-    pub last_region_buckets: Option<BucketStat>,
+    /// region buckets info in this region.
+    region_buckets_info: BucketStatsInfo,
     /// lead_transferee if this peer(leader) is in a leadership transferring.
     pub lead_transferee: u64,
     pub unsafe_recovery_state: Option<UnsafeRecoveryState>,
@@ -1084,6 +907,7 @@ where
         engines: Engines<EK, ER>,
         region: &metapb::Region,
         peer: metapb::Peer,
+        wait_data: bool,
         create_by_peer: Option<metapb::Peer>,
     ) -> Result<Peer<EK, ER>> {
         let peer_id = peer.get_id();
@@ -1116,12 +940,17 @@ where
             skip_bcast_commit: true,
             pre_vote: cfg.prevote,
             max_committed_size_per_ready: MAX_COMMITTED_SIZE_PER_READY,
-            // TODO: if peer.is_witness { 0 } else { 1 },
+            priority: if peer.is_witness { -1 } else { 0 },
             ..Default::default()
         };
 
         let logger = slog_global::get_global().new(slog::o!("region_id" => region.get_id()));
         let raft_group = RawNode::new(&raft_cfg, ps, &logger)?;
+        let last_index = raft_group.store().last_index();
+        // In order to avoid excessive log accumulation due to the loss of pending
+        // compaction cmds after the witness is restarted, it will actively pull
+        // voter_request_index once at start.
+        let has_pending_compact_cmd = peer.is_witness;
 
         let mut peer = Peer {
             peer,
@@ -1137,15 +966,14 @@ where
             create_by_peer,
             peers_start_pending_time: vec![],
             down_peer_ids: vec![],
-            size_diff_hint: 0,
+            split_check_trigger: SplitCheckTrigger::default(),
             delete_keys_hint: 0,
-            approximate_size: None,
-            approximate_keys: None,
-            may_skip_split_check: false,
-            compaction_declined_bytes: 0,
             leader_unreachable: false,
             pending_remove: false,
-            wait_data: false,
+            wait_data,
+            request_index: last_index,
+            delay_clean_data: false,
+            should_reject_msgappend: false,
             should_wake_up: false,
             force_leader: None,
             pending_merge_state: None,
@@ -1158,6 +986,8 @@ where
             tag: tag.clone(),
             last_applying_idx: applied_index,
             last_compacted_idx: 0,
+            last_compacted_time: Instant::now(),
+            has_pending_compact_cmd,
             last_urgent_proposal_idx: u64::MAX,
             last_committed_split_idx: 0,
             last_sent_snapshot_idx: 0,
@@ -1202,8 +1032,7 @@ where
             unpersisted_ready: None,
             persisted_number: 0,
             apply_snap_ctx: None,
-            region_buckets: None,
-            last_region_buckets: None,
+            region_buckets_info: BucketStatsInfo::default(),
             lead_transferee: raft::INVALID_ID,
             unsafe_recovery_state: None,
             snapshot_recovery_state: None,
@@ -1213,6 +1042,9 @@ where
         if region.get_peers().len() == 1 && region.get_peers()[0].get_store_id() == store_id {
             peer.raft_group.campaign()?;
         }
+
+        let persisted_index = peer.raft_group.raft.raft_log.persisted;
+        peer.mut_store().update_cache_persisted(persisted_index);
 
         Ok(peer)
     }
@@ -1360,6 +1192,8 @@ where
             // of term explicitly to get correct metadata.
             info!(
                 "become follower for new logs";
+                "first_log_term" => first.term,
+                "first_log_index" => first.index,
                 "new_log_term" => last_log.term,
                 "new_log_index" => last_log.index,
                 "term" => self.term(),
@@ -1586,6 +1420,16 @@ where
         self.get_store().region()
     }
 
+    #[inline]
+    pub fn region_buckets_info_mut(&mut self) -> &mut BucketStatsInfo {
+        &mut self.region_buckets_info
+    }
+
+    #[inline]
+    pub fn region_buckets_info(&self) -> &BucketStatsInfo {
+        &self.region_buckets_info
+    }
+
     /// Check whether the peer can be hibernated.
     ///
     /// This should be used with `check_after_tick` to get a correct conclusion.
@@ -1633,6 +1477,14 @@ where
             res.reason = "replication mode";
             return res;
         }
+        if !self.disk_full_peers.is_empty() {
+            res.reason = "has disk full peers";
+            return res;
+        }
+        if !self.wait_data_peers.is_empty() {
+            res.reason = "has wait data peers";
+            return res;
+        }
         res.up_to_date = true;
         res
     }
@@ -1658,6 +1510,8 @@ where
                 && !self.has_unresolved_reads()
                 // If it becomes leader, the stats is not valid anymore.
                 && !self.is_leader()
+                // Keep ticking if it's waiting for snapshot.
+                && !self.wait_data
         }
     }
 
@@ -1866,7 +1720,7 @@ where
                 {
                     let proposal = &self.proposals.queue[idx];
                     if term == proposal.term {
-                        for tracker in proposal.cb.write_trackers().iter().flat_map(|v| v.iter()) {
+                        for tracker in proposal.cb.write_trackers() {
                             tracker.observe(std_now, &ctx.raft_metrics.wf_send_proposal, |t| {
                                 &mut t.metrics.wf_send_proposal_nanos
                             });
@@ -1985,7 +1839,7 @@ where
         let has_snap_task = self.get_store().has_gen_snap_task();
         let pre_commit_index = self.raft_group.raft.raft_log.committed;
         self.raft_group.step(m)?;
-        self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
+        self.report_commit_log_duration(pre_commit_index, &mut ctx.raft_metrics);
 
         let mut for_balance = false;
         if !has_snap_task && self.get_store().has_gen_snap_task() {
@@ -2007,7 +1861,7 @@ where
         Ok(())
     }
 
-    fn report_persist_log_duration(&self, pre_persist_index: u64, metrics: &RaftMetrics) {
+    fn report_persist_log_duration(&self, pre_persist_index: u64, metrics: &mut RaftMetrics) {
         if !metrics.waterfall_metrics || self.proposals.is_empty() {
             return;
         }
@@ -2030,7 +1884,7 @@ where
         }
     }
 
-    fn report_commit_log_duration(&self, pre_commit_index: u64, metrics: &RaftMetrics) {
+    fn report_commit_log_duration(&self, pre_commit_index: u64, metrics: &mut RaftMetrics) {
         if !metrics.waterfall_metrics || self.proposals.is_empty() {
             return;
         }
@@ -2050,10 +1904,21 @@ where
                         &metrics.wf_commit_not_persist_log
                     };
                     for tracker in trackers {
-                        tracker.observe(now, hist, |t| {
+                        // Collect the metrics related to commit_log
+                        // durations.
+                        let duration = tracker.observe(now, hist, |t| {
                             t.metrics.commit_not_persisted = !commit_persisted;
                             &mut t.metrics.wf_commit_log_nanos
                         });
+                        // Normally, commit_log_duration both contains the duraiton on persisting
+                        // raft logs and transferring raft logs to other nodes. Therefore, it can
+                        // reflects slowness of the node on I/Os, whatever the reason is.
+                        // Here, health_stats uses the recorded commit_log_duration as the
+                        // latency to perspect whether there exists jitters on network. It's not
+                        // accurate, but it's proved that it's a good approximation.
+                        metrics
+                            .health_stats
+                            .observe(Duration::from_nanos(duration), IoType::Network);
                     }
                 }
             }
@@ -2114,6 +1979,12 @@ where
         let mut pending_peers = Vec::with_capacity(self.region().get_peers().len());
         let status = self.raft_group.status();
         let truncated_idx = self.get_store().truncated_index();
+
+        for peer_id in &self.wait_data_peers {
+            if let Some(p) = self.get_peer_from_cache(*peer_id) {
+                pending_peers.push(p);
+            }
+        }
 
         if status.progress.is_none() {
             return pending_peers;
@@ -2189,6 +2060,9 @@ where
         }
         for i in 0..self.peers_start_pending_time.len() {
             if self.peers_start_pending_time[i].0 != peer_id {
+                continue;
+            }
+            if self.wait_data_peers.contains(&peer_id) {
                 continue;
             }
             let truncated_idx = self.raft_group.store().truncated_index();
@@ -2347,6 +2221,10 @@ where
                     self.mut_store().cancel_generating_snap(None);
                     self.clear_disk_full_peers(ctx);
                     self.clear_in_memory_pessimistic_locks();
+                    if self.peer.is_witness && self.delay_clean_data {
+                        let _ = self.get_store().clear_data();
+                        self.delay_clean_data = false;
+                    }
                 }
                 _ => {}
             }
@@ -2358,6 +2236,8 @@ where
                     leader_id: ss.leader_id,
                     prev_lead_transferee: self.lead_transferee,
                     vote: self.raft_group.raft.vote,
+                    initialized: self.is_initialized(),
+                    peer_id: self.peer.get_id(),
                 },
             );
             self.cmd_epoch_checker.maybe_update_term(self.term());
@@ -2451,8 +2331,12 @@ where
         // a stale heartbeat can make the leader think follower has already applied
         // the snapshot, and send remaining log entries, which may increase
         // commit_index.
+        //
+        // If it's witness before, but a command changes it to non-witness, it will stop
+        // applying all following command, therefore, add the judgment of `wait_data` to
+        // avoid applying snapshot is also blocked.
         // TODO: add more test
-        self.last_applying_idx == self.get_store().applied_index()
+        (self.last_applying_idx == self.get_store().applied_index() || self.wait_data)
             // Requesting snapshots also triggers apply workers to write
             // apply states even if there is no pending committed entry.
             // TODO: Instead of sharing the counter, we should apply snapshots
@@ -2563,14 +2447,14 @@ where
             CheckApplyingSnapStatus::Applying => {
                 // If this peer is applying snapshot, we should not get a new ready.
                 // There are two reasons in my opinion:
-                //   1. If we handle a new ready and persist the data(e.g. entries),
-                //      we can not tell raft-rs that this ready has been persisted because
-                //      the ready need to be persisted one by one from raft-rs's view.
-                //   2. When this peer is applying snapshot, the response msg should not
-                //      be sent to leader, thus the leader will not send new entries to
-                //      this peer. Although it's possible a new leader may send a AppendEntries
-                //      msg to this peer, this possibility is very low. In most cases, there
-                //      is no msg need to be handled.
+                //   1. If we handle a new ready and persist the data(e.g. entries), we can not
+                //      tell raft-rs that this ready has been persisted because the ready need
+                //      to be persisted one by one from raft-rs's view.
+                //   2. When this peer is applying snapshot, the response msg should not be sent
+                //      to leader, thus the leader will not send new entries to this peer.
+                //      Although it's possible a new leader may send a AppendEntries msg to this
+                //      peer, this possibility is very low. In most cases, there is no msg need
+                //      to be handled.
                 // So we choose to not get a new ready which makes the logic more clear.
                 debug!(
                     "still applying snapshot, skip further handling";
@@ -2622,11 +2506,19 @@ where
                 // i.e. call `RawNode::advance_apply_to`.
                 self.post_pending_read_index_on_replica(ctx);
                 // Resume `read_progress`
+                self.update_read_progress(ctx, ReadProgress::WaitData(false));
                 self.read_progress.resume();
                 // Update apply index to `last_applying_idx`
                 self.read_progress
                     .update_applied(self.last_applying_idx, &ctx.coprocessor_host);
-                self.notify_leader_the_peer_is_available(ctx);
+                if self.wait_data {
+                    self.notify_leader_the_peer_is_available(ctx);
+                    ctx.apply_router
+                        .schedule_task(self.region_id, ApplyTask::Recover(self.region_id));
+                    self.wait_data = false;
+                    self.should_reject_msgappend = false;
+                    return false;
+                }
             }
             CheckApplyingSnapStatus::Idle => {
                 // FIXME: It's possible that the snapshot applying task is canceled.
@@ -2647,22 +2539,19 @@ where
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
     ) {
-        if self.wait_data {
-            self.wait_data = false;
-            fail_point!("ignore notify leader the peer is available", |_| {});
-            let leader_id = self.leader_id();
-            let leader = self.get_peer_from_cache(leader_id);
-            if let Some(leader) = leader {
-                let mut msg = ExtraMessage::default();
-                msg.set_type(ExtraMessageType::MsgAvailabilityResponse);
-                msg.wait_data = false;
-                self.send_extra_message(msg, &mut ctx.trans, &leader);
-                info!(
-                    "notify leader the leader is available";
-                    "region id" => self.region().get_id(),
-                    "peer id" => self.peer.id
-                );
-            }
+        fail_point!("ignore notify leader the peer is available", |_| {});
+        let leader_id = self.leader_id();
+        let leader = self.get_peer_from_cache(leader_id);
+        if let Some(leader) = leader {
+            let mut msg = ExtraMessage::default();
+            msg.set_type(ExtraMessageType::MsgAvailabilityResponse);
+            msg.wait_data = false;
+            self.send_extra_message(msg, &mut ctx.trans, &leader);
+            info!(
+                "notify leader the peer is available";
+                "region_id" => self.region().get_id(),
+                "peer_id" => self.peer.id
+            );
         }
     }
 
@@ -2824,8 +2713,8 @@ where
             for entry in ready.entries() {
                 if let Some((term, times)) = self.proposals.find_trackers(entry.get_index()) {
                     if entry.term == term {
-                        trackers.extend_from_slice(times);
                         for tracker in times {
+                            trackers.push(*tracker);
                             tracker.observe(now, &ctx.raft_metrics.wf_send_to_queue, |t| {
                                 &mut t.metrics.wf_send_to_queue_nanos
                             });
@@ -3084,7 +2973,9 @@ where
                 commit_term,
                 committed_entries,
                 cbs,
-                self.region_buckets.as_ref().map(|b| b.meta.clone()),
+                self.region_buckets_info()
+                    .bucket_stat()
+                    .map(|b| b.meta.clone()),
             );
             apply.on_schedule(&ctx.raft_metrics);
             self.mut_store()
@@ -3101,6 +2992,11 @@ where
 
     /// Check long uncommitted proposals and log some info to help find why.
     pub fn check_long_uncommitted_proposals<T>(&mut self, ctx: &mut PollContext<EK, ER, T>) {
+        fail_point!(
+            "on_check_long_uncommitted_proposals_1",
+            self.peer_id() == 1,
+            |_| {}
+        );
         if self.has_long_uncommitted_proposals(ctx) {
             let status = self.raft_group.status();
             let mut buffer: Vec<(u64, u64, u64)> = Vec::new();
@@ -3185,9 +3081,8 @@ where
                 "after" => ?peer,
             );
             self.peer = peer;
-            // TODO: set priority for witness
-            // self.raft_group
-            //     .set_priority(if self.peer.is_witness { 0 } else { 1 });
+            self.raft_group
+                .set_priority(if self.peer.is_witness { -1 } else { 0 });
         };
 
         self.activate(ctx);
@@ -3240,13 +3135,13 @@ where
             let pre_persist_index = self.raft_group.raft.raft_log.persisted;
             let pre_commit_index = self.raft_group.raft.raft_log.committed;
             self.raft_group.on_persist_ready(self.persisted_number);
-            self.report_persist_log_duration(pre_persist_index, &ctx.raft_metrics);
-            self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
+            self.report_persist_log_duration(pre_persist_index, &mut ctx.raft_metrics);
+            self.report_commit_log_duration(pre_commit_index, &mut ctx.raft_metrics);
 
             let persist_index = self.raft_group.raft.raft_log.persisted;
             self.mut_store().update_cache_persisted(persist_index);
 
-            if let Some(ForceLeaderState::ForceLeader { .. }) = self.force_leader {
+            if self.is_in_force_leader() {
                 // forward commit index, the committed entries will be applied in the next raft
                 // base tick round
                 self.maybe_force_forward_commit_index();
@@ -3285,11 +3180,11 @@ where
         let pre_persist_index = self.raft_group.raft.raft_log.persisted;
         let pre_commit_index = self.raft_group.raft.raft_log.committed;
         let mut light_rd = self.raft_group.advance_append(ready);
-        self.report_persist_log_duration(pre_persist_index, &ctx.raft_metrics);
-        self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
+        self.report_persist_log_duration(pre_persist_index, &mut ctx.raft_metrics);
+        self.report_commit_log_duration(pre_commit_index, &mut ctx.raft_metrics);
 
         let persist_index = self.raft_group.raft.raft_log.persisted;
-        if let Some(ForceLeaderState::ForceLeader { .. }) = self.force_leader {
+        if self.is_in_force_leader() {
             // forward commit index, the committed entries will be applied in the next raft
             // base tick round
             self.maybe_force_forward_commit_index();
@@ -3349,7 +3244,7 @@ where
         let time = monotonic_raw_now();
         for (req, cb, mut read_index) in read.take_cmds().drain(..) {
             cb.read_tracker().map(|tracker| {
-                GLOBAL_TRACKERS.with_tracker(*tracker, |t| {
+                GLOBAL_TRACKERS.with_tracker(tracker, |t| {
                     t.metrics.read_index_confirm_wait_nanos =
                         (time - read.propose_time).to_std().unwrap().as_nanos() as u64;
                 })
@@ -3398,6 +3293,33 @@ where
         }
     }
 
+    pub(crate) fn respond_replica_read_error(
+        &self,
+        read_index_req: &mut ReadIndexRequest<Callback<EK::Snapshot>>,
+        response: RaftCmdResponse,
+    ) {
+        debug!(
+            "handle replica reads with a read index failed";
+            "request_id" => ?read_index_req.id,
+            "response" => ?response,
+            "peer_id" => self.peer_id(),
+        );
+        RAFT_READ_INDEX_PENDING_COUNT.sub(read_index_req.cmds().len() as i64);
+        let time = monotonic_raw_now();
+        for (_, ch, _) in read_index_req.take_cmds().drain(..) {
+            ch.read_tracker().map(|tracker| {
+                GLOBAL_TRACKERS.with_tracker(tracker, |t| {
+                    t.metrics.read_index_confirm_wait_nanos = (time - read_index_req.propose_time)
+                        .to_std()
+                        .unwrap()
+                        .as_nanos()
+                        as u64;
+                })
+            });
+            ch.report_error(response.clone());
+        }
+    }
+
     /// Responses to the ready read index request on the replica, the replica is
     /// not a leader.
     fn post_pending_read_index_on_replica<T>(&mut self, ctx: &mut PollContext<EK, ER, T>) {
@@ -3425,10 +3347,20 @@ where
                 && read.cmds()[0].0.get_requests().len() == 1
                 && read.cmds()[0].0.get_requests()[0].get_cmd_type() == CmdType::ReadIndex;
 
+            let read_index = read.read_index.unwrap();
             if is_read_index_request {
                 self.response_read(&mut read, ctx, false);
-            } else if self.ready_to_handle_unsafe_replica_read(read.read_index.unwrap()) {
+            } else if self.ready_to_handle_unsafe_replica_read(read_index) {
                 self.response_read(&mut read, ctx, true);
+            } else if self.get_store().applied_index() + ctx.cfg.follower_read_max_log_gap()
+                <= read_index
+            {
+                let mut response = cmd_resp::new_error(Error::ReadIndexNotReady {
+                    region_id: self.region_id,
+                    reason: "applied index fail behind read index too long",
+                });
+                cmd_resp::bind_term(&mut response, self.term());
+                self.respond_replica_read_error(&mut read, response);
             } else {
                 // TODO: `ReadIndex` requests could be blocked.
                 self.pending_reads.push_front(read);
@@ -3543,8 +3475,8 @@ where
         self.peer_stat.written_keys += apply_metrics.written_keys;
         self.peer_stat.written_bytes += apply_metrics.written_bytes;
         self.delete_keys_hint += apply_metrics.delete_keys_hint;
-        let diff = self.size_diff_hint as i64 + apply_metrics.size_diff_hint;
-        self.size_diff_hint = cmp::max(diff, 0) as u64;
+        self.split_check_trigger
+            .add_size_diff(apply_metrics.size_diff_hint);
 
         if self.has_pending_snapshot() && self.ready_to_handle_pending_snap() {
             has_ready = true;
@@ -3576,17 +3508,14 @@ where
     }
 
     pub fn post_split(&mut self) {
-        // Reset delete_keys_hint and size_diff_hint.
         self.delete_keys_hint = 0;
-        self.size_diff_hint = 0;
+        self.split_check_trigger.post_split();
+
         self.reset_region_buckets();
     }
 
     pub fn reset_region_buckets(&mut self) {
-        if self.region_buckets.is_some() {
-            self.last_region_buckets = self.region_buckets.take();
-            self.region_buckets = None;
-        }
+        self.region_buckets_info_mut().set_bucket_stat(None);
     }
 
     /// Try to renew leader lease.
@@ -3616,7 +3545,7 @@ where
             let term = self.term();
             self.leader_lease
                 .maybe_new_remote_lease(term)
-                .map(ReadProgress::leader_lease)
+                .map(ReadProgress::set_leader_lease)
         };
         if let Some(progress) = progress {
             let mut meta = ctx.store_meta.lock().unwrap();
@@ -3641,6 +3570,16 @@ where
             "progress" => ?progress,
         );
         reader.update(progress);
+    }
+
+    pub fn update_read_progress<T>(
+        &self,
+        ctx: &mut PollContext<EK, ER, T>,
+        progress: ReadProgress,
+    ) {
+        let mut meta = ctx.store_meta.lock().unwrap();
+        let reader = meta.readers.get_mut(&self.region_id).unwrap();
+        self.maybe_update_read_progress(reader, progress);
     }
 
     pub fn maybe_campaign(&mut self, parent_is_leader: bool) -> bool {
@@ -3744,6 +3683,7 @@ where
                     cb,
                     propose_time: None,
                     must_pass_epoch_check: has_applied_to_current_term,
+                    sent: false,
                 };
                 if let Some(cmd_type) = req_admin_cmd_type {
                     self.cmd_epoch_checker
@@ -4042,7 +3982,7 @@ where
             .get_mut(0)
             .filter(|req| req.has_read_index())
             .map(|req| req.take_read_index());
-        let (id, dropped) = self.propose_read_index(request.as_ref(), None);
+        let (id, dropped) = self.propose_read_index(request.as_ref());
         if dropped && self.is_leader() {
             // The message gets dropped silently, can't be handled anymore.
             apply::notify_stale_req(self.term(), cb);
@@ -4075,6 +4015,7 @@ where
                     cb: Callback::None,
                     propose_time: Some(now),
                     must_pass_epoch_check: false,
+                    sent: false,
                 };
                 self.post_propose(poll_ctx, p);
             }
@@ -4088,9 +4029,8 @@ where
     pub fn propose_read_index(
         &mut self,
         request: Option<&raft_cmdpb::ReadIndexRequest>,
-        locked: Option<&LockInfo>,
     ) -> (Uuid, bool) {
-        propose_read_index(&mut self.raft_group, request, locked)
+        propose_read_index(&mut self.raft_group, request)
     }
 
     /// Returns (minimal matched, minimal committed_index)
@@ -4554,13 +4494,10 @@ where
         msg: &eraftpb::Message,
         peer_disk_usage: DiskUsage,
     ) -> bool {
-        if self.is_witness() {
-            // shouldn't transfer leader to witness peer
-            return true;
-        }
-
         let pending_snapshot = self.is_handling_snapshot() || self.has_pending_snapshot();
-        if pending_snapshot
+        // shouldn't transfer leader to witness peer or non-witness waiting data
+        if self.is_witness() || self.wait_data
+            || pending_snapshot
             || msg.get_from() != self.leader_id()
             // Transfer leader to node with disk full will lead to write availablity downback.
             // But if the current leader is disk full, and send such request, we should allow it,
@@ -4575,6 +4512,8 @@ where
                 "from" => msg.get_from(),
                 "pending_snapshot" => pending_snapshot,
                 "disk_usage" => ?ctx.self_disk_usage,
+                "is_witness" => self.is_witness(),
+                "wait_data" => self.wait_data,
             );
             return true;
         }
@@ -4654,33 +4593,31 @@ where
         self.raft_group.raft.msgs.push(msg);
     }
 
-    /// Return true to if the transfer leader request is accepted.
+    /// Return true if the transfer leader request is accepted.
     ///
     /// When transferring leadership begins, leader sends a pre-transfer
     /// to target follower first to ensures it's ready to become leader.
     /// After that the real transfer leader process begin.
     ///
-    /// 1. pre_transfer_leader on leader:
-    ///     Leader will send a MsgTransferLeader to follower.
-    /// 2. pre_ack_transfer_leader_msg on follower:
-    ///     If follower passes all necessary checks, it will try to warmup
-    ///     the entry cache.
-    /// 3. ack_transfer_leader_msg on follower:
-    ///     When the entry cache has been warmed up or the operator is timeout,
-    ///     the follower reply an ACK with type MsgTransferLeader and
-    ///     its promised persistent index.
+    /// 1. pre_transfer_leader on leader: Leader will send a MsgTransferLeader
+    ///    to follower.
+    /// 2. pre_ack_transfer_leader_msg on follower: If follower passes all
+    ///    necessary checks, it will try to warmup the entry cache.
+    /// 3. ack_transfer_leader_msg on follower: When the entry cache has been
+    ///    warmed up or the operator is timeout, the follower reply an ACK with
+    ///    type MsgTransferLeader and its promised persistent index.
     ///
     /// Additional steps when there are remaining pessimistic
     /// locks to propose (detected in function on_transfer_leader_msg).
     ///    1. Leader firstly proposes pessimistic locks and then proposes a
     ///       TransferLeader command.
-    ///    2. ack_transfer_leader_msg on follower again:
-    ///        The follower applies the TransferLeader command and replies an
-    ///        ACK with special context TRANSFER_LEADER_COMMAND_REPLY_CTX.
+    ///    2. ack_transfer_leader_msg on follower again: The follower applies
+    ///       the TransferLeader command and replies an ACK with special context
+    ///       TRANSFER_LEADER_COMMAND_REPLY_CTX.
     ///
-    /// 4. ready_to_transfer_leader on leader:
-    ///     Leader checks if it's appropriate to transfer leadership. If it
-    ///     does, it calls raft transfer_leader API to do the remaining work.
+    /// 4. ready_to_transfer_leader on leader: Leader checks if it's appropriate
+    ///    to transfer leadership. If it does, it calls raft transfer_leader API
+    ///    to do the remaining work.
     ///
     /// See also: tikv/rfcs#37.
     fn propose_transfer_leader<T>(
@@ -4728,7 +4665,7 @@ where
             });
         let peer = match peers.len() {
             0 => transfer_leader.get_peer(),
-            1 => peers.get(0).unwrap(),
+            1 => peers.first().unwrap(),
             _ => peers.choose(&mut rand::thread_rng()).unwrap(),
         };
 
@@ -4763,7 +4700,7 @@ where
         if self.pending_merge_state.is_some() {
             return Err(Error::ProposalInMergingMode(self.region_id));
         }
-        if self.raft_group.raft.pending_conf_index > self.get_store().applied_index() {
+        if self.raft_group.raft.has_pending_conf() {
             info!(
                 "there is a pending conf change, try later";
                 "region_id" => self.region_id,
@@ -4846,7 +4783,8 @@ where
             &self.peer,
             changes.as_ref(),
             &cc,
-            self.is_force_leader(),
+            self.is_in_force_leader(),
+            &self.peer_heartbeats,
         )?;
 
         ctx.raft_metrics.propose.conf_change.inc();
@@ -4880,7 +4818,7 @@ where
     ) -> ReadResponse<EK::Snapshot> {
         let region = self.region().clone();
         if check_epoch {
-            if let Err(e) = check_region_epoch(&req, &region, true) {
+            if let Err(e) = check_req_region_epoch(&req, &region, true) {
                 debug!("epoch not match"; "region_id" => region.get_id(), "err" => ?e);
                 let mut response = cmd_resp::new_error(e);
                 cmd_resp::bind_term(&mut response, self.term());
@@ -4903,8 +4841,8 @@ where
                 }
                 warn!(
                     "read rejected by safe timestamp";
-                    "safe ts" => safe_ts,
-                    "read ts" => read_ts,
+                    "safe_ts" => safe_ts,
+                    "read_ts" => read_ts,
                     "tag" => &self.tag,
                 );
                 let mut response = cmd_resp::new_error(Error::DataIsNotReady {
@@ -4921,10 +4859,22 @@ where
             }
         }
 
-        let mut resp = reader.execute(&req, &Arc::new(region), read_index, None);
+        let snap_ctx = if let Ok(read_ts) = decode_u64(&mut req.get_header().get_flag_data()) {
+            Some(SnapshotContext {
+                range: Some(CacheRange::from_region(&region)),
+                read_ts,
+            })
+        } else {
+            None
+        };
+
+        let mut resp = reader.execute(&req, &Arc::new(region), read_index, snap_ctx, None);
         if let Some(snap) = resp.snapshot.as_mut() {
             snap.txn_ext = Some(self.txn_ext.clone());
-            snap.bucket_meta = self.region_buckets.as_ref().map(|b| b.meta.clone());
+            snap.bucket_meta = self
+                .region_buckets_info()
+                .bucket_stat()
+                .map(|s| s.meta.clone());
         }
         resp.txn_extra_op = self.txn_extra_op.load();
         cmd_resp::bind_term(&mut resp.response, self.term());
@@ -4949,7 +4899,7 @@ where
             return;
         }
         if let Some(ref state) = self.pending_merge_state {
-            if state.get_commit() == extra_msg.get_premerge_commit() {
+            if state.get_commit() == extra_msg.get_index() {
                 self.add_want_rollback_merge_peer(peer_id);
             }
         }
@@ -5190,7 +5140,8 @@ where
     }
 
     pub fn maybe_gen_approximate_buckets<T>(&self, ctx: &PollContext<EK, ER, T>) {
-        if ctx.coprocessor_host.cfg.enable_region_bucket && !self.region().get_peers().is_empty() {
+        if ctx.coprocessor_host.cfg.enable_region_bucket() && !self.region().get_peers().is_empty()
+        {
             if let Err(e) = ctx
                 .split_check_scheduler
                 .schedule(SplitCheckTask::ApproximateBuckets(self.region().clone()))
@@ -5206,7 +5157,7 @@ where
     }
 
     #[inline]
-    pub fn is_force_leader(&self) -> bool {
+    pub fn is_in_force_leader(&self) -> bool {
         matches!(
             self.force_leader,
             Some(ForceLeaderState::ForceLeader { .. })
@@ -5218,7 +5169,7 @@ where
             &self.unsafe_recovery_state
         {
             if self.raft_group.raft.raft_log.applied >= *target_index || force {
-                if self.is_force_leader() {
+                if self.is_in_force_leader() {
                     info!(
                         "Unsafe recovery, finish wait apply";
                         "region_id" => self.region().get_id(),
@@ -5292,6 +5243,15 @@ impl DiskFullPeers {
     }
     pub fn majority(&self) -> bool {
         self.majority
+    }
+    pub fn set_majority(&mut self, majority: bool) {
+        self.majority = majority;
+    }
+    pub fn peers(&self) -> &HashMap<u64, (DiskUsage, bool)> {
+        &self.peers
+    }
+    pub fn peers_mut(&mut self) -> &mut HashMap<u64, (DiskUsage, bool)> {
+        &mut self.peers
     }
     pub fn has(&self, peer_id: u64) -> bool {
         !self.peers.is_empty() && self.peers.contains_key(&peer_id)
@@ -5424,8 +5384,8 @@ where
             pending_peers: self.collect_pending_peers(ctx),
             written_bytes: self.peer_stat.written_bytes,
             written_keys: self.peer_stat.written_keys,
-            approximate_size: self.approximate_size,
-            approximate_keys: self.approximate_keys,
+            approximate_size: self.split_check_trigger.approximate_size,
+            approximate_keys: self.split_check_trigger.approximate_keys,
             replication_status: self.region_replication_status(ctx),
             wait_data_peers: self.wait_data_peers.clone(),
         });
@@ -5607,7 +5567,7 @@ where
         };
         let mut extra_msg = ExtraMessage::default();
         extra_msg.set_type(ExtraMessageType::MsgWantRollbackMerge);
-        extra_msg.set_premerge_commit(premerge_commit);
+        extra_msg.set_index(premerge_commit);
         self.send_extra_message(extra_msg, &mut ctx.trans, &to_peer);
     }
 
@@ -5784,7 +5744,6 @@ pub trait RequestInspector {
         }
 
         // Local read should be performed, if and only if leader is in lease.
-        // None for now.
         match self.inspect_lease() {
             LeaseState::Valid => Ok(RequestPolicy::ReadLocal),
             LeaseState::Expired | LeaseState::Suspect => {
@@ -5835,8 +5794,12 @@ where
         &self.engines.kv
     }
 
-    fn get_snapshot(&mut self, _: &Option<LocalReadContext<'_, EK>>) -> Arc<EK::Snapshot> {
-        Arc::new(self.engines.kv.snapshot())
+    fn get_snapshot(
+        &mut self,
+        snap_ctx: Option<SnapshotContext>,
+        _: &Option<LocalReadContext<'_, EK>>,
+    ) -> Arc<EK::Snapshot> {
+        Arc::new(self.engines.kv.snapshot(snap_ctx))
     }
 }
 
@@ -5892,10 +5855,11 @@ fn is_request_urgent(req: &RaftCmdRequest) -> bool {
             | AdminCmdType::PrepareMerge
             | AdminCmdType::CommitMerge
             | AdminCmdType::RollbackMerge
+            | AdminCmdType::BatchSwitchWitness
     )
 }
 
-fn make_transfer_leader_response() -> RaftCmdResponse {
+pub fn make_transfer_leader_response() -> RaftCmdResponse {
     let mut response = AdminResponse::default();
     response.set_cmd_type(AdminCmdType::TransferLeader);
     response.set_transfer_leader(TransferLeaderResponse::default());
@@ -5964,6 +5928,7 @@ mod tests {
             AdminCmdType::ComputeHash,
             AdminCmdType::VerifyHash,
             AdminCmdType::BatchSwitchWitness,
+            AdminCmdType::UpdateGcPeer,
         ];
         for tp in AdminCmdType::values() {
             let mut msg = RaftCmdRequest::default();
@@ -5989,6 +5954,7 @@ mod tests {
             AdminCmdType::PrepareMerge,
             AdminCmdType::CommitMerge,
             AdminCmdType::RollbackMerge,
+            AdminCmdType::BatchSwitchWitness,
         ];
         for tp in AdminCmdType::values() {
             let mut req = RaftCmdRequest::default();
@@ -6070,7 +6036,7 @@ mod tests {
         admin_req.clear_transfer_leader();
         req.clear_admin_request();
 
-        for (op, policy) in vec![
+        for (op, policy) in [
             (CmdType::Get, RequestPolicy::ReadLocal),
             (CmdType::Snap, RequestPolicy::ReadLocal),
             (CmdType::Put, RequestPolicy::ProposeNormal),
@@ -6162,6 +6128,7 @@ mod tests {
                 cb: Callback::write(Box::new(|_| {})),
                 propose_time: Some(u64_to_timespec(index)),
                 must_pass_epoch_check: false,
+                sent: false,
             });
         };
         for index in 1..=100 {
@@ -6208,6 +6175,10 @@ mod tests {
         fn must_call() -> ExtCallback {
             let mut d = DropPanic(true);
             Box::new(move || {
+                // Must move the entire struct to closure,
+                // or else it will be dropped early in 2021 edition
+                // https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+                let _ = &d;
                 d.0 = false;
             })
         }
@@ -6218,7 +6189,7 @@ mod tests {
 
         // (1, 4) and (1, 5) is not committed
         let entries = vec![(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (2, 6), (2, 7)];
-        let committed = vec![(1, 1), (1, 2), (1, 3), (2, 6), (2, 7)];
+        let committed = [(1, 1), (1, 2), (1, 3), (2, 6), (2, 7)];
         for (index, term) in entries.clone() {
             if term != 1 {
                 continue;
@@ -6235,6 +6206,7 @@ mod tests {
                 is_conf_change: false,
                 propose_time: None,
                 must_pass_epoch_check: false,
+                sent: false,
             });
         }
         for (index, term) in entries {

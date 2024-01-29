@@ -30,7 +30,10 @@ command! {
     /// This should follow after a `ResolveLockReadPhase`.
     ResolveLock:
         cmd_ty => (),
-        display => "kv::resolve_lock {:?} scan_key({:?}) key_locks({:?})", (txn_status, scan_key, key_locks),
+        display => {
+            "kv::resolve_lock {:?} scan_key({:?}) key_locks({:?})",
+            (txn_status, scan_key, key_locks),
+        }
         content => {
             /// Maps lock_ts to commit_ts. If a transaction was rolled back, it is mapped to 0.
             ///
@@ -83,6 +86,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
         let mut scan_key = self.scan_key.take();
         let rows = key_locks.len();
         let mut released_locks = ReleasedLocks::new();
+        let mut known_txn_status = vec![];
         for (current_key, current_lock) in key_locks {
             txn.start_ts = current_lock.ts;
             reader.start_ts = current_lock.ts;
@@ -103,7 +107,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
                 // type. They could be left if the transaction is finally committed and
                 // pessimistic conflict retry happens during execution.
                 match commit(&mut txn, &mut reader, current_key.clone(), commit_ts) {
-                    Ok(res) => res,
+                    Ok(res) => {
+                        known_txn_status.push((current_lock.ts, commit_ts));
+                        res
+                    }
                     Err(MvccError(box MvccErrorInner::TxnLockNotFound { .. }))
                         if current_lock.is_pessimistic_lock() =>
                     {
@@ -125,6 +132,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
             }
         }
 
+        known_txn_status.sort();
+        known_txn_status.dedup();
+
         let pr = if scan_key.is_none() {
             ProcessResult::Res
         } else {
@@ -138,6 +148,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
                 cmd: Command::ResolveLockReadPhase(next_cmd),
             }
         };
+        let new_acquired_locks = txn.take_new_locks();
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
         write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
@@ -147,8 +158,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
             pr,
             lock_info: vec![],
             released_locks,
+            new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
+            known_txn_status,
         })
     }
 }

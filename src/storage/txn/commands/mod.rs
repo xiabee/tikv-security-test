@@ -18,6 +18,7 @@ pub(crate) mod mvcc_by_key;
 pub(crate) mod mvcc_by_start_ts;
 pub(crate) mod pause;
 pub(crate) mod pessimistic_rollback;
+mod pessimistic_rollback_read_phase;
 pub(crate) mod prewrite;
 pub(crate) mod resolve_lock;
 pub(crate) mod resolve_lock_lite;
@@ -52,6 +53,7 @@ pub use mvcc_by_key::MvccByKey;
 pub use mvcc_by_start_ts::MvccByStartTs;
 pub use pause::Pause;
 pub use pessimistic_rollback::PessimisticRollback;
+pub use pessimistic_rollback_read_phase::PessimisticRollbackReadPhase;
 pub use prewrite::{one_pc_commit, Prewrite, PrewritePessimistic};
 pub use resolve_lock::{ResolveLock, RESOLVE_LOCK_BATCH_SIZE};
 pub use resolve_lock_lite::ResolveLockLite;
@@ -70,7 +72,7 @@ use crate::storage::{
     },
     metrics,
     mvcc::{Lock as MvccLock, MvccReader, ReleasedLock, SnapshotReader},
-    txn::{latch, ProcessResult, Result},
+    txn::{latch, txn_status_cache::TxnStatusCache, ProcessResult, Result},
     types::{
         MvccInfo, PessimisticLockParameters, PessimisticLockResults, PrewriteResult,
         SecondaryLocksStatus, StorageCallbackType, TxnStatus,
@@ -95,6 +97,7 @@ pub enum Command {
     Cleanup(Cleanup),
     Rollback(Rollback),
     PessimisticRollback(PessimisticRollback),
+    PessimisticRollbackReadPhase(PessimisticRollbackReadPhase),
     TxnHeartBeat(TxnHeartBeat),
     CheckTxnStatus(CheckTxnStatus),
     CheckSecondaryLocks(CheckSecondaryLocks),
@@ -121,7 +124,8 @@ pub enum Command {
 /// 2. The `From<CommitRequest>` impl for `TypedCommand` gets chosen, and its
 /// generic parameter indicates that the result type for this instance of
 /// `TypedCommand` is going to be `TxnStatus` - one of the variants of the
-/// `StorageCallback` enum. 3. In the above `from` method, the details of the
+/// `StorageCallback` enum.
+/// 3. In the above `from` method, the details of the
 /// commit request are captured by creating an instance of the struct
 /// `storage::txn::commands::commit::Command` via its `new` method.
 /// 4. This struct is wrapped in a variant of the enum
@@ -197,6 +201,7 @@ impl From<PrewriteRequest> for TypedCommand<PrewriteResult> {
                 secondary_keys,
                 req.get_try_one_pc(),
                 req.get_assertion_level(),
+                req.take_for_update_ts_constraints().into(),
                 req.take_context(),
             )
         }
@@ -273,14 +278,26 @@ impl From<BatchRollbackRequest> for TypedCommand<()> {
 
 impl From<PessimisticRollbackRequest> for TypedCommand<Vec<StorageResult<()>>> {
     fn from(mut req: PessimisticRollbackRequest) -> Self {
-        let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
-
-        PessimisticRollback::new(
-            keys,
-            req.get_start_version().into(),
-            req.get_for_update_ts().into(),
-            req.take_context(),
-        )
+        // If the keys are empty, try to scan locks with specified `start_ts` and
+        // `for_update_ts`, and then pass them to a new pessimitic rollback
+        // command to clean up, just like resolve lock with read phase.
+        if req.get_keys().is_empty() {
+            PessimisticRollbackReadPhase::new(
+                req.get_start_version().into(),
+                req.get_for_update_ts().into(),
+                None,
+                req.take_context(),
+            )
+        } else {
+            let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
+            PessimisticRollback::new(
+                keys,
+                req.get_start_version().into(),
+                req.get_for_update_ts().into(),
+                None,
+                req.take_context(),
+            )
+        }
     }
 }
 
@@ -418,8 +435,15 @@ pub struct WriteResult {
     pub pr: ProcessResult,
     pub lock_info: Vec<WriteResultLockInfo>,
     pub released_locks: ReleasedLocks,
+    pub new_acquired_locks: Vec<LockInfo>,
     pub lock_guards: Vec<KeyHandleGuard>,
     pub response_policy: ResponsePolicy,
+    /// The txn status that can be inferred by the successful writing. This will
+    /// be used to update the cache.
+    ///
+    /// Currently only commit_ts of committed transactions will be collected.
+    /// Rolled-back transactions may also be collected in the future.
+    pub known_txn_status: Vec<(TimeStamp, TimeStamp)>,
 }
 
 pub struct WriteResultLockInfo {
@@ -571,6 +595,7 @@ pub struct WriteContext<'a, L: LockManager> {
     pub statistics: &'a mut Statistics,
     pub async_apply_prewrite: bool,
     pub raw_ext: Option<RawExt>, // use for apiv2
+    pub txn_status_cache: &'a TxnStatusCache,
 }
 
 pub struct ReaderWithStats<'a, S: Snapshot> {
@@ -617,6 +642,7 @@ impl Command {
             Command::Cleanup(t) => t,
             Command::Rollback(t) => t,
             Command::PessimisticRollback(t) => t,
+            Command::PessimisticRollbackReadPhase(t) => t,
             Command::TxnHeartBeat(t) => t,
             Command::CheckTxnStatus(t) => t,
             Command::CheckSecondaryLocks(t) => t,
@@ -643,6 +669,7 @@ impl Command {
             Command::Cleanup(t) => t,
             Command::Rollback(t) => t,
             Command::PessimisticRollback(t) => t,
+            Command::PessimisticRollbackReadPhase(t) => t,
             Command::TxnHeartBeat(t) => t,
             Command::CheckTxnStatus(t) => t,
             Command::CheckSecondaryLocks(t) => t,
@@ -666,6 +693,7 @@ impl Command {
     ) -> Result<ProcessResult> {
         match self {
             Command::ResolveLockReadPhase(t) => t.process_read(snapshot, statistics),
+            Command::PessimisticRollbackReadPhase(t) => t.process_read(snapshot, statistics),
             Command::MvccByKey(t) => t.process_read(snapshot, statistics),
             Command::MvccByStartTs(t) => t.process_read(snapshot, statistics),
             Command::FlashbackToVersionReadPhase(t) => t.process_read(snapshot, statistics),
@@ -713,6 +741,16 @@ impl Command {
             return CommandPri::High;
         }
         self.command_ext().get_ctx().get_priority()
+    }
+
+    pub fn resource_control_ctx(&self) -> &ResourceControlContext {
+        self.command_ext().get_ctx().get_resource_control_context()
+    }
+
+    pub fn group_name(&self) -> String {
+        self.resource_control_ctx()
+            .get_resource_group_name()
+            .to_owned()
     }
 
     pub fn need_flow_control(&self) -> bool {
@@ -811,6 +849,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
         let ret = cmd.cmd.process_write(snap, context)?;
         let res = match ret.pr {
@@ -925,6 +964,28 @@ pub mod test_util {
         prewrite_command(engine, cm, statistics, cmd)
     }
 
+    pub fn pessimistic_prewrite_check_for_update_ts<E: Engine>(
+        engine: &mut E,
+        statistics: &mut Statistics,
+        mutations: Vec<(Mutation, PrewriteRequestPessimisticAction)>,
+        primary: Vec<u8>,
+        start_ts: u64,
+        for_update_ts: u64,
+        for_update_ts_constraints: impl IntoIterator<Item = (usize, u64)>,
+    ) -> Result<PrewriteResult> {
+        let cmd = PrewritePessimistic::with_for_update_ts_constraints(
+            mutations,
+            primary,
+            start_ts.into(),
+            for_update_ts.into(),
+            for_update_ts_constraints
+                .into_iter()
+                .map(|(size, ts)| (size, TimeStamp::from(ts))),
+        );
+        let cm = ConcurrencyManager::new(start_ts.into());
+        prewrite_command(engine, cm, statistics, cmd)
+    }
+
     pub fn commit<E: Engine>(
         engine: &mut E,
         statistics: &mut Statistics,
@@ -949,6 +1010,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
 
         let ret = cmd.cmd.process_write(snap, context)?;
@@ -974,6 +1036,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
 
         let ret = cmd.cmd.process_write(snap, context)?;
