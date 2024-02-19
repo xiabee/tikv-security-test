@@ -2,7 +2,6 @@
 name = "raftstore-v2"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
 
 [features]
 default = ["testexport", "test-engine-kv-rocksdb", "test-engine-raft-raft-engine"]
@@ -24,6 +23,10 @@ test-engines-panic = [
   "raftstore/test-engines-panic",
   "engine_test/test-engines-panic",
 ]
+
+cloud-aws = ["raftstore/cloud-aws"]
+cloud-gcp = ["raftstore/cloud-gcp"]
+cloud-azure = ["raftstore/cloud-azure"]
 
 [dependencies]
 batch-system = { workspace = true }
@@ -58,7 +61,7 @@ smallvec = "1.4"
 sst_importer = { workspace = true }
 thiserror = "1.0"
 tikv_util = { workspace = true }
-time = { workspace = true }
+time = "0.1"
 tracker = { workspace = true }
 txn_types = { workspace = true }
 yatp = { git = "https://github.com/tikv/yatp.git", branch = "master" }

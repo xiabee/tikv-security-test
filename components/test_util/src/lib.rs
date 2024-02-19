@@ -18,7 +18,6 @@ use std::{
     fmt::Debug,
     sync::atomic::{AtomicU16, Ordering},
     thread,
-    time::Duration,
 };
 
 use rand::Rng;
@@ -28,6 +27,7 @@ pub use crate::{
     encryption::*,
     kv_generator::*,
     logging::*,
+    macros::*,
     runner::{clear_failpoints, run_failpoint_tests, run_test_with_hook, run_tests, TestHook},
     security::*,
 };
@@ -153,22 +153,4 @@ pub fn assert_eq_debug<C: PartialEq + Debug>(lhs: &C, rhs: &C) {
         "config not matched:\nlhs: ...{}...,\nrhs: ...{}...",
         lhs_diff, rhs_diff
     );
-}
-
-#[track_caller]
-pub fn eventually(tick: Duration, total: Duration, mut check: impl FnMut() -> bool) {
-    let start = std::time::Instant::now();
-    loop {
-        if check() {
-            return;
-        }
-        if start.elapsed() < total {
-            std::thread::sleep(tick);
-            continue;
-        }
-        panic!(
-            "failed to pass the check after {:?} elapsed",
-            start.elapsed()
-        );
-    }
 }

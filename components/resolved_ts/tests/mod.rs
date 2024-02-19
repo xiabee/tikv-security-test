@@ -4,7 +4,6 @@ use std::{sync::*, time::Duration};
 
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
-use engine_rocks::RocksEngine;
 use futures::{executor::block_on, stream, SinkExt};
 use grpcio::{ChannelBuilder, ClientUnaryReceiver, Environment, Result, WriteFlags};
 use kvproto::{
@@ -27,7 +26,7 @@ pub fn init() {
 }
 
 pub struct TestSuite {
-    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    pub cluster: Cluster<ServerCluster>,
     pub endpoints: HashMap<u64, LazyWorker<Task>>,
     pub obs: HashMap<u64, Observer>,
     tikv_cli: HashMap<u64, TikvClient>,
@@ -45,10 +44,7 @@ impl TestSuite {
         Self::with_cluster(count, cluster)
     }
 
-    pub fn with_cluster(
-        count: usize,
-        mut cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
-    ) -> Self {
+    pub fn with_cluster(count: usize, mut cluster: Cluster<ServerCluster>) -> Self {
         init();
         let pd_cli = cluster.pd_client.clone();
         let mut endpoints = HashMap::default();

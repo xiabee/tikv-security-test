@@ -89,14 +89,15 @@ use crate::{
             TRANSFER_LEADER_COMMAND_REPLY_CTX,
         },
         region_meta::RegionMeta,
-        snapshot_backup::{AbortReason, SnapshotBrState, SnapshotBrWaitApplyRequest},
         transport::Transport,
         unsafe_recovery::{
-            exit_joint_request, ForceLeaderState, UnsafeRecoveryExecutePlanSyncer,
+            exit_joint_request, ForceLeaderState, SnapshotRecoveryState,
+            SnapshotRecoveryWaitApplySyncer, UnsafeRecoveryExecutePlanSyncer,
             UnsafeRecoveryFillOutReportSyncer, UnsafeRecoveryForceLeaderSyncer,
             UnsafeRecoveryState, UnsafeRecoveryWaitApplySyncer,
         },
-        util::{self, compare_region_epoch, KeysInfoFormatter, LeaseState},
+        util,
+        util::{KeysInfoFormatter, LeaseState},
         worker::{
             Bucket, BucketRange, CleanupTask, ConsistencyCheckTask, GcSnapshotTask, RaftlogGcTask,
             ReadDelegate, ReadProgress, RegionTask, SplitCheckTask,
@@ -783,9 +784,7 @@ where
         syncer: UnsafeRecoveryExecutePlanSyncer,
         failed_voters: Vec<metapb::Peer>,
     ) {
-        if let Some(state) = &self.fsm.peer.unsafe_recovery_state
-            && !state.is_abort()
-        {
+        if let Some(state) = &self.fsm.peer.unsafe_recovery_state && !state.is_abort() {
             warn!(
                 "Unsafe recovery, demote failed voters has already been initiated";
                 "region_id" => self.region().get_id(),
@@ -891,9 +890,7 @@ where
     }
 
     fn on_unsafe_recovery_destroy(&mut self, syncer: UnsafeRecoveryExecutePlanSyncer) {
-        if let Some(state) = &self.fsm.peer.unsafe_recovery_state
-            && !state.is_abort()
-        {
+        if let Some(state) = &self.fsm.peer.unsafe_recovery_state && !state.is_abort() {
             warn!(
                 "Unsafe recovery, can't destroy, another plan is executing in progress";
                 "region_id" => self.region_id(),
@@ -912,9 +909,7 @@ where
     }
 
     fn on_unsafe_recovery_wait_apply(&mut self, syncer: UnsafeRecoveryWaitApplySyncer) {
-        if let Some(state) = &self.fsm.peer.unsafe_recovery_state
-            && !state.is_abort()
-        {
+        if let Some(state) = &self.fsm.peer.unsafe_recovery_state && !state.is_abort() {
             warn!(
                 "Unsafe recovery, can't wait apply, another plan is executing in progress";
                 "region_id" => self.region_id(),
@@ -954,7 +949,7 @@ where
     // func be invoked firstly after assigned leader by BR, wait all leader apply to
     // last log index func be invoked secondly wait follower apply to last
     // index, however the second call is broadcast, it may improve in future
-    fn on_snapshot_br_wait_apply(&mut self, req: SnapshotBrWaitApplyRequest) {
+    fn on_snapshot_recovery_wait_apply(&mut self, syncer: SnapshotRecoveryWaitApplySyncer) {
         if let Some(state) = &self.fsm.peer.snapshot_recovery_state {
             warn!(
                 "can't wait apply, another recovery in progress";
@@ -962,47 +957,20 @@ where
                 "peer_id" => self.fsm.peer_id(),
                 "state" => ?state,
             );
-            req.syncer.abort(AbortReason::Duplicated);
+            syncer.abort();
             return;
         }
 
         let target_index = self.fsm.peer.raft_group.raft.raft_log.last_index();
-        let applied_index = self.fsm.peer.raft_group.raft.raft_log.applied;
-        let term = self.fsm.peer.raft_group.raft.term;
-        if let Some(e) = &req.expected_epoch {
-            if let Err(err) = compare_region_epoch(e, self.region(), true, true, true) {
-                warn!("epoch not match for wait apply, aborting."; "err" => %err, 
-                    "peer" => self.fsm.peer.peer_id(), 
-                    "region" => self.fsm.peer.region().get_id());
-                let mut pberr = errorpb::Error::from(err);
-                req.syncer
-                    .abort(AbortReason::EpochNotMatch(pberr.take_epoch_not_match()));
-                return;
-            }
-        }
-
-        // trivial case: no need to wait apply -- already the latest.
-        // Return directly for avoiding to print tons of logs.
-        if target_index == applied_index {
-            debug!(
-                "skip trivial case of waiting apply.";
-                "region_id" => self.region_id(),
-                "peer_id" => self.fsm.peer_id(),
-                "target_index" => target_index,
-                "applied_index" => applied_index,
-            );
-            SNAP_BR_WAIT_APPLY_EVENT.trivial.inc();
-            return;
-        }
 
         // during the snapshot recovery, broadcast waitapply, some peer may stale
         if !self.fsm.peer.is_leader() {
             info!(
-                "snapshot follower wait apply started";
+                "snapshot follower recovery started";
                 "region_id" => self.region_id(),
                 "peer_id" => self.fsm.peer_id(),
                 "target_index" => target_index,
-                "applied_index" => applied_index,
+                "applied_index" => self.fsm.peer.raft_group.raft.raft_log.applied,
                 "pending_remove" => self.fsm.peer.pending_remove,
                 "voter" => self.fsm.peer.raft_group.raft.vote,
             );
@@ -1012,8 +980,7 @@ where
             // case#2 if peer is suppose to remove
             if self.fsm.peer.raft_group.raft.vote == 0 || self.fsm.peer.pending_remove {
                 info!(
-                    "this peer is never vote before or pending remove, it should be skip to wait apply";
-                    "region" => %self.region_id(),
+                    "this peer is never vote before or pending remove, it should be skip to wait apply"
                 );
                 return;
             }
@@ -1023,15 +990,13 @@ where
                 "region_id" => self.region_id(),
                 "peer_id" => self.fsm.peer_id(),
                 "target_index" => target_index,
-                "applied_index" => applied_index,
+                "applied_index" => self.fsm.peer.raft_group.raft.raft_log.applied,
             );
         }
-        SNAP_BR_WAIT_APPLY_EVENT.accepted.inc();
 
-        self.fsm.peer.snapshot_recovery_state = Some(SnapshotBrState::WaitLogApplyToLast {
+        self.fsm.peer.snapshot_recovery_state = Some(SnapshotRecoveryState::WaitLogApplyToLast {
             target_index,
-            valid_for_term: req.abort_when_term_change.then_some(term),
-            syncer: req.syncer,
+            syncer,
         });
         self.fsm
             .peer
@@ -1074,10 +1039,10 @@ where
             // in snapshot recovery after we stopped all conf changes from PD.
             // if the follower slow than leader and has the pending conf change.
             // that's means
-            // 1. if the follower didn't finished the conf change => it cannot be chosen to
-            //    be leader during recovery.
-            // 2. if the follower has been chosen to be leader => it already apply the
-            //    pending conf change already.
+            // 1. if the follower didn't finished the conf change
+            //    => it cannot be chosen to be leader during recovery.
+            // 2. if the follower has been chosen to be leader
+            //    => it already apply the pending conf change already.
             return;
         }
         debug!(
@@ -1538,7 +1503,9 @@ where
                 self.on_unsafe_recovery_fill_out_report(syncer)
             }
             // for snapshot recovery (safe recovery)
-            SignificantMsg::SnapshotBrWaitApply(syncer) => self.on_snapshot_br_wait_apply(syncer),
+            SignificantMsg::SnapshotRecoveryWaitApply(syncer) => {
+                self.on_snapshot_recovery_wait_apply(syncer)
+            }
             SignificantMsg::CheckPendingAdmin(ch) => self.on_check_pending_admin(ch),
         }
     }
@@ -1759,11 +1726,8 @@ where
         if self.fsm.peer.force_leader.is_none() {
             return;
         }
-        if let Some(UnsafeRecoveryState::Failed) = self.fsm.peer.unsafe_recovery_state
-            && !force
-        {
-            // Skip force leader if the plan failed, so wait for the next retry of plan with
-            // force leader state holding
+        if let Some(UnsafeRecoveryState::Failed) = self.fsm.peer.unsafe_recovery_state && !force {
+            // Skip force leader if the plan failed, so wait for the next retry of plan with force leader state holding
             info!(
                 "skip exiting force leader state";
                 "region_id" => self.fsm.region_id(),
@@ -6097,6 +6061,7 @@ where
                         .peer
                         .region_buckets_info()
                         .bucket_stat()
+                        .as_ref()
                         .unwrap()
                         .meta
                         .clone(),
@@ -6125,6 +6090,7 @@ where
             .peer
             .region_buckets_info()
             .bucket_stat()
+            .as_ref()
             .unwrap()
             .clone();
         let buckets_count = region_buckets.meta.keys.len() - 1;
@@ -6284,6 +6250,7 @@ where
         if source == "bucket" {
             return;
         }
+
         let task = SplitCheckTask::split_check_key_range(
             region.clone(),
             start_key,
@@ -6339,7 +6306,7 @@ where
                         .send_extra_message(msg, &mut self.ctx.trans, &peer);
                     debug!(
                         "check peer availability";
-                        "target_peer_id" => *peer_id,
+                        "target peer id" => *peer_id,
                     );
                 }
                 None => invalid_peers.push(*peer_id),

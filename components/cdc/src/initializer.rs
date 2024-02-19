@@ -1,5 +1,5 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use api_version::ApiV2;
 use crossbeam::atomic::AtomicCell;
@@ -38,7 +38,7 @@ use tikv_util::{
     debug, defer, error, info,
     memory::MemoryQuota,
     sys::inspector::{self_thread_inspector, ThreadInspector},
-    time::{duration_to_sec, Instant, Limiter},
+    time::{Instant, Limiter},
     warn,
     worker::Scheduler,
     Either,
@@ -51,13 +51,12 @@ use crate::{
     delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState, ObservedRange},
     endpoint::Deregister,
     metrics::*,
-    old_value::{near_seek_old_value, OldValueCursors},
+    old_value::{near_seek_old_value, new_old_value_cursor, OldValueCursors},
     service::ConnId,
     Error, Result, Task,
 };
 
-#[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct ScanStat {
+struct ScanStat {
     // Fetched bytes to the scanner.
     emit: usize,
     // Bytes from the device, `None` if not possible to get it.
@@ -173,7 +172,6 @@ impl<E: KvEngine> Initializer<E> {
             assert_eq!(self.region_id, region.get_id());
             self.async_incremental_scan(region_snapshot, region, memory_quota)
                 .await
-                .map(|_| ())
         } else {
             assert!(
                 resp.response.get_header().has_error(),
@@ -190,7 +188,7 @@ impl<E: KvEngine> Initializer<E> {
         snap: S,
         region: Region,
         memory_quota: Arc<MemoryQuota>,
-    ) -> Result<ScanStat> {
+    ) -> Result<()> {
         CDC_SCAN_TASKS.with_label_values(&["ongoing"]).inc();
         defer!(CDC_SCAN_TASKS.with_label_values(&["ongoing"]).dec());
 
@@ -199,7 +197,7 @@ impl<E: KvEngine> Initializer<E> {
         let observe_id = self.observe_id;
         let conn_id = self.conn_id;
         let kv_api = self.kv_api;
-        let on_cancel = || -> Result<ScanStat> {
+        let on_cancel = || -> Result<()> {
             info!("cdc async incremental scan canceled";
                 "region_id" => region_id,
                 "downstream_id" => ?downstream_id,
@@ -213,29 +211,13 @@ impl<E: KvEngine> Initializer<E> {
         }
 
         self.observed_range.update_region_key_range(&region);
-
-        // Be compatible with old TiCDC clients, which won't give `observed_range`.
-        let (start_key, end_key): (Key, Key);
-        if self.observed_range.start_key_encoded <= region.start_key {
-            start_key = Key::from_encoded_slice(&region.start_key);
-        } else {
-            start_key = Key::from_encoded_slice(&self.observed_range.start_key_encoded);
-        }
-        if self.observed_range.end_key_encoded.is_empty()
-            || self.observed_range.end_key_encoded >= region.end_key && !region.end_key.is_empty()
-        {
-            end_key = Key::from_encoded_slice(&region.end_key);
-        } else {
-            end_key = Key::from_encoded_slice(&self.observed_range.end_key_encoded)
-        }
-
         debug!("cdc async incremental scan";
             "region_id" => region_id,
             "downstream_id" => ?downstream_id,
             "observe_id" => ?self.observe_id,
             "all_key_covered" => ?self.observed_range.all_key_covered,
-            "start_key" => log_wrappers::Value::key(start_key.as_encoded()),
-            "end_key" => log_wrappers::Value::key(end_key.as_encoded()));
+            "start_key" => log_wrappers::Value::key(snap.lower_bound().unwrap_or_default()),
+            "end_key" => log_wrappers::Value::key(snap.upper_bound().unwrap_or_default()));
 
         let mut resolver = if self.build_resolver {
             Some(Resolver::new(region_id, memory_quota))
@@ -245,21 +227,17 @@ impl<E: KvEngine> Initializer<E> {
 
         let (mut hint_min_ts, mut old_value_cursors) = (None, None);
         let mut scanner = if kv_api == ChangeDataRequestKvApi::TiDb {
-            if self.ts_filter_is_helpful(&start_key, &end_key) {
+            if self.ts_filter_is_helpful(&snap) {
                 hint_min_ts = Some(self.checkpoint_ts);
-                old_value_cursors = Some(OldValueCursors::new(&snap));
+                let wc = new_old_value_cursor(&snap, CF_WRITE);
+                let dc = new_old_value_cursor(&snap, CF_DEFAULT);
+                old_value_cursors = Some(OldValueCursors::new(wc, dc));
             }
-            let upper_boundary = if end_key.as_encoded().is_empty() {
-                // Region upper boundary could be an empty slice.
-                None
-            } else {
-                Some(end_key)
-            };
 
             // Time range: (checkpoint_ts, max]
             let txnkv_scanner = ScannerBuilder::new(snap, TimeStamp::max())
                 .fill_cache(false)
-                .range(Some(start_key), upper_boundary)
+                .range(None, None)
                 .hint_min_ts(hint_min_ts)
                 .build_delta_scanner(self.checkpoint_ts, TxnExtraOp::ReadOldValue)
                 .unwrap();
@@ -282,7 +260,6 @@ impl<E: KvEngine> Initializer<E> {
         fail_point!("cdc_incremental_scan_start");
         let mut done = false;
         let start = Instant::now_coarse();
-        let mut sink_time = Duration::default();
 
         let curr_state = self.downstream_state.load();
         assert!(matches!(
@@ -290,7 +267,6 @@ impl<E: KvEngine> Initializer<E> {
             DownstreamState::Initializing | DownstreamState::Stopped
         ));
 
-        let mut scan_stat = ScanStat::default();
         while !done {
             // When downstream_state is Stopped, it means the corresponding
             // delegate is stopped. The initialization can be safely canceled.
@@ -299,18 +275,14 @@ impl<E: KvEngine> Initializer<E> {
             }
             let cursors = old_value_cursors.as_mut();
             let resolver = resolver.as_mut();
-            let entries = self
-                .scan_batch(&mut scanner, cursors, resolver, &mut scan_stat)
-                .await?;
+            let entries = self.scan_batch(&mut scanner, cursors, resolver).await?;
             if let Some(None) = entries.last() {
                 // If the last element is None, it means scanning is finished.
                 done = true;
             }
             debug!("cdc scan entries"; "len" => entries.len(), "region_id" => region_id);
             fail_point!("before_schedule_incremental_scan");
-            let start_sink = Instant::now_coarse();
             self.sink_scan_events(entries, done).await?;
-            sink_time += start_sink.saturating_elapsed();
         }
 
         fail_point!("before_post_incremental_scan");
@@ -330,8 +302,7 @@ impl<E: KvEngine> Initializer<E> {
         }
 
         CDC_SCAN_DURATION_HISTOGRAM.observe(takes.as_secs_f64());
-        CDC_SCAN_SINK_DURATION_HISTOGRAM.observe(duration_to_sec(sink_time));
-        Ok(scan_stat)
+        Ok(())
     }
 
     // It's extracted from `Initializer::scan_batch` to avoid becoming an
@@ -340,20 +311,16 @@ impl<E: KvEngine> Initializer<E> {
     fn do_scan<S: Snapshot>(
         &self,
         scanner: &mut Scanner<S>,
-        mut old_value_cursors: Option<&mut OldValueCursors<S>>,
+        mut old_value_cursors: Option<&mut OldValueCursors<S::Iter>>,
         entries: &mut Vec<Option<KvEntry>>,
     ) -> Result<ScanStat> {
         let mut read_old_value = |v: &mut OldValue, stats: &mut Statistics| -> Result<()> {
-            let Some(cursors) = old_value_cursors.as_mut() else {
-                return Ok(());
+            let (wc, dc) = match old_value_cursors {
+                Some(ref mut x) => (&mut x.write, &mut x.default),
+                None => return Ok(()),
             };
             if let OldValue::SeekWrite(ref key) = v {
-                match near_seek_old_value(
-                    key,
-                    &mut cursors.write,
-                    Either::<&S, _>::Right(&mut cursors.default),
-                    stats,
-                )? {
+                match near_seek_old_value(key, wc, Either::<&S, _>::Right(dc), stats)? {
                     Some(x) => *v = OldValue::value(x),
                     None => *v = OldValue::None,
                 }
@@ -417,26 +384,24 @@ impl<E: KvEngine> Initializer<E> {
     async fn scan_batch<S: Snapshot>(
         &self,
         scanner: &mut Scanner<S>,
-        old_value_cursors: Option<&mut OldValueCursors<S>>,
+        old_value_cursors: Option<&mut OldValueCursors<S::Iter>>,
         resolver: Option<&mut Resolver>,
-        scan_stat: &mut ScanStat,
     ) -> Result<Vec<Option<KvEntry>>> {
         let mut entries = Vec::with_capacity(self.max_scan_batch_size);
-        let delta = self.do_scan(scanner, old_value_cursors, &mut entries)?;
-        scan_stat.emit += delta.emit;
-        scan_stat.perf_delta += delta.perf_delta;
-        if let Some(disk_read) = delta.disk_read {
-            *scan_stat.disk_read.get_or_insert(0) += disk_read;
-        }
+        let ScanStat {
+            emit,
+            disk_read,
+            perf_delta,
+        } = self.do_scan(scanner, old_value_cursors, &mut entries)?;
 
-        TLS_CDC_PERF_STATS.with(|x| *x.borrow_mut() += delta.perf_delta);
+        TLS_CDC_PERF_STATS.with(|x| *x.borrow_mut() += perf_delta);
         tls_flush_perf_stats();
-        if let Some(bytes) = delta.disk_read {
+        if let Some(bytes) = disk_read {
             CDC_SCAN_DISK_READ_BYTES.inc_by(bytes as _);
             self.scan_speed_limiter.consume(bytes).await;
         }
-        CDC_SCAN_BYTES.inc_by(delta.emit as _);
-        self.fetch_speed_limiter.consume(delta.emit as _).await;
+        CDC_SCAN_BYTES.inc_by(emit as _);
+        self.fetch_speed_limiter.consume(emit as _).await;
 
         if let Some(resolver) = resolver {
             // Track the locks.
@@ -537,13 +502,13 @@ impl<E: KvEngine> Initializer<E> {
         }
     }
 
-    fn ts_filter_is_helpful(&self, start_key: &Key, end_key: &Key) -> bool {
+    fn ts_filter_is_helpful<S: Snapshot>(&self, snap: &S) -> bool {
         if self.ts_filter_ratio < f64::EPSILON {
             return false;
         }
-        let start_key = data_key(start_key.as_encoded());
-        let end_key = data_end_key(end_key.as_encoded());
 
+        let start_key = data_key(snap.lower_bound().unwrap_or_default());
+        let end_key = data_end_key(snap.upper_bound().unwrap_or_default());
         let range = Range::new(&start_key, &end_key);
         let tablet = match self.tablet.as_ref() {
             Some(t) => t,
@@ -736,14 +701,12 @@ mod tests {
             total_bytes += v.len();
             let ts = TimeStamp::new(i as _);
             must_prewrite_put(&mut engine, k, v, k, ts);
-            if i < 90 {
-                let txn_locks = expected_locks.entry(ts).or_insert_with(|| {
-                    let mut txn_locks = TxnLocks::default();
-                    txn_locks.sample_lock = Some(k.to_vec().into());
-                    txn_locks
-                });
-                txn_locks.lock_count += 1;
-            }
+            let txn_locks = expected_locks.entry(ts).or_insert_with(|| {
+                let mut txn_locks = TxnLocks::default();
+                txn_locks.sample_lock = Some(k.to_vec().into());
+                txn_locks
+            });
+            txn_locks.lock_count += 1;
         }
 
         let region = Region::default();
@@ -759,11 +722,12 @@ mod tests {
             false,
         );
         initializer.observed_range = observed_range.clone();
-        let check_result = || {
+        let check_result = || loop {
             let task = rx.recv().unwrap();
             match task {
                 Task::ResolverReady { resolver, .. } => {
                     assert_eq!(resolver.locks(), &expected_locks);
+                    return;
                 }
                 t => panic!("unexpected task {} received", t),
             }
@@ -813,11 +777,13 @@ mod tests {
         ))
         .unwrap();
 
-        let task = rx.recv_timeout(Duration::from_millis(100));
-        match task {
-            Ok(t) => panic!("unexpected task {} received", t),
-            Err(RecvTimeoutError::Timeout) => (),
-            Err(e) => panic!("unexpected err {:?}", e),
+        loop {
+            let task = rx.recv_timeout(Duration::from_millis(100));
+            match task {
+                Ok(t) => panic!("unexpected task {} received", t),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(e) => panic!("unexpected err {:?}", e),
+            }
         }
 
         // Test cancellation.
@@ -1125,13 +1091,13 @@ mod tests {
     #[test]
     fn test_scanner_with_titan() {
         let mut cfg = DbConfig::default();
-        cfg.titan.enabled = Some(true);
+        cfg.titan.enabled = true;
         cfg.defaultcf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.defaultcf.titan.min_blob_size = Some(ReadableSize(0));
+        cfg.defaultcf.titan.min_blob_size = ReadableSize(0);
         cfg.writecf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.writecf.titan.min_blob_size = Some(ReadableSize(0));
+        cfg.writecf.titan.min_blob_size = ReadableSize(0);
         cfg.lockcf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.lockcf.titan.min_blob_size = Some(ReadableSize(0));
+        cfg.lockcf.titan.min_blob_size = ReadableSize(0);
         let mut engine = TestEngineBuilder::new().build_with_cfg(&cfg).unwrap();
 
         must_prewrite_put(&mut engine, b"zkey", b"value", b"zkey", 100);
@@ -1173,69 +1139,5 @@ mod tests {
         assert_eq!(total_entries, 2);
         block_on(th).unwrap();
         worker.stop();
-    }
-
-    #[test]
-    fn test_initialize_scan_range() {
-        let mut cfg = DbConfig::default();
-        cfg.writecf.disable_auto_compactions = true;
-        let mut engine = TestEngineBuilder::new().build_with_cfg(&cfg).unwrap();
-
-        // Must start with 'z', otherwise table property collector doesn't work.
-        let ka = Key::from_raw(b"zaaa").into_encoded();
-        let km = Key::from_raw(b"zmmm").into_encoded();
-        let ky = Key::from_raw(b"zyyy").into_encoded();
-        let kz = Key::from_raw(b"zzzz").into_encoded();
-
-        // Incremental scan iterator shouldn't access the key because it's out of range.
-        must_prewrite_put(&mut engine, &ka, b"value", &ka, 200);
-        must_commit(&mut engine, &ka, 200, 210);
-        for cf in &[CF_WRITE, CF_DEFAULT] {
-            let kv = engine.kv_engine().unwrap();
-            kv.flush_cf(cf, true).unwrap();
-        }
-
-        // Incremental scan iterator shouldn't access the key because it's skiped by ts
-        // filter.
-        must_prewrite_put(&mut engine, &km, b"value", &km, 100);
-        must_commit(&mut engine, &km, 100, 110);
-        for cf in &[CF_WRITE, CF_DEFAULT] {
-            let kv = engine.kv_engine().unwrap();
-            kv.flush_cf(cf, true).unwrap();
-        }
-
-        must_prewrite_put(&mut engine, &ky, b"value", &ky, 200);
-        must_commit(&mut engine, &ky, 200, 210);
-        for cf in &[CF_WRITE, CF_DEFAULT] {
-            let kv = engine.kv_engine().unwrap();
-            kv.flush_cf(cf, true).unwrap();
-        }
-
-        let (mut _worker, pool, mut initializer, _rx, mut drain) = mock_initializer(
-            usize::MAX,
-            usize::MAX,
-            1000,
-            engine.kv_engine(),
-            ChangeDataRequestKvApi::TiDb,
-            false,
-        );
-
-        initializer.observed_range = ObservedRange::new(km, kz).unwrap();
-        initializer.checkpoint_ts = 150.into();
-
-        let th = pool.spawn(async move {
-            let snap = engine.snapshot(Default::default()).unwrap();
-            let region = Region::default();
-            let memory_quota = Arc::new(MemoryQuota::new(usize::MAX));
-            let scan_stat = initializer
-                .async_incremental_scan(snap, region, memory_quota)
-                .await
-                .unwrap();
-            let block_reads = scan_stat.perf_delta.block_read_count;
-            let block_gets = scan_stat.perf_delta.block_cache_hit_count;
-            assert_eq!(block_reads + block_gets, 1);
-        });
-        while block_on(drain.drain().next()).is_some() {}
-        block_on(th).unwrap();
     }
 }

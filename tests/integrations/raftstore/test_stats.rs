@@ -7,7 +7,6 @@ use std::{
 };
 
 use api_version::{test_kv_format_impl, KvFormat};
-use engine_rocks::RocksEngine;
 use engine_traits::MiscExt;
 use futures::{executor::block_on, SinkExt, StreamExt};
 use grpcio::*;
@@ -18,7 +17,7 @@ use test_raftstore::*;
 use tikv_util::{config::*, store::QueryStats};
 use txn_types::Key;
 
-fn check_available<T: Simulator<RocksEngine>>(cluster: &mut Cluster<RocksEngine, T>) {
+fn check_available<T: Simulator>(cluster: &mut Cluster<T>) {
     let pd_client = Arc::clone(&cluster.pd_client);
     let engine = cluster.get_engine(1);
 
@@ -44,7 +43,7 @@ fn check_available<T: Simulator<RocksEngine>>(cluster: &mut Cluster<RocksEngine,
     panic!("available not changed")
 }
 
-fn test_simple_store_stats<T: Simulator<RocksEngine>>(cluster: &mut Cluster<RocksEngine, T>) {
+fn test_simple_store_stats<T: Simulator>(cluster: &mut Cluster<T>) {
     let pd_client = Arc::clone(&cluster.pd_client);
 
     cluster.cfg.raft_store.pd_store_heartbeat_tick_interval = ReadableDuration::millis(20);
@@ -143,14 +142,7 @@ fn test_store_heartbeat_report_hotspots() {
     fail::remove("mock_hotspot_threshold");
 }
 
-type Query = dyn Fn(
-    Context,
-    &Cluster<RocksEngine, ServerCluster<RocksEngine>>,
-    TikvClient,
-    u64,
-    u64,
-    Vec<u8>,
-);
+type Query = dyn Fn(Context, &Cluster<ServerCluster>, TikvClient, u64, u64, Vec<u8>);
 
 #[test]
 fn test_query_stats() {
@@ -433,7 +425,7 @@ fn test_txn_query_stats_tmpl<F: KvFormat>() {
     // enabled, disable it.
     test_query_num::<F>(batch_get_command, false, false);
     test_query_num::<F>(batch_coprocessor, false, false);
-    test_txn_delete_query();
+    test_txn_delete_query::<F>();
     test_pessimistic_lock();
     test_rollback();
     fail::remove("mock_tick_interval");
@@ -442,8 +434,8 @@ fn test_txn_query_stats_tmpl<F: KvFormat>() {
     fail::remove("only_check_source_task_name");
 }
 
-fn raw_put(
-    _cluster: &Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+fn raw_put<F: KvFormat>(
+    _cluster: &Cluster<ServerCluster>,
     client: &TikvClient,
     ctx: &Context,
     _store_id: u64,
@@ -461,7 +453,7 @@ fn raw_put(
 }
 
 fn put(
-    cluster: &Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    cluster: &Cluster<ServerCluster>,
     client: &TikvClient,
     ctx: &Context,
     store_id: u64,
@@ -621,7 +613,7 @@ fn test_query_num<F: KvFormat>(query: Box<Query>, is_raw_kv: bool, auto_split: b
     let store_id = 1;
     if is_raw_kv {
         k = b"r_key".to_vec(); // "r" is key prefix of RawKV.
-        raw_put(&cluster, &client, &ctx, store_id, k.clone());
+        raw_put::<F>(&cluster, &client, &ctx, store_id, k.clone());
     } else {
         k = b"x_key".to_vec(); // "x" is key prefix of TxnKV.
         put(&cluster, &client, &ctx, store_id, k.clone());
@@ -642,7 +634,7 @@ fn test_raw_delete_query<F: KvFormat>() {
         ctx.set_api_version(F::CLIENT_TAG);
         ctx.set_request_source("test_stats".to_owned());
 
-        raw_put(&cluster, &client, &ctx, store_id, k.clone());
+        raw_put::<F>(&cluster, &client, &ctx, store_id, k.clone());
         // Raw Delete
         let mut delete_req = RawDeleteRequest::default();
         delete_req.set_context(ctx.clone());
@@ -650,7 +642,7 @@ fn test_raw_delete_query<F: KvFormat>() {
         client.raw_delete(&delete_req).unwrap();
         // skip raw kv write query check
 
-        raw_put(&cluster, &client, &ctx, store_id, k.clone());
+        raw_put::<F>(&cluster, &client, &ctx, store_id, k.clone());
         // Raw DeleteRange
         let mut delete_req = RawDeleteRangeRequest::default();
         delete_req.set_context(ctx);
@@ -661,7 +653,7 @@ fn test_raw_delete_query<F: KvFormat>() {
     }
 }
 
-fn test_txn_delete_query() {
+fn test_txn_delete_query<F: KvFormat>() {
     let k = b"t_key".to_vec();
     let store_id = 1;
 
@@ -682,7 +674,7 @@ fn test_txn_delete_query() {
 }
 
 fn check_query_num_read(
-    cluster: &Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    cluster: &Cluster<ServerCluster>,
     store_id: u64,
     region_id: u64,
     kind: QueryKind,
@@ -708,7 +700,7 @@ fn check_query_num_read(
 }
 
 fn check_query_num_write(
-    cluster: &Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    cluster: &Cluster<ServerCluster>,
     store_id: u64,
     kind: QueryKind,
     expect: u64,
@@ -728,7 +720,7 @@ fn check_query_num_write(
 }
 
 fn check_split_key(
-    cluster: &Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    cluster: &Cluster<ServerCluster>,
     start_key: Vec<u8>,
     end_key: Option<Vec<u8>>,
 ) -> bool {

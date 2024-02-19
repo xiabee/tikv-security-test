@@ -27,7 +27,6 @@ use std::{
 };
 
 use api_version::{dispatch_api_version, KvFormat};
-use backup::disk_snap::Env;
 use backup_stream::{
     config::BackupStreamConfigManager, metadata::store::PdStore, observer::BackupStreamObserver,
     BackupStreamResolver,
@@ -64,11 +63,11 @@ use raftstore::{
     RegionInfoAccessor,
 };
 use raftstore_v2::{
-    router::{DiskSnapBackupHandle, PeerMsg, RaftRouter},
+    router::{PeerMsg, RaftRouter},
     StateStorage,
 };
 use resolved_ts::Task;
-use resource_control::ResourceGroupManager;
+use resource_control::{priority_from_task_meta, ResourceGroupManager};
 use security::SecurityManager;
 use service::{service_event::ServiceEvent, service_manager::GrpcServiceManager};
 use tikv::{
@@ -195,6 +194,15 @@ pub fn run_tikv(
     service_event_tx: TikvMpsc::Sender<ServiceEvent>,
     service_event_rx: TikvMpsc::Receiver<ServiceEvent>,
 ) {
+    // Sets the global logger ASAP.
+    // It is okay to use the config w/o `validate()`,
+    // because `initial_logger()` handles various conditions.
+    initial_logger(&config);
+
+    // Print version information.
+    let build_timestamp = option_env!("TIKV_BUILD_TIME");
+    tikv::log_tikv_info(build_timestamp);
+
     // Print resource quota.
     SysQuota::log_quota();
     CPU_CORES_QUOTA_GAUGE.set(SysQuota::cpu_cores_quota());
@@ -256,7 +264,7 @@ struct TikvEngines<EK: KvEngine, ER: RaftEngine> {
 struct Servers<EK: KvEngine, ER: RaftEngine> {
     lock_mgr: LockManager,
     server: LocalServer<EK, ER>,
-    importer: Arc<SstImporter<EK>>,
+    importer: Arc<SstImporter>,
     rsmeter_pubsub_service: resource_metering::PubSubService,
 }
 
@@ -464,7 +472,7 @@ where
                 engines.engine.clone(),
                 resource_ctl,
                 CleanupMethod::Remote(self.core.background_worker.remote()),
-                true,
+                Some(Arc::new(priority_from_task_meta)),
             ))
         } else {
             None
@@ -918,10 +926,7 @@ where
         // Backup service.
         let mut backup_worker = Box::new(self.core.background_worker.lazy_build("backup-endpoint"));
         let backup_scheduler = backup_worker.scheduler();
-        let backup_service = backup::Service::new(
-            backup_scheduler,
-            Env::new(DiskSnapBackupHandle, Default::default(), None),
-        );
+        let backup_service = backup::Service::<RocksEngine, ER>::new(backup_scheduler);
         if servers
             .server
             .register_service(create_backup(backup_service))
@@ -1089,7 +1094,7 @@ where
         let mut engine_metrics = EngineMetricsManager::<RocksEngine, ER>::new(
             self.tablet_registry.clone().unwrap(),
             self.kv_statistics.clone(),
-            self.core.config.rocksdb.titan.enabled.map_or(false, |v| v),
+            self.core.config.rocksdb.titan.enabled,
             self.engines.as_ref().unwrap().raft_engine.clone(),
             self.raft_statistics.clone(),
         );
@@ -1303,6 +1308,7 @@ where
                 self.cfg_controller.clone().unwrap(),
                 Arc::new(self.core.config.security.clone()),
                 self.engines.as_ref().unwrap().engine.raft_extension(),
+                self.core.store_path.clone(),
                 self.resource_manager.clone(),
                 self.grpc_service_mgr.clone(),
             ) {

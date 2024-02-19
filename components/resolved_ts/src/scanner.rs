@@ -100,7 +100,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine> ScannerPool<T, E> {
         Self {
             workers,
             cdc_handle,
-            _phantom: PhantomData,
+            _phantom: PhantomData::default(),
         }
     }
 
@@ -229,10 +229,10 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine> ScannerPool<T, E> {
         _checkpoint_ts: TimeStamp,
     ) -> Result<(Vec<(Key, Lock)>, bool)> {
         let (locks, has_remaining) = reader
-            .scan_locks_from_storage(
+            .scan_locks(
                 start,
                 None,
-                |_, lock| matches!(lock.lock_type, LockType::Put | LockType::Delete),
+                |lock| matches!(lock.lock_type, LockType::Put | LockType::Delete),
                 DEFAULT_SCAN_BATCH_SIZE,
             )
             .map_err(|e| Error::Other(box_err!("{:?}", e)))?;

@@ -1,6 +1,6 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{collections::HashSet, result::Result, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use dashmap::{
     mapref::{entry::Entry, one::RefMut as DashRefMut},
@@ -9,11 +9,7 @@ use dashmap::{
 use kvproto::metapb::Region;
 use raftstore::coprocessor::*;
 use resolved_ts::{Resolver, TsSource, TxnLocks};
-use tikv_util::{
-    info,
-    memory::{MemoryQuota, MemoryQuotaExceeded},
-    warn,
-};
+use tikv_util::{info, memory::MemoryQuota, warn};
 use txn_types::TimeStamp;
 
 use crate::{debug, metrics::TRACK_REGION, utils};
@@ -31,7 +27,7 @@ pub struct SubscriptionTracer(Arc<DashMap<u64, SubscribeState>>);
 /// You may notice there are also some state transforms in the
 /// [`TwoPhaseResolver`] struct, states there are sub-states of the `RUNNING`
 /// stage here.
-pub enum SubscribeState {
+enum SubscribeState {
     // NOTE: shall we add `SubscriptionHandle` here?
     // (So we can check this when calling `remove_if`.)
     Pending(Region),
@@ -209,7 +205,7 @@ impl SubscriptionTracer {
         handle: ObserveHandle,
         start_ts: Option<TimeStamp>,
     ) {
-        info!("start listen stream from store"; "observer" => ?handle, utils::slog_region(region));
+        info!("start listen stream from store"; "observer" => ?handle);
         TRACK_REGION.inc();
         let e = self.0.entry(region.id);
         match e {
@@ -311,7 +307,7 @@ impl SubscriptionTracer {
             }
         };
 
-        let subscription = sub.value_mut();
+        let mut subscription = sub.value_mut();
 
         let old_epoch = subscription.meta.get_region_epoch();
         let new_epoch = new_region.get_region_epoch();
@@ -342,7 +338,7 @@ impl SubscriptionTracer {
     ) -> Option<impl RefMut<Key = u64, Value = ActiveSubscription> + '_> {
         self.0
             .get_mut(&region_id)
-            .and_then(|x| ActiveSubscriptionRef::try_from_dash(x))
+            .and_then(|x| SubscriptionRef::try_from_dash(x))
     }
 }
 
@@ -358,7 +354,7 @@ pub trait RefMut: Ref {
     fn value_mut(&mut self) -> &mut <Self as Ref>::Value;
 }
 
-impl<'a> Ref for ActiveSubscriptionRef<'a> {
+impl<'a> Ref for SubscriptionRef<'a> {
     type Key = u64;
     type Value = ActiveSubscription;
 
@@ -371,15 +367,15 @@ impl<'a> Ref for ActiveSubscriptionRef<'a> {
     }
 }
 
-impl<'a> RefMut for ActiveSubscriptionRef<'a> {
+impl<'a> RefMut for SubscriptionRef<'a> {
     fn value_mut(&mut self) -> &mut <Self as Ref>::Value {
         self.sub_mut()
     }
 }
 
-struct ActiveSubscriptionRef<'a>(DashRefMut<'a, u64, SubscribeState>);
+struct SubscriptionRef<'a>(DashRefMut<'a, u64, SubscribeState>);
 
-impl<'a> ActiveSubscriptionRef<'a> {
+impl<'a> SubscriptionRef<'a> {
     fn try_from_dash(mut d: DashRefMut<'a, u64, SubscribeState>) -> Option<Self> {
         match d.value_mut() {
             SubscribeState::Pending(_) => None,
@@ -480,29 +476,21 @@ impl TwoPhaseResolver {
         self.stable_ts.is_some()
     }
 
-    pub fn track_phase_one_lock(
-        &mut self,
-        start_ts: TimeStamp,
-        key: Vec<u8>,
-    ) -> Result<(), MemoryQuotaExceeded> {
+    pub fn track_phase_one_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
         if !self.in_phase_one() {
             warn!("backup stream tracking lock as if in phase one"; "start_ts" => %start_ts, "key" => %utils::redact(&key))
         }
-        self.resolver.track_lock(start_ts, key, None)?;
-        Ok(())
+        // TODO: handle memory quota exceed, for now, quota is set to usize::MAX.
+        self.resolver.track_lock(start_ts, key, None).unwrap();
     }
 
-    pub fn track_lock(
-        &mut self,
-        start_ts: TimeStamp,
-        key: Vec<u8>,
-    ) -> Result<(), MemoryQuotaExceeded> {
+    pub fn track_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
         if self.in_phase_one() {
             self.future_locks.push(FutureLock::Lock(key, start_ts));
-            return Ok(());
+            return;
         }
-        self.resolver.track_lock(start_ts, key, None)?;
-        Ok(())
+        // TODO: handle memory quota exceed, for now, quota is set to usize::MAX.
+        self.resolver.track_lock(start_ts, key, None).unwrap();
     }
 
     pub fn untrack_lock(&mut self, key: &[u8]) {
@@ -596,13 +584,13 @@ mod test {
         let key = b"somewhere_over_the_rainbow";
         let ts = TimeStamp::new;
         let mut r = TwoPhaseResolver::new(42, Some(ts(42)));
-        r.track_phase_one_lock(ts(48), key.to_vec()).unwrap();
+        r.track_phase_one_lock(ts(48), key.to_vec());
         // When still in phase one, the resolver should not be advanced.
         r.untrack_lock(&key[..]);
         assert_eq!(r.resolve(ts(50)), ts(42));
 
         // Even new lock tracked...
-        r.track_lock(ts(52), key.to_vec()).unwrap();
+        r.track_lock(ts(52), key.to_vec());
         r.untrack_lock(&key[..]);
         assert_eq!(r.resolve(ts(53)), ts(42));
 
@@ -611,7 +599,7 @@ mod test {
         assert_eq!(r.resolve(ts(54)), ts(54));
 
         // It should be able to track incremental locks.
-        r.track_lock(ts(55), key.to_vec()).unwrap();
+        r.track_lock(ts(55), key.to_vec());
         assert_eq!(r.resolve(ts(56)), ts(55));
         r.untrack_lock(&key[..]);
         assert_eq!(r.resolve(ts(57)), ts(57));
@@ -667,8 +655,7 @@ mod test {
         region4_sub
             .value_mut()
             .resolver
-            .track_lock(TimeStamp::new(128), b"Alpi".to_vec())
-            .unwrap();
+            .track_lock(TimeStamp::new(128), b"Alpi".to_vec());
         subs.register_region(&region(5, 8, 1), ObserveHandle::new(), None);
         subs.deregister_region_if(&region(5, 8, 1), |_, _| true);
         drop(region4_sub);

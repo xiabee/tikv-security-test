@@ -247,7 +247,7 @@ impl<P: RegionInfoProvider> SstPartitioner for CompactionGuardGenerator<P> {
     }
 }
 
-fn seek_to(all_data: &[Vec<u8>], target_key: &[u8], from_pos: usize) -> usize {
+fn seek_to(all_data: &Vec<Vec<u8>>, target_key: &[u8], from_pos: usize) -> usize {
     let mut pos = from_pos;
     let mut skip_count = 0;
     while pos < all_data.len() && all_data[pos].as_slice() <= target_key {
@@ -541,7 +541,7 @@ mod tests {
     }
 
     fn collect_keys(path: &str) -> Vec<Vec<u8>> {
-        let reader = RocksSstReader::open(path, None).unwrap();
+        let reader = RocksSstReader::open(path).unwrap();
         let mut sst_reader = reader.iter(IterOptions::default()).unwrap();
         let mut valid = sst_reader.seek_to_first().unwrap();
         let mut ret = vec![];

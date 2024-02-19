@@ -796,6 +796,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             self.read_progress().clone(),
             self.region_buckets_info()
                 .bucket_stat()
+                .as_ref()
                 .map(|b| b.meta.clone()),
         )
     }

@@ -2,7 +2,6 @@
 
 mod bucket;
 mod command;
-mod disk_snapshot_backup;
 mod life;
 mod misc;
 mod pd;
@@ -18,7 +17,6 @@ pub use command::{
     SplitFlowControl, SplitPendingAppend, MERGE_IN_PROGRESS_PREFIX, MERGE_SOURCE_PREFIX,
     SPLIT_PREFIX,
 };
-pub use disk_snapshot_backup::UnimplementedHandle as DiskSnapBackupHandle;
 pub use life::{AbnormalPeerContext, DestroyProgress, GcPeerContext};
 pub use ready::{
     write_initial_states, ApplyTrace, AsyncWriter, DataTrace, GenSnapTask, ReplayWatch, SnapState,
@@ -38,7 +36,7 @@ pub mod test_util {
         Arc,
     };
 
-    use engine_traits::{CfName, KvEngine, CF_DEFAULT};
+    use engine_traits::{CfName, CF_DEFAULT};
     use kvproto::{kvrpcpb::ApiVersion, metapb::RegionEpoch, raft_cmdpb::RaftRequestHeader};
     use raft::prelude::{Entry, EntryType};
     use raftstore::store::simple_write::SimpleWriteEncoder;
@@ -48,7 +46,7 @@ pub mod test_util {
     use super::{CatchUpLogs, SimpleWriteReqEncoder};
     use crate::{fsm::ApplyResReporter, router::ApplyRes};
 
-    pub fn create_tmp_importer<E: KvEngine>() -> (TempDir, Arc<SstImporter<E>>) {
+    pub fn create_tmp_importer() -> (TempDir, Arc<SstImporter>) {
         let dir = TempDir::new().unwrap();
         let importer = Arc::new(
             SstImporter::new(&Default::default(), dir.path(), None, ApiVersion::V1, true).unwrap(),

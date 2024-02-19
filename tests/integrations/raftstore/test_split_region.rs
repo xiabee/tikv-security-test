@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use engine_rocks::RocksEngine;
 use engine_traits::{Peekable, CF_DEFAULT, CF_WRITE};
 use keys::data_key;
 use kvproto::{
@@ -630,10 +629,7 @@ fn test_node_split_region_after_reboot_with_config_change() {
     }
 }
 
-fn test_split_epoch_not_match<T: Simulator<RocksEngine>>(
-    cluster: &mut Cluster<RocksEngine, T>,
-    right_derive: bool,
-) {
+fn test_split_epoch_not_match<T: Simulator>(cluster: &mut Cluster<T>, right_derive: bool) {
     cluster.cfg.raft_store.right_derive_when_split = right_derive;
     cluster.run();
     let pd_client = Arc::clone(&cluster.pd_client);
@@ -828,8 +824,8 @@ fn test_node_split_update_region_right_derive() {
     let new_leader = right
         .get_peers()
         .iter()
-        .find(|&p| p.get_id() != origin_leader.get_id())
         .cloned()
+        .find(|p| p.get_id() != origin_leader.get_id())
         .unwrap();
 
     // Make sure split is done in the new_leader.
@@ -1172,9 +1168,6 @@ fn test_gen_split_check_bucket_ranges() {
     cluster.cfg.coprocessor.enable_region_bucket = Some(true);
     // disable report buckets; as it will reset the user traffic stats to randomize
     // the test result
-    cluster.cfg.raft_store.check_leader_lease_interval = ReadableDuration::secs(5);
-    // Make merge check resume quickly.
-    cluster.cfg.raft_store.merge_check_tick_interval = ReadableDuration::millis(100);
     cluster.run();
     let pd_client = Arc::clone(&cluster.pd_client);
 
@@ -1194,7 +1187,6 @@ fn test_gen_split_check_bucket_ranges() {
         .insert(0, region.get_start_key().to_vec());
     expected_buckets.keys.push(region.get_end_key().to_vec());
     let buckets = vec![bucket];
-
     // initialize fsm.peer.bucket_regions
     cluster.refresh_region_bucket_keys(
         &region,

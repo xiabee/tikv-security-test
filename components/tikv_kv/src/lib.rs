@@ -8,7 +8,6 @@
 #![feature(bound_map)]
 #![feature(min_specialization)]
 #![feature(type_alias_impl_trait)]
-#![feature(impl_trait_in_assoc_type)]
 #![feature(associated_type_defaults)]
 
 #[macro_use(fail_point)]
@@ -63,8 +62,8 @@ pub use self::{
     raft_extension::{FakeExtension, RaftExtension},
     rocksdb_engine::{RocksEngine, RocksSnapshot},
     stats::{
-        CfStatistics, FlowStatistics, FlowStatsReporter, LoadDataHint, StageLatencyStats,
-        Statistics, StatisticsSummary, RAW_VALUE_TOMBSTONE,
+        CfStatistics, FlowStatistics, FlowStatsReporter, StageLatencyStats, Statistics,
+        StatisticsSummary, RAW_VALUE_TOMBSTONE,
     },
 };
 
@@ -554,7 +553,7 @@ pub enum ErrorInner {
     Request(ErrorHeader),
     #[error("timeout after {0:?}")]
     Timeout(Duration),
-    #[error("an empty request")]
+    #[error("an empty requets")]
     EmptyRequest,
     #[error("key is locked (backoff or cleanup) {0:?}")]
     KeyIsLocked(kvproto::kvrpcpb::LockInfo),
@@ -629,7 +628,7 @@ impl ErrorCodeExt for Error {
 
 thread_local! {
     // A pointer to thread local engine. Use raw pointer and `UnsafeCell` to reduce runtime check.
-    static TLS_ENGINE_ANY: UnsafeCell<*mut ()> = const { UnsafeCell::new(ptr::null_mut())};
+    static TLS_ENGINE_ANY: UnsafeCell<*mut ()> = UnsafeCell::new(ptr::null_mut());
 }
 
 /// Execute the closure on the thread local engine.

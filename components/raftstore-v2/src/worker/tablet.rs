@@ -235,7 +235,7 @@ impl<EK> Task<EK> {
 
 pub struct Runner<EK: KvEngine> {
     tablet_registry: TabletRegistry<EK>,
-    sst_importer: Arc<SstImporter<EK>>,
+    sst_importer: Arc<SstImporter>,
     snap_mgr: TabletSnapManager,
     logger: Logger,
 
@@ -252,7 +252,7 @@ pub struct Runner<EK: KvEngine> {
 impl<EK: KvEngine> Runner<EK> {
     pub fn new(
         tablet_registry: TabletRegistry<EK>,
-        sst_importer: Arc<SstImporter<EK>>,
+        sst_importer: Arc<SstImporter>,
         snap_mgr: TabletSnapManager,
         logger: Logger,
     ) -> Self {
@@ -467,8 +467,7 @@ impl<EK: KvEngine> Runner<EK> {
         let Some(Some(tablet)) = self
             .tablet_registry
             .get(region_id)
-            .map(|mut cache| cache.latest().cloned())
-        else {
+            .map(|mut cache| cache.latest().cloned()) else {
             warn!(
                 self.logger,
                 "flush memtable failed to acquire tablet";
@@ -556,15 +555,7 @@ impl<EK: KvEngine> Runner<EK> {
     }
 
     fn delete_range(&self, delete_range: Task<EK>) {
-        let Task::DeleteRange {
-            region_id,
-            tablet,
-            cf,
-            start_key,
-            end_key,
-            cb,
-        } = delete_range
-        else {
+        let Task::DeleteRange { region_id, tablet, cf, start_key, end_key, cb } = delete_range else {
             slog_panic!(self.logger, "unexpected task"; "task" => format!("{}", delete_range))
         };
 

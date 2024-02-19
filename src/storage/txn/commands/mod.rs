@@ -18,7 +18,6 @@ pub(crate) mod mvcc_by_key;
 pub(crate) mod mvcc_by_start_ts;
 pub(crate) mod pause;
 pub(crate) mod pessimistic_rollback;
-mod pessimistic_rollback_read_phase;
 pub(crate) mod prewrite;
 pub(crate) mod resolve_lock;
 pub(crate) mod resolve_lock_lite;
@@ -53,7 +52,6 @@ pub use mvcc_by_key::MvccByKey;
 pub use mvcc_by_start_ts::MvccByStartTs;
 pub use pause::Pause;
 pub use pessimistic_rollback::PessimisticRollback;
-pub use pessimistic_rollback_read_phase::PessimisticRollbackReadPhase;
 pub use prewrite::{one_pc_commit, Prewrite, PrewritePessimistic};
 pub use resolve_lock::{ResolveLock, RESOLVE_LOCK_BATCH_SIZE};
 pub use resolve_lock_lite::ResolveLockLite;
@@ -97,7 +95,6 @@ pub enum Command {
     Cleanup(Cleanup),
     Rollback(Rollback),
     PessimisticRollback(PessimisticRollback),
-    PessimisticRollbackReadPhase(PessimisticRollbackReadPhase),
     TxnHeartBeat(TxnHeartBeat),
     CheckTxnStatus(CheckTxnStatus),
     CheckSecondaryLocks(CheckSecondaryLocks),
@@ -124,8 +121,7 @@ pub enum Command {
 /// 2. The `From<CommitRequest>` impl for `TypedCommand` gets chosen, and its
 /// generic parameter indicates that the result type for this instance of
 /// `TypedCommand` is going to be `TxnStatus` - one of the variants of the
-/// `StorageCallback` enum.
-/// 3. In the above `from` method, the details of the
+/// `StorageCallback` enum. 3. In the above `from` method, the details of the
 /// commit request are captured by creating an instance of the struct
 /// `storage::txn::commands::commit::Command` via its `new` method.
 /// 4. This struct is wrapped in a variant of the enum
@@ -278,26 +274,14 @@ impl From<BatchRollbackRequest> for TypedCommand<()> {
 
 impl From<PessimisticRollbackRequest> for TypedCommand<Vec<StorageResult<()>>> {
     fn from(mut req: PessimisticRollbackRequest) -> Self {
-        // If the keys are empty, try to scan locks with specified `start_ts` and
-        // `for_update_ts`, and then pass them to a new pessimitic rollback
-        // command to clean up, just like resolve lock with read phase.
-        if req.get_keys().is_empty() {
-            PessimisticRollbackReadPhase::new(
-                req.get_start_version().into(),
-                req.get_for_update_ts().into(),
-                None,
-                req.take_context(),
-            )
-        } else {
-            let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
-            PessimisticRollback::new(
-                keys,
-                req.get_start_version().into(),
-                req.get_for_update_ts().into(),
-                None,
-                req.take_context(),
-            )
-        }
+        let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
+
+        PessimisticRollback::new(
+            keys,
+            req.get_start_version().into(),
+            req.get_for_update_ts().into(),
+            req.take_context(),
+        )
     }
 }
 
@@ -642,7 +626,6 @@ impl Command {
             Command::Cleanup(t) => t,
             Command::Rollback(t) => t,
             Command::PessimisticRollback(t) => t,
-            Command::PessimisticRollbackReadPhase(t) => t,
             Command::TxnHeartBeat(t) => t,
             Command::CheckTxnStatus(t) => t,
             Command::CheckSecondaryLocks(t) => t,
@@ -669,7 +652,6 @@ impl Command {
             Command::Cleanup(t) => t,
             Command::Rollback(t) => t,
             Command::PessimisticRollback(t) => t,
-            Command::PessimisticRollbackReadPhase(t) => t,
             Command::TxnHeartBeat(t) => t,
             Command::CheckTxnStatus(t) => t,
             Command::CheckSecondaryLocks(t) => t,
@@ -693,7 +675,6 @@ impl Command {
     ) -> Result<ProcessResult> {
         match self {
             Command::ResolveLockReadPhase(t) => t.process_read(snapshot, statistics),
-            Command::PessimisticRollbackReadPhase(t) => t.process_read(snapshot, statistics),
             Command::MvccByKey(t) => t.process_read(snapshot, statistics),
             Command::MvccByStartTs(t) => t.process_read(snapshot, statistics),
             Command::FlashbackToVersionReadPhase(t) => t.process_read(snapshot, statistics),

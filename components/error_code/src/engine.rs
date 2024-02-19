@@ -10,6 +10,5 @@ define_error_codes!(
     CF_NAME => ("CfName", "", ""),
     CODEC => ("Codec", "", ""),
     DATALOSS => ("DataLoss", "", ""),
-    DATACOMPACTED => ("DataCompacted", "", ""),
-    BOUNDARY_NOT_SET => ("BoundaryNotSet", "", "")
+    DATACOMPACTED => ("DataCompacted", "", "")
 );

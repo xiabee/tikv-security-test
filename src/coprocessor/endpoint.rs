@@ -424,16 +424,15 @@ impl<E: Engine> Endpoint<E> {
 
         // Check if the buckets version is latest.
         // skip if request don't carry this bucket version.
-        if let Some(ref buckets) = latest_buckets
-            && buckets.version > tracker.req_ctx.context.buckets_version
-            && tracker.req_ctx.context.buckets_version != 0
-        {
-            let mut bucket_not_match = errorpb::BucketVersionNotMatch::default();
-            bucket_not_match.set_version(buckets.version);
-            bucket_not_match.set_keys(buckets.keys.clone().into());
-            let mut err = errorpb::Error::default();
-            err.set_bucket_version_not_match(bucket_not_match);
-            return Err(Error::Region(err));
+        if let Some(ref buckets) = latest_buckets&&
+            buckets.version > tracker.req_ctx.context.buckets_version &&
+            tracker.req_ctx.context.buckets_version!=0 {
+                let mut bucket_not_match = errorpb::BucketVersionNotMatch::default();
+                bucket_not_match.set_version(buckets.version);
+                bucket_not_match.set_keys(buckets.keys.clone().into());
+                let mut err = errorpb::Error::default();
+                err.set_bucket_version_not_match(bucket_not_match);
+                return Err(Error::Region(err));
         }
         // When snapshot is retrieved, deadline may exceed.
         tracker.on_snapshot_finished();
@@ -551,9 +550,8 @@ impl<E: Engine> Endpoint<E> {
         if let Err(busy_err) = self.read_pool.check_busy_threshold(Duration::from_millis(
             req.get_context().get_busy_threshold_ms() as u64,
         )) {
-            let mut pb_error = errorpb::Error::new();
-            pb_error.set_server_is_busy(busy_err);
-            let resp = make_error_response(Error::Region(pb_error));
+            let mut resp = coppb::Response::default();
+            resp.mut_region_error().set_server_is_busy(busy_err);
             return Either::Left(async move { resp.into() });
         }
 
@@ -822,62 +820,83 @@ impl<E: Engine> Endpoint<E> {
     }
 }
 
-macro_rules! make_error_response_common {
-    ($resp:expr, $tag:expr, $e:expr) => {{
-        match $e {
-            Error::Region(e) => {
-                $tag = storage::get_tag_from_header(&e);
-                $resp.set_region_error(e);
-            }
-            Error::Locked(info) => {
-                $tag = "meet_lock";
-                $resp.set_locked(info);
-            }
-            Error::DeadlineExceeded => {
-                $tag = "deadline_exceeded";
-                let mut err = errorpb::Error::default();
-                set_deadline_exceeded_busy_error(&mut err);
-                err.set_message($e.to_string());
-                $resp.set_region_error(err);
-            }
-            Error::MaxPendingTasksExceeded => {
-                $tag = "max_pending_tasks_exceeded";
-                let mut server_is_busy_err = errorpb::ServerIsBusy::default();
-                server_is_busy_err.set_reason($e.to_string());
-                let mut errorpb = errorpb::Error::default();
-                errorpb.set_message($e.to_string());
-                errorpb.set_server_is_busy(server_is_busy_err);
-                $resp.set_region_error(errorpb);
-            }
-            Error::Other(_) => {
-                $tag = "other";
-                warn!("unexpected other error encountered processing coprocessor task";
-                    "error" => ?&$e,
-                );
-                $resp.set_other_error($e.to_string());
-            }
-        };
-        COPR_REQ_ERROR.with_label_values(&[$tag]).inc();
-    }};
-}
-
 fn make_error_batch_response(batch_resp: &mut coppb::StoreBatchTaskResponse, e: Error) {
-    debug!(
+    warn!(
         "batch cop task error-response";
         "err" => %e
     );
     let tag;
-    make_error_response_common!(batch_resp, tag, e);
+    match e {
+        Error::Region(e) => {
+            tag = storage::get_tag_from_header(&e);
+            batch_resp.set_region_error(e);
+        }
+        Error::Locked(info) => {
+            tag = "meet_lock";
+            batch_resp.set_locked(info);
+        }
+        Error::DeadlineExceeded => {
+            tag = "deadline_exceeded";
+            let mut err = errorpb::Error::default();
+            set_deadline_exceeded_busy_error(&mut err);
+            err.set_message(e.to_string());
+            batch_resp.set_region_error(err);
+        }
+        Error::MaxPendingTasksExceeded => {
+            tag = "max_pending_tasks_exceeded";
+            let mut server_is_busy_err = errorpb::ServerIsBusy::default();
+            server_is_busy_err.set_reason(e.to_string());
+            let mut errorpb = errorpb::Error::default();
+            errorpb.set_message(e.to_string());
+            errorpb.set_server_is_busy(server_is_busy_err);
+            batch_resp.set_region_error(errorpb);
+        }
+        Error::Other(_) => {
+            tag = "other";
+            batch_resp.set_other_error(e.to_string());
+        }
+    };
+    COPR_REQ_ERROR.with_label_values(&[tag]).inc();
 }
 
 fn make_error_response(e: Error) -> coppb::Response {
-    debug!(
+    warn!(
         "error-response";
         "err" => %e
     );
-    let tag;
     let mut resp = coppb::Response::default();
-    make_error_response_common!(resp, tag, e);
+    let tag;
+    match e {
+        Error::Region(e) => {
+            tag = storage::get_tag_from_header(&e);
+            resp.set_region_error(e);
+        }
+        Error::Locked(info) => {
+            tag = "meet_lock";
+            resp.set_locked(info);
+        }
+        Error::DeadlineExceeded => {
+            tag = "deadline_exceeded";
+            let mut err = errorpb::Error::default();
+            set_deadline_exceeded_busy_error(&mut err);
+            err.set_message(e.to_string());
+            resp.set_region_error(err);
+        }
+        Error::MaxPendingTasksExceeded => {
+            tag = "max_pending_tasks_exceeded";
+            let mut server_is_busy_err = errorpb::ServerIsBusy::default();
+            server_is_busy_err.set_reason(e.to_string());
+            let mut errorpb = errorpb::Error::default();
+            errorpb.set_message(e.to_string());
+            errorpb.set_server_is_busy(server_is_busy_err);
+            resp.set_region_error(errorpb);
+        }
+        Error::Other(_) => {
+            tag = "other";
+            resp.set_other_error(e.to_string());
+        }
+    };
+    COPR_REQ_ERROR.with_label_values(&[tag]).inc();
     resp
 }
 

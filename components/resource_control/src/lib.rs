@@ -1,5 +1,7 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 #![feature(test)]
+#![feature(local_key_cell_methods)]
+#![feature(array_zip)]
 
 use std::sync::Arc;
 
@@ -9,9 +11,9 @@ use serde::{Deserialize, Serialize};
 
 mod resource_group;
 pub use resource_group::{
-    ResourceConsumeType, ResourceController, ResourceGroupManager, MIN_PRIORITY_UPDATE_INTERVAL,
+    priority_from_task_meta, ResourceConsumeType, ResourceController, ResourceGroupManager,
+    TaskMetadata, MIN_PRIORITY_UPDATE_INTERVAL,
 };
-pub use tikv_util::resource_control::*;
 
 mod future;
 pub use future::{with_resource_limiter, ControlledFuture};

@@ -126,7 +126,7 @@ pub struct ImportSstService<E: Engine> {
     tablets: LocalTablets<E::Local>,
     engine: E,
     threads: Arc<Runtime>,
-    importer: Arc<SstImporter<E::Local>>,
+    importer: Arc<SstImporter>,
     limiter: Limiter,
     task_slots: Arc<Mutex<HashSet<PathBuf>>>,
     raft_entry_max_size: ReadableSize,
@@ -322,7 +322,7 @@ impl<E: Engine> ImportSstService<E> {
         raft_entry_max_size: ReadableSize,
         engine: E,
         tablets: LocalTablets<E::Local>,
-        importer: Arc<SstImporter<E::Local>>,
+        importer: Arc<SstImporter>,
         store_meta: Option<Arc<Mutex<StoreMeta<E::Local>>>>,
         resource_manager: Option<Arc<ResourceGroupManager>>,
         region_info_accessor: Arc<RegionInfoAccessor>,
@@ -350,7 +350,7 @@ impl<E: Engine> ImportSstService<E> {
         if let LocalTablets::Singleton(tablet) = &tablets {
             importer.start_switch_mode_check(threads.handle(), Some(tablet.clone()));
         } else {
-            importer.start_switch_mode_check(threads.handle(), None);
+            importer.start_switch_mode_check::<E::Local>(threads.handle(), None);
         }
 
         let writer = raft_writer::ThrottledTlsEngineWriter::default();
@@ -385,7 +385,7 @@ impl<E: Engine> ImportSstService<E> {
         self.cfg.clone()
     }
 
-    async fn tick(importer: Arc<SstImporter<E::Local>>, cfg: ConfigManager) {
+    async fn tick(importer: Arc<SstImporter>, cfg: ConfigManager) {
         loop {
             sleep(Duration::from_secs(10)).await;
 
@@ -563,7 +563,7 @@ impl<E: Engine> ImportSstService<E> {
 
     async fn apply_imp(
         mut req: ApplyRequest,
-        importer: Arc<SstImporter<E::Local>>,
+        importer: Arc<SstImporter>,
         writer: raft_writer::ThrottledTlsEngineWriter,
         limiter: Limiter,
         max_raft_size: usize,
@@ -1098,7 +1098,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
             };
 
             let res = with_resource_limiter(
-                importer.download_ext(
+                importer.download_ext::<E::Local>(
                     req.get_sst(),
                     req.get_storage_backend(),
                     req.get_name(),
@@ -1139,14 +1139,12 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     ) {
         let label = "ingest";
         let timer = Instant::now_coarse();
-        let mut resp = IngestResponse::default();
-
         if let Err(err) = self.check_suspend() {
-            resp.set_error(ImportPbError::from(err).take_store_error());
-            ctx.spawn(async move { crate::send_rpc_response!(Ok(resp), sink, label, timer) });
+            ctx.spawn(async move { crate::send_rpc_response!(Err(err), sink, label, timer) });
             return;
         }
 
+        let mut resp = IngestResponse::default();
         let region_id = req.get_context().get_region_id();
         if let Some(errorpb) = self.check_write_stall(region_id) {
             resp.set_error(errorpb);
@@ -1188,13 +1186,12 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     ) {
         let label = "multi-ingest";
         let timer = Instant::now_coarse();
-        let mut resp = IngestResponse::default();
         if let Err(err) = self.check_suspend() {
-            resp.set_error(ImportPbError::from(err).take_store_error());
-            ctx.spawn(async move { crate::send_rpc_response!(Ok(resp), sink, label, timer) });
+            ctx.spawn(async move { crate::send_rpc_response!(Err(err), sink, label, timer) });
             return;
         }
 
+        let mut resp = IngestResponse::default();
         if let Some(errorpb) = self.check_write_stall(req.get_context().get_region_id()) {
             resp.set_error(errorpb);
             ctx.spawn(

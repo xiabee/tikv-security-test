@@ -3,7 +3,6 @@
 use std::{sync::Arc, thread, time::Duration};
 
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
-use engine_rocks::RocksEngine;
 use futures::executor::block_on;
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::{
@@ -15,7 +14,7 @@ use test_raftstore::*;
 use tikv_util::{time::Instant, HandyRwLock};
 
 struct TestSuite {
-    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    pub cluster: Cluster<ServerCluster>,
     api_version: ApiVersion,
 }
 
@@ -209,7 +208,7 @@ fn test_leader_transfer() {
 #[test]
 fn test_region_merge() {
     let mut suite = TestSuite::new(3, ApiVersion::V2);
-    let keys = [b"rk0", b"rk1", b"rk2", b"rk3", b"rk4", b"rk5"];
+    let keys = vec![b"rk0", b"rk1", b"rk2", b"rk3", b"rk4", b"rk5"];
 
     suite.must_raw_put(keys[1], b"v1");
     suite.must_raw_put(keys[3], b"v3");

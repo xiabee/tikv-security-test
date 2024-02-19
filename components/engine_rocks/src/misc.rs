@@ -195,7 +195,10 @@ impl MiscExt for RocksEngine {
             fopts.set_allow_write_stall(true);
             fopts.set_check_if_compaction_disabled(true);
             fopts.set_expected_oldest_key_time(time);
-            self.as_inner().flush_cf(handle, &fopts).map_err(r2e)?;
+            self
+                .as_inner()
+                .flush_cf(handle, &fopts)
+                .map_err(r2e)?;
             return Ok(true);
         }
         Ok(false)
@@ -445,11 +448,6 @@ impl MiscExt for RocksEngine {
             .get();
         Ok(n)
     }
-
-    type DiskEngine = RocksEngine;
-    fn get_disk_engine(&self) -> &Self::DiskEngine {
-        self
-    }
 }
 
 #[cfg(test)]
@@ -501,7 +499,7 @@ mod tests {
             .collect();
 
         let mut kvs: Vec<(&[u8], &[u8])> = vec![];
-        for key in keys.iter() {
+        for (_, key) in keys.iter().enumerate() {
             kvs.push((key.as_slice(), b"value"));
         }
         for &(k, v) in kvs.as_slice() {

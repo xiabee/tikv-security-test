@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::with_prefix;
 use tikv_util::{
     box_err,
-    config::{ReadableDuration, ReadableSchedule, ReadableSize, VersionTrack},
+    config::{ReadableDuration, ReadableSize, VersionTrack},
     error, info,
     sys::SysQuota,
     warn,
@@ -142,7 +142,6 @@ pub struct Config {
     pub region_compact_redundant_rows_percent: Option<u64>,
     pub pd_heartbeat_tick_interval: ReadableDuration,
     pub pd_store_heartbeat_tick_interval: ReadableDuration,
-    pub pd_report_min_resolved_ts_interval: ReadableDuration,
     pub snap_mgr_gc_tick_interval: ReadableDuration,
     pub snap_gc_timeout: ReadableDuration,
     /// The duration of snapshot waits for region split. It prevents leader from
@@ -151,15 +150,6 @@ pub struct Config {
     pub snap_wait_split_duration: ReadableDuration,
     pub lock_cf_compact_interval: ReadableDuration,
     pub lock_cf_compact_bytes_threshold: ReadableSize,
-
-    /// Hours of the day during which we may execute a periodic full compaction.
-    /// If not set or empty, periodic full compaction will not run. In toml this
-    /// should be a list of timesin "HH:MM" format with an optional timezone
-    /// offset. If no timezone is specified, local timezone is used. E.g.,
-    /// `["23:00 +0000", "03:00 +0700"]` or `["23:00", "03:00"]`.
-    pub periodic_full_compact_start_times: ReadableSchedule,
-    /// Do not start a full compaction if cpu utilization exceeds this number.
-    pub periodic_full_compact_start_max_cpu: f64,
 
     #[online_config(skip)]
     pub notify_capacity: usize,
@@ -361,8 +351,9 @@ pub struct Config {
     pub slow_trend_unsensitive_cause: f64,
     // The unsensitive(increase it to reduce sensitiveness) of the result-trend detection
     pub slow_trend_unsensitive_result: f64,
-    // The sensitiveness of slowness on network-io.
-    pub slow_trend_network_io_factor: f64,
+
+    // Interval to report min resolved ts, if it is zero, it means disabled.
+    pub report_min_resolved_ts_interval: ReadableDuration,
 
     /// Interval to check whether to reactivate in-memory pessimistic lock after
     /// being disabled before transferring leader.
@@ -446,12 +437,6 @@ impl Default for Config {
             region_compact_redundant_rows_percent: Some(20),
             pd_heartbeat_tick_interval: ReadableDuration::minutes(1),
             pd_store_heartbeat_tick_interval: ReadableDuration::secs(10),
-            pd_report_min_resolved_ts_interval: ReadableDuration::secs(1),
-            // Disable periodic full compaction by default.
-            periodic_full_compact_start_times: ReadableSchedule::default(),
-            // If periodic full compaction is enabled, do not start a full compaction
-            // if the CPU utilization is over 10%.
-            periodic_full_compact_start_max_cpu: 0.1,
             notify_capacity: 40960,
             snap_mgr_gc_tick_interval: ReadableDuration::minutes(1),
             snap_gc_timeout: ReadableDuration::hours(4),
@@ -507,12 +492,12 @@ impl Default for Config {
             reactive_memory_lock_tick_interval: ReadableDuration::secs(2),
             reactive_memory_lock_timeout_tick: 5,
             check_long_uncommitted_interval: ReadableDuration::secs(10),
-            // In some cases, such as rolling upgrade, some regions' commit log
-            // duration can be 12 seconds. Before #13078 is merged,
-            // the commit log duration can be 2.8 minutes. So maybe
-            // 20s is a relatively reasonable base threshold. Generally,
-            // the log commit duration is less than 1s. Feel free to adjust
-            // this config :)
+            /// In some cases, such as rolling upgrade, some regions' commit log
+            /// duration can be 12 seconds. Before #13078 is merged,
+            /// the commit log duration can be 2.8 minutes. So maybe
+            /// 20s is a relatively reasonable base threshold. Generally,
+            /// the log commit duration is less than 1s. Feel free to adjust
+            /// this config :)
             long_uncommitted_base_threshold: ReadableDuration::secs(20),
             max_entry_cache_warmup_duration: ReadableDuration::secs(1),
 
@@ -530,7 +515,7 @@ impl Default for Config {
             // make it `10.0` to reduce a bit sensitiveness because SpikeFilter is disabled
             slow_trend_unsensitive_cause: 10.0,
             slow_trend_unsensitive_result: 0.5,
-            slow_trend_network_io_factor: 0.0,
+            report_min_resolved_ts_interval: ReadableDuration::secs(1),
             check_leader_lease_interval: ReadableDuration::secs(0),
             renew_leader_lease_advance_duration: ReadableDuration::secs(0),
             allow_unsafe_vote_after_start: false,
@@ -942,12 +927,6 @@ impl Config {
             ));
         }
 
-        if self.slow_trend_network_io_factor < 0.0 {
-            return Err(box_err!(
-                "slow_trend_network_io_factor must be greater than 0"
-            ));
-        }
-
         Ok(())
     }
 
@@ -1048,9 +1027,6 @@ impl Config {
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["pd_store_heartbeat_tick_interval"])
             .set(self.pd_store_heartbeat_tick_interval.as_secs_f64());
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["pd_report_min_resolved_ts_interval"])
-            .set(self.pd_report_min_resolved_ts_interval.as_secs_f64());
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["snap_mgr_gc_tick_interval"])
             .set(self.snap_mgr_gc_tick_interval.as_secs_f64());
