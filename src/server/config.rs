@@ -6,6 +6,7 @@ use collections::HashMap;
 use engine_traits::{perf_level_serde, PerfLevel};
 use grpcio::{CompressionAlgorithms, ResourceQuota};
 use online_config::{ConfigChange, ConfigManager, OnlineConfig};
+use raftstore::store::config::DEFAULT_SNAP_MAX_BYTES_PER_SEC;
 pub use raftstore::store::Config as RaftStoreConfig;
 use regex::Regex;
 use tikv_util::{
@@ -41,8 +42,6 @@ const DEFAULT_ENDPOINT_STREAM_BATCH_ROW_LIMIT: usize = 128;
 
 // At least 4 long coprocessor requests are allowed to run concurrently.
 const MIN_ENDPOINT_MAX_CONCURRENCY: usize = 4;
-
-const DEFAULT_SNAP_MAX_BYTES_PER_SEC: u64 = 100 * 1024 * 1024;
 
 const DEFAULT_MAX_GRPC_SEND_MSG_LEN: i32 = 10 * 1024 * 1024;
 
@@ -140,13 +139,14 @@ pub struct Config {
     #[online_config(skip)]
     pub end_point_enable_batch_if_possible: bool,
     #[online_config(skip)]
-    pub end_point_request_max_handle_duration: ReadableDuration,
+    pub end_point_request_max_handle_duration: Option<ReadableDuration>,
     #[online_config(skip)]
     pub end_point_max_concurrency: usize,
     #[serde(with = "perf_level_serde")]
     #[online_config(skip)]
     pub end_point_perf_level: PerfLevel,
-    pub snap_max_write_bytes_per_sec: ReadableSize,
+    #[serde(alias = "snap-max-write-bytes-per-sec")]
+    pub snap_io_max_bytes_per_sec: ReadableSize,
     pub snap_max_total_size: ReadableSize,
     #[online_config(skip)]
     pub stats_concurrency: usize,
@@ -187,26 +187,27 @@ pub struct Config {
     #[online_config(skip)]
     pub labels: HashMap<String, String>,
 
-    // deprecated. use readpool.coprocessor.xx_concurrency.
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[online_config(skip)]
+    #[online_config(hidden)]
+    #[deprecated = "The configuration has been moved to readpool.coprocessor.*_concurrency."]
     pub end_point_concurrency: Option<usize>,
 
-    // deprecated. use readpool.coprocessor.stack_size.
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[online_config(skip)]
+    #[online_config(hidden)]
+    #[deprecated = "The configuration has been moved to readpool.coprocessor.stack_size."]
     pub end_point_stack_size: Option<ReadableSize>,
 
-    // deprecated. use readpool.coprocessor.max_tasks_per_worker_xx.
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[online_config(skip)]
+    #[online_config(hidden)]
+    #[deprecated = "The configuration has been moved to readpool.coprocessor.max_tasks_per_worker_*."]
     pub end_point_max_tasks: Option<usize>,
 }
 
 impl Default for Config {
+    #[allow(deprecated)]
     fn default() -> Config {
         let cpu_num = SysQuota::cpu_cores_quota();
         let background_thread_count = if cpu_num > 16.0 { 3 } else { 2 };
@@ -246,12 +247,10 @@ impl Default for Config {
             end_point_batch_row_limit: DEFAULT_ENDPOINT_BATCH_ROW_LIMIT,
             end_point_stream_batch_row_limit: DEFAULT_ENDPOINT_STREAM_BATCH_ROW_LIMIT,
             end_point_enable_batch_if_possible: true,
-            end_point_request_max_handle_duration: ReadableDuration::secs(
-                DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS,
-            ),
+            end_point_request_max_handle_duration: None,
             end_point_max_concurrency: cmp::max(cpu_num as usize, MIN_ENDPOINT_MAX_CONCURRENCY),
             end_point_perf_level: PerfLevel::Uninitialized,
-            snap_max_write_bytes_per_sec: ReadableSize(DEFAULT_SNAP_MAX_BYTES_PER_SEC),
+            snap_io_max_bytes_per_sec: ReadableSize(DEFAULT_SNAP_MAX_BYTES_PER_SEC),
             snap_max_total_size: ReadableSize(0),
             stats_concurrency: 1,
             // 75 means a gRPC thread is under heavy load if its total CPU usage
@@ -351,7 +350,7 @@ impl Config {
             return Err(box_err!("server.end-point-recursion-limit is too small"));
         }
 
-        if self.end_point_request_max_handle_duration.as_secs()
+        if self.end_point_request_max_handle_duration().as_secs()
             < DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS
         {
             return Err(box_err!(
@@ -403,6 +402,32 @@ impl Config {
             GrpcCompressionType::None => CompressionAlgorithms::GRPC_COMPRESS_NONE,
             GrpcCompressionType::Deflate => CompressionAlgorithms::GRPC_COMPRESS_DEFLATE,
             GrpcCompressionType::Gzip => CompressionAlgorithms::GRPC_COMPRESS_GZIP,
+        }
+    }
+
+    pub fn end_point_request_max_handle_duration(&self) -> ReadableDuration {
+        if let Some(end_point_request_max_handle_duration) =
+            self.end_point_request_max_handle_duration
+        {
+            return end_point_request_max_handle_duration;
+        }
+        ReadableDuration::secs(DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS)
+    }
+
+    pub fn optimize_for(&mut self, region_size: ReadableSize) {
+        // It turns out for 256MB region size, 60s is typically enough.
+        const THRESHOLD_SIZE: ReadableSize = ReadableSize::mb(256);
+        if region_size.0 < THRESHOLD_SIZE.0 {
+            self.end_point_request_max_handle_duration
+                .get_or_insert(ReadableDuration::secs(
+                    DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS,
+                ));
+        } else {
+            self.end_point_request_max_handle_duration
+                .get_or_insert(ReadableDuration::secs(cmp::min(
+                    1800,
+                    region_size.0 / THRESHOLD_SIZE.0 * DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS,
+                )));
         }
     }
 }
@@ -514,7 +539,7 @@ mod tests {
         invalid_cfg.validate().unwrap_err();
 
         let mut invalid_cfg = cfg.clone();
-        invalid_cfg.end_point_request_max_handle_duration = ReadableDuration::secs(0);
+        invalid_cfg.end_point_request_max_handle_duration = Some(ReadableDuration::secs(0));
         invalid_cfg.validate().unwrap_err();
 
         invalid_cfg = Config::default();

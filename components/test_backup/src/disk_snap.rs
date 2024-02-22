@@ -169,8 +169,8 @@ impl PrepareBackup {
             while !regions.is_empty() {
                 let resp = self.rx.next().await.unwrap().unwrap();
                 assert_eq!(resp.ty, PrepareSnapshotBackupEventType::WaitApplyDone);
-                assert!(!resp.has_error(), "{:?}", resp);
-                assert!(regions.remove(&resp.get_region().id), "{:?}", regions);
+                assert!(!resp.has_error(), "{resp:?}");
+                assert!(regions.remove(&resp.get_region().id), "{regions:?}");
             }
         });
     }
@@ -217,7 +217,7 @@ impl PrepareBackup {
 
 #[track_caller]
 pub fn must_wait_apply_success(res: &PrepareSnapshotBackupResponse) -> u64 {
-    assert!(!res.has_error(), "{:?}", res);
+    assert!(!res.has_error(), "{res:?}");
     assert_eq!(res.ty, PrepareSnapshotBackupEventType::WaitApplyDone);
     res.get_region().id
 }

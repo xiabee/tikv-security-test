@@ -69,14 +69,17 @@ use std::{
         atomic::{self, AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use api_version::{ApiV1, ApiV2, KeyMode, KvFormat, RawValue};
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use collections::HashMap;
 use concurrency_manager::{ConcurrencyManager, KeyHandleGuard};
-use engine_traits::{raw_ttl::ttl_to_expire_ts, CfName, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_CFS};
-use futures::prelude::*;
+use engine_traits::{
+    raw_ttl::ttl_to_expire_ts, CfName, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_CFS, DATA_CFS_LEN,
+};
+use futures::{future::Either, prelude::*};
 use kvproto::{
     kvrpcpb::{
         ApiVersion, ChecksumAlgorithm, CommandPri, Context, GetRequest, IsolationLevel, KeyRange,
@@ -87,13 +90,14 @@ use kvproto::{
 use pd_client::FeatureGate;
 use raftstore::store::{util::build_key_range, ReadStats, TxnExt, WriteStats};
 use rand::prelude::*;
+use resource_control::{ResourceController, ResourceGroupManager, ResourceLimiter, TaskMetadata};
 use resource_metering::{FutureExt, ResourceTagFactory};
 use tikv_kv::{OnAppliedCb, SnapshotExt};
 use tikv_util::{
     deadline::Deadline,
     future::try_poll,
     quota_limiter::QuotaLimiter,
-    time::{duration_to_ms, Instant, ThreadReadId},
+    time::{duration_to_ms, duration_to_sec, Instant, ThreadReadId},
 };
 use tracker::{
     clear_tls_tracker_token, set_tls_tracker_token, with_tls_tracker, TrackedFuture, TrackerToken,
@@ -127,7 +131,7 @@ use crate::{
         txn::{
             commands::{RawAtomicStore, RawCompareAndSwap, TypedCommand},
             flow_controller::{EngineFlowController, FlowController},
-            scheduler::Scheduler as TxnScheduler,
+            scheduler::TxnScheduler,
             Command, ErrorInner as TxnError,
         },
         types::StorageCallbackType,
@@ -136,6 +140,25 @@ use crate::{
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Callback<T> = Box<dyn FnOnce(Result<T>) + Send>;
+
+macro_rules! check_key_size {
+    ($key_iter:expr, $max_key_size:expr, $callback:ident) => {
+        for k in $key_iter {
+            let key_size = k.len();
+            if key_size > $max_key_size {
+                $callback(Err(Error::from(ErrorInner::KeyTooLarge {
+                    size: key_size,
+                    limit: $max_key_size,
+                })));
+                return Ok(());
+            }
+        }
+    };
+}
+
+/// Storage for Api V1
+/// To be convenience for test cases unrelated to RawKV.
+pub type StorageApiV1<E, L> = Storage<E, L, ApiV1>;
 
 /// [`Storage`](Storage) implements transactional KV APIs and raw KV APIs on a
 /// given [`Engine`]. An [`Engine`] provides low level KV functionality.
@@ -188,13 +211,10 @@ pub struct Storage<E: Engine, L: LockManager, F: KvFormat> {
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
 
     quota_limiter: Arc<QuotaLimiter>,
+    resource_manager: Option<Arc<ResourceGroupManager>>,
 
     _phantom: PhantomData<F>,
 }
-
-/// Storage for Api V1
-/// To be convenience for test cases unrelated to RawKV.
-pub type StorageApiV1<E, L> = Storage<E, L, ApiV1>;
 
 impl<E: Engine, L: LockManager, F: KvFormat> Clone for Storage<E, L, F> {
     #[inline]
@@ -215,7 +235,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Clone for Storage<E, L, F> {
             api_version: self.api_version,
             causal_ts_provider: self.causal_ts_provider.clone(),
             resource_tag_factory: self.resource_tag_factory.clone(),
-            quota_limiter: Arc::clone(&self.quota_limiter),
+            quota_limiter: self.quota_limiter.clone(),
+            resource_manager: self.resource_manager.clone(),
             _phantom: PhantomData,
         }
     }
@@ -238,21 +259,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Drop for Storage<E, L, F> {
     }
 }
 
-macro_rules! check_key_size {
-    ($key_iter:expr, $max_key_size:expr, $callback:ident) => {
-        for k in $key_iter {
-            let key_size = k.len();
-            if key_size > $max_key_size {
-                $callback(Err(Error::from(ErrorInner::KeyTooLarge {
-                    size: key_size,
-                    limit: $max_key_size,
-                })));
-                return Ok(());
-            }
-        }
-    };
-}
-
 impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     /// Create a `Storage` from given engine.
     pub fn from_engine<R: FlowStatsReporter>(
@@ -268,6 +274,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         quota_limiter: Arc<QuotaLimiter>,
         feature_gate: FeatureGate,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
+        resource_ctl: Option<Arc<ResourceController>>,
+        resource_manager: Option<Arc<ResourceGroupManager>>,
     ) -> Result<Self> {
         assert_eq!(config.api_version(), F::TAG, "Api version not match");
 
@@ -283,6 +291,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             resource_tag_factory.clone(),
             Arc::clone(&quota_limiter),
             feature_gate,
+            resource_ctl,
+            resource_manager.clone(),
         );
 
         info!("Storage started.");
@@ -298,6 +308,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             causal_ts_provider,
             resource_tag_factory,
             quota_limiter,
+            resource_manager,
             _phantom: PhantomData,
         })
     }
@@ -590,8 +601,17 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<(Option<Value>, KvGetStatistics)>> {
         let stage_begin_ts = Instant::now();
+        let deadline = Self::get_deadline(&ctx);
         const CMD: CommandKind = CommandKind::get;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self.resource_tag_factory.new_tag_with_key_ranges(
             &ctx,
@@ -599,11 +619,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         );
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
         let quota_limiter = self.quota_limiter.clone();
         let mut sample = quota_limiter.new_sample(true);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 let stage_scheduled_ts = Instant::now();
                 tls_collect_query(
@@ -620,9 +642,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     .get(priority_tag)
                     .inc();
 
+                deadline.check()?;
+
                 Self::check_api_version(api_version, ctx.api_version, CMD, [key.as_encoded()])?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
 
                 // The bypass_locks and access_locks set will be checked at most once.
                 // `TsSet::vec` is more efficient here.
@@ -641,6 +665,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
 
                 {
+                    deadline.check()?;
                     let begin_instant = Instant::now();
                     let stage_snap_recv_ts = begin_instant;
                     let buckets = snapshot.ext().get_buckets();
@@ -657,13 +682,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             false,
                         );
                         snap_store
-                        .get(&key, &mut statistics)
-                        // map storage::txn::Error -> storage::Error
-                        .map_err(Error::from)
-                        .map(|r| {
-                            KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
-                            r
-                        })
+                    .get(&key, &mut statistics)
+                    // map storage::txn::Error -> storage::Error
+                    .map_err(Error::from)
+                    .map(|r| {
+                        KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
+                        r
+                    })
                     });
                     metrics::tls_collect_scan_details(CMD, &statistics);
                     metrics::tls_collect_read_flow(
@@ -673,12 +698,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &statistics,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     let read_bytes = key.len()
                         + result
@@ -704,10 +732,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     let process_wall_time =
                         stage_finished_ts.saturating_duration_since(stage_snap_recv_ts);
                     let latency_stats = StageLatencyStats {
-                        schedule_wait_time_ms: duration_to_ms(schedule_wait_time),
-                        snapshot_wait_time_ms: duration_to_ms(snapshot_wait_time),
-                        wait_wall_time_ms: duration_to_ms(wait_wall_time),
-                        process_wall_time_ms: duration_to_ms(process_wall_time),
+                        schedule_wait_time_ns: schedule_wait_time.as_nanos() as u64,
+                        snapshot_wait_time_ns: snapshot_wait_time.as_nanos() as u64,
+                        wait_wall_time_ns: wait_wall_time.as_nanos() as u64,
+                        process_wall_time_ns: process_wall_time.as_nanos() as u64,
                     };
                     with_tls_tracker(|tracker| {
                         tracker.metrics.read_pool_schedule_wait_nanos =
@@ -725,11 +753,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     /// Get values of a set of keys with separate context from a snapshot,
@@ -743,13 +769,30 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         ids: Vec<u64>,
         trackers: Vec<TrackerToken>,
         consumer: P,
-        begin_instant: tikv_util::time::Instant,
+        begin_instant: Instant,
     ) -> impl Future<Output = Result<()>> {
         const CMD: CommandKind = CommandKind::batch_get_command;
         // all requests in a batch have the same region, epoch, term, replica_read
         let priority = requests[0].get_context().get_priority();
+        let metadata =
+            TaskMetadata::from_ctx(requests[0].get_context().get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                requests[0]
+                    .get_context()
+                    .get_resource_control_context()
+                    .get_resource_group_name(),
+                requests[0].get_context().get_request_source(),
+                requests[0]
+                    .get_context()
+                    .get_resource_control_context()
+                    .get_override_priority(),
+            )
+        });
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
+        let busy_threshold =
+            Duration::from_millis(requests[0].get_context().busy_threshold_ms as u64);
 
         // The resource tags of these batched requests are not the same, and it is quite
         // expensive to distinguish them, so we can find random one of them as a
@@ -763,13 +806,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         // Unset the TLS tracker because the future below does not belong to any
         // specific request
         clear_tls_tracker_token();
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 KV_COMMAND_KEYREAD_HISTOGRAM_STATIC
                     .get(CMD)
                     .observe(requests.len() as f64);
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let read_id = Some(ThreadReadId::new());
                 let mut statistics = Statistics::default();
                 let mut req_snaps = vec![];
@@ -777,6 +821,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 for ((mut req, id), tracker) in requests.into_iter().zip(ids).zip(trackers) {
                     set_tls_tracker_token(tracker);
                     let mut ctx = req.take_context();
+                    let deadline = Self::get_deadline(&ctx);
                     let source = ctx.take_request_source();
                     let region_id = ctx.get_region_id();
                     let peer = ctx.get_peer();
@@ -835,6 +880,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         id,
                         source,
                         tracker,
+                        deadline,
                     ));
                 }
                 Self::with_tls_engine(|engine| engine.release_snapshot());
@@ -851,8 +897,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         id,
                         source,
                         tracker,
+                        deadline,
                     ) = req_snap;
                     let snap_res = snap.await;
+                    if let Err(e) = deadline.check() {
+                        consumer.consume(id, Err(Error::from(e)), begin_instant, source);
+                        continue;
+                    }
+
                     set_tls_tracker_token(tracker);
                     match snap_res {
                         Ok(snapshot) => Self::with_perf_context(CMD, || {
@@ -908,11 +960,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     /// Get values of a set of keys in a batch from the snapshot.
@@ -925,8 +975,17 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<(Vec<Result<KvPair>>, KvGetStatistics)>> {
         let stage_begin_ts = Instant::now();
+        let deadline = Self::get_deadline(&ctx);
         const CMD: CommandKind = CommandKind::batch_get;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let key_ranges = keys
             .iter()
@@ -937,9 +996,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .new_tag_with_key_ranges(&ctx, key_ranges);
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
         let quota_limiter = self.quota_limiter.clone();
         let mut sample = quota_limiter.new_sample(true);
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 let stage_scheduled_ts = Instant::now();
                 let mut key_ranges = vec![];
@@ -958,6 +1019,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     .get(priority_tag)
                     .inc();
 
+                deadline.check()?;
+
                 Self::check_api_version(
                     api_version,
                     ctx.api_version,
@@ -965,7 +1028,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     keys.iter().map(Key::as_encoded),
                 )?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
 
                 let bypass_locks = TsSet::from_u64s(ctx.take_resolved_locks());
                 let access_locks = TsSet::from_u64s(ctx.take_committed_locks());
@@ -981,6 +1044,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 let snapshot =
                     Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
                 {
+                    deadline.check()?;
                     let begin_instant = Instant::now();
 
                     let stage_snap_recv_ts = begin_instant;
@@ -1031,12 +1095,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         (result, stats)
                     });
                     metrics::tls_collect_scan_details(CMD, &stats);
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     let read_bytes = stats.cf_statistics(CF_DEFAULT).flow_stats.read_bytes
                         + stats.cf_statistics(CF_LOCK).flow_stats.read_bytes
@@ -1063,10 +1130,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             schedule_wait_time.as_nanos() as u64;
                     });
                     let latency_stats = StageLatencyStats {
-                        schedule_wait_time_ms: duration_to_ms(schedule_wait_time),
-                        snapshot_wait_time_ms: duration_to_ms(snapshot_wait_time),
-                        wait_wall_time_ms: duration_to_ms(wait_wall_time),
-                        process_wall_time_ms: duration_to_ms(process_wall_time),
+                        schedule_wait_time_ns: duration_to_ms(schedule_wait_time),
+                        snapshot_wait_time_ns: duration_to_ms(snapshot_wait_time),
+                        wait_wall_time_ns: duration_to_ms(wait_wall_time),
+                        process_wall_time_ns: duration_to_ms(process_wall_time),
                     };
                     Ok((
                         result?,
@@ -1080,12 +1147,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     /// Scan keys in [`start_key`, `end_key`) up to `limit` keys from the
@@ -1107,6 +1171,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<Result<KvPair>>>> {
         const CMD: CommandKind = CommandKind::scan;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self.resource_tag_factory.new_tag_with_key_ranges(
             &ctx,
@@ -1120,8 +1192,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         );
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 {
                     let end_key = match &end_key {
@@ -1156,7 +1230,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 if reverse_scan {
                     std::mem::swap(&mut start_key, &mut end_key);
                 }
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
 
                 let bypass_locks = TsSet::from_u64s(ctx.take_resolved_locks());
                 let access_locks = TsSet::from_u64s(ctx.take_committed_locks());
@@ -1235,12 +1309,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &statistics,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     res.map_err(Error::from).map(|results| {
                         KV_COMMAND_KEYREAD_HISTOGRAM_STATIC
@@ -1256,12 +1333,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     pub fn scan_lock(
@@ -1274,6 +1348,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<LockInfo>>> {
         const CMD: CommandKind = CommandKind::scan_lock;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self.resource_tag_factory.new_tag_with_key_ranges(
             &ctx,
@@ -1318,7 +1400,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 // which resolves locks on regions, and boundary of regions will be out of range
                 // of TiDB keys.
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
 
                 concurrency_manager.update_max_ts(max_ts);
                 let begin_instant = Instant::now();
@@ -1390,12 +1472,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &statistics,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     Ok(locks)
                 })
@@ -1403,6 +1488,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            metadata,
+            resource_limiter,
         );
         async move {
             res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
@@ -1491,15 +1578,20 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
     // Schedule raw modify commands, which reuse the scheduler worker pool.
     // TODO: separate the txn and raw commands if needed in the future.
-    fn sched_raw_command<T>(&self, tag: CommandKind, future: T) -> Result<()>
+    fn sched_raw_command<T>(
+        &self,
+        metadata: TaskMetadata<'_>,
+        pri: CommandPri,
+        tag: CommandKind,
+        future: T,
+    ) -> Result<()>
     where
-        T: Future + Send + 'static,
+        T: Future<Output = ()> + Send + 'static,
     {
         SCHED_STAGE_COUNTER_VEC.get(tag).new.inc();
         self.sched
-            .get_sched_pool(CommandPri::Normal)
-            .pool
-            .spawn(future)
+            .get_sched_pool()
+            .spawn(metadata, pri, future)
             .map_err(|_| Error::from(ErrorInner::SchedTooBusy))
     }
 
@@ -1536,7 +1628,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             [(Some(start_key.as_encoded()), Some(end_key.as_encoded()))],
         )?;
 
-        let mut modifies = Vec::with_capacity(DATA_CFS.len());
+        let mut modifies = Vec::with_capacity(DATA_CFS_LEN);
         for cf in DATA_CFS {
             modifies.push(Modify::DeleteRange(
                 cf,
@@ -1573,13 +1665,23 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Option<Vec<u8>>>> {
         const CMD: CommandKind = CommandKind::raw_get;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, vec![(key.clone(), key.clone())]);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -1588,7 +1690,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
                 Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -1623,24 +1725,24 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &stats,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
                     r
                 }
             }
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     /// Get the values of a set of raw keys, return a list of `Result`s.
@@ -1653,8 +1755,23 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         const CMD: CommandKind = CommandKind::raw_batch_get_command;
         // all requests in a batch have the same region, epoch, term, replica_read
         let priority = gets[0].get_context().get_priority();
+        let metadata = TaskMetadata::from_ctx(gets[0].get_context().get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                gets[0]
+                    .get_context()
+                    .get_resource_control_context()
+                    .get_resource_group_name(),
+                gets[0].get_context().get_request_source(),
+                gets[0]
+                    .get_context()
+                    .get_resource_control_context()
+                    .get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(gets[0].get_context().busy_threshold_ms as u64);
 
         // The resource tags of these batched requests are not the same, and it is quite
         // expensive to distinguish them, so we can find random one of them as a
@@ -1666,7 +1783,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .resource_tag_factory
             .new_tag_with_key_ranges(rand_ctx, vec![(rand_key.clone(), rand_key)]);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -1686,7 +1804,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     .map_err(Error::from)?;
                 }
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let read_id = Some(ThreadReadId::new());
                 let mut snaps = vec![];
                 for (mut req, id) in gets.into_iter().zip(ids) {
@@ -1755,22 +1873,23 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     }
                 }
 
+                let now = Instant::now();
                 SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                     .get(CMD)
-                    .observe(begin_instant.saturating_elapsed_secs());
-                SCHED_HISTOGRAM_VEC_STATIC
-                    .get(CMD)
-                    .observe(command_duration.saturating_elapsed_secs());
+                    .observe(duration_to_sec(
+                        now.saturating_duration_since(begin_instant),
+                    ));
+                SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                    now.saturating_duration_since(command_duration),
+                ));
                 Ok(())
             }
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     /// Get the values of some raw keys in a batch.
@@ -1782,14 +1901,24 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<Result<KvPair>>>> {
         const CMD: CommandKind = CommandKind::raw_batch_get;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let key_ranges = keys.iter().map(|k| (k.clone(), k.clone())).collect();
         let resource_tag = self
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, key_ranges);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 let mut key_ranges = vec![];
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
@@ -1799,7 +1928,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
                 Self::check_api_version(api_version, ctx.api_version, CMD, &keys)?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -1850,24 +1979,24 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     KV_COMMAND_KEYREAD_HISTOGRAM_STATIC
                         .get(CMD)
                         .observe(stats.data.flow_stats.read_keys as f64);
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
                     Ok(result)
                 }
             }
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     async fn check_causal_ts_flushed(ctx: &mut Context, tag: CommandKind) -> Result<()> {
@@ -1927,11 +2056,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let provider = self.causal_ts_provider.clone();
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
-        self.sched_raw_command(CMD, async move {
+
+        let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
 
             if let Err(e) = Self::check_causal_ts_flushed(&mut ctx, CMD).await {
                 return callback(Err(e));
@@ -2037,11 +2169,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
         let deadline = Self::get_deadline(&ctx);
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
 
             if let Err(e) = Self::check_causal_ts_flushed(&mut ctx, CMD).await {
                 return callback(Err(e));
@@ -2100,11 +2234,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
         let deadline = Self::get_deadline(&ctx);
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
 
             if let Err(e) = Self::check_causal_ts_flushed(&mut ctx, CMD).await {
                 return callback(Err(e));
@@ -2159,11 +2295,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
         let engine = self.engine.clone();
         let deadline = Self::get_deadline(&ctx);
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
             let start_key = F::encode_raw_key_owned(start_key, None);
             let end_key = F::encode_raw_key_owned(end_key, None);
 
@@ -2205,11 +2343,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
         let deadline = Self::get_deadline(&ctx);
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        self.sched_raw_command(metadata, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
 
             if let Err(e) = Self::check_causal_ts_flushed(&mut ctx, CMD).await {
                 return callback(Err(e));
@@ -2268,11 +2408,21 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<Result<KvPair>>>> {
         const CMD: CommandKind = CommandKind::raw_scan;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self.resource_tag_factory.new_tag(&ctx);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -2286,7 +2436,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     [(Some(&start_key), end_key.as_ref())],
                 )?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -2363,12 +2513,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         .get(CMD)
                         .observe(statistics.data.flow_stats.read_keys as f64);
                     metrics::tls_collect_scan_details(CMD, &statistics);
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     result
                 }
@@ -2376,12 +2529,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     /// Scan raw keys in multiple ranges in a batch.
@@ -2396,6 +2546,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<Result<KvPair>>>> {
         const CMD: CommandKind = CommandKind::raw_batch_scan;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let key_ranges = ranges
             .iter()
@@ -2405,8 +2563,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, key_ranges);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -2422,7 +2582,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         .map(|range| (Some(range.get_start_key()), Some(range.get_end_key()))),
                 )?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -2520,24 +2680,24 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         .get(CMD)
                         .observe(statistics.data.flow_stats.read_keys as f64);
                     metrics::tls_collect_scan_details(CMD, &statistics);
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
                     Ok(result)
                 }
             }
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     /// Get the value of a raw key.
@@ -2549,13 +2709,23 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Option<u64>>> {
         const CMD: CommandKind = CommandKind::raw_get_key_ttl;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, vec![(key.clone(), key.clone())]);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -2564,7 +2734,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
                 Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -2599,24 +2769,24 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &stats,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
                     r
                 }
             }
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            metadata,
+            resource_limiter,
+        )
     }
 
     pub fn raw_compare_and_swap_atomic(
@@ -2638,7 +2808,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             return Err(Error::from(ErrorInner::TtlNotEnabled));
         }
         let sched = self.get_scheduler();
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        self.sched_raw_command(metadata, priority, CMD, async move {
             let key = F::encode_raw_key_owned(key, None);
             let cmd = RawCompareAndSwap::new(cf, key, previous_value, value, ttl, api_version, ctx);
             Self::sched_raw_atomic_command(
@@ -2669,7 +2841,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         Self::check_ttl_valid(pairs.len(), &ttls)?;
 
         let sched = self.get_scheduler();
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        self.sched_raw_command(metadata, priority, CMD, async move {
             let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, None);
             let cmd = RawAtomicStore::new(cf, modifies, ctx);
             Self::sched_raw_atomic_command(
@@ -2692,7 +2866,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         Self::check_api_version(self.api_version, ctx.api_version, CMD, &keys)?;
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
         let sched = self.get_scheduler();
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        self.sched_raw_command(metadata, priority, CMD, async move {
             // Do NOT encode ts here as RawAtomicStore use key to gen lock
             let modifies = keys
                 .into_iter()
@@ -2715,6 +2891,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<(u64, u64, u64)>> {
         const CMD: CommandKind = CommandKind::raw_checksum;
         let priority = ctx.get_priority();
+        let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                ctx.get_resource_control_context().get_resource_group_name(),
+                ctx.get_request_source(),
+                ctx.get_resource_control_context().get_override_priority(),
+            )
+        });
         let priority_tag = get_priority_tag(priority);
         let key_ranges = ranges
             .iter()
@@ -2751,7 +2935,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     range.set_end_key(end_key.into_encoded());
                 }
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -2762,7 +2946,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 let store = RawStore::new(snapshot, api_version);
                 let cf = Self::rawkv_cf("", api_version)?;
 
-                let begin_instant = tikv_util::time::Instant::now();
+                let begin_instant = Instant::now();
                 let mut stats = Vec::with_capacity(ranges.len());
                 let ret = store
                     .raw_checksum_ranges(cf, &ranges, &mut stats)
@@ -2777,24 +2961,55 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         buckets.as_ref(),
                     );
                 });
+                let now = Instant::now();
                 SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                     .get(CMD)
-                    .observe(begin_instant.saturating_elapsed().as_secs_f64());
-                SCHED_HISTOGRAM_VEC_STATIC
-                    .get(CMD)
-                    .observe(command_duration.saturating_elapsed().as_secs_f64());
+                    .observe(duration_to_sec(
+                        now.saturating_duration_since(begin_instant),
+                    ));
+                SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                    now.saturating_duration_since(command_duration),
+                ));
 
                 ret
             }
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            metadata,
+            resource_limiter,
         );
 
         async move {
             res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
                 .await?
         }
+    }
+
+    fn read_pool_spawn_with_busy_check<Fut, T>(
+        &self,
+        busy_threshold: Duration,
+        future: Fut,
+        priority: CommandPri,
+        task_id: u64,
+        metadata: TaskMetadata<'_>,
+        resource_limiter: Option<Arc<ResourceLimiter>>,
+    ) -> impl Future<Output = Result<T>>
+    where
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Err(busy_err) = self.read_pool.check_busy_threshold(busy_threshold) {
+            let mut err = kvproto::errorpb::Error::default();
+            err.set_server_is_busy(busy_err);
+            return Either::Left(future::err(Error::from(ErrorInner::Kv(err.into()))));
+        }
+        Either::Right(
+            self.read_pool
+                .spawn_handle(future, priority, task_id, metadata, resource_limiter)
+                .map_err(|_| Error::from(ErrorInner::SchedTooBusy))
+                .and_then(|res| future::ready(res)),
+        )
     }
 }
 
@@ -2816,7 +3031,7 @@ pub async fn get_raw_key_guard(
         // get maximum resolved-ts from concurrency_manager.global_min_lock_ts
         let encode_key = ApiV2::encode_raw_key(&raw_key, Some(ts));
         let key_guard = concurrency_manager.lock_key(&encode_key).await;
-        let lock = Lock::new(LockType::Put, raw_key, ts, 0, None, 0.into(), 1, ts);
+        let lock = Lock::new(LockType::Put, raw_key, ts, 0, None, 0.into(), 1, ts, false);
         key_guard.with_lock(|l| *l = Some(lock));
         Ok(Some(key_guard))
     } else {
@@ -3129,7 +3344,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
         } else {
             None
         };
-
+        let manager = Arc::new(ResourceGroupManager::default());
+        let resource_ctl = manager.derive_controller("test".into(), false);
         Storage::from_engine(
             self.engine,
             &self.config,
@@ -3147,6 +3363,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             Arc::new(QuotaLimiter::default()),
             latest_feature_gate(),
             ts_provider,
+            Some(resource_ctl),
+            Some(manager),
         )
     }
 
@@ -3154,6 +3372,43 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
         let engine = TxnTestEngine {
             engine: self.engine,
             txn_ext,
+        };
+        let read_pool = build_read_pool_for_test(
+            &crate::config::StorageReadPoolConfig::default_for_test(),
+            engine.clone(),
+        );
+        let manager = Arc::new(ResourceGroupManager::default());
+        let resource_ctl = manager.derive_controller("test".into(), false);
+        Storage::from_engine(
+            engine,
+            &self.config,
+            ReadPool::from(read_pool).handle(),
+            self.lock_mgr,
+            ConcurrencyManager::new(1.into()),
+            DynamicConfigs {
+                pipelined_pessimistic_lock: self.pipelined_pessimistic_lock,
+                in_memory_pessimistic_lock: self.in_memory_pessimistic_lock,
+                wake_up_delay_duration_ms: self.wake_up_delay_duration_ms,
+            },
+            Arc::new(FlowController::Singleton(EngineFlowController::empty())),
+            DummyReporter,
+            ResourceTagFactory::new_for_test(),
+            Arc::new(QuotaLimiter::default()),
+            latest_feature_gate(),
+            None,
+            Some(resource_ctl),
+            Some(manager),
+        )
+    }
+
+    pub fn build_for_resource_controller(
+        self,
+        resource_manager: Arc<ResourceGroupManager>,
+        resource_controller: Arc<ResourceController>,
+    ) -> Result<Storage<TxnTestEngine<E>, L, F>> {
+        let engine = TxnTestEngine {
+            engine: self.engine,
+            txn_ext: Arc::new(TxnExt::default()),
         };
         let read_pool = build_read_pool_for_test(
             &crate::config::StorageReadPoolConfig::default_for_test(),
@@ -3177,6 +3432,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             Arc::new(QuotaLimiter::default()),
             latest_feature_gate(),
             None,
+            Some(resource_controller),
+            Some(resource_manager),
         )
     }
 }
@@ -3486,7 +3743,7 @@ pub mod test_util {
             &self,
             id: u64,
             res: Result<(Option<Vec<u8>>, Statistics)>,
-            _: tikv_util::time::Instant,
+            _: Instant,
             _source: String,
         ) {
             self.data.lock().unwrap().push(GetResult {
@@ -3497,13 +3754,7 @@ pub mod test_util {
     }
 
     impl ResponseBatchConsumer<Option<Vec<u8>>> for GetConsumer {
-        fn consume(
-            &self,
-            id: u64,
-            res: Result<Option<Vec<u8>>>,
-            _: tikv_util::time::Instant,
-            _source: String,
-        ) {
+        fn consume(&self, id: u64, res: Result<Option<Vec<u8>>>, _: Instant, _source: String) {
             self.data.lock().unwrap().push(GetResult { id, res });
         }
     }
@@ -3588,9 +3839,10 @@ mod tests {
     use parking_lot::Mutex;
     use tikv_util::config::ReadableSize;
     use tracker::INVALID_TRACKER_TOKEN;
-    use txn_types::{Mutation, PessimisticLock, WriteType, SHORT_VALUE_MAX_LEN};
+    use txn_types::{LastChange, Mutation, PessimisticLock, WriteType, SHORT_VALUE_MAX_LEN};
 
     use super::{
+        config::EngineType,
         mvcc::tests::{must_unlocked, must_written},
         test_util::*,
         txn::{
@@ -3616,6 +3868,7 @@ mod tests {
                 commands,
                 commands::{AcquirePessimisticLock, Prewrite},
                 tests::must_rollback,
+                txn_status_cache::TxnStatusCache,
                 Error as TxnError, ErrorInner as TxnErrorInner,
             },
             types::{PessimisticLockKeyResult, PessimisticLockResults},
@@ -3647,6 +3900,7 @@ mod tests {
                     statistics: &mut Statistics::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
+                    txn_status_cache: &TxnStatusCache::new_for_test(),
                 },
             )
             .unwrap();
@@ -4131,24 +4385,35 @@ mod tests {
         let engine = {
             let path = "".to_owned();
             let cfg_rocksdb = db_config;
-            let cache = BlockCacheConfig::default().build_shared_cache();
+            let shared =
+                cfg_rocksdb.build_cf_resources(BlockCacheConfig::default().build_shared_cache());
             let cfs_opts = vec![
                 (
                     CF_DEFAULT,
-                    cfg_rocksdb
-                        .defaultcf
-                        .build_opt(&cache, None, ApiVersion::V1),
+                    cfg_rocksdb.defaultcf.build_opt(
+                        &shared,
+                        None,
+                        ApiVersion::V1,
+                        None,
+                        EngineType::RaftKv,
+                    ),
                 ),
-                (CF_LOCK, cfg_rocksdb.lockcf.build_opt(&cache)),
-                (CF_WRITE, cfg_rocksdb.writecf.build_opt(&cache, None)),
-                (CF_RAFT, cfg_rocksdb.raftcf.build_opt(&cache)),
+                (
+                    CF_LOCK,
+                    cfg_rocksdb
+                        .lockcf
+                        .build_opt(&shared, None, EngineType::RaftKv),
+                ),
+                (
+                    CF_WRITE,
+                    cfg_rocksdb
+                        .writecf
+                        .build_opt(&shared, None, None, EngineType::RaftKv),
+                ),
+                (CF_RAFT, cfg_rocksdb.raftcf.build_opt(&shared)),
             ];
             RocksEngine::new(
-                &path,
-                None,
-                cfs_opts,
-                cache.is_some(),
-                None, // io_rate_limiter
+                &path, None, cfs_opts, None, // io_rate_limiter
             )
         }
         .unwrap();
@@ -7340,6 +7605,7 @@ mod tests {
                     0.into(),
                     1,
                     20.into(),
+                    false,
                 ));
             });
             guard
@@ -7669,6 +7935,7 @@ mod tests {
                 0.into(),
                 0,
                 0.into(),
+                false,
             )
         };
 
@@ -7835,6 +8102,7 @@ mod tests {
                             0.into(),
                             3,
                             ts(10, 1),
+                            false,
                         )
                         .use_async_commit(vec![b"k1".to_vec(), b"k2".to_vec()]),
                         false,
@@ -8183,6 +8451,7 @@ mod tests {
                     None,
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Context::default(),
                 ),
                 expect_ok_callback(tx.clone(), 0),
@@ -9255,6 +9524,7 @@ mod tests {
                             0.into(),
                             0,
                             0.into(),
+                            false,
                         ),
                         false,
                     ),
@@ -9304,6 +9574,7 @@ mod tests {
                 0.into(),
                 1,
                 20.into(),
+                false,
             ));
         });
 
@@ -9551,6 +9822,7 @@ mod tests {
                     Some(vec![b"e".to_vec()]),
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Context::default(),
                 ),
                 Box::new(move |res| {
@@ -9649,6 +9921,7 @@ mod tests {
                     None,
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Default::default(),
                 ),
                 expect_ok_callback(tx.clone(), 0),
@@ -9700,6 +9973,7 @@ mod tests {
                     Some(vec![k2.to_vec()]),
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Default::default(),
                 ),
                 expect_ok_callback(tx.clone(), 0),
@@ -9994,6 +10268,7 @@ mod tests {
                                 10.into(),
                                 0,
                                 11.into(),
+                                false,
                             ),
                         ),
                         (
@@ -10007,6 +10282,7 @@ mod tests {
                                 10.into(),
                                 0,
                                 11.into(),
+                                false,
                             ),
                         ),
                     ],
@@ -10035,6 +10311,7 @@ mod tests {
                                 10.into(),
                                 0,
                                 11.into(),
+                                false,
                             ),
                         ),
                         (
@@ -10048,6 +10325,7 @@ mod tests {
                                 10.into(),
                                 0,
                                 11.into(),
+                                false,
                             ),
                         ),
                     ],
@@ -10078,6 +10356,7 @@ mod tests {
                                 10.into(),
                                 0,
                                 11.into(),
+                                false,
                             ),
                         ),
                         (
@@ -10091,6 +10370,7 @@ mod tests {
                                 10.into(),
                                 0,
                                 11.into(),
+                                false,
                             ),
                         ),
                     ],
@@ -10487,8 +10767,8 @@ mod tests {
                         ttl: 3000,
                         for_update_ts: 10.into(),
                         min_commit_ts: 11.into(),
-                        last_change_ts: TimeStamp::zero(),
-                        versions_to_last_change: 1,
+                        last_change: LastChange::NotExist,
+                        is_locked_with_conflict: false,
                     },
                     false
                 )
@@ -10536,6 +10816,7 @@ mod tests {
                     None,
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Context::default(),
                 ),
                 Box::new(move |res| {
@@ -10594,6 +10875,7 @@ mod tests {
                     None,
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Context::default(),
                 ),
                 Box::new(move |res| {
@@ -10603,5 +10885,508 @@ mod tests {
             .unwrap();
         // Prewrite still succeeds
         rx.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_prewrite_cached_committed_transaction_do_not_skip_constraint_check() {
+        let storage = TestStorageBuilderApiV1::new(MockLockManager::new())
+            .build()
+            .unwrap();
+        let cm = storage.concurrency_manager.clone();
+        let k1 = Key::from_raw(b"k1");
+        let pk = b"pk";
+        // Simulate the case that the current TiKV instance have a non-unique
+        // index key of a pessimistic transaction. It won't be pessimistic
+        // locked, and prewrite skips constraint checks.
+        // Simulate the case that a prewrite is performed twice, with async
+        // commit enabled, and max_ts changes when the second request arrives.
+
+        // A retrying prewrite request arrives.
+        cm.update_max_ts(20.into());
+        let mut ctx = Context::default();
+        ctx.set_is_retry_request(true);
+        let (tx, rx) = channel();
+        storage
+            .sched_txn_command(
+                commands::PrewritePessimistic::new(
+                    vec![(
+                        Mutation::make_put(k1.clone(), b"v".to_vec()),
+                        SkipPessimisticCheck,
+                    )],
+                    pk.to_vec(),
+                    10.into(),
+                    3000,
+                    10.into(),
+                    1,
+                    11.into(),
+                    0.into(),
+                    Some(vec![]),
+                    false,
+                    AssertionLevel::Off,
+                    vec![],
+                    ctx,
+                ),
+                Box::new(move |res| {
+                    tx.send(res).unwrap();
+                }),
+            )
+            .unwrap();
+
+        let res = rx.recv().unwrap().unwrap();
+        assert_eq!(res.min_commit_ts, 21.into());
+
+        // Commit it.
+        let (tx, rx) = channel();
+        storage
+            .sched_txn_command(
+                commands::Commit::new(vec![k1.clone()], 10.into(), 21.into(), Context::default()),
+                expect_ok_callback(tx, 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        // The txn's status is cached
+        assert_eq!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(10.into())
+                .unwrap(),
+            21.into()
+        );
+
+        // Check committed; push max_ts to 30
+        assert_eq!(
+            block_on(storage.get(Context::default(), k1.clone(), 30.into()))
+                .unwrap()
+                .0,
+            Some(b"v".to_vec())
+        );
+
+        let (tx, rx) = channel();
+        storage
+            .sched_txn_command(
+                commands::PrewritePessimistic::new(
+                    vec![(
+                        Mutation::make_put(k1.clone(), b"v".to_vec()),
+                        SkipPessimisticCheck,
+                    )],
+                    pk.to_vec(),
+                    10.into(),
+                    3000,
+                    10.into(),
+                    1,
+                    11.into(),
+                    0.into(),
+                    Some(vec![]),
+                    false,
+                    AssertionLevel::Off,
+                    vec![],
+                    Context::default(),
+                ),
+                Box::new(move |res| {
+                    tx.send(res).unwrap();
+                }),
+            )
+            .unwrap();
+        let res = rx.recv().unwrap().unwrap();
+        assert_eq!(res.min_commit_ts, 21.into());
+
+        // Key must not be locked.
+        assert_eq!(
+            block_on(storage.get(Context::default(), k1, 50.into()))
+                .unwrap()
+                .0,
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_updating_txn_status_cache() {
+        let storage = TestStorageBuilderApiV1::new(MockLockManager::new())
+            .build()
+            .unwrap();
+        let cm = storage.concurrency_manager.clone();
+
+        // Commit
+        let (tx, rx) = channel();
+        storage
+            .sched_txn_command(
+                commands::PrewritePessimistic::new(
+                    vec![(
+                        Mutation::make_put(Key::from_raw(b"k1"), b"v1".to_vec()),
+                        SkipPessimisticCheck,
+                    )],
+                    b"k1".to_vec(),
+                    10.into(),
+                    3000,
+                    10.into(),
+                    1,
+                    11.into(),
+                    0.into(),
+                    Some(vec![]),
+                    false,
+                    AssertionLevel::Off,
+                    vec![],
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(10.into())
+                .is_none()
+        );
+
+        storage
+            .sched_txn_command(
+                commands::Commit::new(
+                    vec![Key::from_raw(b"k1")],
+                    10.into(),
+                    20.into(),
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert_eq!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(10.into())
+                .unwrap(),
+            20.into()
+        );
+
+        // Unsuccessful commit won't update cache
+        storage
+            .sched_txn_command(
+                commands::Commit::new(
+                    vec![Key::from_raw(b"k2")],
+                    30.into(),
+                    40.into(),
+                    Context::default(),
+                ),
+                expect_fail_callback(tx, 0, |_| ()),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(30.into())
+                .is_none()
+        );
+
+        // 1PC update
+        let (tx, rx) = channel();
+        cm.update_max_ts(59.into());
+        storage
+            .sched_txn_command(
+                Prewrite::new(
+                    vec![Mutation::make_put(Key::from_raw(b"k3"), b"v3".to_vec())],
+                    b"k3".to_vec(),
+                    50.into(),
+                    3000,
+                    false,
+                    1,
+                    51.into(),
+                    0.into(),
+                    Some(vec![]),
+                    true,
+                    AssertionLevel::Off,
+                    Context::default(),
+                ),
+                Box::new(move |res| {
+                    tx.send(res).unwrap();
+                }),
+            )
+            .unwrap();
+        let res = rx.recv().unwrap().unwrap();
+        assert_eq!(res.one_pc_commit_ts, 60.into());
+        assert_eq!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(50.into())
+                .unwrap(),
+            60.into()
+        );
+
+        // Resolve lock commit
+        let (tx, rx) = channel();
+        storage
+            .sched_txn_command(
+                Prewrite::new(
+                    vec![Mutation::make_put(Key::from_raw(b"k4"), b"v4".to_vec())],
+                    b"pk".to_vec(),
+                    70.into(),
+                    3000,
+                    false,
+                    1,
+                    0.into(),
+                    0.into(),
+                    None,
+                    false,
+                    AssertionLevel::Off,
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        storage
+            .sched_txn_command(
+                commands::ResolveLockReadPhase::new(
+                    vec![(TimeStamp::from(70), TimeStamp::from(80))]
+                        .into_iter()
+                        .collect(),
+                    None,
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert_eq!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(70.into())
+                .unwrap(),
+            80.into()
+        );
+
+        // Resolve lock lite
+        storage
+            .sched_txn_command(
+                Prewrite::new(
+                    vec![Mutation::make_put(Key::from_raw(b"k5"), b"v5".to_vec())],
+                    b"pk".to_vec(),
+                    90.into(),
+                    3000,
+                    false,
+                    1,
+                    0.into(),
+                    0.into(),
+                    None,
+                    false,
+                    AssertionLevel::Off,
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        storage
+            .sched_txn_command(
+                commands::ResolveLockLite::new(
+                    90.into(),
+                    100.into(),
+                    vec![Key::from_raw(b"k5")],
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert_eq!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(90.into())
+                .unwrap(),
+            100.into()
+        );
+
+        // CheckTxnStatus: uncommitted transaction
+        storage
+            .sched_txn_command(
+                commands::CheckTxnStatus::new(
+                    Key::from_raw(b"k1"),
+                    9.into(),
+                    110.into(),
+                    110.into(),
+                    true,
+                    false,
+                    false,
+                    false,
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(9.into())
+                .is_none()
+        );
+
+        // CheckTxnStatus: committed transaction
+        storage.sched.get_txn_status_cache().remove(10.into());
+        storage
+            .sched_txn_command(
+                commands::CheckTxnStatus::new(
+                    Key::from_raw(b"k1"),
+                    10.into(),
+                    110.into(),
+                    110.into(),
+                    true,
+                    false,
+                    false,
+                    false,
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert_eq!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(10.into())
+                .unwrap(),
+            20.into()
+        );
+
+        // CheckSecondaryLocks: uncommitted transaction
+        storage
+            .sched_txn_command(
+                Prewrite::new(
+                    vec![Mutation::make_put(Key::from_raw(b"k6"), b"v6".to_vec())],
+                    b"pk".to_vec(),
+                    120.into(),
+                    3000,
+                    false,
+                    1,
+                    0.into(),
+                    0.into(),
+                    Some(vec![]),
+                    false,
+                    AssertionLevel::Off,
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        // Lock exists but the transaction status is still unknown
+        storage
+            .sched_txn_command(
+                commands::CheckSecondaryLocks::new(
+                    vec![Key::from_raw(b"k6")],
+                    120.into(),
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(120.into())
+                .is_none()
+        );
+
+        // One of the lock doesn't exist so the transaction becomes rolled-back status.
+        storage
+            .sched_txn_command(
+                commands::CheckSecondaryLocks::new(
+                    vec![Key::from_raw(b"k6"), Key::from_raw(b"k7")],
+                    120.into(),
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(120.into())
+                .is_none()
+        );
+
+        // CheckSecondaryLocks: committed transaction
+        storage
+            .sched_txn_command(
+                Prewrite::new(
+                    vec![
+                        Mutation::make_put(Key::from_raw(b"k8"), b"v8".to_vec()),
+                        Mutation::make_put(Key::from_raw(b"k9"), b"v9".to_vec()),
+                    ],
+                    b"pk".to_vec(),
+                    130.into(),
+                    3000,
+                    false,
+                    1,
+                    0.into(),
+                    0.into(),
+                    Some(vec![]),
+                    false,
+                    AssertionLevel::Off,
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        // Commit one of the key
+        storage
+            .sched_txn_command(
+                commands::Commit::new(
+                    vec![Key::from_raw(b"k9")],
+                    130.into(),
+                    140.into(),
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert_eq!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .remove(130.into())
+                .unwrap(),
+            140.into()
+        );
+
+        storage
+            .sched_txn_command(
+                commands::CheckSecondaryLocks::new(
+                    vec![Key::from_raw(b"k8"), Key::from_raw(b"k9")],
+                    130.into(),
+                    Context::default(),
+                ),
+                expect_ok_callback(tx, 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        assert_eq!(
+            storage
+                .sched
+                .get_txn_status_cache()
+                .get_no_promote(130.into())
+                .unwrap(),
+            140.into()
+        );
     }
 }

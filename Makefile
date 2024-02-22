@@ -331,11 +331,11 @@ unset-override:
 
 pre-format: unset-override
 	@rustup component add rustfmt
-	@which cargo-sort &> /dev/null || cargo install -q cargo-sort 
+	@which cargo-sort &> /dev/null || cargo install -q cargo-sort
 
 format: pre-format
 	@cargo fmt
-	@cargo sort -w >/dev/null 
+	@cargo sort -w -c &>/dev/null || cargo sort -w >/dev/null
 
 doc:
 	@cargo doc --workspace --document-private-items \
@@ -347,6 +347,7 @@ pre-clippy: unset-override
 
 clippy: pre-clippy
 	@./scripts/check-redact-log
+	@./scripts/check-log-style
 	@./scripts/check-docker-build
 	@./scripts/check-license
 	@./scripts/clippy-all
@@ -400,11 +401,19 @@ docker:
 docker_test:
 	docker build -f Dockerfile.test \
 		-t ${DEV_DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
-		. 
+		.
 	docker run -i -v $(shell pwd):/tikv \
 		${DEV_DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
 		make test
-	
+
+docker_shell:
+	docker build -f Dockerfile.test \
+		-t ${DEV_DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+		.
+	docker run -it -v $(shell pwd):/tikv \
+		${DEV_DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+		/bin/bash
+
 ## The driver for script/run-cargo.sh
 ## ----------------------------------
 

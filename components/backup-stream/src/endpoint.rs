@@ -5,7 +5,6 @@ use std::{
     collections::HashSet,
     fmt,
     marker::PhantomData,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -14,20 +13,17 @@ use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
 use error_code::ErrorCodeExt;
 use futures::{stream::AbortHandle, FutureExt, TryFutureExt};
-use grpcio::Environment;
 use kvproto::{
     brpb::{StreamBackupError, StreamBackupTaskInfo},
     metapb::Region,
 };
-use online_config::ConfigChange;
 use pd_client::PdClient;
 use raft::StateRole;
 use raftstore::{
     coprocessor::{CmdBatch, ObserveHandle, RegionInfoProvider},
-    store::{RegionReadProgressRegistry, SignificantRouter},
+    router::CdcHandle,
 };
-use resolved_ts::LeadershipResolver;
-use security::SecurityManager;
+use resolved_ts::{resolve_by_raft, LeadershipResolver};
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
     box_err,
@@ -61,7 +57,7 @@ use crate::{
     metadata::{store::MetaStore, MetadataClient, MetadataEvent, StreamTask},
     metrics::{self, TaskStatus},
     observer::BackupStreamObserver,
-    router::{ApplyEvents, Router, TaskSelector},
+    router::{self, ApplyEvents, Router, TaskSelector},
     subscription_manager::{RegionSubscriptionManager, ResolvedRegions},
     subscription_track::{Ref, RefMut, ResolveResult, SubscriptionTracer},
     try_send,
@@ -112,7 +108,7 @@ where
     PDC: PdClient + 'static,
     S: MetaStore + 'static,
 {
-    pub fn new<RT: SignificantRouter<E> + 'static>(
+    pub fn new<RT: CdcHandle<E> + 'static>(
         store_id: u64,
         store: S,
         config: BackupStreamConfig,
@@ -122,22 +118,14 @@ where
         router: RT,
         pd_client: Arc<PDC>,
         concurrency_manager: ConcurrencyManager,
-        // Required by Leadership Resolver.
-        env: Arc<Environment>,
-        region_read_progress: RegionReadProgressRegistry,
-        security_mgr: Arc<SecurityManager>,
+        resolver: BackupStreamResolver<RT, E>,
     ) -> Self {
         crate::metrics::STREAM_ENABLED.inc();
         let pool = create_tokio_runtime((config.num_threads / 2).max(1), "backup-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
 
         let meta_client = MetadataClient::new(store, store_id);
-        let range_router = Router::new(
-            PathBuf::from(config.temp_path.clone()),
-            scheduler.clone(),
-            config.file_size_limit.0,
-            config.max_flush_interval.0,
-        );
+        let range_router = Router::new(scheduler.clone(), router::Config::from(config.clone()));
 
         // spawn a worker to watch task changes from etcd periodically.
         let meta_client_clone = meta_client.clone();
@@ -163,14 +151,6 @@ where
         let initial_scan_throughput_quota = Limiter::new(limit);
         info!("the endpoint of stream backup started"; "path" => %config.temp_path);
         let subs = SubscriptionTracer::default();
-        let leadership_resolver = LeadershipResolver::new(
-            store_id,
-            Arc::clone(&pd_client) as _,
-            env,
-            security_mgr,
-            region_read_progress,
-            Duration::from_secs(60),
-        );
 
         let initial_scan_semaphore = Arc::new(Semaphore::new(config.initial_scan_concurrency));
         let (region_operator, op_loop) = RegionSubscriptionManager::start(
@@ -191,7 +171,7 @@ where
             meta_client.clone(),
             pd_client.clone(),
             ((config.num_threads + 1) / 2).max(1),
-            leadership_resolver,
+            resolver,
         );
         pool.spawn(op_loop);
         let mut checkpoint_mgr = CheckpointManager::default();
@@ -366,7 +346,7 @@ where
             let mut watcher = match watcher {
                 Ok(w) => w,
                 Err(e) => {
-                    e.report("failed to start watch pause");
+                    e.report("failed to start watch task");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -375,11 +355,12 @@ where
 
             loop {
                 if let Some(event) = watcher.stream.next().await {
-                    info!("backup stream watch event from etcd"; "event" => ?event);
+                    info!("backup stream watch task from etcd"; "event" => ?event);
 
                     let revision = meta_client.get_reversion().await;
                     if let Ok(r) = revision {
                         revision_new = r;
+                        info!("update the revision"; "revision" => revision_new);
                     }
 
                     match event {
@@ -425,10 +406,11 @@ where
 
             loop {
                 if let Some(event) = watcher.stream.next().await {
-                    info!("backup stream watch event from etcd"; "event" => ?event);
+                    info!("backup stream watch pause from etcd"; "event" => ?event);
                     let revision = meta_client.get_reversion().await;
                     if let Ok(r) = revision {
                         revision_new = r;
+                        info!("update the revision"; "revision" => revision_new);
                     }
 
                     match event {
@@ -570,7 +552,7 @@ where
             .await;
         match range_init_result {
             Ok(()) => {
-                info!("backup stream success to initialize"; 
+                info!("backup stream success to initialize";
                         "start_key" => utils::redact(&start_key),
                         "end_key" => utils::redact(&end_key),
                         "take" => ?start.saturating_elapsed(),)
@@ -659,7 +641,6 @@ where
             let task_clone = task.clone();
             let run = async move {
                 let task_name = task.info.get_name();
-                cli.init_task(&task.info).await?;
                 let ranges = cli.ranges_of_task(task_name).await?;
                 fail::fail_point!("load_task::error_when_fetching_ranges", |_| {
                     Err(Error::Other("what range? no such thing, go away.".into()))
@@ -667,7 +648,7 @@ where
                 info!(
                     "register backup stream ranges";
                     "task" => ?task,
-                    "ranges-count" => ranges.inner.len(),
+                    "ranges_count" => ranges.inner.len(),
                 );
                 let ranges = ranges
                     .inner
@@ -876,7 +857,7 @@ where
                             {
                                 warn!("backup stream failed to set global checkpoint.";
                                     "task" => ?task,
-                                    "global-checkpoint" => global_checkpoint,
+                                    "global_checkpoint" => global_checkpoint,
                                     "err" => ?err,
                                 );
                             }
@@ -884,7 +865,7 @@ where
                         Ok(false) => {
                             debug!("backup stream no need update global checkpoint.";
                                 "task" => ?task,
-                                "global-checkpoint" => global_checkpoint,
+                                "global_checkpoint" => global_checkpoint,
                             );
                         }
                         Err(e) => {
@@ -914,10 +895,6 @@ where
         self.abort_last_storage_save = Some(handle);
     }
 
-    // FIXME: while picking #15541, v6.5.x doesn't support online config change.
-    // This stub was kept so once online config change has been picked, we can reuse
-    // this.
-    #[allow(dead_code)]
     fn on_update_change_config(&mut self, cfg: BackupStreamConfig) {
         let concurrency_diff =
             cfg.initial_scan_concurrency as isize - self.config.initial_scan_concurrency as isize;
@@ -926,6 +903,7 @@ where
              "config" => ?cfg,
              "concurrency_diff" => concurrency_diff,
         );
+        self.range_router.udpate_config(&cfg);
         self.update_semaphore_capacity(&self.initial_scan_semaphore, concurrency_diff);
 
         self.config = cfg;
@@ -970,8 +948,8 @@ where
             Task::ModifyObserve(op) => self.on_modify_observe(op),
             Task::ForceFlush(task) => self.on_force_flush(task),
             Task::FatalError(task, err) => self.on_fatal_error(task, err),
-            Task::ChangeConfig(_) => {
-                warn!("change config online isn't supported for now.")
+            Task::ChangeConfig(cfg) => {
+                self.on_update_change_config(cfg);
             }
             Task::Sync(cb, mut cond) => {
                 if cond(self) {
@@ -1093,7 +1071,7 @@ where
 /// Create a standard tokio runtime
 /// (which allows io and time reactor, involve thread memory accessor),
 fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<Runtime> {
-    info!("create tokio runtime for backup stream"; "thread_name" => thread_name, "thread-count" => thread_count);
+    info!("create tokio runtime for backup stream"; "thread_name" => thread_name, "thread_count" => thread_count);
 
     tokio::runtime::Builder::new_multi_thread()
         .thread_name(thread_name)
@@ -1102,15 +1080,33 @@ fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<R
         // (`File` API in `tokio::io` would use this pool.)
         .max_blocking_threads(thread_count * 8)
         .worker_threads(thread_count)
+        .with_sys_hooks()
         .enable_io()
         .enable_time()
-        .after_start_wrapper(|| {
-            tikv_alloc::add_thread_memory_accessor();
-        })
-        .before_stop_wrapper(|| {
-            tikv_alloc::remove_thread_memory_accessor();
-        })
         .build()
+}
+
+pub enum BackupStreamResolver<RT, EK> {
+    // for raftstore-v1, we use LeadershipResolver to check leadership of a region.
+    V1(LeadershipResolver),
+    // for raftstore-v2, it has less regions. we use CDCHandler to check leadership of a region.
+    V2(RT, PhantomData<EK>),
+}
+
+impl<RT, EK> BackupStreamResolver<RT, EK>
+where
+    RT: CdcHandle<EK> + 'static,
+    EK: KvEngine,
+{
+    pub async fn resolve(&mut self, regions: Vec<u64>, min_ts: TimeStamp) -> Vec<u64> {
+        match self {
+            BackupStreamResolver::V1(x) => x.resolve(regions, min_ts).await,
+            BackupStreamResolver::V2(x, _) => {
+                let x = x.clone();
+                resolve_by_raft(regions, min_ts, x).await
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1157,7 +1153,7 @@ impl fmt::Debug for RegionCheckpointOperation {
 pub enum Task {
     WatchTask(TaskOp),
     BatchEvent(Vec<CmdBatch>),
-    ChangeConfig(ConfigChange),
+    ChangeConfig(BackupStreamConfig),
     /// Change the observe status of some region.
     ModifyObserve(ObserveOp),
     /// Convert status of some task into `flushing` and do flush then.

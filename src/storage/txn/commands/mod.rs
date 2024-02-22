@@ -70,7 +70,7 @@ use crate::storage::{
     },
     metrics,
     mvcc::{Lock as MvccLock, MvccReader, ReleasedLock, SnapshotReader},
-    txn::{latch, ProcessResult, Result},
+    txn::{latch, txn_status_cache::TxnStatusCache, ProcessResult, Result},
     types::{
         MvccInfo, PessimisticLockParameters, PessimisticLockResults, PrewriteResult,
         SecondaryLocksStatus, StorageCallbackType, TxnStatus,
@@ -197,6 +197,7 @@ impl From<PrewriteRequest> for TypedCommand<PrewriteResult> {
                 secondary_keys,
                 req.get_try_one_pc(),
                 req.get_assertion_level(),
+                req.take_for_update_ts_constraints().into(),
                 req.take_context(),
             )
         }
@@ -418,8 +419,15 @@ pub struct WriteResult {
     pub pr: ProcessResult,
     pub lock_info: Vec<WriteResultLockInfo>,
     pub released_locks: ReleasedLocks,
+    pub new_acquired_locks: Vec<LockInfo>,
     pub lock_guards: Vec<KeyHandleGuard>,
     pub response_policy: ResponsePolicy,
+    /// The txn status that can be inferred by the successful writing. This will
+    /// be used to update the cache.
+    ///
+    /// Currently only commit_ts of committed transactions will be collected.
+    /// Rolled-back transactions may also be collected in the future.
+    pub known_txn_status: Vec<(TimeStamp, TimeStamp)>,
 }
 
 pub struct WriteResultLockInfo {
@@ -571,6 +579,7 @@ pub struct WriteContext<'a, L: LockManager> {
     pub statistics: &'a mut Statistics,
     pub async_apply_prewrite: bool,
     pub raw_ext: Option<RawExt>, // use for apiv2
+    pub txn_status_cache: &'a TxnStatusCache,
 }
 
 pub struct ReaderWithStats<'a, S: Snapshot> {
@@ -715,6 +724,16 @@ impl Command {
         self.command_ext().get_ctx().get_priority()
     }
 
+    pub fn resource_control_ctx(&self) -> &ResourceControlContext {
+        self.command_ext().get_ctx().get_resource_control_context()
+    }
+
+    pub fn group_name(&self) -> String {
+        self.resource_control_ctx()
+            .get_resource_group_name()
+            .to_owned()
+    }
+
     pub fn need_flow_control(&self) -> bool {
         !self.readonly() && self.priority() != CommandPri::High
     }
@@ -811,6 +830,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
         let ret = cmd.cmd.process_write(snap, context)?;
         let res = match ret.pr {
@@ -925,6 +945,28 @@ pub mod test_util {
         prewrite_command(engine, cm, statistics, cmd)
     }
 
+    pub fn pessimistic_prewrite_check_for_update_ts<E: Engine>(
+        engine: &mut E,
+        statistics: &mut Statistics,
+        mutations: Vec<(Mutation, PrewriteRequestPessimisticAction)>,
+        primary: Vec<u8>,
+        start_ts: u64,
+        for_update_ts: u64,
+        for_update_ts_constraints: impl IntoIterator<Item = (usize, u64)>,
+    ) -> Result<PrewriteResult> {
+        let cmd = PrewritePessimistic::with_for_update_ts_constraints(
+            mutations,
+            primary,
+            start_ts.into(),
+            for_update_ts.into(),
+            for_update_ts_constraints
+                .into_iter()
+                .map(|(size, ts)| (size, TimeStamp::from(ts))),
+        );
+        let cm = ConcurrencyManager::new(start_ts.into());
+        prewrite_command(engine, cm, statistics, cmd)
+    }
+
     pub fn commit<E: Engine>(
         engine: &mut E,
         statistics: &mut Statistics,
@@ -949,6 +991,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
 
         let ret = cmd.cmd.process_write(snap, context)?;
@@ -974,6 +1017,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
 
         let ret = cmd.cmd.process_write(snap, context)?;

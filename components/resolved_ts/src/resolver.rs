@@ -92,11 +92,10 @@ pub struct Resolver {
     min_ts: TimeStamp,
     // Whether the `Resolver` is stopped
     stopped: bool,
-
-    // The last attempt of resolve(), used for diagnosis.
-    last_attempt: Option<LastAttempt>,
     // The memory quota for the `Resolver` and its lock keys and timestamps.
     memory_quota: Arc<MemoryQuota>,
+    // The last attempt of resolve(), used for diagnosis.
+    last_attempt: Option<LastAttempt>,
 }
 
 #[derive(Clone)]
@@ -189,8 +188,8 @@ impl Resolver {
             tracked_index: 0,
             min_ts: TimeStamp::zero(),
             stopped: false,
-            last_attempt: None,
             memory_quota,
+            last_attempt: None,
         }
     }
 
@@ -226,18 +225,6 @@ impl Resolver {
         );
         self.tracked_index = index;
     }
-    fn shrink_ratio(&mut self, ratio: usize) {
-        // HashMap load factor is 87% approximately, leave some margin to avoid
-        // frequent rehash.
-        //
-        // See https://github.com/rust-lang/hashbrown/blob/v0.14.0/src/raw/mod.rs#L208-L220
-        const MIN_SHRINK_RATIO: usize = 2;
-        if self.locks_by_key.capacity()
-            > self.locks_by_key.len() * cmp::max(MIN_SHRINK_RATIO, ratio)
-        {
-            self.locks_by_key.shrink_to_fit();
-        }
-    }
 
     // Return an approximate heap memory usage in bytes.
     pub fn approximate_heap_bytes(&self) -> usize {
@@ -271,6 +258,19 @@ impl Resolver {
         // track accurate memory usage of lock_ts_heap as a timestamp may have
         // many keys.
         key.heap_size() + std::mem::size_of::<TimeStamp>()
+    }
+
+    fn shrink_ratio(&mut self, ratio: usize) {
+        // HashMap load factor is 87% approximately, leave some margin to avoid
+        // frequent rehash.
+        //
+        // See https://github.com/rust-lang/hashbrown/blob/v0.14.0/src/raw/mod.rs#L208-L220
+        const MIN_SHRINK_RATIO: usize = 2;
+        if self.locks_by_key.capacity()
+            > self.locks_by_key.len() * cmp::max(MIN_SHRINK_RATIO, ratio)
+        {
+            self.locks_by_key.shrink_to_fit();
+        }
     }
 
     pub fn track_lock(

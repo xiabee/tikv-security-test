@@ -13,7 +13,6 @@ use super::Task;
 use crate::disk_snap::{self, StreamHandleLoop};
 
 /// Service handles the RPC messages for the `Backup` service.
-
 #[derive(Clone)]
 pub struct Service<H: SnapshotBrHandle> {
     scheduler: Scheduler<Task>,

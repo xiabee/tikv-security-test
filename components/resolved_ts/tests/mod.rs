@@ -13,7 +13,7 @@ use kvproto::{
     tikvpb::TikvClient,
 };
 use online_config::ConfigValue;
-use raftstore::coprocessor::CoprocessorHost;
+use raftstore::{coprocessor::CoprocessorHost, router::CdcRaftRouter};
 use resolved_ts::{Observer, Task};
 use test_raftstore::*;
 use tikv::config::ResolvedTsConfig;
@@ -40,7 +40,7 @@ impl TestSuite {
     pub fn new(count: usize) -> Self {
         let mut cluster = new_server_cluster(1, count);
         // Increase the Raft tick interval to make this test case running reliably.
-        configure_for_lease_read(&mut cluster, Some(100), None);
+        configure_for_lease_read(&mut cluster.cfg, Some(100), None);
         Self::with_cluster(count, cluster)
     }
 
@@ -62,6 +62,9 @@ impl TestSuite {
             obs.insert(id, rts_ob.clone());
             sim.coprocessor_hooks.entry(id).or_default().push(Box::new(
                 move |host: &mut CoprocessorHost<_>| {
+                    // Migrated to 2021 migration. This let statement is probably not needed, see
+                    //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+                    let _ = &rts_ob;
                     rts_ob.register_to(host);
                 },
             ));
@@ -81,7 +84,7 @@ impl TestSuite {
             let rts_endpoint = resolved_ts::Endpoint::new(
                 &cfg,
                 worker.scheduler(),
-                raft_router,
+                CdcRaftRouter(raft_router),
                 cluster.store_metas[id].clone(),
                 pd_cli.clone(),
                 cm.clone(),
