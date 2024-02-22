@@ -31,7 +31,7 @@ use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_traits::{
     util::SequenceNumber, DeleteStrategy, KvEngine, Mutable, PerfContext, PerfContextKind,
     RaftEngine, RaftEngineReadOnly, Range as EngineRange, Snapshot, SstMetaInfo, WriteBatch,
-    WriteOptions, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
+    ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
 };
 use fail::fail_point;
 use kvproto::{
@@ -555,8 +555,7 @@ where
                 delegate.unfinished_write_seqno.push(seqno);
             }
             self.prepare_for(delegate);
-            delegate.last_flush_applied_index = delegate.apply_state.get_applied_index();
-            delegate.has_pending_ssts = false;
+            delegate.last_flush_applied_index = delegate.apply_state.get_applied_index()
         }
         self.kv_wb_last_bytes = self.kv_wb().data_size() as u64;
         self.kv_wb_last_keys = self.kv_wb().count() as u64;
@@ -678,7 +677,7 @@ where
             exec_res: results,
             metrics: mem::take(&mut delegate.metrics),
             applied_term: delegate.applied_term,
-            bucket_stat: delegate.buckets.clone(),
+            bucket_stat: delegate.buckets.clone().map(Box::new),
         });
         if !self.kv_wb().is_empty() {
             // Pending writes not flushed, need to set seqno to following ApplyRes later
@@ -792,7 +791,7 @@ pub fn notify_stale_req_with_msg(term: u64, msg: String, cb: impl ErrorCallback)
 }
 
 /// Checks if a write is needed to be issued before handling the command.
-fn should_write_to_engine(has_pending_writes: bool, cmd: &RaftCmdRequest) -> bool {
+fn should_write_to_engine(cmd: &RaftCmdRequest) -> bool {
     if cmd.has_admin_request() {
         match cmd.get_admin_request().get_cmd_type() {
             // ComputeHash require an up to date snapshot.
@@ -810,7 +809,7 @@ fn should_write_to_engine(has_pending_writes: bool, cmd: &RaftCmdRequest) -> boo
         if req.has_delete_range() {
             return true;
         }
-        if req.has_ingest_sst() && has_pending_writes {
+        if req.has_ingest_sst() {
             return true;
         }
     }
@@ -1044,8 +1043,6 @@ where
     buckets: Option<BucketStat>,
 
     unfinished_write_seqno: Vec<SequenceNumber>,
-
-    has_pending_ssts: bool,
 }
 
 impl<EK> ApplyDelegate<EK>
@@ -1080,7 +1077,6 @@ where
             trace: ApplyMemoryTrace::default(),
             buckets: None,
             unfinished_write_seqno: vec![],
-            has_pending_ssts: false,
         }
     }
 
@@ -1231,15 +1227,9 @@ where
                 if apply_ctx.yield_high_latency_operation && has_high_latency_operation(&cmd) {
                     self.priority = Priority::Low;
                 }
-                if self.has_pending_ssts {
-                    // we are in low priority handler and to avoid overlapped ssts with same region
-                    // just return Yield
-                    return ApplyResult::Yield;
-                }
                 let mut has_unflushed_data =
                     self.last_flush_applied_index != self.apply_state.get_applied_index();
-                if (has_unflushed_data
-                    && should_write_to_engine(!apply_ctx.kv_wb().is_empty(), &cmd)
+                if (has_unflushed_data && should_write_to_engine(&cmd)
                     || apply_ctx.kv_wb().should_write_to_engine())
                     && apply_ctx.host.pre_persist(&self.region, false, Some(&cmd))
                 {
@@ -1957,9 +1947,8 @@ where
                     e
                 )
             };
-            let wopts = WriteOptions::default();
             engine
-                .delete_ranges_cf(&wopts, cf, DeleteStrategy::DeleteFiles, &range)
+                .delete_ranges_cf(cf, DeleteStrategy::DeleteFiles, &range)
                 .unwrap_or_else(|e| fail_f(e, DeleteStrategy::DeleteFiles));
 
             let strategy = if use_delete_range {
@@ -1969,10 +1958,10 @@ where
             };
             // Delete all remaining keys.
             engine
-                .delete_ranges_cf(&wopts, cf, strategy.clone(), &range)
+                .delete_ranges_cf(cf, strategy.clone(), &range)
                 .unwrap_or_else(move |e| fail_f(e, strategy));
             engine
-                .delete_ranges_cf(&wopts, cf, DeleteStrategy::DeleteBlobs, &range)
+                .delete_ranges_cf(cf, DeleteStrategy::DeleteBlobs, &range)
                 .unwrap_or_else(move |e| fail_f(e, DeleteStrategy::DeleteBlobs));
         }
 
@@ -2007,7 +1996,6 @@ where
         match ctx.importer.validate(sst) {
             Ok(meta_info) => {
                 ctx.pending_ssts.push(meta_info.clone());
-                self.has_pending_ssts = true;
                 ssts.push(meta_info)
             }
             Err(e) => {
@@ -2016,6 +2004,7 @@ where
                 panic!("{} ingest {:?}: {:?}", self.tag, sst, e);
             }
         };
+
         Ok(())
     }
 }
@@ -2123,14 +2112,14 @@ where
 
         match change_type {
             ConfChangeType::AddNode => {
-                let add_node_fp = || {
+                let add_ndoe_fp = || {
                     fail_point!(
                         "apply_on_add_node_1_2",
                         self.id() == 2 && self.region_id() == 1,
                         |_| {}
                     )
                 };
-                add_node_fp();
+                add_ndoe_fp();
 
                 PEER_ADMIN_CMD_COUNTER_VEC
                     .with_label_values(&["add_peer", "all"])
@@ -2393,8 +2382,8 @@ where
                             "region_id" => self.region_id(),
                             "peer_id" => self.id(),
                             "peer" => ?peer,
-                            "exist_peer" => ?exist_peer,
-                            "confchange_type" => ?change_type,
+                            "exist peer" => ?exist_peer,
+                            "confchange type" => ?change_type,
                             "region" => ?&self.region
                         );
                         return Err(box_err!(
@@ -3882,7 +3871,7 @@ where
     pub applied_term: u64,
     pub exec_res: VecDeque<ExecResult<S>>,
     pub metrics: ApplyMetrics,
-    pub bucket_stat: Option<BucketStat>,
+    pub bucket_stat: Option<Box<BucketStat>>,
     pub write_seqno: Vec<SequenceNumber>,
 }
 
@@ -4656,7 +4645,6 @@ where
         self.apply_ctx.flush();
         for fsm in fsms.iter_mut().flatten() {
             fsm.delegate.last_flush_applied_index = fsm.delegate.apply_state.get_applied_index();
-            fsm.delegate.has_pending_ssts = false;
             fsm.delegate.update_memory_trace(&mut self.trace_event);
         }
         MEMTRACE_APPLYS.trace(mem::take(&mut self.trace_event));
@@ -5075,14 +5063,7 @@ mod tests {
     pub fn create_tmp_importer(path: &str) -> (TempDir, Arc<SstImporter>) {
         let dir = Builder::new().prefix(path).tempdir().unwrap();
         let importer = Arc::new(
-            SstImporter::new(
-                &ImportConfig::default(),
-                dir.path(),
-                None,
-                ApiVersion::V1,
-                false,
-            )
-            .unwrap(),
+            SstImporter::new(&ImportConfig::default(), dir.path(), None, ApiVersion::V1).unwrap(),
         );
         (dir, importer)
     }
@@ -5204,7 +5185,7 @@ mod tests {
         req.set_ingest_sst(IngestSstRequest::default());
         let mut cmd = RaftCmdRequest::default();
         cmd.mut_requests().push(req);
-        assert_eq!(should_write_to_engine(true, &cmd), true);
+        assert_eq!(should_write_to_engine(&cmd), true);
         assert_eq!(should_sync_log(&cmd), true);
 
         // Normal command
@@ -5218,17 +5199,7 @@ mod tests {
         let mut req = RaftCmdRequest::default();
         req.mut_admin_request()
             .set_cmd_type(AdminCmdType::ComputeHash);
-        assert_eq!(should_write_to_engine(true, &req), true);
-        assert_eq!(should_write_to_engine(false, &req), true);
-
-        // DeleteRange command
-        let mut req = Request::default();
-        req.set_cmd_type(CmdType::DeleteRange);
-        req.set_delete_range(DeleteRangeRequest::default());
-        let mut cmd = RaftCmdRequest::default();
-        cmd.mut_requests().push(req);
-        assert_eq!(should_write_to_engine(true, &cmd), true);
-        assert_eq!(should_write_to_engine(false, &cmd), true);
+        assert_eq!(should_write_to_engine(&req), true);
 
         // IngestSst command
         let mut req = Request::default();
@@ -5236,8 +5207,7 @@ mod tests {
         req.set_ingest_sst(IngestSstRequest::default());
         let mut cmd = RaftCmdRequest::default();
         cmd.mut_requests().push(req);
-        assert_eq!(should_write_to_engine(true, &cmd), true);
-        assert_eq!(should_write_to_engine(false, &cmd), false);
+        assert_eq!(should_write_to_engine(&cmd), true);
     }
 
     #[test]
@@ -5405,9 +5375,6 @@ mod tests {
         reg.apply_state.set_applied_index(3);
         router.schedule_task(2, Msg::Registration(reg.dup()));
         validate(&router, 2, move |delegate| {
-            // Migrated to 2021 migration. This let statement is probably not needed, see
-            //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
-            let _ = &reg;
             assert_eq!(delegate.id(), 1);
             assert_eq!(delegate.peer, peer);
             assert_eq!(delegate.tag, "[region 2] 1");
@@ -5789,6 +5756,7 @@ mod tests {
                 self.header.clone(),
                 bin,
                 1000,
+                false,
             );
             let (bytes, _) = req_encoder.encode();
             self.entry.set_data(bytes.into());
@@ -6236,7 +6204,7 @@ mod tests {
         // nomral put command, so the first apple_res.exec_res should be empty.
         let apply_res = fetch_apply_res(&rx);
         assert!(apply_res.exec_res.is_empty());
-        // The region was rescheduled low-priority because of ingest command,
+        // The region was rescheduled low-priority becasuee of ingest command,
         // only put entry has been applied;
         let apply_res = fetch_apply_res(&rx);
         assert_eq!(apply_res.applied_term, 3);
@@ -6875,12 +6843,9 @@ mod tests {
             assert!(!resp.get_header().has_error(), "{:?}", resp);
         }
         let mut res = fetch_apply_res(&rx);
-        // There are five entries [put, ingest, put, ingest, put] in one region.
-        // so the apply results should be notified at index 2/4.
-        if res.apply_state.get_applied_index() == 2 {
-            res = fetch_apply_res(&rx);
-        }
-        if res.apply_state.get_applied_index() == 4 {
+        // There may be one or two ApplyRes which depends on whether these two apply
+        // msgs are batched together.
+        if res.apply_state.get_applied_index() == 3 {
             res = fetch_apply_res(&rx);
         }
         assert_eq!(res.apply_state.get_applied_index(), 5);
@@ -6976,7 +6941,7 @@ mod tests {
         router.schedule_task(1, Msg::apply(apply2));
 
         let res = fetch_apply_res(&rx);
-        let bucket_version = res.bucket_stat.unwrap().meta.version;
+        let bucket_version = res.bucket_stat.unwrap().as_ref().meta.version;
 
         assert_eq!(bucket_version, 2);
 

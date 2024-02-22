@@ -335,13 +335,15 @@ pub fn create_local_engine_service(
     let env = config
         .build_shared_rocks_env(key_manager.clone(), None)
         .map_err(|e| format!("build shared rocks env: {}", e))?;
-    let block_cache = config.storage.block_cache.build_shared_cache();
+    let block_cache = config
+        .storage
+        .block_cache
+        .build_shared_cache(config.storage.engine);
 
     // init rocksdb / kv db
-    let factory =
-        KvEngineFactoryBuilder::new(env.clone(), config, block_cache, key_manager.clone())
-            .lite(true)
-            .build();
+    let factory = KvEngineFactoryBuilder::new(env.clone(), config, block_cache)
+        .lite(true)
+        .build();
     let kv_db = match factory.create_shared_db(&config.storage.data_dir) {
         Ok(db) => db,
         Err(e) => handle_engine_error(e),

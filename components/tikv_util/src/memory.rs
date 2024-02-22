@@ -85,11 +85,6 @@ impl std::error::Error for MemoryQuotaExceeded {}
 
 impl_display_as_debug!(MemoryQuotaExceeded);
 
-pub struct MemoryQuota {
-    in_use: AtomicUsize,
-    capacity: AtomicUsize,
-}
-
 pub struct OwnedAllocated {
     allocated: usize,
     from: Arc<MemoryQuota>,
@@ -114,6 +109,11 @@ impl Drop for OwnedAllocated {
     fn drop(&mut self) {
         self.from.free(self.allocated)
     }
+}
+
+pub struct MemoryQuota {
+    in_use: AtomicUsize,
+    capacity: AtomicUsize,
 }
 
 impl MemoryQuota {

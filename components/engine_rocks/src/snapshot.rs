@@ -7,7 +7,6 @@ use std::{
 
 use engine_traits::{
     self, CfNamesExt, IterOptions, Iterable, Peekable, ReadOptions, Result, Snapshot,
-    SnapshotMiscExt,
 };
 use rocksdb::{rocksdb_options::UnsafeSnap, DBIterator, DB};
 
@@ -102,11 +101,5 @@ impl Peekable for RocksSnapshot {
 impl CfNamesExt for RocksSnapshot {
     fn cf_names(&self) -> Vec<&str> {
         self.db.cf_names()
-    }
-}
-
-impl SnapshotMiscExt for RocksSnapshot {
-    fn sequence_number(&self) -> u64 {
-        unsafe { self.snap.get_sequence_number() }
     }
 }

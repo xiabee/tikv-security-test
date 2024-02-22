@@ -465,6 +465,7 @@ impl BlobStorage for GcsStorage {
                 "no content to write",
             ));
         }
+        use std::convert::TryFrom;
 
         let key = self.maybe_prefix_key(name);
         debug!("save file to GCS storage"; "key" => %key);

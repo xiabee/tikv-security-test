@@ -96,7 +96,6 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
             new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
-            known_txn_status: vec![],
         })
     }
 }
@@ -112,10 +111,7 @@ pub mod tests {
         kv::TestEngineBuilder,
         lock_manager::MockLockManager,
         mvcc::tests::*,
-        txn::{
-            commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*,
-            txn_status_cache::TxnStatusCache,
-        },
+        txn::{commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*},
         Engine,
     };
 
@@ -147,7 +143,6 @@ pub mod tests {
                     statistics: &mut Default::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
-                    txn_status_cache: &TxnStatusCache::new_for_test(),
                 },
             )
             .unwrap();
@@ -190,7 +185,6 @@ pub mod tests {
                         statistics: &mut Default::default(),
                         async_apply_prewrite: false,
                         raw_ext: None,
-                        txn_status_cache: &TxnStatusCache::new_for_test(),
                     },
                 )
                 .is_err()

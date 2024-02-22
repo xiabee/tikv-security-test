@@ -254,7 +254,6 @@
 #![feature(linked_list_cursors)]
 #![feature(let_chains)]
 #![feature(str_split_as_str)]
-#![feature(drain_filter)]
 
 #[macro_use(fail_point)]
 extern crate fail;
@@ -289,8 +288,6 @@ mod misc;
 pub use misc::*;
 mod snapshot;
 pub use crate::snapshot::*;
-mod snapshot_misc;
-pub use crate::snapshot_misc::SnapshotMiscExt;
 mod sst;
 pub use crate::sst::*;
 mod write_batch;

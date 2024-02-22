@@ -10,6 +10,7 @@ use engine_traits::{CompactedEvent, KvEngine, Snapshot};
 use futures::channel::mpsc::UnboundedSender;
 use kvproto::{
     brpb::CheckAdminResponse,
+    import_sstpb::SstMeta,
     kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp},
     metapb,
     metapb::RegionEpoch,
@@ -26,16 +27,14 @@ use smallvec::{smallvec, SmallVec};
 use tikv_util::{deadline::Deadline, escape, memory::HeapSize, time::Instant};
 use tracker::{get_tls_tracker_token, TrackerToken};
 
-use super::{
-    local_metrics::TimeTracker, region_meta::RegionMeta,
-    snapshot_backup::SnapshotBrWaitApplyRequest, FetchedLogs, RegionSnapshot,
-};
+use super::{local_metrics::TimeTracker, region_meta::RegionMeta, FetchedLogs, RegionSnapshot};
 use crate::store::{
     fsm::apply::{CatchUpLogs, ChangeObserver, TaskRes as ApplyTaskRes},
     metrics::RaftEventDurationType,
-    unsafe_recovery::{
-        UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryFillOutReportSyncer,
-        UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer,
+    peer::{
+        SnapshotRecoveryWaitApplySyncer, UnsafeRecoveryExecutePlanSyncer,
+        UnsafeRecoveryFillOutReportSyncer, UnsafeRecoveryForceLeaderSyncer,
+        UnsafeRecoveryWaitApplySyncer,
     },
     util::{KeysInfoFormatter, LatencyInspector},
     worker::{Bucket, BucketRange},
@@ -530,7 +529,7 @@ where
     UnsafeRecoveryDestroy(UnsafeRecoveryExecutePlanSyncer),
     UnsafeRecoveryWaitApply(UnsafeRecoveryWaitApplySyncer),
     UnsafeRecoveryFillOutReport(UnsafeRecoveryFillOutReportSyncer),
-    SnapshotBrWaitApply(SnapshotBrWaitApplyRequest),
+    SnapshotRecoveryWaitApply(SnapshotRecoveryWaitApplySyncer),
     CheckPendingAdmin(UnboundedSender<CheckAdminResponse>),
 }
 
@@ -559,14 +558,12 @@ pub enum CasualMessage<EK: KvEngine> {
     /// Approximate size of target region. This message can only be sent by
     /// split-check thread.
     RegionApproximateSize {
-        size: Option<u64>,
-        splitable: Option<bool>,
+        size: u64,
     },
 
     /// Approximate key count of target region.
     RegionApproximateKeys {
-        keys: Option<u64>,
-        splitable: Option<bool>,
+        keys: u64,
     },
     CompactionDeclinedBytes {
         bytes: u64,
@@ -651,19 +648,11 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
                 KeysInfoFormatter(split_keys.iter()),
                 source,
             ),
-            CasualMessage::RegionApproximateSize { size, splitable } => {
-                write!(
-                    fmt,
-                    "Region's approximate size [size: {:?}], [splitable: {:?}]",
-                    size, splitable
-                )
+            CasualMessage::RegionApproximateSize { size } => {
+                write!(fmt, "Region's approximate size [size: {:?}]", size)
             }
-            CasualMessage::RegionApproximateKeys { keys, splitable } => {
-                write!(
-                    fmt,
-                    "Region's approximate keys [keys: {:?}], [splitable: {:?}",
-                    keys, splitable
-                )
+            CasualMessage::RegionApproximateKeys { keys } => {
+                write!(fmt, "Region's approximate keys [keys: {:?}]", keys)
             }
             CasualMessage::CompactionDeclinedBytes { bytes } => {
                 write!(fmt, "compaction declined bytes {}", bytes)
@@ -752,7 +741,7 @@ pub enum PeerMsg<EK: KvEngine> {
     /// Raft message is the message sent between raft nodes in the same
     /// raft group. Messages need to be redirected to raftstore if target
     /// peer doesn't exist.
-    RaftMessage(InspectedRaftMessage, Option<Instant>),
+    RaftMessage(InspectedRaftMessage),
     /// Raft command is the command that is expected to be proposed by the
     /// leader of the target raft group. If it's failed to be sent, callback
     /// usually needs to be called before dropping in case of resource leak.
@@ -790,7 +779,7 @@ impl<EK: KvEngine> ResourceMetered for PeerMsg<EK> {}
 impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PeerMsg::RaftMessage(..) => write!(fmt, "Raft Message"),
+            PeerMsg::RaftMessage(_) => write!(fmt, "Raft Message"),
             PeerMsg::RaftCommand(_) => write!(fmt, "Raft Command"),
             PeerMsg::Tick(tick) => write! {
                 fmt,
@@ -834,6 +823,10 @@ where
     EK: KvEngine,
 {
     RaftMessage(InspectedRaftMessage),
+
+    ValidateSstResult {
+        invalid_ssts: Vec<SstMeta>,
+    },
 
     // Clear region size and keys for all regions in the range, so we can force them to
     // re-calculate their size later.
@@ -891,6 +884,7 @@ where
                 write!(fmt, "Store {}  is unreachable", store_id)
             }
             StoreMsg::CompactedEvent(ref event) => write!(fmt, "CompactedEvent cf {}", event.cf()),
+            StoreMsg::ValidateSstResult { .. } => write!(fmt, "Validate SST Result"),
             StoreMsg::ClearRegionSizeInRange {
                 ref start_key,
                 ref end_key,

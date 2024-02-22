@@ -225,9 +225,6 @@ impl Downstream {
     pub fn get_conn_id(&self) -> ConnId {
         self.conn_id
     }
-    pub fn get_req_id(&self) -> u64 {
-        self.req_id
-    }
 }
 
 struct Pending {
@@ -792,7 +789,6 @@ impl Delegate {
 
             let event = Event {
                 region_id,
-                request_id: downstream.get_req_id(),
                 index,
                 event: Some(Event_oneof_event::Entries(EventEntries {
                     entries: entries_clone.into(),
@@ -1530,7 +1526,6 @@ mod tests {
                 TimeStamp::zero(),
                 0,
                 TimeStamp::zero(),
-                false,
             )
             .to_bytes();
             delegate
@@ -1600,7 +1595,6 @@ mod tests {
                 TimeStamp::zero(),
                 0,
                 TimeStamp::zero(),
-                false,
             );
             // Only the key `a` is a normal write.
             if k != b'a' {

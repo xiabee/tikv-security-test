@@ -49,6 +49,7 @@ where
     channels: Vec<C>,
     size_limit: usize,
     write_type: WriteType,
+    notify_proposed: bool,
 }
 
 impl<C> SimpleWriteReqEncoder<C>
@@ -56,10 +57,14 @@ where
     C: ErrorCallback + WriteCallback,
 {
     /// Create a request encoder.
+    ///
+    /// If `notify_proposed` is true, channels will be called `notify_proposed`
+    /// when it's appended.
     pub fn new(
         header: Box<RaftRequestHeader>,
         bin: SimpleWriteBinary,
         size_limit: usize,
+        notify_proposed: bool,
     ) -> SimpleWriteReqEncoder<C> {
         let mut buf = Vec::with_capacity(256);
         buf.push(MAGIC_PREFIX);
@@ -72,6 +77,7 @@ where
             channels: vec![],
             size_limit,
             write_type: bin.write_type,
+            notify_proposed,
         }
     }
 
@@ -106,8 +112,16 @@ where
     }
 
     #[inline]
-    pub fn add_response_channel(&mut self, ch: C) {
+    pub fn add_response_channel(&mut self, mut ch: C) {
+        if self.notify_proposed {
+            ch.notify_proposed();
+        }
         self.channels.push(ch);
+    }
+
+    #[inline]
+    pub fn notify_proposed(&self) -> bool {
+        self.notify_proposed
     }
 
     #[inline]
@@ -544,6 +558,7 @@ mod tests {
             header.clone(),
             bin,
             usize::MAX,
+            false,
         );
 
         let mut encoder = SimpleWriteEncoder::with_capacity(512);
@@ -555,6 +570,7 @@ mod tests {
             header.clone(),
             bin,
             0,
+            false,
         );
 
         let (bytes, _) = req_encoder.encode();
@@ -603,8 +619,9 @@ mod tests {
             .collect();
         encoder.ingest(exp.clone());
         let bin = encoder.encode();
-        let req_encoder =
-            SimpleWriteReqEncoder::<Callback<engine_rocks::RocksSnapshot>>::new(header, bin, 0);
+        let req_encoder = SimpleWriteReqEncoder::<Callback<engine_rocks::RocksSnapshot>>::new(
+            header, bin, 0, false,
+        );
         let (bytes, _) = req_encoder.encode();
         let mut decoder =
             SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
@@ -666,6 +683,7 @@ mod tests {
                 header.clone(),
                 bin.clone(),
                 512,
+                false,
             );
 
         let mut header2 = Box::<RaftRequestHeader>::default();
@@ -682,6 +700,7 @@ mod tests {
                 header.clone(),
                 bin2.clone(),
                 512,
+                false,
             );
         assert!(!req_encoder2.amend(&header, &bin));
 
@@ -716,6 +735,7 @@ mod tests {
             header.clone(),
             SimpleWriteEncoder::with_capacity(512).encode(),
             512,
+            false,
         );
         let (bin, _) = req_encoder.encode();
         assert_eq!(
@@ -733,6 +753,7 @@ mod tests {
             header.clone(),
             encoder.encode(),
             512,
+            false,
         );
         let (bin, _) = req_encoder.encode();
         let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
@@ -750,6 +771,7 @@ mod tests {
             header.clone(),
             encoder.encode(),
             512,
+            false,
         );
         let (bin, _) = req_encoder.encode();
         let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
@@ -766,6 +788,7 @@ mod tests {
             header.clone(),
             encoder.encode(),
             512,
+            false,
         );
         let (bin, _) = req_encoder.encode();
         let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
@@ -793,6 +816,7 @@ mod tests {
             header,
             encoder.encode(),
             512,
+            false,
         );
         let (bin, _) = req_encoder.encode();
         let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)

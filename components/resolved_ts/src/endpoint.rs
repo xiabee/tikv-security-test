@@ -138,11 +138,12 @@ impl ResolverStatus {
         } = self else {
             panic!("region {:?} resolver has ready", region_id)
         };
+        let memory_quota = memory_quota.clone();
         // Must take locks, otherwise it may double free memory quota on drop.
         let locks = std::mem::take(locks);
         (
             *tracked_index,
-            locks.into_iter().map(|lock| {
+            locks.into_iter().map(move |lock| {
                 memory_quota.free(lock.heap_size());
                 lock
             }),
@@ -395,6 +396,7 @@ where
 
         let store_id = self.get_or_init_store_id();
         let mut stats = Stats::default();
+        let regions = &mut self.regions;
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
                 let (leader_info, leader_store_id) = read_progress.dump_leader_info();
@@ -410,7 +412,7 @@ where
                 if is_leader(store_id, leader_store_id) {
                     // leader resolved-ts
                     if resolved_ts < stats.min_leader_resolved_ts.resolved_ts {
-                        let resolver = self.regions.get_mut(region_id).map(|x| &mut x.resolver);
+                        let resolver = regions.get_mut(region_id).map(|x| &mut x.resolver);
                         stats
                             .min_leader_resolved_ts
                             .set(*region_id, resolver, &core, &leader_info);
@@ -658,8 +660,12 @@ where
             let meta = store_meta.lock().unwrap();
             (meta.region_read_progress().clone(), meta.store_id())
         };
-        let advance_worker =
-            AdvanceTsWorker::new(pd_client.clone(), scheduler.clone(), concurrency_manager);
+        let advance_worker = AdvanceTsWorker::new(
+            cfg.advance_ts_interval.0,
+            pd_client.clone(),
+            scheduler.clone(),
+            concurrency_manager,
+        );
         let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, cdc_handle);
         let store_resolver_gc_interval = Duration::from_secs(60);
         let leader_resolver = LeadershipResolver::new(

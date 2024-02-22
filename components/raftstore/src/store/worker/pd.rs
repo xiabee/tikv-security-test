@@ -8,7 +8,7 @@ use std::{
     sync::{
         atomic::Ordering,
         mpsc::{self, Receiver, Sender},
-        Arc, Mutex,
+        Arc,
     },
     thread::{Builder, JoinHandle},
     time::{Duration, Instant},
@@ -36,12 +36,11 @@ use pd_client::{metrics::*, BucketStat, Error, PdClient, RegionStat};
 use prometheus::local::LocalHistogram;
 use raft::eraftpb::ConfChangeType;
 use resource_metering::{Collector, CollectorGuard, CollectorRegHandle, RawRecords};
-use service::service_manager::GrpcServiceManager;
 use tikv_util::{
     box_err, debug, error, info,
     metrics::ThreadInfoStatistics,
     store::QueryStats,
-    sys::{thread::StdThreadBuildWrapper, SysQuota},
+    sys::thread::StdThreadBuildWrapper,
     thd_name,
     time::{Instant as TiInstant, UnixSecs},
     timer::GLOBAL_TIMER_HANDLE,
@@ -59,16 +58,15 @@ use crate::{
     store::{
         cmd_resp::new_error,
         metrics::*,
-        unsafe_recovery::{
-            UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryHandle,
-        },
+        peer::{UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryForceLeaderSyncer},
+        transport::SignificantRouter,
         util::{is_epoch_stale, KeysInfoFormatter, LatencyInspector, RaftstoreDuration},
         worker::{
             split_controller::{SplitInfo, TOP_N},
             AutoSplitController, ReadStats, SplitConfigChange, WriteStats,
         },
         Callback, CasualMessage, Config, PeerMsg, RaftCmdExtraOpts, RaftCommand, RaftRouter,
-        RegionReadProgressRegistry, SnapManager, StoreInfo, StoreMsg, TxnExt,
+        RegionReadProgressRegistry, SignificantMsg, SnapManager, StoreInfo, StoreMsg, TxnExt,
     },
 };
 
@@ -202,7 +200,6 @@ where
         min_resolved_ts: u64,
     },
     ReportBuckets(BucketStat),
-    ControlGrpcServer(pdpb::ControlGrpcEvent),
 }
 
 pub struct StoreStat {
@@ -225,9 +222,6 @@ pub struct StoreStat {
     pub store_cpu_usages: RecordPairVec,
     pub store_read_io_rates: RecordPairVec,
     pub store_write_io_rates: RecordPairVec,
-
-    store_cpu_quota: f64, // quota of cpu usage
-    store_cpu_busy_thd: f64,
 }
 
 impl Default for StoreStat {
@@ -252,30 +246,7 @@ impl Default for StoreStat {
             store_cpu_usages: RecordPairVec::default(),
             store_read_io_rates: RecordPairVec::default(),
             store_write_io_rates: RecordPairVec::default(),
-
-            store_cpu_quota: 0.0_f64,
-            store_cpu_busy_thd: 0.8_f64,
         }
-    }
-}
-
-impl StoreStat {
-    fn set_cpu_quota(&mut self, cpu_cores: f64, busy_thd: f64) {
-        self.store_cpu_quota = cpu_cores * 100.0;
-        self.store_cpu_busy_thd = busy_thd;
-    }
-
-    fn maybe_busy(&self) -> bool {
-        if self.store_cpu_quota < 1.0 || self.store_cpu_busy_thd > 1.0 {
-            return false;
-        }
-
-        let mut cpu_usage = 0_u64;
-        for record in self.store_cpu_usages.iter() {
-            cpu_usage += record.get_value();
-        }
-
-        (cpu_usage as f64 / self.store_cpu_quota) >= self.store_cpu_busy_thd
     }
 }
 
@@ -459,9 +430,6 @@ where
             Task::ReportBuckets(ref buckets) => {
                 write!(f, "report buckets: {:?}", buckets)
             }
-            Task::ControlGrpcServer(ref event) => {
-                write!(f, "control grpc server: {:?}", event)
-            }
         }
     }
 }
@@ -520,7 +488,6 @@ pub trait StoreStatsReporter: Send + Clone + Sync + 'static + Collector {
     );
     fn report_min_resolved_ts(&self, store_id: u64, min_resolved_ts: u64);
     fn auto_split(&self, split_infos: Vec<SplitInfo>);
-    fn update_latency_stats(&self, timer_tick: u64);
 }
 
 impl<EK, ER> StoreStatsReporter for WrappedScheduler<EK, ER>
@@ -569,11 +536,6 @@ where
             );
         }
     }
-
-    fn update_latency_stats(&self, timer_tick: u64) {
-        debug!("update latency statistics not implemented for raftstore-v1";
-                "tick" => timer_tick);
-    }
 }
 
 pub struct StatsMonitor<T>
@@ -589,19 +551,13 @@ where
     load_base_split_check_interval: Duration,
     collect_tick_interval: Duration,
     report_min_resolved_ts_interval: Duration,
-    inspect_latency_interval: Duration,
 }
 
 impl<T> StatsMonitor<T>
 where
     T: StoreStatsReporter,
 {
-    pub fn new(
-        interval: Duration,
-        report_min_resolved_ts_interval: Duration,
-        inspect_latency_interval: Duration,
-        reporter: T,
-    ) -> Self {
+    pub fn new(interval: Duration, report_min_resolved_ts_interval: Duration, reporter: T) -> Self {
         StatsMonitor {
             reporter,
             handle: None,
@@ -614,12 +570,7 @@ where
                 interval,
             ),
             report_min_resolved_ts_interval: config(report_min_resolved_ts_interval),
-            // Use `inspect_latency_interval` as the minimal limitation for collecting tick.
-            collect_tick_interval: cmp::min(
-                inspect_latency_interval,
-                cmp::min(default_collect_tick_interval(), interval),
-            ),
-            inspect_latency_interval,
+            collect_tick_interval: cmp::min(default_collect_tick_interval(), interval),
         }
     }
 
@@ -632,12 +583,7 @@ where
         collector_reg_handle: CollectorRegHandle,
         store_id: u64,
     ) -> Result<(), io::Error> {
-        if self.collect_tick_interval
-            < cmp::min(
-                self.inspect_latency_interval,
-                default_collect_tick_interval(),
-            )
-        {
+        if self.collect_tick_interval < default_collect_tick_interval() {
             info!(
                 "interval is too small, skip stats monitoring. If we are running tests, it is normal, otherwise a check is needed."
             );
@@ -653,9 +599,6 @@ where
             .div_duration_f64(tick_interval) as u64;
         let report_min_resolved_ts_interval = self
             .report_min_resolved_ts_interval
-            .div_duration_f64(tick_interval) as u64;
-        let update_latency_stats_interval = self
-            .inspect_latency_interval
             .div_duration_f64(tick_interval) as u64;
 
         let (timer_tx, timer_rx) = mpsc::channel();
@@ -677,7 +620,7 @@ where
             .name(thd_name!("stats-monitor"))
             .spawn_wrapper(move || {
                 tikv_util::thread_group::set_properties(props);
-
+                tikv_alloc::add_thread_memory_accessor();
                 // Create different `ThreadInfoStatistics` for different purposes to
                 // make sure the record won't be disturbed.
                 let mut collect_store_infos_thread_stats = ThreadInfoStatistics::new();
@@ -686,7 +629,7 @@ where
                 // Register the region CPU records collector.
                 if auto_split_controller
                     .cfg
-                    .region_cpu_overload_threshold_ratio()
+                    .region_cpu_overload_threshold_ratio
                     > 0.0
                 {
                     region_cpu_records_collector =
@@ -718,11 +661,9 @@ where
                             region_read_progress.get_min_resolved_ts(),
                         );
                     }
-                    if is_enable_tick(timer_cnt, update_latency_stats_interval) {
-                        reporter.update_latency_stats(timer_cnt);
-                    }
                     timer_cnt += 1;
                 }
+                tikv_alloc::remove_thread_memory_accessor();
             })?;
 
         self.handle = Some(h);
@@ -890,14 +831,14 @@ impl SlowScore {
         }
     }
 
-    fn record(&mut self, id: u64, duration: Duration, not_busy: bool) {
+    fn record(&mut self, id: u64, duration: Duration) {
         self.last_record_time = Instant::now();
         if id != self.last_tick_id {
             return;
         }
         self.last_tick_finished = true;
         self.total_requests += 1;
-        if not_busy && duration >= self.inspect_interval {
+        if duration >= self.inspect_interval {
             self.timeout_requests += 1;
         }
     }
@@ -984,9 +925,6 @@ where
     curr_health_status: ServingStatus,
     coprocessor_host: CoprocessorHost<EK>,
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used for rawkv apiv2
-
-    // Service manager for grpc service.
-    grpc_service_manager: GrpcServiceManager,
 }
 
 impl<EK, ER, T> Runner<EK, ER, T>
@@ -1010,16 +948,12 @@ where
         health_service: Option<HealthService>,
         coprocessor_host: CoprocessorHost<EK>,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used for rawkv apiv2
-        grpc_service_manager: GrpcServiceManager,
     ) -> Runner<EK, ER, T> {
-        let mut store_stat = StoreStat::default();
-        store_stat.set_cpu_quota(SysQuota::cpu_cores_quota(), cfg.inspect_cpu_util_thd);
         let store_heartbeat_interval = cfg.pd_store_heartbeat_tick_interval.0;
         let interval = store_heartbeat_interval / NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT;
         let mut stats_monitor = StatsMonitor::new(
             interval,
             cfg.report_min_resolved_ts_interval.0,
-            cfg.inspect_interval.0,
             WrappedScheduler(scheduler.clone()),
         );
         if let Err(e) = stats_monitor.start(
@@ -1038,7 +972,7 @@ where
             is_hb_receiver_scheduled: false,
             region_peers: HashMap::default(),
             region_buckets: HashMap::default(),
-            store_stat,
+            store_stat: StoreStat::default(),
             start_ts: UnixSecs::now(),
             scheduler,
             store_heartbeat_interval,
@@ -1085,7 +1019,6 @@ where
             curr_health_status: ServingStatus::Serving,
             coprocessor_host,
             causal_ts_provider,
-            grpc_service_manager,
         }
     }
 
@@ -1387,17 +1320,20 @@ where
         self.store_stat.region_bytes_read.flush();
         self.store_stat.region_keys_read.flush();
 
-        STORE_SIZE_EVENT_INT_VEC.capacity.set(capacity as i64);
-        STORE_SIZE_EVENT_INT_VEC.available.set(available as i64);
-        STORE_SIZE_EVENT_INT_VEC.used.set(used_size as i64);
+        STORE_SIZE_GAUGE_VEC
+            .with_label_values(&["capacity"])
+            .set(capacity as i64);
+        STORE_SIZE_GAUGE_VEC
+            .with_label_values(&["available"])
+            .set(available as i64);
+        STORE_SIZE_GAUGE_VEC
+            .with_label_values(&["used"])
+            .set(used_size as i64);
 
         let slow_score = self.slow_score.get();
         stats.set_slow_score(slow_score as u64);
         self.set_slow_trend_to_store_stats(&mut stats, total_query_num);
 
-        stats.set_is_grpc_paused(self.grpc_service_manager.is_paused());
-
-        let scheduler = self.scheduler.clone();
         let router = self.router.clone();
         let resp = self
             .pd_client
@@ -1410,7 +1346,6 @@ where
                     }
                     if let Some(mut plan) = resp.recovery_plan.take() {
                         info!("Unsafe recovery, received a recovery plan");
-                        let handle = Arc::new(Mutex::new(router.clone()));
                         if plan.has_force_leader() {
                             let mut failed_stores = HashSet::default();
                             for failed_store in plan.get_force_leader().get_failed_stores() {
@@ -1418,13 +1353,15 @@ where
                             }
                             let syncer = UnsafeRecoveryForceLeaderSyncer::new(
                                 plan.get_step(),
-                                handle.clone(),
+                                router.clone(),
                             );
                             for region in plan.get_force_leader().get_enter_force_leaders() {
-                                if let Err(e) = handle.send_enter_force_leader(
+                                if let Err(e) = router.significant_send(
                                     *region,
-                                    syncer.clone(),
-                                    failed_stores.clone(),
+                                    SignificantMsg::EnterForceLeaderState {
+                                        syncer: syncer.clone(),
+                                        failed_stores: failed_stores.clone(),
+                                    },
                                 ) {
                                     error!("fail to send force leader message for recovery"; "err" => ?e);
                                 }
@@ -1432,23 +1369,33 @@ where
                         } else {
                             let syncer = UnsafeRecoveryExecutePlanSyncer::new(
                                 plan.get_step(),
-                                handle.clone(),
+                                router.clone(),
                             );
                             for create in plan.take_creates().into_iter() {
-                                if let Err(e) = handle.send_create_peer(create, syncer.clone()) {
+                                if let Err(e) =
+                                    router.send_control(StoreMsg::UnsafeRecoveryCreatePeer {
+                                        syncer: syncer.clone(),
+                                        create,
+                                    })
+                                {
                                     error!("fail to send create peer message for recovery"; "err" => ?e);
                                 }
                             }
                             for delete in plan.take_tombstones().into_iter() {
-                                if let Err(e) = handle.send_destroy_peer(delete, syncer.clone()) {
-                                    error!("fail to send destroy peer message for recovery"; "err" => ?e);
+                                if let Err(e) = router.significant_send(
+                                    delete,
+                                    SignificantMsg::UnsafeRecoveryDestroy(syncer.clone()),
+                                ) {
+                                    error!("fail to send delete peer message for recovery"; "err" => ?e);
                                 }
                             }
                             for mut demote in plan.take_demotes().into_iter() {
-                                if let Err(e) = handle.send_demote_peers(
+                                if let Err(e) = router.significant_send(
                                     demote.get_region_id(),
-                                    demote.take_failed_voters().into_vec(),
-                                    syncer.clone(),
+                                    SignificantMsg::UnsafeRecoveryDemoteFailedVoters {
+                                        syncer: syncer.clone(),
+                                        failed_voters: demote.take_failed_voters().into_vec(),
+                                    },
                                 ) {
                                     error!("fail to send update peer list message for recovery"; "err" => ?e);
                                 }
@@ -1462,14 +1409,6 @@ where
                         let _ = router.send_store_msg(StoreMsg::AwakenRegions {
                             abnormal_stores: awaken_regions.get_abnormal_stores().to_vec(),
                         });
-                    }
-                    // Control grpc server.
-                    if let Some(op) = resp.control_grpc.take() {
-                        if let Err(e) =
-                            scheduler.schedule(Task::ControlGrpcServer(op.get_ctrl_event()))
-                        {
-                            warn!("fail to schedule control grpc task"; "err" => ?e);
-                        }
                     }
                 }
                 Err(e) => {
@@ -1514,7 +1453,6 @@ where
         STORE_SLOW_TREND_L1_L2_GAUGE.set(self.slow_trend_cause.l1_l2_rate());
         STORE_SLOW_TREND_L1_MARGIN_ERROR_GAUGE.set(self.slow_trend_cause.l1_margin_error_base());
         STORE_SLOW_TREND_L2_MARGIN_ERROR_GAUGE.set(self.slow_trend_cause.l2_margin_error_base());
-        // Report results of all slow Trends.
         STORE_SLOW_TREND_RESULT_L0_GAUGE.set(self.slow_trend_result.l0_avg());
         STORE_SLOW_TREND_RESULT_L1_GAUGE.set(self.slow_trend_result.l1_avg());
         STORE_SLOW_TREND_RESULT_L2_GAUGE.set(self.slow_trend_result.l2_avg());
@@ -1713,7 +1651,7 @@ where
                     let mut switches = resp.take_switch_witnesses();
                     info!("try to switch witness";
                           "region_id" => region_id,
-                          "switch_witness" => ?switches
+                          "switch witness" => ?switches
                     );
                     let req = new_batch_switch_witness(switches.take_switch_witnesses().into());
                     send_admin_request(&router, region_id, epoch, peer, req, Callback::None, Default::default());
@@ -1801,8 +1739,6 @@ where
         let pd_client = self.pd_client.clone();
         let concurrency_manager = self.concurrency_manager.clone();
         let causal_ts_provider = self.causal_ts_provider.clone();
-        let log_interval = Duration::from_secs(5);
-        let mut last_log_ts = Instant::now().checked_sub(log_interval).unwrap();
 
         let f = async move {
             let mut success = false;
@@ -1841,14 +1777,10 @@ where
                         break;
                     }
                     Err(e) => {
-                        if last_log_ts.elapsed() > log_interval {
-                            warn!(
-                                "failed to update max timestamp for region";
-                                "region_id" => region_id,
-                                "error" => ?e
-                            );
-                            last_log_ts = Instant::now();
-                        }
+                        warn!(
+                            "failed to update max timestamp for region {}: {:?}",
+                            region_id, e
+                        );
                     }
                 }
             }
@@ -1943,9 +1875,6 @@ where
             .pd_client
             .report_region_buckets(&delta, Duration::from_secs(interval_second));
         let f = async move {
-            // Migrated to 2021 migration. This let statement is probably not needed, see
-            //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
-            let _ = &delta;
             if let Err(e) = resp.await {
                 debug!(
                     "failed to send buckets";
@@ -2013,37 +1942,8 @@ where
     fn is_store_heartbeat_delayed(&self) -> bool {
         let now = UnixSecs::now();
         let interval_second = now.into_inner() - self.store_stat.last_report_ts.into_inner();
-        // Only if the `last_report_ts`, that is, the last timestamp of
-        // store_heartbeat, exceeds the interval of store heartbaet but less than
-        // the given limitation, will it trigger a report of fake heartbeat to
-        // make the statistics of slowness percepted by PD timely.
-        (interval_second > self.store_heartbeat_interval.as_secs())
+        (interval_second >= self.store_heartbeat_interval.as_secs())
             && (interval_second <= STORE_HEARTBEAT_DELAY_LIMIT)
-    }
-
-    fn handle_control_grpc_server(&mut self, event: pdpb::ControlGrpcEvent) {
-        info!("forcely control grpc server";
-                "curr_health_status" => ?self.curr_health_status,
-                "event" => ?event,
-        );
-        match event {
-            pdpb::ControlGrpcEvent::Pause => {
-                if let Err(e) = self.grpc_service_manager.pause() {
-                    warn!("failed to send service event to PAUSE grpc server";
-                            "err" => ?e);
-                } else {
-                    self.update_health_status(ServingStatus::NotServing);
-                }
-            }
-            pdpb::ControlGrpcEvent::Resume => {
-                if let Err(e) = self.grpc_service_manager.resume() {
-                    warn!("failed to send service event to RESUME grpc server";
-                            "err" => ?e);
-                } else {
-                    self.update_health_status(ServingStatus::Serving);
-                }
-            }
-        }
     }
 }
 
@@ -2289,11 +2189,10 @@ where
             } => self.handle_update_max_timestamp(region_id, initial_status, txn_ext),
             Task::QueryRegionLeader { region_id } => self.handle_query_region_leader(region_id),
             Task::UpdateSlowScore { id, duration } => {
-                // Fine-tuned, `SlowScore` only takes the I/O jitters on the disk into account.
-                self.slow_score.record(
-                    id,
-                    duration.delays_on_disk_io(false),
-                    !self.store_stat.maybe_busy(),
+                self.slow_score.record(id, duration.sum());
+                self.slow_trend_cause.record(
+                    tikv_util::time::duration_to_us(duration.store_wait_duration.unwrap()),
+                    Instant::now(),
                 );
             }
             Task::RegionCpuRecords(records) => self.handle_region_cpu_records(records),
@@ -2303,9 +2202,6 @@ where
             } => self.handle_report_min_resolved_ts(store_id, min_resolved_ts),
             Task::ReportBuckets(buckets) => {
                 self.handle_report_region_buckets(buckets);
-            }
-            Task::ControlGrpcServer(event) => {
-                self.handle_control_grpc_server(event);
             }
         };
     }
@@ -2333,12 +2229,7 @@ where
             self.update_health_status(ServingStatus::Serving);
         }
         if !self.slow_score.last_tick_finished {
-            // If the last tick is not finished, it means that the current store might
-            // be busy on handling requests or delayed on I/O operations. And only when
-            // the current store is not busy, it should record the last_tick as a timeout.
-            if !self.store_stat.maybe_busy() {
-                self.slow_score.record_timeout();
-            }
+            self.slow_score.record_timeout();
             // If the last slow_score already reached abnormal state and was delayed for
             // reporting by `store-heartbeat` to PD, we should report it here manually as
             // a FAKE `store-heartbeat`.
@@ -2369,18 +2260,17 @@ where
             Box::new(move |id, duration| {
                 let dur = duration.sum();
 
-                STORE_INSPECT_DURATION_HISTOGRAM
+                STORE_INSPECT_DURTION_HISTOGRAM
                     .with_label_values(&["store_process"])
                     .observe(tikv_util::time::duration_to_sec(
-                        duration.store_process_duration.unwrap_or_default(),
+                        duration.store_process_duration.unwrap(),
                     ));
-                STORE_INSPECT_DURATION_HISTOGRAM
+                STORE_INSPECT_DURTION_HISTOGRAM
                     .with_label_values(&["store_wait"])
                     .observe(tikv_util::time::duration_to_sec(
-                        duration.store_wait_duration.unwrap_or_default(),
+                        duration.store_wait_duration.unwrap(),
                     ));
-
-                STORE_INSPECT_DURATION_HISTOGRAM
+                STORE_INSPECT_DURTION_HISTOGRAM
                     .with_label_values(&["all"])
                     .observe(tikv_util::time::duration_to_sec(dur));
                 if let Err(e) = scheduler.schedule(Task::UpdateSlowScore { id, duration }) {
@@ -2631,21 +2521,15 @@ fn collect_engine_size<EK: KvEngine, ER: RaftEngine>(
     } else {
         store_info.capacity
     };
-    let raft_size = store_info
-        .raft_engine
-        .get_engine_size()
-        .expect("raft engine used size");
-
-    let kv_size = store_info
-        .kv_engine
-        .get_engine_used_size()
-        .expect("kv engine used size");
-
-    STORE_SIZE_EVENT_INT_VEC.raft_size.set(raft_size as i64);
-    STORE_SIZE_EVENT_INT_VEC.snap_size.set(snap_mgr_size as i64);
-    STORE_SIZE_EVENT_INT_VEC.kv_size.set(kv_size as i64);
-
-    let used_size = snap_mgr_size + kv_size + raft_size;
+    let used_size = snap_mgr_size
+        + store_info
+            .kv_engine
+            .get_engine_used_size()
+            .expect("kv engine used size")
+        + store_info
+            .raft_engine
+            .get_engine_size()
+            .expect("raft engine used size");
     let mut available = capacity.checked_sub(used_size).unwrap_or_default();
     // We only care about rocksdb SST file size, so we should check disk available
     // here.
@@ -2692,7 +2576,6 @@ mod tests {
                 let mut stats_monitor = StatsMonitor::new(
                     Duration::from_secs(interval),
                     Duration::from_secs(0),
-                    Duration::from_secs(interval),
                     WrappedScheduler(scheduler),
                 );
                 let store_meta = Arc::new(Mutex::new(StoreMeta::new(0)));

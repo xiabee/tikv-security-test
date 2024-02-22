@@ -7,16 +7,14 @@ use std::sync::{
 
 use raft::eraftpb::MessageType;
 use test_raftstore::*;
-use test_raftstore_macro::test_case;
 
 // Test if a singleton can apply a log before persisting it.
-#[test_case(test_raftstore::new_node_cluster)]
-#[test_case(test_raftstore_v2::new_node_cluster)]
+#[test]
 fn test_singleton_cannot_early_apply() {
-    let mut cluster = new_cluster(0, 1);
+    let mut cluster = new_node_cluster(0, 1);
     cluster.pd_client.disable_default_operator();
     // So compact log will not be triggered automatically.
-    configure_for_request_snapshot(&mut cluster.cfg);
+    configure_for_request_snapshot(&mut cluster);
 
     cluster.run();
     // Put one key first to cache leader.
@@ -35,14 +33,13 @@ fn test_singleton_cannot_early_apply() {
     must_get_equal(&cluster.get_engine(1), b"k1", b"v1");
 }
 
-#[test_case(test_raftstore::new_node_cluster)]
-#[test_case(test_raftstore_v2::new_node_cluster)]
+#[test]
 fn test_multi_early_apply() {
-    let mut cluster = new_cluster(0, 3);
+    let mut cluster = new_node_cluster(0, 3);
     cluster.pd_client.disable_default_operator();
     cluster.cfg.raft_store.store_batch_system.pool_size = 1;
     // So compact log will not be triggered automatically.
-    configure_for_request_snapshot(&mut cluster.cfg);
+    configure_for_request_snapshot(&mut cluster);
 
     cluster.run_conf_change();
     // Check mixed regions can be scheduled correctly.
@@ -71,11 +68,9 @@ fn test_multi_early_apply() {
             })),
     ));
     cluster.async_put(b"k4", b"v4").unwrap();
-    // Sleep a while so that follower will send append response
-    sleep_ms(100);
-    cluster.async_put(b"k11", b"v22").unwrap();
     // Sleep a while so that follower will send append response.
     sleep_ms(100);
+    cluster.async_put(b"k11", b"v22").unwrap();
     // Now the store thread of store 1 pauses on `store_1_fp`.
     // Set `store_1_fp` again to make this store thread does not pause on it.
     // Then leader 1 will receive the append response and commit the log.
@@ -97,9 +92,6 @@ fn test_multi_early_apply() {
 /// the peer to fix this issue.
 /// For simplicity, this test uses region merge to ensure that the apply state
 /// will be written to kv db before crash.
-///
-/// Note: partitioned-raft-kv does not need this due to change in disk
-/// persistence logic
 #[test]
 fn test_early_apply_yield_followed_with_many_entries() {
     let mut cluster = new_node_cluster(0, 3);

@@ -3,13 +3,8 @@
 //! This file contains the implementation of sending and receiving tablet
 //! snapshot.
 //!
-//! v2 snapshot transfers engine data in its original form, instead of creating
-//! new files like in v1. It's possible that receiver and sender share some data
-//! files because they might derive from the same snapshot. To optimize transfer
-//! speed, we first compare their file list and only send files missing from
-//! receiver's "cache".
-//!
-//! # Protocol
+//! Different from v1, tablet snapshot always tries to use cache to speed up
+//! transfering speed. The protocol is quite simple:
 //!
 //! sender                            receiver
 //! send snapshot meta    ---->     receive snapshot meta
@@ -21,12 +16,14 @@
 //! wait for receiver       <-----  close sender
 //! finish
 
+#[cfg(any(test, feature = "testexport"))]
+use std::io;
 use std::{
     cmp,
     convert::TryFrom,
     fmt::Debug,
     fs::{self, File},
-    io::{self, BorrowedBuf, Read, Seek, SeekFrom, Write},
+    io::{BorrowedBuf, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -34,11 +31,10 @@ use std::{
 
 use collections::HashMap;
 use crc64fast::Digest;
-use encryption_export::{DataKeyImporter, DataKeyManager};
-use engine_traits::{Checkpointer, EncryptionKeyManager, KvEngine, TabletRegistry};
+use engine_traits::{Checkpointer, KvEngine, TabletRegistry};
 use file_system::{IoType, OpenOptions, WithIoType};
 use futures::{
-    future::FutureExt,
+    future::{Future, FutureExt},
     sink::{Sink, SinkExt},
     stream::{Stream, StreamExt, TryStreamExt},
 };
@@ -64,7 +60,7 @@ use tikv_util::{
     config::{ReadableSize, Tracker, VersionTrack},
     time::Instant,
     worker::Runnable,
-    DeferContext, Either,
+    DeferContext,
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
@@ -84,12 +80,7 @@ fn is_sst(file_name: &str) -> bool {
     file_name.ends_with(".sst")
 }
 
-async fn read_to(
-    f: &mut impl Read,
-    to: &mut Vec<u8>,
-    size: usize,
-    limiter: &Limiter,
-) -> Result<()> {
+async fn read_to(f: &mut File, to: &mut Vec<u8>, size: usize, limiter: &Limiter) -> Result<()> {
     // It's likely in page cache already.
     let cost = size / 2;
     limiter.consume(cost).await;
@@ -104,48 +95,6 @@ async fn read_to(
         to.set_len(size);
     }
     Ok(())
-}
-
-struct EncryptedFile(Either<File, encryption_export::DecrypterReader<File>>);
-
-impl Read for EncryptedFile {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match &mut self.0 {
-            Either::Left(f) => f.read(buf),
-            Either::Right(f) => f.read(buf),
-        }
-    }
-}
-
-impl EncryptedFile {
-    fn open(key_manager: &Option<Arc<DataKeyManager>>, path: &Path) -> Result<Self> {
-        let f = File::open(path)?;
-        let inner = if let Some(m) = key_manager {
-            Either::Right(
-                m.open_file_with_reader(path, f)
-                    .map_err(|e| Error::Other(e.into()))?,
-            )
-        } else {
-            Either::Left(f)
-        };
-        Ok(Self(inner))
-    }
-
-    fn seek(&mut self, to: SeekFrom) -> Result<u64> {
-        let r = match &mut self.0 {
-            Either::Left(f) => f.seek(to)?,
-            Either::Right(f) => f.seek(to)?,
-        };
-        Ok(r)
-    }
-
-    fn len(&self) -> Result<u64> {
-        let r = match &self.0 {
-            Either::Left(f) => f.metadata()?.len(),
-            Either::Right(f) => f.inner().metadata()?.len(),
-        };
-        Ok(r)
-    }
 }
 
 pub trait SnapCacheBuilder: Send + Sync {
@@ -245,15 +194,15 @@ fn protocol_error(exp: &str, act: impl Debug) -> Error {
 /// actual data of an SST;
 /// 3. The last `PREVIEW_CHUNK_LEN` bytes are the same, this contains checksum,
 /// properties and other medata of an SST.
-async fn is_sst_match_preview(
+pub(crate) async fn is_sst_match_preview(
     preview_meta: &TabletSnapshotFileMeta,
     target: &Path,
     buffer: &mut Vec<u8>,
     limiter: &Limiter,
-    key_manager: &Option<Arc<DataKeyManager>>,
 ) -> Result<bool> {
-    let mut f = EncryptedFile::open(key_manager, target)?;
-    if f.len()? != preview_meta.file_size {
+    let mut f = File::open(target)?;
+    let exist_len = f.metadata()?.len();
+    if exist_len != preview_meta.file_size {
         return Ok(false);
     }
 
@@ -284,12 +233,11 @@ async fn is_sst_match_preview(
     Ok(*buffer == preview_meta.trailing_chunk)
 }
 
-async fn cleanup_cache(
+pub(crate) async fn cleanup_cache(
     path: &Path,
     stream: &mut (impl Stream<Item = Result<TabletSnapshotRequest>> + Unpin),
     sink: &mut (impl Sink<(TabletSnapshotResponse, WriteFlags), Error = grpcio::Error> + Unpin),
     limiter: &Limiter,
-    key_manager: &Option<Arc<DataKeyManager>>,
 ) -> Result<(u64, Vec<String>)> {
     let mut reused = 0;
     let mut exists = HashMap::default();
@@ -297,9 +245,7 @@ async fn cleanup_cache(
         let entry = entry?;
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            if let Some(m) = key_manager {
-                m.remove_dir(&entry.path(), None)?;
-            }
+            // TODO(tabokie)
             fs::remove_dir_all(entry.path())?;
             continue;
         }
@@ -314,9 +260,6 @@ async fn cleanup_cache(
             }
         }
         fs::remove_file(entry.path())?;
-        if let Some(m) = key_manager {
-            m.delete_file(entry.path().to_str().unwrap(), None)?;
-        }
     }
     let mut missing = vec![];
     loop {
@@ -327,15 +270,12 @@ async fn cleanup_cache(
         let mut buffer = Vec::with_capacity(PREVIEW_CHUNK_LEN);
         for meta in preview.take_metas().into_vec() {
             if is_sst(&meta.file_name) && let Some(p) = exists.remove(&meta.file_name) {
-                if is_sst_match_preview(&meta, &p, &mut buffer, limiter, key_manager).await? {
+                if is_sst_match_preview(&meta, &p, &mut buffer, limiter).await? {
                     reused += meta.file_size;
                     continue;
                 }
                 // We should not write to the file directly as it's hard linked.
-                fs::remove_file(&p)?;
-                if let Some(m) = key_manager {
-                    m.delete_file(p.to_str().unwrap(), None)?;
-                }
+                fs::remove_file(p)?;
             }
             missing.push(meta.file_name);
         }
@@ -344,10 +284,7 @@ async fn cleanup_cache(
         }
     }
     for (_, p) in exists {
-        fs::remove_file(&p)?;
-        if let Some(m) = key_manager {
-            m.delete_file(p.to_str().unwrap(), None)?;
-        }
+        fs::remove_file(p)?;
     }
     let mut resp = TabletSnapshotResponse::default();
     resp.mut_files().set_file_name(missing.clone().into());
@@ -355,27 +292,19 @@ async fn cleanup_cache(
     Ok((reused, missing))
 }
 
-async fn accept_one_file(
+pub(crate) async fn accept_one_file(
     path: &Path,
     mut chunk: TabletSnapshotFileChunk,
     stream: &mut (impl Stream<Item = Result<TabletSnapshotRequest>> + Unpin),
     limiter: &Limiter,
-    key_importer: &mut Option<DataKeyImporter<'_>>,
     digest: &mut Digest,
 ) -> Result<u64> {
-    let iv = chunk.take_iv();
-    let key = if chunk.has_key() {
-        Some(chunk.take_key())
-    } else {
-        None
-    };
     let name = chunk.file_name;
     digest.write(name.as_bytes());
-    let path = path.join(&name);
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)?;
+        .open(path.join(&name))?;
     let exp_size = chunk.file_size;
     let mut file_size = 0;
     loop {
@@ -394,16 +323,6 @@ async fn accept_one_file(
         f.write_all(&chunk.data)?;
         if exp_size == file_size {
             f.sync_data()?;
-            if let Some(key) = key {
-                if let Some(i) = key_importer {
-                    i.add(path.to_str().unwrap(), iv, key)
-                        .map_err(|e| Error::Other(e.into()))?;
-                } else {
-                    return Err(Error::Other(
-                        "encryption not enabled on receiving end".to_string().into(),
-                    ));
-                }
-            }
             return Ok(exp_size);
         }
         chunk = match stream.next().await {
@@ -416,16 +335,14 @@ async fn accept_one_file(
     }
 }
 
-async fn accept_missing(
+pub(crate) async fn accept_missing(
     path: &Path,
     missing_ssts: Vec<String>,
     stream: &mut (impl Stream<Item = Result<TabletSnapshotRequest>> + Unpin),
     limiter: &Limiter,
-    key_manager: &Option<Arc<DataKeyManager>>,
 ) -> Result<u64> {
     let mut digest = Digest::default();
     let mut received_bytes: u64 = 0;
-    let mut key_importer = key_manager.as_deref().map(|m| DataKeyImporter::new(m));
     for name in missing_ssts {
         let chunk = match stream.next().await {
             Some(Ok(mut req)) if req.has_chunk() => req.take_chunk(),
@@ -434,8 +351,7 @@ async fn accept_missing(
         if chunk.file_name != name {
             return Err(protocol_error(&name, &chunk.file_name));
         }
-        received_bytes +=
-            accept_one_file(path, chunk, stream, limiter, &mut key_importer, &mut digest).await?;
+        received_bytes += accept_one_file(path, chunk, stream, limiter, &mut digest).await?;
     }
     // Now receive other files.
     loop {
@@ -454,9 +370,6 @@ async fn accept_missing(
                 File::open(path)?.sync_data()?;
                 let res = stream.next().await;
                 return if res.is_none() {
-                    if let Some(i) = key_importer {
-                        i.commit().map_err(|e| Error::Other(e.into()))?;
-                    }
                     Ok(received_bytes)
                 } else {
                     Err(protocol_error("None", res))
@@ -467,12 +380,11 @@ async fn accept_missing(
         if chunk.file_name.is_empty() {
             return Err(protocol_error("file_name", &chunk.file_name));
         }
-        received_bytes +=
-            accept_one_file(path, chunk, stream, limiter, &mut key_importer, &mut digest).await?;
+        received_bytes += accept_one_file(path, chunk, stream, limiter, &mut digest).await?;
     }
 }
 
-async fn recv_snap_imp<'a>(
+pub(crate) async fn recv_snap_files<'a>(
     snap_mgr: &'a TabletSnapManager,
     cache_builder: impl SnapCacheBuilder,
     mut stream: impl Stream<Item = Result<TabletSnapshotRequest>> + Unpin,
@@ -496,16 +408,9 @@ async fn recv_snap_imp<'a>(
         ));
     }
     let path = snap_mgr.tmp_recv_path(&context.key);
-    info!(
-        "begin to receive tablet snapshot files";
-        "file" => %path.display(),
-        "region_id" => region_id,
-        "temp_exists" => path.exists(),
-    );
+    info!("begin to receive tablet snapshot files"; "file" => %path.display(), "region_id" => region_id);
     if path.exists() {
-        if let Some(m) = snap_mgr.key_manager() {
-            m.remove_dir(&path, None)?;
-        }
+        // TODO(tabokie)
         fs::remove_dir_all(&path)?;
     }
     let (reused, missing_ssts) = if context.use_cache {
@@ -513,47 +418,24 @@ async fn recv_snap_imp<'a>(
             info!("not using cache"; "region_id" => region_id, "err" => ?e);
             fs::create_dir_all(&path)?;
         }
-        cleanup_cache(&path, &mut stream, sink, &limiter, snap_mgr.key_manager()).await?
+        cleanup_cache(&path, &mut stream, sink, &limiter).await?
     } else {
         info!("not using cache"; "region_id" => region_id);
         fs::create_dir_all(&path)?;
         (0, vec![])
     };
-    let received = accept_missing(
-        &path,
-        missing_ssts,
-        &mut stream,
-        &limiter,
-        snap_mgr.key_manager(),
-    )
-    .await?;
+    let received = accept_missing(&path, missing_ssts, &mut stream, &limiter).await?;
     info!("received all tablet snapshot file"; "snap_key" => %context.key, "region_id" => region_id, "received" => received, "reused" => reused);
     let final_path = snap_mgr.final_recv_path(&context.key);
-    if let Some(m) = snap_mgr.key_manager() {
-        m.link_file(path.to_str().unwrap(), final_path.to_str().unwrap())?;
-    }
-    fs::rename(&path, &final_path).map_err(|e| {
-        if let Some(m) = snap_mgr.key_manager() {
-            if let Err(e) = m.remove_dir(&final_path, Some(&path)) {
-                error!(
-                    "failed to clean up encryption keys after rename fails";
-                    "src" => %path.display(),
-                    "dst" => %final_path.display(),
-                    "err" => ?e,
-                );
-            }
-        }
-        e
-    })?;
-    if let Some(m) = snap_mgr.key_manager() {
-        m.remove_dir(&path, Some(&final_path))?;
-    }
+    // TODO(tabokie)
+    fs::rename(&path, final_path)?;
+
     Ok(context)
 }
 
 pub(crate) async fn recv_snap<R: RaftExtension + 'static>(
     stream: RequestStream<TabletSnapshotRequest>,
-    mut sink: DuplexSink<TabletSnapshotResponse>,
+    sink: DuplexSink<TabletSnapshotResponse>,
     snap_mgr: TabletSnapManager,
     raft_router: R,
     cache_builder: impl SnapCacheBuilder,
@@ -561,7 +443,8 @@ pub(crate) async fn recv_snap<R: RaftExtension + 'static>(
     snap_mgr_v1: Option<SnapManager>,
 ) -> Result<()> {
     let stream = stream.map_err(Error::from);
-    let res = recv_snap_imp(&snap_mgr, cache_builder, stream, &mut sink, limiter)
+    let mut sink = sink;
+    let res = recv_snap_files(&snap_mgr, cache_builder, stream, &mut sink, limiter)
         .await
         .and_then(|context| {
             // some means we are in raftstore-v1 config and received a tablet snapshot from
@@ -577,21 +460,18 @@ pub(crate) async fn recv_snap<R: RaftExtension + 'static>(
             context.finish(raft_router)
         });
     match res {
-        Ok(()) => sink.close().await?,
+        Ok(()) => sink.close().await.map_err(Error::from),
         Err(e) => {
-            info!("receive tablet snapshot aborted"; "err" => ?e);
             let status = RpcStatus::with_message(RpcStatusCode::UNKNOWN, format!("{:?}", e));
-            sink.fail(status).await?;
+            sink.fail(status).await.map_err(Error::from)
         }
     }
-    Ok(())
 }
 
 async fn build_one_preview(
     path: &Path,
     iter: &mut impl Iterator<Item = (&String, &u64)>,
     limiter: &Limiter,
-    key_manager: &Option<Arc<DataKeyManager>>,
 ) -> Result<TabletSnapshotRequest> {
     let mut preview = TabletSnapshotPreview::default();
     for _ in 0..PREVIEW_BATCH_SIZE {
@@ -602,7 +482,7 @@ async fn build_one_preview(
         let mut meta = TabletSnapshotFileMeta::default();
         meta.file_name = name.clone();
         meta.file_size = size;
-        let mut f = EncryptedFile::open(key_manager, &path.join(name))?;
+        let mut f = File::open(path.join(name))?;
         let to_read = cmp::min(size as usize, PREVIEW_CHUNK_LEN);
         read_to(&mut f, &mut meta.head_chunk, to_read, limiter).await?;
         if size > PREVIEW_CHUNK_LEN as u64 {
@@ -622,7 +502,6 @@ async fn find_missing(
     sender: &mut (impl Sink<(TabletSnapshotRequest, WriteFlags), Error = Error> + Unpin),
     receiver: &mut (impl Stream<Item = grpcio::Result<TabletSnapshotResponse>> + Unpin),
     limiter: &Limiter,
-    key_manager: &Option<Arc<DataKeyManager>>,
 ) -> Result<Vec<(String, u64)>> {
     let mut sst_sizes = 0;
     let mut ssts = HashMap::default();
@@ -655,15 +534,19 @@ async fn find_missing(
     head.mut_head().set_use_cache(true);
     // Send immediately to make receiver collect cache earlier.
     sender.send((head, WriteFlags::default())).await?;
-    let mut ssts_iter = ssts.iter().peekable();
-    while ssts_iter.peek().is_some() {
-        let mut req = build_one_preview(path, &mut ssts_iter, limiter, key_manager).await?;
-        let is_end = ssts_iter.peek().is_none();
-        req.mut_preview().end = is_end;
+    let sst_count = ssts.len();
+    // PREVIEW_BATCH_SIZE -> 1, PREVIEW_BATCH_SIZE + 1 = 2. sst_count can't be 0.
+    let batch_count = (sst_count - 1) / PREVIEW_BATCH_SIZE + 1;
+    let mut ssts_iter = ssts.iter();
+    for _ in 0..batch_count {
+        let req = build_one_preview(path, &mut ssts_iter, limiter).await?;
         sender
-            .send((req, WriteFlags::default().buffer_hint(!is_end)))
+            .send((req, WriteFlags::default().buffer_hint(true)))
             .await?;
     }
+    let mut req = build_one_preview(path, &mut ssts_iter, limiter).await?;
+    req.mut_preview().end = true;
+    sender.send((req, WriteFlags::default())).await?;
 
     let accepted = match receiver.next().await {
         Some(Ok(mut req)) if req.has_files() => req.take_files().take_file_name(),
@@ -686,23 +569,15 @@ async fn send_missing(
     missing: Vec<(String, u64)>,
     sender: &mut (impl Sink<(TabletSnapshotRequest, WriteFlags), Error = Error> + Unpin),
     limiter: &Limiter,
-    key_manager: &Option<Arc<DataKeyManager>>,
 ) -> Result<(u64, u64)> {
     let mut total_sent = 0;
     let mut digest = Digest::default();
     for (name, mut file_size) in missing {
-        let file_path = path.join(&name);
         let mut chunk = TabletSnapshotFileChunk::default();
         chunk.file_name = name;
         digest.write(chunk.file_name.as_bytes());
         chunk.file_size = file_size;
         total_sent += file_size;
-        if let Some(m) = key_manager
-            && let Some((iv, key)) = m.get_file_internal(file_path.to_str().unwrap())?
-        {
-            chunk.iv = iv;
-            chunk.set_key(key);
-        }
         if file_size == 0 {
             let mut req = TabletSnapshotRequest::default();
             req.set_chunk(chunk);
@@ -712,8 +587,7 @@ async fn send_missing(
             continue;
         }
 
-        // Send encrypted content.
-        let mut f = File::open(&file_path)?;
+        let mut f = File::open(path.join(&chunk.file_name))?;
         loop {
             let to_read = cmp::min(FILE_CHUNK_LEN as u64, file_size) as usize;
             read_to(&mut f, &mut chunk.data, to_read, limiter).await?;
@@ -733,16 +607,49 @@ async fn send_missing(
     Ok((total_sent, digest.sum64()))
 }
 
+async fn send_snap_files(
+    mgr: &TabletSnapManager,
+    mut sender: impl Sink<(TabletSnapshotRequest, WriteFlags), Error = Error> + Unpin,
+    receiver: &mut (impl Stream<Item = grpcio::Result<TabletSnapshotResponse>> + Unpin),
+    msg: RaftMessage,
+    key: TabletSnapKey,
+    limiter: Limiter,
+) -> Result<u64> {
+    let region_id = key.region_id;
+    let to_peer = key.to_peer;
+    let path = mgr.tablet_gen_path(&key);
+    info!("begin to send snapshot file"; "snap_key" => %key, "region_id" => region_id, "to_peer" => to_peer);
+    let io_type = io_type_from_raft_message(&msg)?;
+    let _with_io_type = WithIoType::new(io_type);
+    let mut head = TabletSnapshotRequest::default();
+    head.mut_head().set_message(msg);
+    let missing = find_missing(&path, head, &mut sender, receiver, &limiter).await?;
+    let (total_sent, checksum) = send_missing(&path, missing, &mut sender, &limiter).await?;
+    // In gRPC, stream in serverside can finish without error (when the connection
+    // is closed). So we need to use an explicit `Done` to indicate all messages
+    // are sent. In V1, we have checksum and meta list, so this is not a
+    // problem.
+    let mut req = TabletSnapshotRequest::default();
+    req.mut_end().set_checksum(checksum);
+    sender.send((req, WriteFlags::default())).await?;
+    info!("sent all snap file finish"; "snap_key" => %key, "region_id" => region_id, "to_peer" => to_peer);
+    sender.close().await?;
+    Ok(total_sent)
+}
+
 /// Send the snapshot to specified address.
 ///
 /// It will first send the normal raft snapshot message and then send the
 /// snapshot file.
-pub async fn send_snap(
-    client: TikvClient,
-    snap_mgr: TabletSnapManager,
+pub fn send_snap(
+    env: Arc<Environment>,
+    mgr: TabletSnapManager,
+    security_mgr: Arc<SecurityManager>,
+    cfg: &Config,
+    addr: &str,
     msg: RaftMessage,
     limiter: Limiter,
-) -> Result<SendStat> {
+) -> Result<impl Future<Output = Result<SendStat>>> {
     assert!(msg.get_message().has_snapshot());
     let timer = Instant::now();
     let send_timer = SEND_SNAP_HISTOGRAM.start_coarse_timer();
@@ -752,54 +659,45 @@ pub async fn send_snap(
         msg.get_message().get_snapshot(),
     );
     let deregister = {
-        let (snap_mgr, key) = (snap_mgr.clone(), key.clone());
+        let (mgr, key) = (mgr.clone(), key.clone());
         DeferContext::new(move || {
-            snap_mgr.finish_snapshot(key.clone(), timer);
+            mgr.finish_snapshot(key.clone(), timer);
+            mgr.delete_snapshot(&key);
         })
     };
+
+    let cb = ChannelBuilder::new(env)
+        .stream_initial_window_size(cfg.grpc_stream_initial_window_size.0 as i32)
+        .keepalive_time(cfg.grpc_keepalive_time.0)
+        .keepalive_timeout(cfg.grpc_keepalive_timeout.0)
+        .default_compression_algorithm(cfg.grpc_compression_algorithm())
+        .default_gzip_compression_level(cfg.grpc_gzip_compression_level)
+        .default_grpc_min_message_size_to_compress(cfg.grpc_min_message_size_to_compress);
+
+    let channel = security_mgr.connect(cb, addr);
+    let client = TikvClient::new(channel);
     let (sink, mut receiver) = client.tablet_snapshot()?;
-    let mut sink = sink.sink_map_err(Error::from);
-    let path = snap_mgr.tablet_gen_path(&key);
-    info!("begin to send snapshot file"; "snap_key" => %key);
-    let io_type = io_type_from_raft_message(&msg)?;
-    let _with_io_type = WithIoType::new(io_type);
-    let mut head = TabletSnapshotRequest::default();
-    head.mut_head().set_message(msg);
-    let missing = find_missing(
-        &path,
-        head,
-        &mut sink,
-        &mut receiver,
-        &limiter,
-        snap_mgr.key_manager(),
-    )
-    .await?;
-    let (total_size, checksum) =
-        send_missing(&path, missing, &mut sink, &limiter, snap_mgr.key_manager()).await?;
-    // In gRPC, stream in serverside can finish without error (when the connection
-    // is closed). So we need to use an explicit `Done` to indicate all messages
-    // are sent. In V1, we have checksum and meta list, so this is not a
-    // problem.
-    let mut req = TabletSnapshotRequest::default();
-    req.mut_end().set_checksum(checksum);
-    sink.send((req, WriteFlags::default())).await?;
-    info!("sent all snap file finish"; "snap_key" => %key);
-    sink.close().await?;
-    let recv_result = receiver.next().await;
-    send_timer.observe_duration();
-    drop(client);
-    drop(deregister);
-    match recv_result {
-        None => Ok(SendStat {
-            key,
-            total_size,
-            elapsed: timer.saturating_elapsed(),
-        }),
-        Some(Err(e)) => Err(e.into()),
-        Some(Ok(resp)) => Err(Error::Other(
-            format!("receive unexpected response {:?}", resp).into(),
-        )),
-    }
+    let send_task = async move {
+        let sink = sink.sink_map_err(Error::from);
+        let total_size =
+            send_snap_files(&mgr, sink, &mut receiver, msg, key.clone(), limiter).await?;
+        let recv_result = receiver.next().await;
+        send_timer.observe_duration();
+        drop(client);
+        drop(deregister);
+        match recv_result {
+            None => Ok(SendStat {
+                key,
+                total_size,
+                elapsed: timer.saturating_elapsed(),
+            }),
+            Some(Err(e)) => Err(e.into()),
+            Some(Ok(resp)) => Err(Error::Other(
+                format!("receive unexpected response {:?}", resp).into(),
+            )),
+        }
+    };
+    Ok(send_task)
 }
 
 pub struct TabletRunner<B, R: RaftExtension + 'static> {
@@ -838,8 +736,9 @@ impl<B, R: RaftExtension> TabletRunner<B, R> {
             snap_mgr,
             pool: RuntimeBuilder::new_multi_thread()
                 .thread_name(thd_name!("tablet-snap-sender"))
-                .with_sys_hooks()
                 .worker_threads(DEFAULT_POOL_SIZE)
+                .after_start_wrapper(tikv_alloc::add_thread_memory_accessor)
+                .before_stop_wrapper(tikv_alloc::remove_thread_memory_accessor)
                 .build()
                 .unwrap(),
             raft_router: r,
@@ -906,14 +805,12 @@ where
                 }
                 SNAP_TASK_COUNTER_STATIC.recv.inc();
 
-                recving_count.fetch_add(1, Ordering::SeqCst);
-
                 let snap_mgr = self.snap_mgr.clone();
                 let raft_router = self.raft_router.clone();
+                recving_count.fetch_add(1, Ordering::SeqCst);
                 let limiter = self.limiter.clone();
                 let cache_builder = self.cache_builder.clone();
-
-                self.pool.spawn(async move {
+                let task = async move {
                     let result = recv_snap(
                         stream,
                         sink,
@@ -928,14 +825,21 @@ where
                     if let Err(e) = result {
                         error!("failed to recv snapshot"; "err" => %e);
                     }
-                });
+                };
+                self.pool.spawn(task);
             }
             Task::Send { addr, msg, cb } => {
                 let region_id = msg.get_region_id();
                 let sending_count = self.snap_mgr.sending_count().clone();
                 if sending_count.load(Ordering::SeqCst) >= self.cfg.concurrent_send_snap_limit {
+                    let key = TabletSnapKey::from_region_snap(
+                        msg.get_region_id(),
+                        msg.get_to_peer().get_id(),
+                        msg.get_message().get_snapshot(),
+                    );
+                    self.snap_mgr.delete_snapshot(&key);
                     warn!(
-                        "Too many sending snapshot tasks, drop Send Snap[to: {}, snap: {:?}]",
+                        "too many sending snapshot tasks, drop Send Snap[to: {}, snap: {:?}]",
                         addr, msg
                     );
                     cb(Err(Error::Other("Too many sending snapshot tasks".into())));
@@ -943,34 +847,27 @@ where
                 }
                 SNAP_TASK_COUNTER_STATIC.send.inc();
 
-                sending_count.fetch_add(1, Ordering::SeqCst);
-
-                let snap_mgr = self.snap_mgr.clone();
+                let env = Arc::clone(&self.env);
+                let mgr = self.snap_mgr.clone();
                 let security_mgr = Arc::clone(&self.security_mgr);
+                sending_count.fetch_add(1, Ordering::SeqCst);
                 let limiter = self.limiter.clone();
-
-                let channel_builder = ChannelBuilder::new(self.env.clone())
-                    .stream_initial_window_size(self.cfg.grpc_stream_initial_window_size.0 as i32)
-                    .keepalive_time(self.cfg.grpc_keepalive_time.0)
-                    .keepalive_timeout(self.cfg.grpc_keepalive_timeout.0)
-                    .default_compression_algorithm(self.cfg.grpc_compression_algorithm())
-                    .default_gzip_compression_level(self.cfg.grpc_gzip_compression_level)
-                    .default_grpc_min_message_size_to_compress(
-                        self.cfg.grpc_min_message_size_to_compress,
-                    );
-                let channel = security_mgr.connect(channel_builder, &addr);
-                let client = TikvClient::new(channel);
-
-                self.pool.spawn(async move {
-                    let res = send_snap(
-                        client,
-                        snap_mgr.clone(),
-                        msg,
-                        limiter,
-                    ).await;
+                let send_task = send_snap(
+                    env,
+                    mgr,
+                    security_mgr,
+                    &self.cfg.clone(),
+                    &addr,
+                    msg,
+                    limiter,
+                );
+                let task = async move {
+                    let res = match send_task {
+                        Err(e) => Err(e),
+                        Ok(f) => f.await,
+                    };
                     match res {
                         Ok(stat) => {
-                            snap_mgr.delete_snapshot(&stat.key);
                             info!(
                                 "sent snapshot";
                                 "region_id" => region_id,
@@ -986,7 +883,9 @@ where
                         }
                     };
                     sending_count.fetch_sub(1, Ordering::SeqCst);
-                });
+                };
+
+                self.pool.spawn(task);
             }
             Task::RefreshConfigEvent => {
                 self.refresh_cfg();
@@ -1019,42 +918,17 @@ pub fn copy_tablet_snapshot(
     let recv_path = recver_snap_mgr.tmp_recv_path(&recv_context.key);
     fs::create_dir_all(&recv_path)?;
 
-    let mut key_importer = recver_snap_mgr
-        .key_manager()
-        .as_deref()
-        .map(|m| DataKeyImporter::new(m));
     for path in files {
-        let recv = recv_path.join(path.file_name().unwrap());
-        std::fs::copy(&path, &recv)?;
-        if let Some(m) = sender_snap_mgr.key_manager()
-            && let Some((iv, key)) = m.get_file_internal(path.to_str().unwrap())?
-        {
-            key_importer.as_mut().unwrap().add(recv.to_str().unwrap(), iv, key).unwrap();
-        }
-    }
-    if let Some(i) = key_importer {
-        i.commit().unwrap();
+        let sender_name = path.file_name().unwrap().to_str().unwrap();
+        let mut sender_f = File::open(&path)?;
+
+        let recv_p = recv_path.join(sender_name);
+        let mut recv_f = File::create(recv_p)?;
+
+        while io::copy(&mut sender_f, &mut recv_f)? != 0 {}
     }
 
     let final_path = recver_snap_mgr.final_recv_path(&recv_context.key);
-    if let Some(m) = recver_snap_mgr.key_manager() {
-        m.link_file(recv_path.to_str().unwrap(), final_path.to_str().unwrap())?;
-    }
-    // Remove final path to make snapshot retryable.
-    if fs::remove_dir_all(&final_path).is_ok() {
-        if let Some(m) = recver_snap_mgr.key_manager() {
-            let _ = m.remove_dir(&final_path, None);
-        }
-    }
-    fs::rename(&recv_path, &final_path).map_err(|e| {
-        if let Some(m) = recver_snap_mgr.key_manager() {
-            let _ = m.remove_dir(&final_path, Some(&recv_path));
-        }
-        e
-    })?;
-    if let Some(m) = recver_snap_mgr.key_manager() {
-        m.remove_dir(&recv_path, Some(&final_path))?;
-    }
-
+    fs::rename(&recv_path, final_path)?;
     Ok(())
 }

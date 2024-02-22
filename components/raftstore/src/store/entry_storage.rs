@@ -1177,8 +1177,6 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
                         } else {
                             range.1 == self.last_index() + 1
                         };
-                        // FIXME: the assertion below doesn't hold.
-                        // assert!(is_valid, "the warmup range should still be valid");
                         if !is_valid {
                             error!(
                                 "unexpected warmup state";

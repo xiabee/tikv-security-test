@@ -37,13 +37,12 @@ pub use self::{
         StoreMetaDelegate, TrackVer,
     },
     refresh_config::{
-        BatchComponent as RaftStoreBatchComponent, BatchComponent, Runner as RefreshConfigRunner,
-        Task as RefreshConfigTask, WriterContoller,
+        BatchComponent as RaftStoreBatchComponent, Runner as RefreshConfigRunner,
+        Task as RefreshConfigTask,
     },
     region::{Runner as RegionRunner, Task as RegionTask},
     split_check::{
-        Bucket, BucketRange, BucketStatsInfo, KeyEntry, Runner as SplitCheckRunner,
-        Task as SplitCheckTask,
+        Bucket, BucketRange, KeyEntry, Runner as SplitCheckRunner, Task as SplitCheckTask,
     },
     split_config::{
         SplitConfig, SplitConfigManager, BIG_REGION_CPU_OVERLOAD_THRESHOLD_RATIO,

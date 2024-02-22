@@ -166,7 +166,6 @@ where
         } else {
             E::SstReader::open(&path)?
         };
-
         if let Err(e) = sst_reader.verify_checksum() {
             // use sst reader to verify block checksum, it would detect corrupted SST due to
             // memory bit-flip

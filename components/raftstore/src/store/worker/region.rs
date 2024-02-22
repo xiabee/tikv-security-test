@@ -17,9 +17,7 @@ use std::{
 };
 
 use collections::HashMap;
-use engine_traits::{
-    DeleteStrategy, KvEngine, Mutable, Range, WriteBatch, WriteOptions, CF_LOCK, CF_RAFT,
-};
+use engine_traits::{DeleteStrategy, KvEngine, Mutable, Range, WriteBatch, CF_LOCK, CF_RAFT};
 use fail::fail_point;
 use file_system::{IoType, WithIoType};
 use kvproto::raft_serverpb::{PeerState, RaftApplyState, RegionLocalState};
@@ -28,11 +26,14 @@ use raft::eraftpb::Snapshot as RaftSnapshot;
 use tikv_util::{
     box_err, box_try,
     config::VersionTrack,
-    defer, error, info,
+    defer, error, info, thd_name,
     time::{Instant, UnixSecs},
     warn,
     worker::{Runnable, RunnableWithTimer},
-    yatp_pool::{DefaultTicker, FuturePool, YatpPoolBuilder},
+};
+use yatp::{
+    pool::{Builder, ThreadPool},
+    task::future::TaskCell,
 };
 
 use super::metrics::*;
@@ -51,7 +52,6 @@ use crate::{
 };
 
 const CLEANUP_MAX_REGION_COUNT: usize = 64;
-const SNAP_GENERATOR_MAX_POOL_SIZE: usize = 16;
 
 const TIFLASH: &str = "tiflash";
 const ENGINE: &str = "engine";
@@ -347,7 +347,6 @@ where
 {
     batch_size: usize,
     use_delete_range: bool,
-    ingest_copy_symlink: bool,
     clean_stale_tick: usize,
     clean_stale_check_interval: Duration,
     clean_stale_ranges_tick: usize,
@@ -371,7 +370,7 @@ where
     coprocessor_host: CoprocessorHost<EK>,
     router: R,
     pd_client: Option<Arc<T>>,
-    pool: FuturePool,
+    pool: ThreadPool<TaskCell>,
 }
 
 impl<EK, R, T> Runner<EK, R, T>
@@ -391,7 +390,6 @@ where
         Runner {
             batch_size: cfg.value().snap_apply_batch_size.0 as usize,
             use_delete_range: cfg.value().use_delete_range,
-            ingest_copy_symlink: cfg.value().snap_apply_copy_symlink,
             clean_stale_tick: 0,
             clean_stale_check_interval: Duration::from_millis(
                 cfg.value().region_worker_tick_interval.as_millis(),
@@ -405,19 +403,10 @@ where
             coprocessor_host,
             router,
             pd_client,
-            pool: YatpPoolBuilder::new(DefaultTicker::default())
-                .name_prefix("snap-generator")
-                .thread_count(
-                    1,
-                    cfg.value().snap_generator_pool_size,
-                    SNAP_GENERATOR_MAX_POOL_SIZE,
-                )
+            pool: Builder::new(thd_name!("snap-generator"))
+                .max_thread_count(cfg.value().snap_generator_pool_size)
                 .build_future_pool(),
         }
-    }
-
-    pub fn snap_generator_pool(&self) -> FuturePool {
-        self.pool.clone()
     }
 
     fn region_state(&self, region_id: u64) -> Result<RegionLocalState> {
@@ -486,7 +475,6 @@ where
             abort: Arc::clone(&abort),
             write_batch_size: self.batch_size,
             coprocessor_host: self.coprocessor_host.clone(),
-            ingest_copy_symlink: self.ingest_copy_symlink,
         };
         s.apply(options)?;
         self.coprocessor_host
@@ -594,15 +582,10 @@ where
             })
             .collect();
         self.engine
-            .delete_ranges_cfs(
-                &WriteOptions::default(),
-                DeleteStrategy::DeleteFiles,
-                &df_ranges,
-            )
-            .map_err(|e| {
+            .delete_ranges_cfs(DeleteStrategy::DeleteFiles, &df_ranges)
+            .unwrap_or_else(|e| {
                 error!("failed to delete files in range"; "err" => %e);
-            })
-            .unwrap();
+            });
         (start_key, end_key)
     }
 
@@ -663,29 +646,19 @@ where
             .collect();
 
         self.engine
-            .delete_ranges_cfs(
-                &WriteOptions::default(),
-                DeleteStrategy::DeleteFiles,
-                &ranges,
-            )
-            .map_err(|e| {
+            .delete_ranges_cfs(DeleteStrategy::DeleteFiles, &ranges)
+            .unwrap_or_else(|e| {
                 error!("failed to delete files in range"; "err" => %e);
-            })
-            .unwrap();
+            });
         if let Err(e) = self.delete_all_in_range(&ranges) {
             error!("failed to cleanup stale range"; "err" => %e);
             return;
         }
         self.engine
-            .delete_ranges_cfs(
-                &WriteOptions::default(),
-                DeleteStrategy::DeleteBlobs,
-                &ranges,
-            )
-            .map_err(|e| {
+            .delete_ranges_cfs(DeleteStrategy::DeleteBlobs, &ranges)
+            .unwrap_or_else(|e| {
                 error!("failed to delete blobs in range"; "err" => %e);
-            })
-            .unwrap();
+            });
 
         for (_, key, _) in region_ranges {
             assert!(
@@ -712,7 +685,6 @@ where
     }
 
     fn delete_all_in_range(&self, ranges: &[Range<'_>]) -> Result<()> {
-        let wopts = WriteOptions::default();
         for cf in self.engine.cf_names() {
             // CF_LOCK usually contains fewer keys than other CFs, so we delete them by key.
             let strategy = if cf == CF_LOCK {
@@ -724,7 +696,7 @@ where
                     sst_path: self.mgr.get_temp_path_for_ingest(),
                 }
             };
-            box_try!(self.engine.delete_ranges_cf(&wopts, cf, strategy, ranges));
+            box_try!(self.engine.delete_ranges_cf(cf, strategy, ranges));
         }
 
         Ok(())
@@ -854,11 +826,8 @@ where
                     router: self.router.clone(),
                     start: UnixSecs::now(),
                 };
-                let scheduled_time = Instant::now_coarse();
                 self.pool.spawn(async move {
-                    SNAP_GEN_WAIT_DURATION_HISTOGRAM
-                        .observe(scheduled_time.saturating_elapsed_secs());
-
+                    tikv_alloc::add_thread_memory_accessor();
                     ctx.handle_gen(
                         region_id,
                         last_applied_term,
@@ -869,12 +838,8 @@ where
                         for_balance,
                         allow_multi_files_snapshot,
                     );
-                }).unwrap_or_else(
-                    |e| {
-                        error!("failed to generate snapshot"; "region_id" => region_id, "err" => ?e);
-                        SNAP_COUNTER.generate.fail.inc();
-                    },
-                );
+                    tikv_alloc::remove_thread_memory_accessor();
+                });
             }
             task @ Task::Apply { .. } => {
                 fail_point!("on_region_worker_apply", true, |_| {});
@@ -902,6 +867,10 @@ where
                 self.clean_stale_ranges();
             }
         }
+    }
+
+    fn shutdown(&mut self) {
+        self.pool.shutdown();
     }
 }
 

@@ -12,18 +12,15 @@ use engine_traits::{KvEngine, RaftEngine, TabletRegistry};
 use kvproto::{metapb, pdpb};
 use pd_client::{BucketStat, PdClient};
 use raftstore::store::{
-    metrics::STORE_INSPECT_DURATION_HISTOGRAM,
-    util::{KeysInfoFormatter, LatencyInspector, RaftstoreDuration},
-    AutoSplitController, Config, FlowStatsReporter, PdStatsMonitor, ReadStats,
-    RegionReadProgressRegistry, SplitInfo, StoreStatsReporter, TabletSnapManager, TxnExt,
-    WriteStats, NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT,
+    util::KeysInfoFormatter, AutoSplitController, Config, FlowStatsReporter, PdStatsMonitor,
+    ReadStats, RegionReadProgressRegistry, SplitInfo, StoreStatsReporter, TabletSnapManager,
+    TxnExt, WriteStats, NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT,
 };
 use resource_metering::{Collector, CollectorRegHandle, RawRecords};
-use service::service_manager::GrpcServiceManager;
-use slog::{error, warn, Logger};
+use slog::{error, Logger};
 use tikv_util::{
     config::VersionTrack,
-    time::{Instant as TiInstant, UnixSecs},
+    time::UnixSecs,
     worker::{Runnable, Scheduler},
 };
 use yatp::{task::future::TaskCell, Remote};
@@ -35,7 +32,6 @@ use crate::{
 
 mod misc;
 mod region;
-mod slowness;
 mod split;
 mod store;
 
@@ -47,8 +43,7 @@ pub enum Task {
     // In store.rs.
     StoreHeartbeat {
         stats: pdpb::StoreStats,
-        report: Option<pdpb::StoreReport>,
-        // TODO: StoreDrAutoSyncStatus
+        // TODO: StoreReport, StoreDrAutoSyncStatus
     },
     UpdateStoreInfos {
         cpu_usages: RecordPairVec,
@@ -57,6 +52,7 @@ pub enum Task {
     },
     // In region.rs.
     RegionHeartbeat(RegionHeartbeatTask),
+    ReportRegionBuckets(BucketStat),
     UpdateReadStats(ReadStats),
     UpdateWriteStats(WriteStats),
     UpdateRegionCpuRecords(Arc<RawRecords>),
@@ -84,21 +80,10 @@ pub enum Task {
         initial_status: u64,
         txn_ext: Arc<TxnExt>,
     },
-    // BucketStat is the delta write flow of the bucket.
     ReportBuckets(BucketStat),
     ReportMinResolvedTs {
         store_id: u64,
         min_resolved_ts: u64,
-    },
-    // In slowness.rs
-    InspectLatency {
-        send_time: TiInstant,
-        inspector: LatencyInspector,
-    },
-    TickSlownessStats,
-    UpdateSlownessStats {
-        tick_id: u64,
-        duration: RaftstoreDuration,
     },
 }
 
@@ -123,6 +108,7 @@ impl Display for Task {
                 hb_task.region,
                 hb_task.peer.get_id(),
             ),
+            Task::ReportRegionBuckets(ref buckets) => write!(f, "report buckets: {:?}", buckets),
             Task::UpdateReadStats(ref stats) => {
                 write!(f, "update read stats: {stats:?}")
             }
@@ -163,23 +149,6 @@ impl Display for Task {
                 "report min resolved ts: store {}, resolved ts {}",
                 store_id, min_resolved_ts,
             ),
-            Task::InspectLatency {
-                send_time,
-                ref inspector,
-            } => write!(
-                f,
-                "inspect latency: send_time {:?}, inspector {:?}",
-                send_time, inspector
-            ),
-            Task::TickSlownessStats => write!(f, "tick slowness statistics"),
-            Task::UpdateSlownessStats {
-                tick_id,
-                ref duration,
-            } => write!(
-                f,
-                "update slowness statistics: tick_id {}, duration {:?}",
-                tick_id, duration
-            ),
         }
     }
 }
@@ -203,7 +172,6 @@ where
     // For store.
     start_ts: UnixSecs,
     store_stat: store::StoreStat,
-    store_heartbeat_interval: std::time::Duration,
 
     // For region.
     region_peers: HashMap<u64, region::PeerStat>,
@@ -215,12 +183,6 @@ where
     // For update_max_timestamp.
     concurrency_manager: ConcurrencyManager,
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
-
-    // For slowness detection
-    slowness_stats: slowness::SlownessStatistics,
-
-    // For grpc server.
-    grpc_service_manager: GrpcServiceManager,
 
     logger: Logger,
     shutdown: Arc<AtomicBool>,
@@ -247,16 +209,13 @@ where
         auto_split_controller: AutoSplitController,
         region_read_progress: RegionReadProgressRegistry,
         collector_reg_handle: CollectorRegHandle,
-        grpc_service_manager: GrpcServiceManager,
         logger: Logger,
         shutdown: Arc<AtomicBool>,
         cfg: Arc<VersionTrack<Config>>,
     ) -> Result<Self, std::io::Error> {
-        let store_heartbeat_interval = cfg.value().pd_store_heartbeat_tick_interval.0;
         let mut stats_monitor = PdStatsMonitor::new(
-            store_heartbeat_interval / NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT,
+            cfg.value().pd_store_heartbeat_tick_interval.0 / NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT,
             cfg.value().report_min_resolved_ts_interval.0,
-            cfg.value().inspect_interval.0,
             PdReporter::new(pd_scheduler, logger.clone()),
         );
         stats_monitor.start(
@@ -265,7 +224,6 @@ where
             collector_reg_handle,
             store_id,
         )?;
-        let slowness_stats = slowness::SlownessStatistics::new(&cfg.value());
         Ok(Self {
             store_id,
             pd_client,
@@ -274,7 +232,6 @@ where
             snap_mgr,
             router,
             stats_monitor,
-            store_heartbeat_interval,
             remote,
             start_ts: UnixSecs::zero(),
             store_stat: store::StoreStat::default(),
@@ -284,8 +241,6 @@ where
             is_hb_receiver_scheduled: false,
             concurrency_manager,
             causal_ts_provider,
-            slowness_stats,
-            grpc_service_manager,
             logger,
             shutdown,
             cfg,
@@ -304,15 +259,14 @@ where
     fn run(&mut self, task: Task) {
         self.maybe_schedule_heartbeat_receiver();
         match task {
-            Task::StoreHeartbeat { stats, report } => {
-                self.handle_store_heartbeat(stats, false /* is_fake_hb */, report)
-            }
+            Task::StoreHeartbeat { stats } => self.handle_store_heartbeat(stats),
             Task::UpdateStoreInfos {
                 cpu_usages,
                 read_io_rates,
                 write_io_rates,
             } => self.handle_update_store_infos(cpu_usages, read_io_rates, write_io_rates),
             Task::RegionHeartbeat(task) => self.handle_region_heartbeat(task),
+            Task::ReportRegionBuckets(buckets) => self.handle_report_region_buckets(buckets),
             Task::UpdateReadStats(stats) => self.handle_update_read_stats(stats),
             Task::UpdateWriteStats(stats) => self.handle_update_write_stats(stats),
             Task::UpdateRegionCpuRecords(records) => self.handle_update_region_cpu_records(records),
@@ -339,19 +293,11 @@ where
                 initial_status,
                 txn_ext,
             } => self.handle_update_max_timestamp(region_id, initial_status, txn_ext),
-            Task::ReportBuckets(delta_buckets) => self.handle_report_region_buckets(delta_buckets),
+            Task::ReportBuckets(buckets) => self.handle_report_region_buckets(buckets),
             Task::ReportMinResolvedTs {
                 store_id,
                 min_resolved_ts,
             } => self.handle_report_min_resolved_ts(store_id, min_resolved_ts),
-            Task::InspectLatency {
-                send_time,
-                inspector,
-            } => self.handle_inspect_latency(send_time, inspector),
-            Task::TickSlownessStats => self.handle_slowness_stats_tick(),
-            Task::UpdateSlownessStats { tick_id, duration } => {
-                self.handle_update_slowness_stats(tick_id, duration)
-            }
         }
     }
 }
@@ -433,66 +379,6 @@ impl StoreStatsReporter for PdReporter {
                 "failed to send split infos to pd worker";
                 "err" => ?e,
             );
-        }
-    }
-
-    fn update_latency_stats(&self, timer_tick: u64) {
-        // Tick slowness statistics.
-        {
-            if let Err(e) = self.scheduler.schedule(Task::TickSlownessStats) {
-                error!(
-                    self.logger,
-                    "failed to send tick slowness statistics to pd worker";
-                    "err" => ?e,
-                );
-            }
-        }
-        // Tick a new latency inspector.
-        {
-            let scheduler = self.scheduler.clone();
-            let logger = self.logger.clone();
-            let tick_id = timer_tick;
-
-            let inspector = LatencyInspector::new(
-                tick_id,
-                Box::new(move |tick_id, duration| {
-                    let dur = duration.sum();
-
-                    STORE_INSPECT_DURATION_HISTOGRAM
-                        .with_label_values(&["store_process"])
-                        .observe(tikv_util::time::duration_to_sec(
-                            duration.store_process_duration.unwrap(),
-                        ));
-                    STORE_INSPECT_DURATION_HISTOGRAM
-                        .with_label_values(&["store_wait"])
-                        .observe(tikv_util::time::duration_to_sec(
-                            duration.store_wait_duration.unwrap(),
-                        ));
-                    STORE_INSPECT_DURATION_HISTOGRAM
-                        .with_label_values(&["store_commit"])
-                        .observe(tikv_util::time::duration_to_sec(
-                            duration.store_commit_duration.unwrap(),
-                        ));
-                    STORE_INSPECT_DURATION_HISTOGRAM
-                        .with_label_values(&["all"])
-                        .observe(tikv_util::time::duration_to_sec(dur));
-                    if let Err(e) =
-                        scheduler.schedule(Task::UpdateSlownessStats { tick_id, duration })
-                    {
-                        warn!(logger, "schedule pd UpdateSlownessStats task failed"; "err" => ?e);
-                    }
-                }),
-            );
-            if let Err(e) = self.scheduler.schedule(Task::InspectLatency {
-                send_time: TiInstant::now(),
-                inspector,
-            }) {
-                error!(
-                    self.logger,
-                    "failed to send inspect latency to pd worker";
-                    "err" => ?e,
-                );
-            }
         }
     }
 }

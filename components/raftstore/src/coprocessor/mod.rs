@@ -13,10 +13,7 @@ use engine_traits::{CfName, SstMetaInfo};
 use kvproto::{
     metapb::Region,
     pdpb::CheckPolicy,
-    raft_cmdpb::{
-        AdminRequest, AdminResponse, RaftCmdRequest, RaftCmdResponse, Request,
-        TransferLeaderRequest,
-    },
+    raft_cmdpb::{AdminRequest, AdminResponse, RaftCmdRequest, RaftCmdResponse, Request},
     raft_serverpb::RaftApplyState,
 };
 use raft::{eraftpb, StateRole};
@@ -132,14 +129,6 @@ pub trait AdminObserver: Coprocessor {
         _: &mut ApplyCtxInfo<'_>,
     ) -> bool {
         false
-    }
-
-    fn pre_transfer_leader(
-        &self,
-        _ctx: &mut ObserverContext<'_>,
-        _tr: &TransferLeaderRequest,
-    ) -> Result<()> {
-        Ok(())
     }
 }
 

@@ -42,7 +42,7 @@ pub struct StoreMeta<EK> {
     /// to avoid end key conflict.
     pub(crate) region_ranges: BTreeMap<(Vec<u8>, u64), u64>,
     /// region_id -> (region, initialized)
-    pub regions: HashMap<u64, (Region, bool)>,
+    pub(crate) regions: HashMap<u64, (Region, bool)>,
 }
 
 impl<EK> StoreMeta<EK> {
@@ -250,11 +250,6 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T> StoreFsmDelegate<'a, EK, ER, T> {
             self.store_ctx.cfg.cleanup_import_sst_interval.0,
         );
         self.register_compact_check_tick();
-
-        self.schedule_tick(
-            StoreTick::SnapGc,
-            self.store_ctx.cfg.snap_mgr_gc_tick_interval.0,
-        );
     }
 
     pub fn schedule_tick(&mut self, tick: StoreTick, timeout: Duration) {
@@ -280,12 +275,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T> StoreFsmDelegate<'a, EK, ER, T> {
             StoreTick::PdStoreHeartbeat => self.on_pd_store_heartbeat(),
             StoreTick::CleanupImportSst => self.on_cleanup_import_sst(),
             StoreTick::CompactCheck => self.on_compact_check_tick(),
-            StoreTick::SnapGc => self.on_snapshot_gc(),
-            _ => slog_panic!(
-                self.store_ctx.logger,
-                "unimplemented";
-                "tick" => ?tick,
-            ),
+            _ => unimplemented!(),
         }
     }
 
@@ -297,19 +287,8 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T> StoreFsmDelegate<'a, EK, ER, T> {
             match msg {
                 StoreMsg::Start => self.on_start(),
                 StoreMsg::Tick(tick) => self.on_tick(tick),
-                StoreMsg::RaftMessage(msg) => {
-                    self.fsm.store.on_raft_message(self.store_ctx, msg);
-                }
-                StoreMsg::SplitInit(msg) => {
-                    // For normal region split, it must not skip sending
-                    // SplitInit message, otherwise it requests a snapshot from
-                    // leader which is expensive.
-                    self.fsm.store.on_split_init(
-                        self.store_ctx,
-                        msg,
-                        false, // skip_if_exists
-                    )
-                }
+                StoreMsg::RaftMessage(msg) => self.fsm.store.on_raft_message(self.store_ctx, msg),
+                StoreMsg::SplitInit(msg) => self.fsm.store.on_split_init(self.store_ctx, msg),
                 StoreMsg::StoreUnreachable { to_store_id } => self
                     .fsm
                     .store
@@ -321,22 +300,6 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T> StoreFsmDelegate<'a, EK, ER, T> {
                 StoreMsg::WaitFlush { region_id, ch } => {
                     self.fsm.store.on_wait_flush(self.store_ctx, region_id, ch)
                 }
-                StoreMsg::LatencyInspect {
-                    send_time,
-                    inspector,
-                } => self.fsm.store.on_update_latency_inspectors(
-                    self.store_ctx,
-                    send_time,
-                    inspector,
-                ),
-                StoreMsg::UnsafeRecoveryReport(report) => self
-                    .fsm
-                    .store
-                    .on_unsafe_recovery_report(self.store_ctx, report),
-                StoreMsg::UnsafeRecoveryCreatePeer { region, syncer } => self
-                    .fsm
-                    .store
-                    .on_unsafe_recovery_create_peer(self.store_ctx, region, syncer),
             }
         }
     }

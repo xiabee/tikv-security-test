@@ -92,6 +92,7 @@ pub struct Resolver {
     min_ts: TimeStamp,
     // Whether the `Resolver` is stopped
     stopped: bool,
+
     // The memory quota for the `Resolver` and its lock keys and timestamps.
     memory_quota: Arc<MemoryQuota>,
     // The last attempt of resolve(), used for diagnosis.
@@ -188,8 +189,8 @@ impl Resolver {
             tracked_index: 0,
             min_ts: TimeStamp::zero(),
             stopped: false,
-            memory_quota,
             last_attempt: None,
+            memory_quota,
         }
     }
 

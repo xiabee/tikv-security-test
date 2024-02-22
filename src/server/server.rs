@@ -170,7 +170,8 @@ where
                 RuntimeBuilder::new_multi_thread()
                     .thread_name(STATS_THREAD_PREFIX)
                     .worker_threads(cfg.value().stats_concurrency)
-                    .with_sys_hooks()
+                    .after_start_wrapper(|| {})
+                    .before_stop_wrapper(|| {})
                     .build()
                     .unwrap(),
             )
@@ -437,7 +438,6 @@ pub mod test_router {
     use engine_rocks::{RocksEngine, RocksSnapshot};
     use kvproto::raft_serverpb::RaftMessage;
     use raftstore::{router::RaftStoreRouter, store::*, Result as RaftStoreResult};
-    use tikv_util::time::Instant as TiInstant;
 
     use super::*;
 
@@ -497,10 +497,12 @@ pub mod test_router {
 
     impl RaftStoreRouter<RocksEngine> for TestRaftStoreRouter {
         fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()> {
-            let _ = self.tx.send(Either::Left(PeerMsg::RaftMessage(
-                InspectedRaftMessage { heap_size: 0, msg },
-                Some(TiInstant::now()),
-            )));
+            let _ = self
+                .tx
+                .send(Either::Left(PeerMsg::RaftMessage(InspectedRaftMessage {
+                    heap_size: 0,
+                    msg,
+                })));
             Ok(())
         }
 
@@ -532,8 +534,8 @@ mod tests {
 
     use super::{
         super::{
-            resolve::{self, Callback as ResolveCallback, StoreAddrResolver},
-            Config,
+            resolve::{Callback as ResolveCallback, StoreAddrResolver},
+            Config, Result,
         },
         *,
     };
@@ -551,7 +553,7 @@ mod tests {
     }
 
     impl StoreAddrResolver for MockResolver {
-        fn resolve(&self, _: u64, cb: ResolveCallback) -> resolve::Result<()> {
+        fn resolve(&self, _: u64, cb: ResolveCallback) -> Result<()> {
             if self.quick_fail.load(Ordering::SeqCst) {
                 return Err(box_err!("quick fail"));
             }
@@ -636,14 +638,14 @@ mod tests {
             storage.get_concurrency_manager(),
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
-            None,
         );
         let copr_v2 = coprocessor_v2::Endpoint::new(&coprocessor_v2::Config::default());
         let debug_thread_pool = Arc::new(
             TokioBuilder::new_multi_thread()
                 .thread_name(thd_name!("debugger"))
                 .worker_threads(1)
-                .with_sys_hooks()
+                .after_start_wrapper(|| {})
+                .before_stop_wrapper(|| {})
                 .build()
                 .unwrap(),
         );

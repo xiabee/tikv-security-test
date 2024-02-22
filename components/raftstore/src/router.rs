@@ -289,11 +289,11 @@ impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for RaftRouter<EK, ER> {
 // duplicated codes.
 
 impl<EK: KvEngine, ER: RaftEngine> crate::coprocessor::StoreHandle for RaftRouter<EK, ER> {
-    fn update_approximate_size(&self, region_id: u64, size: Option<u64>, splitable: Option<bool>) {
+    fn update_approximate_size(&self, region_id: u64, size: u64) {
         if let Err(e) = CasualRouter::send(
             self,
             region_id,
-            CasualMessage::RegionApproximateSize { size, splitable },
+            CasualMessage::RegionApproximateSize { size },
         ) {
             warn!(
                 "failed to send approximate region size";
@@ -304,11 +304,11 @@ impl<EK: KvEngine, ER: RaftEngine> crate::coprocessor::StoreHandle for RaftRoute
         }
     }
 
-    fn update_approximate_keys(&self, region_id: u64, keys: Option<u64>, splitable: Option<bool>) {
+    fn update_approximate_keys(&self, region_id: u64, keys: u64) {
         if let Err(e) = CasualRouter::send(
             self,
             region_id,
-            CasualMessage::RegionApproximateKeys { keys, splitable },
+            CasualMessage::RegionApproximateKeys { keys },
         ) {
             warn!(
                 "failed to send approximate region keys";
