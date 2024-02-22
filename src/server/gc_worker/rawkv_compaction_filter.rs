@@ -9,8 +9,9 @@ use std::{
 use api_version::{ApiV2, KeyMode, KvFormat};
 use engine_rocks::{
     raw::{
-        CompactionFilter, CompactionFilterContext, CompactionFilterDecision,
-        CompactionFilterFactory, CompactionFilterValueType,
+        new_compaction_filter_raw, CompactionFilter, CompactionFilterContext,
+        CompactionFilterDecision, CompactionFilterFactory, CompactionFilterValueType,
+        DBCompactionFilter,
     },
     RocksEngine,
 };
@@ -35,20 +36,19 @@ use crate::{
 pub struct RawCompactionFilterFactory;
 
 impl CompactionFilterFactory for RawCompactionFilterFactory {
-    type Filter = RawCompactionFilter;
-
     fn create_compaction_filter(
         &self,
         context: &CompactionFilterContext,
-    ) -> Option<(CString, Self::Filter)> {
+    ) -> *mut DBCompactionFilter {
         //---------------- GC context --------------
         let gc_context_option = GC_CONTEXT.lock().unwrap();
         let gc_context = match *gc_context_option {
             Some(ref ctx) => ctx,
-            None => return None,
+            None => return std::ptr::null_mut(),
         };
         //---------------- GC context END --------------
 
+        let db = gc_context.db.clone();
         let gc_scheduler = gc_context.gc_scheduler.clone();
         let store_id = gc_context.store_id;
         let region_info_provider = gc_context.region_info_provider.clone();
@@ -58,7 +58,7 @@ impl CompactionFilterFactory for RawCompactionFilterFactory {
         if safe_point == 0 {
             // Safe point has not been initialized yet.
             debug!("skip gc in compaction filter because of no safe point");
-            return None;
+            return std::ptr::null_mut();
         }
 
         let ratio_threshold = {
@@ -71,13 +71,9 @@ impl CompactionFilterFactory for RawCompactionFilterFactory {
             "ratio_threshold" => ratio_threshold,
         );
 
-        if gc_context
-            .db
-            .as_ref()
-            .map_or(false, RocksEngine::is_stalled_or_stopped)
-        {
+        if db.is_stalled_or_stopped() {
             debug!("skip gc in compaction filter because the DB is stalled");
-            return None;
+            return std::ptr::null_mut();
         }
 
         drop(gc_context_option);
@@ -91,10 +87,11 @@ impl CompactionFilterFactory for RawCompactionFilterFactory {
             GC_COMPACTION_FILTER_SKIP
                 .with_label_values(&[STAT_RAW_KEYMODE])
                 .inc();
-            return None;
+            return std::ptr::null_mut();
         }
 
         let filter = RawCompactionFilter::new(
+            db,
             safe_point,
             gc_scheduler,
             current,
@@ -102,12 +99,13 @@ impl CompactionFilterFactory for RawCompactionFilterFactory {
             (store_id, region_info_provider),
         );
         let name = CString::new("raw_compaction_filter").unwrap();
-        Some((name, filter))
+        unsafe { new_compaction_filter_raw(name, filter) }
     }
 }
 
-pub struct RawCompactionFilter {
+struct RawCompactionFilter {
     safe_point: u64,
+    engine: RocksEngine,
     is_bottommost_level: bool,
     gc_scheduler: Scheduler<GcTask<RocksEngine>>,
     current_ts: u64,
@@ -136,6 +134,8 @@ impl Drop for RawCompactionFilter {
     // result becomes installed into the DB instance.
     fn drop(&mut self) {
         self.raw_gc_mvcc_deletions();
+
+        self.engine.sync_wal().unwrap();
 
         self.switch_key_metrics();
         self.flush_metrics();
@@ -172,6 +172,7 @@ impl CompactionFilter for RawCompactionFilter {
 
 impl RawCompactionFilter {
     fn new(
+        engine: RocksEngine,
         safe_point: u64,
         gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         ts: u64,
@@ -183,6 +184,7 @@ impl RawCompactionFilter {
         debug!("gc in compaction filter"; "safe_point" => safe_point);
         RawCompactionFilter {
             safe_point,
+            engine,
             is_bottommost_level: context.is_bottommost_level(),
             gc_scheduler,
             current_ts: ts,
@@ -359,7 +361,7 @@ pub mod tests {
     use std::time::Duration;
 
     use api_version::RawValue;
-    use engine_traits::{DeleteStrategy, Peekable, Range, WriteOptions, CF_DEFAULT};
+    use engine_traits::{DeleteStrategy, Peekable, Range, CF_DEFAULT};
     use kvproto::kvrpcpb::{ApiVersion, Context};
     use tikv_kv::{Engine, Modify, WriteData};
     use txn_types::TimeStamp;
@@ -516,7 +518,6 @@ pub mod tests {
         );
         raw_engine
             .delete_ranges_cf(
-                &WriteOptions::default(),
                 CF_DEFAULT,
                 DeleteStrategy::DeleteByKey,
                 &[Range::new(

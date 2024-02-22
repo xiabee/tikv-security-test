@@ -11,6 +11,7 @@ pub mod msg;
 mod peer;
 mod read_queue;
 pub mod region_meta;
+pub mod snapshot_backup;
 pub mod transport;
 #[macro_use]
 pub mod util;
@@ -22,10 +23,8 @@ mod hibernate_state;
 mod peer_storage;
 mod region_snapshot;
 mod replication_mode;
-pub mod simple_write;
 pub mod snap;
 mod txn_ext;
-mod unsafe_recovery;
 mod worker;
 
 #[cfg(any(test, feature = "testexport"))]
@@ -34,8 +33,8 @@ pub use self::{
     async_io::{
         read::{AsyncReadNotifier, FetchedLogs, GenSnapRes, ReadRunner, ReadTask},
         write::{
-            write_to_db_for_test, PersistedNotifier, StoreWriters, StoreWritersContext,
-            Worker as WriteWorker, WriteMsg, WriteTask,
+            ExtraStates, PersistedNotifier, StoreWriters, Worker as WriteWorker, WriteMsg,
+            WriteTask,
         },
         write_router::{WriteRouter, WriteRouterContext, WriteSenders},
     },
@@ -56,9 +55,9 @@ pub use self::{
         StoreMsg, StoreTick, WriteCallback, WriteResponse,
     },
     peer::{
-        can_amend_read, get_sync_log_from_request, make_transfer_leader_response,
-        propose_read_index, should_renew_lease, DiskFullPeers, Peer, PeerStat, ProposalContext,
-        ProposalQueue, RequestInspector, RequestPolicy, TRANSFER_LEADER_COMMAND_REPLY_CTX,
+        can_amend_read, get_sync_log_from_request, propose_read_index, should_renew_lease, Peer,
+        PeerStat, ProposalContext, ProposalQueue, RequestInspector, RequestPolicy,
+        SnapshotRecoveryWaitApplySyncer,
     },
     peer_storage::{
         clear_meta, do_snapshot, write_initial_apply_state, write_initial_raft_state,
@@ -74,25 +73,16 @@ pub use self::{
         ApplyOptions, CfFile, Error as SnapError, SnapEntry, SnapKey, SnapManager,
         SnapManagerBuilder, Snapshot, SnapshotStatistics, TabletSnapKey, TabletSnapManager,
     },
+    snapshot_backup::SnapshotBrWaitApplySyncer,
     transport::{CasualRouter, ProposalRouter, SignificantRouter, StoreRouter, Transport},
     txn_ext::{LocksStatus, PeerPessimisticLocks, PessimisticLockPair, TxnExt},
-    unsafe_recovery::{
-        demote_failed_voters_request, exit_joint_request, ForceLeaderState,
-        SnapshotRecoveryWaitApplySyncer, UnsafeRecoveryExecutePlanSyncer,
-        UnsafeRecoveryFillOutReportSyncer, UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryHandle,
-        UnsafeRecoveryState, UnsafeRecoveryWaitApplySyncer,
-    },
     util::{RegionReadProgress, RegionReadProgressRegistry},
     worker::{
-        metrics as worker_metrics, need_compact, AutoSplitController, BatchComponent, Bucket,
-        BucketRange, BucketStatsInfo, CachedReadDelegate, CheckLeaderRunner, CheckLeaderTask,
-        CompactThreshold, FlowStatistics, FlowStatsReporter, KeyEntry, LocalReadContext,
-        LocalReader, LocalReaderCore, PdStatsMonitor, PdTask, ReadDelegate, ReadExecutor,
-        ReadExecutorProvider, ReadProgress, ReadStats, RefreshConfigTask, RegionTask,
-        SplitCheckRunner, SplitCheckTask, SplitConfig, SplitConfigManager, SplitInfo,
-        StoreMetaDelegate, StoreStatsReporter, TrackVer, WriteStats, WriterContoller,
-        BIG_REGION_CPU_OVERLOAD_THRESHOLD_RATIO, DEFAULT_BIG_REGION_BYTE_THRESHOLD,
-        DEFAULT_BIG_REGION_QPS_THRESHOLD, DEFAULT_BYTE_THRESHOLD, DEFAULT_QPS_THRESHOLD,
-        NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT, REGION_CPU_OVERLOAD_THRESHOLD_RATIO,
+        metrics::TLS_LOCAL_READ_METRICS, AutoSplitController, Bucket, BucketRange,
+        CachedReadDelegate, CheckLeaderRunner, CheckLeaderTask, FlowStatistics, FlowStatsReporter,
+        KeyEntry, LocalReadContext, LocalReader, LocalReaderCore, PdTask, ReadDelegate,
+        ReadExecutor, ReadExecutorProvider, ReadProgress, ReadStats, RefreshConfigTask, RegionTask,
+        SplitCheckRunner, SplitCheckTask, SplitConfig, SplitConfigManager, StoreMetaDelegate,
+        TrackVer, WriteStats,
     },
 };

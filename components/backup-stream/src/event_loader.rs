@@ -6,8 +6,7 @@ use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 use raftstore::{
     coprocessor::ObserveHandle,
-    router::CdcHandle,
-    store::{fsm::ChangeObserver, Callback},
+    store::{fsm::ChangeObserver, Callback, SignificantMsg, SignificantRouter},
 };
 use tikv::storage::{
     kv::StatisticsSummary,
@@ -33,7 +32,7 @@ use crate::{
     utils, Task,
 };
 
-const MAX_GET_SNAPSHOT_RETRY: usize = 5;
+const MAX_GET_SNAPSHOT_RETRY: usize = 3;
 
 struct ScanResult {
     more: bool,
@@ -201,7 +200,7 @@ pub struct InitialDataLoader<E: KvEngine, H> {
 impl<E, H> InitialDataLoader<E, H>
 where
     E: KvEngine,
-    H: CdcHandle<E> + Sync,
+    H: SignificantRouter<E> + Sync,
 {
     pub fn new(
         sink: Router,
@@ -233,25 +232,27 @@ where
             tikv_util::future::paired_future_callback::<std::result::Result<_, Error>>();
 
         self.cdc_handle
-            .capture_change(
+            .significant_send(
                 region.get_id(),
-                region.get_region_epoch().clone(),
-                cmd,
-                Callback::read(Box::new(|snapshot| {
-                    if snapshot.response.get_header().has_error() {
-                        callback(Err(Error::RaftRequest(
-                            snapshot.response.get_header().get_error().clone(),
-                        )));
-                        return;
-                    }
-                    if let Some(snap) = snapshot.snapshot {
-                        callback(Ok(snap));
-                        return;
-                    }
-                    callback(Err(Error::Other(box_err!(
-                        "PROBABLY BUG: the response contains neither error nor snapshot"
-                    ))))
-                })),
+                SignificantMsg::CaptureChange {
+                    region_epoch: region.get_region_epoch().clone(),
+                    cmd,
+                    callback: Callback::read(Box::new(|snapshot| {
+                        if snapshot.response.get_header().has_error() {
+                            callback(Err(Error::RaftRequest(
+                                snapshot.response.get_header().get_error().clone(),
+                            )));
+                            return;
+                        }
+                        if let Some(snap) = snapshot.snapshot {
+                            callback(Ok(snap));
+                            return;
+                        }
+                        callback(Err(Error::Other(box_err!(
+                            "PROBABLY BUG: the response contains neither error nor snapshot"
+                        ))))
+                    })),
+                },
             )
             .context(format_args!(
                 "failed to register the observer to region {}",

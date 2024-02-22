@@ -26,8 +26,11 @@ use kvproto::{
 use pd_client::PdClient;
 use protobuf::Message;
 use raftstore::{
-    router::CdcHandle,
-    store::{msg::Callback, util::RegionReadProgressRegistry},
+    router::RaftStoreRouter,
+    store::{
+        msg::{Callback, SignificantMsg},
+        util::RegionReadProgressRegistry,
+    },
 };
 use security::SecurityManager;
 use tikv_util::{
@@ -51,7 +54,6 @@ const DEFAULT_GRPC_MIN_MESSAGE_SIZE_TO_COMPRESS: usize = 4096;
 
 pub struct AdvanceTsWorker {
     pd_client: Arc<dyn PdClient>,
-    advance_ts_interval: Duration,
     timer: SteadyTimer,
     worker: Runtime,
     scheduler: Scheduler<Task>,
@@ -65,7 +67,6 @@ pub struct AdvanceTsWorker {
 
 impl AdvanceTsWorker {
     pub fn new(
-        advance_ts_interval: Duration,
         pd_client: Arc<dyn PdClient>,
         scheduler: Scheduler<Task>,
         concurrency_manager: ConcurrencyManager,
@@ -74,14 +75,14 @@ impl AdvanceTsWorker {
             .thread_name("advance-ts")
             .worker_threads(1)
             .enable_time()
-            .with_sys_hooks()
+            .after_start_wrapper(|| {})
+            .before_stop_wrapper(|| {})
             .build()
             .unwrap();
         Self {
             scheduler,
             pd_client,
             worker,
-            advance_ts_interval,
             timer: SteadyTimer::default(),
             concurrency_manager,
             last_pd_tso: Arc::new(std::sync::Mutex::new(None)),
@@ -104,7 +105,7 @@ impl AdvanceTsWorker {
         let timeout = self.timer.delay(advance_ts_interval);
         let min_timeout = self.timer.delay(cmp::min(
             DEFAULT_CHECK_LEADER_TIMEOUT_DURATION,
-            self.advance_ts_interval,
+            advance_ts_interval,
         ));
 
         let last_pd_tso = self.last_pd_tso.clone();
@@ -222,6 +223,44 @@ impl LeadershipResolver {
         }
         self.checking_regions.clear();
         self.valid_regions.clear();
+    }
+
+    pub async fn resolve_by_raft<T, E>(
+        &self,
+        regions: Vec<u64>,
+        min_ts: TimeStamp,
+        raft_router: T,
+    ) -> Vec<u64>
+    where
+        T: 'static + RaftStoreRouter<E>,
+        E: KvEngine,
+    {
+        let mut reqs = Vec::with_capacity(regions.len());
+        for region_id in regions {
+            let raft_router_clone = raft_router.clone();
+            let req = async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let msg = SignificantMsg::LeaderCallback(Callback::read(Box::new(move |resp| {
+                    let resp = if resp.response.get_header().has_error() {
+                        None
+                    } else {
+                        Some(region_id)
+                    };
+                    if tx.send(resp).is_err() {
+                        error!("cdc send tso response failed"; "region_id" => region_id);
+                    }
+                })));
+                if let Err(e) = raft_router_clone.significant_send(region_id, msg) {
+                    warn!("cdc send LeaderCallback failed"; "err" => ?e, "min_ts" => min_ts);
+                    return None;
+                }
+                rx.await.unwrap_or(None)
+            };
+            reqs.push(req);
+        }
+
+        let resps = futures::future::join_all(reqs).await;
+        resps.into_iter().flatten().collect::<Vec<u64>>()
     }
 
     // Confirms leadership of region peer before trying to advance resolved ts.
@@ -419,39 +458,6 @@ impl LeadershipResolver {
         }
         res
     }
-}
-
-pub async fn resolve_by_raft<T, E>(regions: Vec<u64>, min_ts: TimeStamp, cdc_handle: T) -> Vec<u64>
-where
-    T: 'static + CdcHandle<E>,
-    E: KvEngine,
-{
-    let mut reqs = Vec::with_capacity(regions.len());
-    for region_id in regions {
-        let cdc_handle_clone = cdc_handle.clone();
-        let req = async move {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let callback = Callback::read(Box::new(move |resp| {
-                let resp = if resp.response.get_header().has_error() {
-                    None
-                } else {
-                    Some(region_id)
-                };
-                if tx.send(resp).is_err() {
-                    error!("cdc send tso response failed"; "region_id" => region_id);
-                }
-            }));
-            if let Err(e) = cdc_handle_clone.check_leadership(region_id, callback) {
-                warn!("cdc send LeaderCallback failed"; "err" => ?e, "min_ts" => min_ts);
-                return None;
-            }
-            rx.await.unwrap_or(None)
-        };
-        reqs.push(req);
-    }
-
-    let resps = futures::future::join_all(reqs).await;
-    resps.into_iter().flatten().collect::<Vec<u64>>()
 }
 
 fn region_has_quorum(peers: &[Peer], stores: &[u64]) -> bool {

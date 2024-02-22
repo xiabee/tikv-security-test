@@ -8,7 +8,6 @@ use std::{
 };
 
 use collections::HashMap;
-use engine_rocks::RocksEngine;
 use engine_traits::CF_DEFAULT;
 use external_storage_export::{ExternalStorage, UnpinReader};
 use futures::{executor::block_on, io::Cursor as AsyncCursor, stream, SinkExt};
@@ -22,7 +21,6 @@ use kvproto::{
 use security::SecurityConfig;
 use tempfile::TempDir;
 use test_raftstore::*;
-use test_raftstore_v2::{Cluster as ClusterV2, ServerCluster as ServerClusterV2};
 use tikv::config::TikvConfig;
 use tikv_util::{codec::stream_event::EventEncoder, stream::block_on_external_io, HandyRwLock};
 use txn_types::Key;
@@ -33,31 +31,6 @@ const CLEANUP_SST_MILLIS: u64 = 10;
 pub fn new_cluster(cfg: TikvConfig) -> (Cluster<ServerCluster>, Context) {
     let count = 1;
     let mut cluster = new_server_cluster(0, count);
-    cluster.cfg = Config {
-        tikv: cfg,
-        prefer_mem: true,
-    };
-    cluster.run();
-
-    let region_id = 1;
-    let leader = cluster.leader_of_region(region_id).unwrap();
-    let epoch = cluster.get_region_epoch(region_id);
-    let mut ctx = Context::default();
-    ctx.set_region_id(region_id);
-    ctx.set_peer(leader);
-    ctx.set_region_epoch(epoch);
-
-    (cluster, ctx)
-}
-
-pub fn new_cluster_v2(
-    cfg: TikvConfig,
-) -> (
-    ClusterV2<ServerClusterV2<RocksEngine>, RocksEngine>,
-    Context,
-) {
-    let count = 1;
-    let mut cluster = test_raftstore_v2::new_server_cluster(0, count);
     cluster.cfg = Config {
         tikv: cfg,
         prefer_mem: true,
@@ -110,46 +83,6 @@ pub fn open_cluster_and_tikv_import_client(
     (cluster, ctx, tikv, import)
 }
 
-pub fn open_cluster_and_tikv_import_client_v2(
-    cfg: Option<TikvConfig>,
-) -> (
-    ClusterV2<ServerClusterV2<RocksEngine>, RocksEngine>,
-    Context,
-    TikvClient,
-    ImportSstClient,
-) {
-    let cfg = cfg.unwrap_or_else(|| {
-        let mut config = TikvConfig::default();
-        config.server.addr = "127.0.0.1:0".to_owned();
-        let cleanup_interval = Duration::from_millis(CLEANUP_SST_MILLIS);
-        config.raft_store.cleanup_import_sst_interval.0 = cleanup_interval;
-        config.server.grpc_concurrency = 1;
-        config
-    });
-
-    let (cluster, ctx) = new_cluster_v2(cfg.clone());
-
-    let ch = {
-        let env = Arc::new(Environment::new(1));
-        let node = ctx.get_peer().get_store_id();
-        let builder = ChannelBuilder::new(env)
-            .http2_max_ping_strikes(i32::MAX) // For pings without data from clients.
-            .keepalive_time(cluster.cfg.server.grpc_keepalive_time.into())
-            .keepalive_timeout(cluster.cfg.server.grpc_keepalive_timeout.into());
-
-        if cfg.security != SecurityConfig::default() {
-            let creds = test_util::new_channel_cred();
-            builder.secure_connect(&cluster.sim.rl().get_addr(node), creds)
-        } else {
-            builder.connect(&cluster.sim.rl().get_addr(node))
-        }
-    };
-    let tikv = TikvClient::new(ch.clone());
-    let import = ImportSstClient::new(ch);
-
-    (cluster, ctx, tikv, import)
-}
-
 pub fn new_cluster_and_tikv_import_client()
 -> (Cluster<ServerCluster>, Context, TikvClient, ImportSstClient) {
     open_cluster_and_tikv_import_client(None)
@@ -163,7 +96,7 @@ pub fn new_cluster_and_tikv_import_client_tde() -> (
     ImportSstClient,
 ) {
     let tmp_dir = tempfile::TempDir::new().unwrap();
-    let encryption_cfg = test_util::new_file_security_config(tmp_dir.path());
+    let encryption_cfg = test_util::new_file_security_config(&tmp_dir);
     let mut security = test_util::new_security_cfg(None);
     security.encryption = encryption_cfg;
     let mut config = TikvConfig::default();

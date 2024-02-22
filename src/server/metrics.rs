@@ -77,7 +77,6 @@ make_auto_flush_static_metric! {
     pub label_enum SnapTask {
         send,
         recv,
-        recv_v2,
     }
 
     pub label_enum ResolveStore {
@@ -86,7 +85,6 @@ make_auto_flush_static_metric! {
         failed,
         success,
         tombstone,
-        not_found,
     }
 
     pub label_enum ReplicaReadLockCheckResult {
@@ -207,13 +205,6 @@ lazy_static! {
         "tikv_grpc_msg_fail_total",
         "Total number of handle grpc message failure",
         &["type"]
-    )
-    .unwrap();
-    // TODO: deprecate the "name" label in v8.0.
-    pub static ref GRPC_RESOURCE_GROUP_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
-        "tikv_grpc_resource_group_total",
-        "Total number of handle grpc message for each resource group",
-        &["name", "resource_group"]
     )
     .unwrap();
     pub static ref GRPC_PROXY_MSG_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
@@ -471,15 +462,6 @@ make_auto_flush_static_metric! {
         err_store_not_match,
         err_raft_entry_too_large,
         err_leader_memory_lock_check,
-        err_read_index_not_ready,
-        err_proposal_in_merging_mode,
-        err_data_is_not_ready,
-        err_region_not_initialized,
-        err_disk_full,
-        err_recovery_in_progress,
-        err_flashback_in_progress,
-        err_buckets_version_not_match,
-        err_undetermind,
     }
 
     pub label_enum RequestTypeKind {
@@ -516,16 +498,6 @@ impl From<ErrorHeaderKind> for RequestStatusKind {
             ErrorHeaderKind::StaleCommand => RequestStatusKind::err_stale_command,
             ErrorHeaderKind::StoreNotMatch => RequestStatusKind::err_store_not_match,
             ErrorHeaderKind::RaftEntryTooLarge => RequestStatusKind::err_raft_entry_too_large,
-            ErrorHeaderKind::ReadIndexNotReady => RequestStatusKind::err_read_index_not_ready,
-            ErrorHeaderKind::ProposalInMergeMode => RequestStatusKind::err_proposal_in_merging_mode,
-            ErrorHeaderKind::DataNotReady => RequestStatusKind::err_data_is_not_ready,
-            ErrorHeaderKind::RegionNotInitialized => RequestStatusKind::err_region_not_found,
-            ErrorHeaderKind::DiskFull => RequestStatusKind::err_disk_full,
-            ErrorHeaderKind::RecoveryInProgress => RequestStatusKind::err_recovery_in_progress,
-            ErrorHeaderKind::FlashbackInProgress => RequestStatusKind::err_flashback_in_progress,
-            ErrorHeaderKind::BucketsVersionNotMatch => {
-                RequestStatusKind::err_buckets_version_not_match
-            }
             ErrorHeaderKind::Other => RequestStatusKind::err_other,
         }
     }
@@ -542,7 +514,7 @@ lazy_static! {
         "tikv_storage_engine_async_request_duration_seconds",
         "Bucketed histogram of processing successful asynchronous requests.",
         &["type"],
-        exponential_buckets(0.00001, 2.0, 32).unwrap() // 10us ~ 42949s.
+        exponential_buckets(0.00001, 2.0, 26).unwrap()
     )
     .unwrap();
 }

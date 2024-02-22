@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use api_version::{dispatch_api_version, keyspace::KvPair, ApiV1, KvFormat, RawValue};
+use api_version::{dispatch_api_version, KvFormat, RawValue};
 use backup::Task;
 use collections::HashMap;
 use engine_traits::{CfName, IterOptions, CF_DEFAULT, CF_WRITE, DATA_KEY_PREFIX_LEN};
@@ -26,7 +26,7 @@ use tikv::{
     config::BackupConfig,
     coprocessor::{checksum_crc64_xor, dag::TikvStorage},
     storage::{
-        kv::{Engine, LocalTablets, SnapContext},
+        kv::{Engine, SnapContext},
         SnapshotStore,
     },
 };
@@ -37,6 +37,8 @@ use tikv_util::{
     HandyRwLock,
 };
 use txn_types::TimeStamp;
+
+pub mod disk_snap;
 
 pub struct TestSuite {
     pub cluster: Cluster<ServerCluster>,
@@ -73,7 +75,7 @@ impl TestSuite {
     pub fn new(count: usize, sst_max_size: u64, api_version: ApiVersion) -> TestSuite {
         let mut cluster = new_server_cluster_with_api_ver(1, count, api_version);
         // Increase the Raft tick interval to make this test case running reliably.
-        configure_for_lease_read(&mut cluster.cfg, Some(100), None);
+        configure_for_lease_read(&mut cluster, Some(100), None);
         cluster.run();
 
         let mut endpoints = HashMap::default();
@@ -85,7 +87,7 @@ impl TestSuite {
                 *id,
                 sim.storages[id].clone(),
                 sim.region_info_accessors[id].clone(),
-                LocalTablets::Singleton(engines.kv.clone()),
+                engines.kv.clone(),
                 BackupConfig {
                     num_threads: 4,
                     batch_size: 8,
@@ -94,7 +96,6 @@ impl TestSuite {
                 },
                 sim.get_concurrency_manager(*id),
                 api_version,
-                None,
                 None,
             );
             let mut worker = bg_worker.lazy_build(format!("backup-{}", id));
@@ -355,7 +356,7 @@ impl TestSuite {
             Default::default(),
             false,
         );
-        let mut scanner = RangesScanner::<_, ApiV1>::new(RangesScannerOptions {
+        let mut scanner = RangesScanner::new(RangesScannerOptions {
             storage: TikvStorage::new(snap_store, false),
             ranges: vec![Range::Interval(IntervalRange::from((start, end)))],
             scan_backward_in_range: false,
@@ -363,9 +364,8 @@ impl TestSuite {
             is_scanned_range_aware: false,
         });
         let digest = crc64fast::Digest::new();
-        while let Some(row) = block_on(scanner.next()).unwrap() {
-            let (k, v) = row.kv();
-            checksum = checksum_crc64_xor(checksum, digest.clone(), k, v);
+        while let Some((k, v)) = block_on(scanner.next()).unwrap() {
+            checksum = checksum_crc64_xor(checksum, digest.clone(), &k, &v);
             total_kvs += 1;
             total_bytes += (k.len() + v.len()) as u64;
         }

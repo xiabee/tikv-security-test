@@ -21,12 +21,10 @@
 // Functionalities like read, write, etc should be implemented in [`operation`]
 // using a standalone modules.
 
+#![allow(unused)]
 #![feature(let_chains)]
 #![feature(array_windows)]
 #![feature(div_duration)]
-#![feature(box_into_inner)]
-#![feature(assert_matches)]
-#![feature(option_get_or_insert_default)]
 
 mod batch;
 mod bootstrap;
@@ -34,18 +32,11 @@ mod fsm;
 mod operation;
 mod raft;
 pub mod router;
+mod tablet;
 mod worker;
 
 pub(crate) use batch::StoreContext;
 pub use batch::{create_store_batch_system, StoreRouter, StoreSystem};
 pub use bootstrap::Bootstrap;
 pub use fsm::StoreMeta;
-pub use operation::{write_initial_states, SimpleWriteBinary, SimpleWriteEncoder, StateStorage};
-pub use raftstore::{store::Config, Error, Result};
-pub use worker::{
-    cleanup::CompactTask,
-    pd::{PdReporter, Task as PdTask},
-    tablet::Task as TabletTask,
-};
-
-pub use crate::raft::Storage;
+pub use raftstore::{Error, Result};

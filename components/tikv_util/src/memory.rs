@@ -90,32 +90,6 @@ pub struct MemoryQuota {
     capacity: AtomicUsize,
 }
 
-pub struct OwnedAllocated {
-    allocated: usize,
-    from: Arc<MemoryQuota>,
-}
-
-impl OwnedAllocated {
-    pub fn new(target: Arc<MemoryQuota>) -> Self {
-        Self {
-            allocated: 0,
-            from: target,
-        }
-    }
-
-    pub fn alloc(&mut self, bytes: usize) -> Result<(), MemoryQuotaExceeded> {
-        self.from.alloc(bytes)?;
-        self.allocated += bytes;
-        Ok(())
-    }
-}
-
-impl Drop for OwnedAllocated {
-    fn drop(&mut self) {
-        self.from.free(self.allocated)
-    }
-}
-
 impl MemoryQuota {
     pub fn new(capacity: usize) -> MemoryQuota {
         MemoryQuota {
@@ -171,6 +145,32 @@ impl MemoryQuota {
                 Err(current) => in_use_bytes = current,
             }
         }
+    }
+}
+
+pub struct OwnedAllocated {
+    allocated: usize,
+    from: Arc<MemoryQuota>,
+}
+
+impl OwnedAllocated {
+    pub fn new(target: Arc<MemoryQuota>) -> Self {
+        Self {
+            allocated: 0,
+            from: target,
+        }
+    }
+
+    pub fn alloc(&mut self, bytes: usize) -> Result<(), MemoryQuotaExceeded> {
+        self.from.alloc(bytes)?;
+        self.allocated += bytes;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedAllocated {
+    fn drop(&mut self) {
+        self.from.free(self.allocated)
     }
 }
 

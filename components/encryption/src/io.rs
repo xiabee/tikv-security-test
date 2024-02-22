@@ -82,10 +82,6 @@ impl<R> DecrypterReader<R> {
             iv,
         )?))
     }
-
-    pub fn inner(&self) -> &R {
-        &self.0.reader
-    }
 }
 
 impl<R: Read> Read for DecrypterReader<R> {

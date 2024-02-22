@@ -10,10 +10,7 @@ use pd_client::{Error as PdError, PdClient};
 use raft_log_engine::RaftLogEngine;
 use raftstore::store::initial_region;
 use thiserror::Error;
-use tikv::{
-    config::TikvConfig,
-    server::{config::Config as ServerConfig, KvEngineFactoryBuilder},
-};
+use tikv::{config::TikvConfig, server::config::Config as ServerConfig};
 use tikv_util::{
     config::{ReadableDuration, ReadableSize, VersionTrack},
     sys::SysQuota,
@@ -83,7 +80,7 @@ pub fn enter_snap_recovery_mode(config: &mut TikvConfig) {
     config.raft_store.snap_apply_batch_size = ReadableSize::gb(1);
 
     // unlimit the snapshot I/O.
-    config.server.snap_io_max_bytes_per_sec = ReadableSize::gb(16);
+    config.server.snap_max_write_bytes_per_sec = ReadableSize::gb(16);
     config.server.concurrent_recv_snap_limit = 256;
     config.server.concurrent_send_snap_limit = 256;
 
@@ -121,7 +118,7 @@ pub fn enter_snap_recovery_mode(config: &mut TikvConfig) {
 
     // Disable region split during recovering.
     config.coprocessor.region_max_size = Some(ReadableSize::gb(MAX_REGION_SIZE));
-    config.coprocessor.region_split_size = Some(ReadableSize::gb(MAX_REGION_SIZE));
+    config.coprocessor.region_split_size = ReadableSize::gb(MAX_REGION_SIZE);
     config.coprocessor.region_max_keys = Some(MAX_SPLIT_KEY);
     config.coprocessor.region_split_keys = Some(MAX_SPLIT_KEY);
 }
@@ -338,27 +335,37 @@ pub fn create_local_engine_service(
     let block_cache = config.storage.block_cache.build_shared_cache();
 
     // init rocksdb / kv db
-    let factory =
-        KvEngineFactoryBuilder::new(env.clone(), config, block_cache, key_manager.clone())
-            .lite(true)
-            .build();
-    let kv_db = match factory.create_shared_db(&config.storage.data_dir) {
+    let mut db_opts = config.rocksdb.build_opt();
+    db_opts.set_env(env.clone());
+    let cf_opts = config
+        .rocksdb
+        .build_cf_opts(&block_cache, None, config.storage.api_version());
+    let db_path = config
+        .infer_kv_engine_path(None)
+        .map_err(|e| format!("infer kvdb path: {}", e))?;
+    let mut kv_db = match new_engine_opt(&db_path, db_opts, cf_opts) {
         Ok(db) => db,
         Err(e) => handle_engine_error(e),
     };
 
+    let shared_block_cache = block_cache.is_some();
+    kv_db.set_shared_block_cache(shared_block_cache);
+
     // init raft engine, either is rocksdb or raft engine
     if !config.raft_engine.enable {
         // rocksdb
-        let raft_db_opts = config.raftdb.build_opt(env, None);
-        let raft_db_cf_opts = config.raftdb.build_cf_opts(factory.block_cache());
+        let mut raft_db_opts = config.raftdb.build_opt();
+        raft_db_opts.set_env(env);
+        let raft_db_cf_opts = config.raftdb.build_cf_opts(&block_cache);
         let raft_path = config
             .infer_raft_db_path(None)
             .map_err(|e| format!("infer raftdb path: {}", e))?;
-        let raft_db = match new_engine_opt(&raft_path, raft_db_opts, raft_db_cf_opts) {
+        let mut raft_db = match new_engine_opt(&raft_path, raft_db_opts, raft_db_cf_opts) {
             Ok(db) => db,
             Err(e) => handle_engine_error(e),
         };
+        //       let mut raft_db = RocksEngine::from_db(Arc::new(raft_db));
+        raft_db.set_shared_block_cache(shared_block_cache);
 
         let local_engines = LocalEngines::new(Engines::new(kv_db, raft_db));
         Ok(Box::new(local_engines) as Box<dyn LocalEngineService>)

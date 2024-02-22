@@ -383,6 +383,15 @@ pub struct CallbackWaitGroup {
     on_finish_all: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
+/// A shortcut for making an opaque future type for return type or argument
+/// type, which is sendable and not borrowing any variables.  
+///
+/// `fut![T]` == `impl Future<Output = T> + Send + 'static`
+#[macro_export(crate)]
+macro_rules! future {
+    ($t:ty) => { impl core::future::Future<Output = $t> + Send + 'static };
+}
+
 impl CallbackWaitGroup {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -536,18 +545,18 @@ pub fn is_overlapping(range: (&[u8], &[u8]), range2: (&[u8], &[u8])) -> bool {
 }
 
 /// read files asynchronously in sequence
-pub struct FilesReader<R> {
-    files: Vec<R>,
+pub struct FilesReader {
+    files: Vec<File>,
     index: usize,
 }
 
-impl<R> FilesReader<R> {
-    pub fn new(files: Vec<R>) -> Self {
+impl FilesReader {
+    pub fn new(files: Vec<File>) -> Self {
         FilesReader { files, index: 0 }
     }
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for FilesReader<R> {
+impl AsyncRead for FilesReader {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -573,7 +582,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for FilesReader<R> {
 #[async_trait::async_trait]
 pub trait CompressionWriter: AsyncWrite + Sync + Send {
     /// call the `File.sync_all()` to flush immediately to disk.
-    async fn done(&mut self) -> Result<()>;
+    async fn done(mut self: Pin<&mut Self>) -> Result<()>;
 }
 
 /// a writer dispatcher for different compression type.
@@ -582,11 +591,11 @@ pub trait CompressionWriter: AsyncWrite + Sync + Send {
 pub async fn compression_writer_dispatcher(
     local_path: impl AsRef<Path>,
     compression_type: CompressionType,
-) -> Result<Box<dyn CompressionWriter + Unpin>> {
+) -> Result<Pin<Box<dyn CompressionWriter>>> {
     let inner = BufWriter::with_capacity(128 * 1024, File::create(local_path.as_ref()).await?);
     match compression_type {
-        CompressionType::Unknown => Ok(Box::new(NoneCompressionWriter::new(inner))),
-        CompressionType::Zstd => Ok(Box::new(ZstdCompressionWriter::new(inner))),
+        CompressionType::Unknown => Ok(Box::pin(NoneCompressionWriter::new(inner))),
+        CompressionType::Zstd => Ok(Box::pin(ZstdCompressionWriter::new(inner))),
         _ => Err(Error::Other(box_err!(format!(
             "the compression type is unimplemented, compression type id {:?}",
             compression_type
@@ -626,7 +635,7 @@ impl AsyncWrite for NoneCompressionWriter {
 
 #[async_trait::async_trait]
 impl CompressionWriter for NoneCompressionWriter {
-    async fn done(&mut self) -> Result<()> {
+    async fn done(mut self: Pin<&mut Self>) -> Result<()> {
         let bufwriter = &mut self.inner;
         bufwriter.flush().await?;
         bufwriter.get_ref().sync_all().await?;
@@ -635,27 +644,19 @@ impl CompressionWriter for NoneCompressionWriter {
 }
 
 /// use zstd compression algorithm
-pub struct ZstdCompressionWriter<R> {
-    inner: ZstdEncoder<R>,
+pub struct ZstdCompressionWriter {
+    inner: ZstdEncoder<BufWriter<File>>,
 }
 
-impl<R: AsyncWrite> ZstdCompressionWriter<R> {
-    pub fn new(inner: R) -> Self {
+impl ZstdCompressionWriter {
+    pub fn new(inner: BufWriter<File>) -> Self {
         ZstdCompressionWriter {
             inner: ZstdEncoder::with_quality(inner, Level::Fastest),
         }
     }
-
-    pub fn get_ref(&self) -> &R {
-        self.inner.get_ref()
-    }
-
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut()
-    }
 }
 
-impl<R: AsyncWrite + Unpin> AsyncWrite for ZstdCompressionWriter<R> {
+impl AsyncWrite for ZstdCompressionWriter {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -675,12 +676,13 @@ impl<R: AsyncWrite + Unpin> AsyncWrite for ZstdCompressionWriter<R> {
 }
 
 #[async_trait::async_trait]
-impl<R: AsyncWrite + Sync + Send + Unpin> CompressionWriter for ZstdCompressionWriter<R> {
-    async fn done(&mut self) -> Result<()> {
+impl CompressionWriter for ZstdCompressionWriter {
+    async fn done(mut self: Pin<&mut Self>) -> Result<()> {
         let encoder = &mut self.inner;
         encoder.shutdown().await?;
         let bufwriter = encoder.get_mut();
         bufwriter.flush().await?;
+        bufwriter.get_ref().sync_all().await?;
         Ok(())
     }
 }
@@ -765,15 +767,6 @@ impl<'a> slog::KV for SlogRegion<'a> {
         )?;
         Ok(())
     }
-}
-
-/// A shortcut for making an opaque future type for return type or argument
-/// type, which is sendable and not borrowing any variables.  
-///
-/// `future![T]` == `impl Future<Output = T> + Send + 'static`
-#[macro_export]
-macro_rules! future {
-    ($t:ty) => { impl core::future::Future<Output = $t> + Send + 'static };
 }
 
 pub fn debug_iter<D: std::fmt::Debug>(t: impl Iterator<Item = D>) -> impl std::fmt::Debug {
@@ -1077,7 +1070,7 @@ mod test {
             .await
             .unwrap();
         writer.write_all(content.as_bytes()).await.unwrap();
-        writer.done().await.unwrap();
+        writer.as_mut().done().await.unwrap();
 
         let mut reader = BufReader::new(File::open(path1).await.unwrap());
         let mut read_content = String::new();
@@ -1090,7 +1083,7 @@ mod test {
             .await
             .unwrap();
         writer.write_all(content.as_bytes()).await.unwrap();
-        writer.done().await.unwrap();
+        writer.as_mut().done().await.unwrap();
 
         use async_compression::tokio::bufread::ZstdDecoder;
         let mut reader = ZstdDecoder::new(BufReader::new(File::open(path2).await.unwrap()));

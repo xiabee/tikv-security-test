@@ -50,7 +50,7 @@ pub enum FieldTypeTp {
 }
 
 impl FieldTypeTp {
-    pub fn from_i32(i: i32) -> Option<FieldTypeTp> {
+    fn from_i32(i: i32) -> Option<FieldTypeTp> {
         if (i >= FieldTypeTp::Unspecified as i32 && i <= FieldTypeTp::Bit as i32)
             || (i >= FieldTypeTp::Json as i32 && i <= FieldTypeTp::Geometry as i32)
         {
@@ -110,8 +110,6 @@ pub enum Collation {
     Utf8Mb4BinNoPadding = 46,
     Utf8Mb4GeneralCi = -45,
     Utf8Mb4UnicodeCi = -224,
-    Utf8Mb40900AiCi = -255,
-    Utf8Mb40900Bin = -309,
     Latin1Bin = -47,
     GbkBin = -87,
     GbkChineseCi = -28,
@@ -132,18 +130,13 @@ impl Collation {
             -224 | -192 => Ok(Collation::Utf8Mb4UnicodeCi),
             -87 => Ok(Collation::GbkBin),
             -28 => Ok(Collation::GbkChineseCi),
-            -255 => Ok(Collation::Utf8Mb40900AiCi),
-            -309 => Ok(Collation::Utf8Mb40900Bin),
             n if n >= 0 => Ok(Collation::Utf8Mb4BinNoPadding),
             n => Err(DataTypeError::UnsupportedCollation { code: n }),
         }
     }
 
     pub fn is_bin_collation(&self) -> bool {
-        matches!(
-            self,
-            Collation::Utf8Mb4Bin | Collation::Latin1Bin | Collation::Utf8Mb40900Bin
-        )
+        matches!(self, Collation::Utf8Mb4Bin | Collation::Latin1Bin)
     }
 }
 
@@ -336,10 +329,6 @@ pub trait FieldTypeAccessor {
                 .map(|col| col.is_bin_collation())
                 .unwrap_or(false)
                 || self.is_varchar_like())
-            && self
-                .collation()
-                .map(|col| col != Collation::Utf8Mb40900Bin)
-                .unwrap_or(false)
     }
 }
 
@@ -462,7 +451,6 @@ mod tests {
     use std::i32;
 
     use super::*;
-    use crate::builder::FieldTypeBuilder;
 
     fn field_types() -> Vec<FieldTypeTp> {
         vec![
@@ -542,8 +530,7 @@ mod tests {
             (83, Some(Collation::Utf8Mb4BinNoPadding)),
             (-83, Some(Collation::Utf8Mb4Bin)),
             (255, Some(Collation::Utf8Mb4BinNoPadding)),
-            (-255, Some(Collation::Utf8Mb40900AiCi)),
-            (-309, Some(Collation::Utf8Mb40900Bin)),
+            (-255, None),
             (i32::MAX, Some(Collation::Utf8Mb4BinNoPadding)),
             (i32::MIN, None),
             (-192, Some(Collation::Utf8Mb4UnicodeCi)),
@@ -589,33 +576,6 @@ mod tests {
             } else {
                 charset.unwrap_err();
             }
-        }
-    }
-
-    #[test]
-    fn test_need_restored_data() {
-        let cases = vec![
-            (FieldTypeTp::String, Collation::Binary, false),
-            (FieldTypeTp::VarString, Collation::Binary, false),
-            (FieldTypeTp::String, Collation::Utf8Mb4Bin, false),
-            (FieldTypeTp::VarString, Collation::Utf8Mb4Bin, true),
-            (FieldTypeTp::String, Collation::Utf8Mb4GeneralCi, true),
-            (FieldTypeTp::VarString, Collation::Utf8Mb4GeneralCi, true),
-            (FieldTypeTp::String, Collation::Utf8Mb4UnicodeCi, true),
-            (FieldTypeTp::VarString, Collation::Utf8Mb4UnicodeCi, true),
-            (FieldTypeTp::String, Collation::Utf8Mb40900AiCi, true),
-            (FieldTypeTp::VarString, Collation::Utf8Mb40900AiCi, true),
-            (FieldTypeTp::String, Collation::Utf8Mb40900Bin, false),
-            (FieldTypeTp::VarString, Collation::Utf8Mb40900Bin, false),
-            (FieldTypeTp::String, Collation::GbkBin, true),
-            (FieldTypeTp::VarString, Collation::GbkBin, true),
-            (FieldTypeTp::String, Collation::GbkChineseCi, true),
-            (FieldTypeTp::VarString, Collation::GbkChineseCi, true),
-        ];
-
-        for (tp, collation, result) in cases {
-            let ft = FieldTypeBuilder::new().tp(tp).collation(collation).build();
-            assert_eq!(ft.need_restored_data(), result)
         }
     }
 }

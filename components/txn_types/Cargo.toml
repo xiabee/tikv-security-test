@@ -1,7 +1,7 @@
 [package]
 name = "txn_types"
 version = "0.1.0"
-edition = "2021"
+edition = "2018"
 publish = false
 
 [dependencies]
@@ -13,7 +13,7 @@ error_code = { workspace = true }
 farmhash = "1.1.5"
 kvproto = { workspace = true }
 log_wrappers = { workspace = true }
-slog = { workspace = true }
+slog = "2.3"
 thiserror = "1.0"
 tikv_alloc = { workspace = true }
 tikv_util = { workspace = true }

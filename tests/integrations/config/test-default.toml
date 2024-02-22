@@ -2,8 +2,6 @@
 
 [log.file]
 
-[memory]
-
 [readpool.unified]
 
 [readpool.storage]

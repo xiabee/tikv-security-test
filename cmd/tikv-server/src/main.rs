@@ -7,10 +7,7 @@ use std::{path::Path, process};
 use clap::{crate_authors, App, Arg};
 use serde_json::{Map, Value};
 use server::setup::{ensure_no_unrecognized_config, validate_and_persist_config};
-use tikv::{
-    config::{to_flatten_config_info, TikvConfig},
-    storage::config::EngineType,
-};
+use tikv::config::{to_flatten_config_info, TikvConfig};
 
 fn main() {
     let build_timestamp = option_env!("TIKV_BUILD_TIME");
@@ -210,21 +207,6 @@ fn main() {
         process::exit(0);
     }
 
-    // engine config needs to be validated
-    // so that it can adjust the engine type before too late
-    if let Err(e) = config.storage.validate_engine_type() {
-        println!("invalid storage.engine configuration: {}", e);
-        process::exit(1)
-    }
-
-    // Init memory related settings.
-    config.memory.init();
-
     let (service_event_tx, service_event_rx) = tikv_util::mpsc::unbounded(); // pipe for controling service
-    match config.storage.engine {
-        EngineType::RaftKv => server::server::run_tikv(config, service_event_tx, service_event_rx),
-        EngineType::RaftKv2 => {
-            server::server2::run_tikv(config, service_event_tx, service_event_rx)
-        }
-    }
+    server::server::run_tikv(config, service_event_tx, service_event_rx);
 }

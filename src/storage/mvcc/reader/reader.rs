@@ -10,7 +10,7 @@ use kvproto::{
 };
 use raftstore::store::LocksStatus;
 use tikv_kv::{SnapshotExt, SEEK_BOUND};
-use txn_types::{Key, LastChange, Lock, OldValue, TimeStamp, Value, Write, WriteRef, WriteType};
+use txn_types::{Key, Lock, OldValue, TimeStamp, Value, Write, WriteRef, WriteType};
 
 use crate::storage::{
     kv::{
@@ -409,18 +409,22 @@ impl<S: EngineSnapshot> MvccReader<S> {
                         WriteType::Delete => {
                             return Ok(None);
                         }
-                        WriteType::Lock | WriteType::Rollback => match write.last_change {
-                            LastChange::NotExist => {
+                        WriteType::Lock | WriteType::Rollback => {
+                            if write.versions_to_last_change > 0 && write.last_change_ts.is_zero() {
                                 return Ok(None);
                             }
-                            LastChange::Exist {
-                                last_change_ts: commit_ts,
-                                estimated_versions_to_last_change,
-                            } if estimated_versions_to_last_change >= SEEK_BOUND => {
+                            if write.versions_to_last_change < SEEK_BOUND {
+                                if ts.is_zero() {
+                                    // this should only happen in tests
+                                    return Ok(None);
+                                }
+                                ts = commit_ts.prev();
+                            } else {
+                                let commit_ts = write.last_change_ts;
                                 let key_with_ts = key.clone().append_ts(commit_ts);
                                 let Some(value) = self
-                                        .snapshot
-                                        .get_cf(CF_WRITE, &key_with_ts)? else {
+                                    .snapshot
+                                    .get_cf(CF_WRITE, &key_with_ts)? else {
                                         return Ok(None);
                                     };
                                 self.statistics.write.get += 1;
@@ -435,14 +439,7 @@ impl<S: EngineSnapshot> MvccReader<S> {
                                 seek_res = Some((commit_ts, write));
                                 continue;
                             }
-                            _ => {
-                                if ts.is_zero() {
-                                    // this should only happen in tests
-                                    return Ok(None);
-                                }
-                                ts = commit_ts.prev();
-                            }
-                        },
+                        }
                     }
                 }
                 None => return Ok(None),
@@ -788,10 +785,6 @@ impl<S: EngineSnapshot> MvccReader<S> {
         self.hint_min_ts = ts_bound;
     }
 
-    pub fn snapshot_ext(&self) -> S::Ext<'_> {
-        self.snapshot.ext()
-    }
-
     pub fn snapshot(&self) -> &S {
         &self.snapshot
     }
@@ -820,7 +813,7 @@ pub mod tests {
     };
     use pd_client::FeatureGate;
     use raftstore::store::RegionSnapshot;
-    use txn_types::{LastChange, LockType, Mutation};
+    use txn_types::{LockType, Mutation};
 
     use super::*;
     use crate::storage::{
@@ -927,7 +920,6 @@ pub mod tests {
                 m,
                 &None,
                 SkipPessimisticCheck,
-                None,
             )
             .unwrap();
             self.write(txn.into_modifies());
@@ -952,7 +944,6 @@ pub mod tests {
                 m,
                 &None,
                 DoPessimisticCheck,
-                None,
             )
             .unwrap();
             self.write(txn.into_modifies());
@@ -1062,7 +1053,6 @@ pub mod tests {
                             wb.delete_range_cf(cf, &k1, &k2).unwrap();
                         }
                     }
-                    Modify::Ingest(_) => unimplemented!(),
                 }
             }
             wb.write().unwrap();
@@ -1076,7 +1066,7 @@ pub mod tests {
 
         pub fn compact(&mut self) {
             for cf in ALL_CFS {
-                self.db.compact_range_cf(cf, None, None, false, 1).unwrap();
+                self.db.compact_range(cf, None, None, false, 1).unwrap();
             }
         }
     }
@@ -1269,7 +1259,7 @@ pub mod tests {
         let overlapped_write = reader
             .get_txn_commit_record(&key, 55.into())
             .unwrap()
-            .unwrap_none(0);
+            .unwrap_none();
         assert!(overlapped_write.is_none());
 
         // When no such record is found but a record of another txn has a write record
@@ -1277,7 +1267,7 @@ pub mod tests {
         let overlapped_write = reader
             .get_txn_commit_record(&key, 50.into())
             .unwrap()
-            .unwrap_none(0)
+            .unwrap_none()
             .unwrap();
         assert_eq!(overlapped_write.write.start_ts, 45.into());
         assert_eq!(overlapped_write.write.write_type, WriteType::Put);
@@ -1705,12 +1695,11 @@ pub mod tests {
                     for_update_ts,
                     0,
                     TimeStamp::zero(),
-                    false,
                 )
-                .set_last_change(LastChange::from_parts(
+                .set_last_change(
                     TimeStamp::zero(),
                     (lock_type == LockType::Lock || lock_type == LockType::Pessimistic) as u64,
-                )),
+                ),
             )
         })
         .collect();
@@ -2452,9 +2441,8 @@ pub mod tests {
             .unwrap();
         assert_eq!(commit_ts, 2.into());
         assert_eq!(write, w2);
-        // estimated_versions_to_last_change should be large enough to trigger a second
-        // get instead of calling a series of next, so the count of next should
-        // be 0 instead
+        // versions_to_last_change should be large enough to trigger a second get
+        // instead of calling a series of next, so the count of next should be 0 instead
         assert_eq!(reader.statistics.write.next, 0);
         assert_eq!(reader.statistics.write.get, 1);
 
@@ -2465,9 +2453,8 @@ pub mod tests {
             .unwrap();
         // If the type is Delete, get_write_with_commit_ts should return None.
         assert!(res.is_none());
-        // estimated_versions_to_last_change should be large enough to trigger a second
-        // get instead of calling a series of next, so the count of next should
-        // be 0 instead
+        // versions_to_last_change should be large enough to trigger a second get
+        // instead of calling a series of next, so the count of next should be 0 instead
         assert_eq!(reader.statistics.write.next, 0);
         assert_eq!(reader.statistics.write.get, 1);
     }
@@ -2496,7 +2483,7 @@ pub mod tests {
             .get_write_with_commit_ts(&Key::from_raw(k), 40.into(), None)
             .unwrap();
         // We can know the key doesn't exist without skipping all these locks according
-        // to last_change_ts and estimated_versions_to_last_change.
+        // to last_change_ts and versions_to_last_change.
         assert!(res.is_none());
         assert_eq!(reader.statistics.write.seek, 1);
         assert_eq!(reader.statistics.write.next, 0);
@@ -2597,7 +2584,6 @@ pub mod tests {
         assert_eq!(res.0.write_type, WriteType::Put);
         assert_eq!(res.1, 2.into());
         assert_eq!(reader.statistics.write.seek, 1);
-        assert_eq!(reader.statistics.write.next, 2);
-        assert_eq!(reader.statistics.write.get, 1);
+        assert_eq!(reader.statistics.write.next, 0);
     }
 }
