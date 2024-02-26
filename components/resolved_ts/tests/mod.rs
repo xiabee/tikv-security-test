@@ -4,6 +4,7 @@ use std::{sync::*, time::Duration};
 
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
+use engine_rocks::RocksEngine;
 use futures::{executor::block_on, stream, SinkExt};
 use grpcio::{ChannelBuilder, ClientUnaryReceiver, Environment, Result, WriteFlags};
 use kvproto::{
@@ -26,7 +27,7 @@ pub fn init() {
 }
 
 pub struct TestSuite {
-    pub cluster: Cluster<ServerCluster>,
+    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
     pub endpoints: HashMap<u64, LazyWorker<Task>>,
     pub obs: HashMap<u64, Observer>,
     tikv_cli: HashMap<u64, TikvClient>,
@@ -44,7 +45,10 @@ impl TestSuite {
         Self::with_cluster(count, cluster)
     }
 
-    pub fn with_cluster(count: usize, mut cluster: Cluster<ServerCluster>) -> Self {
+    pub fn with_cluster(
+        count: usize,
+        mut cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    ) -> Self {
         init();
         let pd_cli = cluster.pd_client.clone();
         let mut endpoints = HashMap::default();
@@ -62,6 +66,9 @@ impl TestSuite {
             obs.insert(id, rts_ob.clone());
             sim.coprocessor_hooks.entry(id).or_default().push(Box::new(
                 move |host: &mut CoprocessorHost<_>| {
+                    // Migrated to 2021 migration. This let statement is probably not needed, see
+                    //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+                    let _ = &rts_ob;
                     rts_ob.register_to(host);
                 },
             ));

@@ -1,9 +1,10 @@
 [package]
 name = "test_sst_importer"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
 publish = false
 description = "test helpers for sst_importer"
+license = "Apache-2.0"
 
 [lib]
 test = false

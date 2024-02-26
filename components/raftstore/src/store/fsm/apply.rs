@@ -31,9 +31,10 @@ use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_traits::{
     util::SequenceNumber, DeleteStrategy, KvEngine, Mutable, PerfContext, PerfContextKind,
     RaftEngine, RaftEngineReadOnly, Range as EngineRange, Snapshot, SstMetaInfo, WriteBatch,
-    ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
+    WriteOptions, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
 };
 use fail::fail_point;
+use health_controller::types::LatencyInspector;
 use kvproto::{
     import_sstpb::SstMeta,
     kvrpcpb::ExtraOp as TxnExtraOp,
@@ -92,7 +93,7 @@ use crate::{
         peer_storage::{write_initial_apply_state, write_peer_state},
         util::{
             self, admin_cmd_epoch_lookup, check_flashback_state, check_req_region_epoch,
-            compare_region_epoch, ChangePeerI, ConfChangeKind, KeysInfoFormatter, LatencyInspector,
+            compare_region_epoch, ChangePeerI, ConfChangeKind, KeysInfoFormatter,
         },
         Config, RegionSnapshot, RegionTask, WriteCallback,
     },
@@ -392,7 +393,7 @@ where
     tag: String,
     timer: Option<Instant>,
     host: CoprocessorHost<EK>,
-    importer: Arc<SstImporter>,
+    importer: Arc<SstImporter<EK>>,
     region_scheduler: Scheduler<RegionTask<EK::Snapshot>>,
     router: ApplyRouter<EK>,
     notifier: Box<dyn Notifier<EK>>,
@@ -475,7 +476,7 @@ where
     pub fn new(
         tag: String,
         host: CoprocessorHost<EK>,
-        importer: Arc<SstImporter>,
+        importer: Arc<SstImporter<EK>>,
         region_scheduler: Scheduler<RegionTask<EK::Snapshot>>,
         engine: EK,
         router: ApplyRouter<EK>,
@@ -555,7 +556,8 @@ where
                 delegate.unfinished_write_seqno.push(seqno);
             }
             self.prepare_for(delegate);
-            delegate.last_flush_applied_index = delegate.apply_state.get_applied_index()
+            delegate.last_flush_applied_index = delegate.apply_state.get_applied_index();
+            delegate.has_pending_ssts = false;
         }
         self.kv_wb_last_bytes = self.kv_wb().data_size() as u64;
         self.kv_wb_last_keys = self.kv_wb().count() as u64;
@@ -677,7 +679,7 @@ where
             exec_res: results,
             metrics: mem::take(&mut delegate.metrics),
             applied_term: delegate.applied_term,
-            bucket_stat: delegate.buckets.clone().map(Box::new),
+            bucket_stat: delegate.buckets.clone(),
         });
         if !self.kv_wb().is_empty() {
             // Pending writes not flushed, need to set seqno to following ApplyRes later
@@ -791,7 +793,7 @@ pub fn notify_stale_req_with_msg(term: u64, msg: String, cb: impl ErrorCallback)
 }
 
 /// Checks if a write is needed to be issued before handling the command.
-fn should_write_to_engine(cmd: &RaftCmdRequest) -> bool {
+fn should_write_to_engine(has_pending_writes: bool, cmd: &RaftCmdRequest) -> bool {
     if cmd.has_admin_request() {
         match cmd.get_admin_request().get_cmd_type() {
             // ComputeHash require an up to date snapshot.
@@ -809,7 +811,7 @@ fn should_write_to_engine(cmd: &RaftCmdRequest) -> bool {
         if req.has_delete_range() {
             return true;
         }
-        if req.has_ingest_sst() {
+        if req.has_ingest_sst() && has_pending_writes {
             return true;
         }
     }
@@ -1043,6 +1045,8 @@ where
     buckets: Option<BucketStat>,
 
     unfinished_write_seqno: Vec<SequenceNumber>,
+
+    has_pending_ssts: bool,
 }
 
 impl<EK> ApplyDelegate<EK>
@@ -1077,6 +1081,7 @@ where
             trace: ApplyMemoryTrace::default(),
             buckets: None,
             unfinished_write_seqno: vec![],
+            has_pending_ssts: false,
         }
     }
 
@@ -1227,9 +1232,15 @@ where
                 if apply_ctx.yield_high_latency_operation && has_high_latency_operation(&cmd) {
                     self.priority = Priority::Low;
                 }
+                if self.has_pending_ssts {
+                    // we are in low priority handler and to avoid overlapped ssts with same region
+                    // just return Yield
+                    return ApplyResult::Yield;
+                }
                 let mut has_unflushed_data =
                     self.last_flush_applied_index != self.apply_state.get_applied_index();
-                if (has_unflushed_data && should_write_to_engine(&cmd)
+                if (has_unflushed_data
+                    && should_write_to_engine(!apply_ctx.kv_wb().is_empty(), &cmd)
                     || apply_ctx.kv_wb().should_write_to_engine())
                     && apply_ctx.host.pre_persist(&self.region, false, Some(&cmd))
                 {
@@ -1260,9 +1271,9 @@ where
             apply_ctx.host.on_empty_cmd(&self.region, index, term);
 
             // 1. When a peer become leader, it will send an empty entry.
-            // 2. When a leader tries to read index during transferring leader,
-            //    it will also propose an empty entry. But that entry will not contain
-            //    any associated callback. So no need to clear callback.
+            // 2. When a leader tries to read index during transferring leader, it will also
+            //    propose an empty entry. But that entry will not contain any associated
+            //    callback. So no need to clear callback.
             while let Some(mut cmd) = self.pending_cmds.pop_normal(u64::MAX, term - 1) {
                 if let Some(cb) = cmd.cb.take() {
                     apply_ctx
@@ -1947,8 +1958,9 @@ where
                     e
                 )
             };
+            let wopts = WriteOptions::default();
             engine
-                .delete_ranges_cf(cf, DeleteStrategy::DeleteFiles, &range)
+                .delete_ranges_cf(&wopts, cf, DeleteStrategy::DeleteFiles, &range)
                 .unwrap_or_else(|e| fail_f(e, DeleteStrategy::DeleteFiles));
 
             let strategy = if use_delete_range {
@@ -1958,10 +1970,10 @@ where
             };
             // Delete all remaining keys.
             engine
-                .delete_ranges_cf(cf, strategy.clone(), &range)
+                .delete_ranges_cf(&wopts, cf, strategy.clone(), &range)
                 .unwrap_or_else(move |e| fail_f(e, strategy));
             engine
-                .delete_ranges_cf(cf, DeleteStrategy::DeleteBlobs, &range)
+                .delete_ranges_cf(&wopts, cf, DeleteStrategy::DeleteBlobs, &range)
                 .unwrap_or_else(move |e| fail_f(e, DeleteStrategy::DeleteBlobs));
         }
 
@@ -1996,6 +2008,7 @@ where
         match ctx.importer.validate(sst) {
             Ok(meta_info) => {
                 ctx.pending_ssts.push(meta_info.clone());
+                self.has_pending_ssts = true;
                 ssts.push(meta_info)
             }
             Err(e) => {
@@ -2004,7 +2017,6 @@ where
                 panic!("{} ingest {:?}: {:?}", self.tag, sst, e);
             }
         };
-
         Ok(())
     }
 }
@@ -2112,14 +2124,14 @@ where
 
         match change_type {
             ConfChangeType::AddNode => {
-                let add_ndoe_fp = || {
+                let add_node_fp = || {
                     fail_point!(
                         "apply_on_add_node_1_2",
                         self.id() == 2 && self.region_id() == 1,
                         |_| {}
                     )
                 };
-                add_ndoe_fp();
+                add_node_fp();
 
                 PEER_ADMIN_CMD_COUNTER_VEC
                     .with_label_values(&["add_peer", "all"])
@@ -2382,8 +2394,8 @@ where
                             "region_id" => self.region_id(),
                             "peer_id" => self.id(),
                             "peer" => ?peer,
-                            "exist peer" => ?exist_peer,
-                            "confchange type" => ?change_type,
+                            "exist_peer" => ?exist_peer,
+                            "confchange_type" => ?change_type,
                             "region" => ?&self.region
                         );
                         return Err(box_err!(
@@ -2465,8 +2477,8 @@ where
             "region_id" => self.region_id(),
             "peer_id" => self.id(),
             "changes" => ?changes,
-            "original region" => ?&self.region,
-            "current region" => ?&region,
+            "original_region" => ?&self.region,
+            "current_region" => ?&region,
         );
         Ok(region)
     }
@@ -3243,7 +3255,7 @@ where
                     // open files in rocksdb.
                     // TODO: figure out another way to do consistency check without snapshot
                     // or short life snapshot.
-                    snap: ctx.engine.snapshot(),
+                    snap: ctx.engine.snapshot(None),
                 })
             },
         ))
@@ -3334,8 +3346,8 @@ where
             "region_id" => self.region_id(),
             "peer_id" => self.id(),
             "switches" => ?switches,
-            "original region" => ?&self.region,
-            "current region" => ?&region,
+            "original_region" => ?&self.region,
+            "current_region" => ?&region,
         );
 
         let state = if self.pending_remove {
@@ -3362,10 +3374,10 @@ where
     }
 
     fn update_memory_trace(&mut self, event: &mut TraceEvent) {
-        let pending_cmds = self.pending_cmds.heap_size();
+        let pending_cmds = self.pending_cmds.approximate_heap_size();
         let merge_yield = if let Some(ref mut state) = self.yield_state {
             if state.heap_size.is_none() {
-                state.heap_size = Some(state.heap_size());
+                state.heap_size = Some(state.approximate_heap_size());
             }
             state.heap_size.unwrap()
         } else {
@@ -3871,7 +3883,7 @@ where
     pub applied_term: u64,
     pub exec_res: VecDeque<ExecResult<S>>,
     pub metrics: ApplyMetrics,
-    pub bucket_stat: Option<Box<BucketStat>>,
+    pub bucket_stat: Option<BucketStat>,
     pub write_seqno: Vec<SequenceNumber>,
 }
 
@@ -4197,7 +4209,7 @@ where
         }
 
         if let Err(e) = snap_task.generate_and_schedule_snapshot::<EK>(
-            apply_ctx.engine.snapshot(),
+            apply_ctx.engine.snapshot(None),
             self.delegate.applied_term,
             self.delegate.apply_state.clone(),
             &apply_ctx.region_scheduler,
@@ -4269,7 +4281,7 @@ where
                 ReadResponse {
                     response: Default::default(),
                     snapshot: Some(RegionSnapshot::from_snapshot(
-                        Arc::new(apply_ctx.engine.snapshot()),
+                        Arc::new(apply_ctx.engine.snapshot(None)),
                         Arc::new(self.delegate.region.clone()),
                     )),
                     txn_extra_op: TxnExtraOp::Noop,
@@ -4645,6 +4657,7 @@ where
         self.apply_ctx.flush();
         for fsm in fsms.iter_mut().flatten() {
             fsm.delegate.last_flush_applied_index = fsm.delegate.apply_state.get_applied_index();
+            fsm.delegate.has_pending_ssts = false;
             fsm.delegate.update_memory_trace(&mut self.trace_event);
         }
         MEMTRACE_APPLYS.trace(mem::take(&mut self.trace_event));
@@ -4659,7 +4672,7 @@ pub struct Builder<EK: KvEngine> {
     tag: String,
     cfg: Arc<VersionTrack<Config>>,
     coprocessor_host: CoprocessorHost<EK>,
-    importer: Arc<SstImporter>,
+    importer: Arc<SstImporter<EK>>,
     region_scheduler: Scheduler<RegionTask<<EK as KvEngine>::Snapshot>>,
     engine: EK,
     sender: Box<dyn Notifier<EK>>,
@@ -4785,12 +4798,12 @@ where
                     // command may not read the writes of previous commands and break ACID. If
                     // it's still leader, there are two possibility that mailbox is closed:
                     // 1. The process is shutting down.
-                    // 2. The leader is destroyed. A leader won't propose to destroy itself, so
-                    //     it should either destroyed by older leaders or newer leaders. Leader
-                    //     won't respond to read until it has applied to current term, so no
-                    //     command will be proposed until command from older leaders have applied,
-                    //     which will then stop it from accepting proposals. If the command is
-                    //     proposed by new leader, then it won't be able to propose new proposals.
+                    // 2. The leader is destroyed. A leader won't propose to destroy itself, so it
+                    //    should either destroyed by older leaders or newer leaders. Leader won't
+                    //    respond to read until it has applied to current term, so no command will
+                    //    be proposed until command from older leaders have applied, which will then
+                    //    stop it from accepting proposals. If the command is proposed by new
+                    //    leader, then it won't be able to propose new proposals.
                     // So only shutdown needs to be checked here.
                     if !tikv_util::thread_group::is_shutdown(!cfg!(test)) {
                         for p in apply.cbs.drain(..) {
@@ -4942,7 +4955,7 @@ mod memtrace {
     }
 
     impl<C> HeapSize for PendingCmdQueue<C> {
-        fn heap_size(&self) -> usize {
+        fn approximate_heap_size(&self) -> usize {
             // Some fields of `PendingCmd` are on stack, but ignore them because they are
             // just some small boxed closures.
             self.normals.capacity() * mem::size_of::<PendingCmd<C>>()
@@ -4953,7 +4966,7 @@ mod memtrace {
     where
         EK: KvEngine,
     {
-        fn heap_size(&self) -> usize {
+        fn approximate_heap_size(&self) -> usize {
             let mut size = self.pending_entries.capacity() * mem::size_of::<Entry>();
             for e in &self.pending_entries {
                 size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
@@ -4961,7 +4974,7 @@ mod memtrace {
 
             size += self.pending_msgs.capacity() * mem::size_of::<Msg<EK>>();
             for msg in &self.pending_msgs {
-                size += msg.heap_size();
+                size += msg.approximate_heap_size();
             }
 
             size
@@ -4973,9 +4986,9 @@ mod memtrace {
         EK: KvEngine,
     {
         /// Only consider large fields in `Msg`.
-        fn heap_size(&self) -> usize {
+        fn approximate_heap_size(&self) -> usize {
             match self {
-                Msg::LogsUpToDate(l) => l.heap_size(),
+                Msg::LogsUpToDate(l) => l.approximate_heap_size(),
                 // For entries in `Msg::Apply`, heap size is already updated when fetching them
                 // from `raft::Storage`. So use `0` here.
                 Msg::Apply { .. } => 0,
@@ -4993,7 +5006,7 @@ mod memtrace {
     }
 
     impl HeapSize for CatchUpLogs {
-        fn heap_size(&self) -> usize {
+        fn approximate_heap_size(&self) -> usize {
             let mut size: usize = 0;
             for e in &self.merge.entries {
                 size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
@@ -5060,10 +5073,17 @@ mod tests {
         (path, engine)
     }
 
-    pub fn create_tmp_importer(path: &str) -> (TempDir, Arc<SstImporter>) {
+    pub fn create_tmp_importer(path: &str) -> (TempDir, Arc<SstImporter<KvTestEngine>>) {
         let dir = Builder::new().prefix(path).tempdir().unwrap();
         let importer = Arc::new(
-            SstImporter::new(&ImportConfig::default(), dir.path(), None, ApiVersion::V1).unwrap(),
+            SstImporter::new(
+                &ImportConfig::default(),
+                dir.path(),
+                None,
+                ApiVersion::V1,
+                false,
+            )
+            .unwrap(),
         );
         (dir, importer)
     }
@@ -5185,7 +5205,7 @@ mod tests {
         req.set_ingest_sst(IngestSstRequest::default());
         let mut cmd = RaftCmdRequest::default();
         cmd.mut_requests().push(req);
-        assert_eq!(should_write_to_engine(&cmd), true);
+        assert_eq!(should_write_to_engine(true, &cmd), true);
         assert_eq!(should_sync_log(&cmd), true);
 
         // Normal command
@@ -5199,7 +5219,17 @@ mod tests {
         let mut req = RaftCmdRequest::default();
         req.mut_admin_request()
             .set_cmd_type(AdminCmdType::ComputeHash);
-        assert_eq!(should_write_to_engine(&req), true);
+        assert_eq!(should_write_to_engine(true, &req), true);
+        assert_eq!(should_write_to_engine(false, &req), true);
+
+        // DeleteRange command
+        let mut req = Request::default();
+        req.set_cmd_type(CmdType::DeleteRange);
+        req.set_delete_range(DeleteRangeRequest::default());
+        let mut cmd = RaftCmdRequest::default();
+        cmd.mut_requests().push(req);
+        assert_eq!(should_write_to_engine(true, &cmd), true);
+        assert_eq!(should_write_to_engine(false, &cmd), true);
 
         // IngestSst command
         let mut req = Request::default();
@@ -5207,7 +5237,8 @@ mod tests {
         req.set_ingest_sst(IngestSstRequest::default());
         let mut cmd = RaftCmdRequest::default();
         cmd.mut_requests().push(req);
-        assert_eq!(should_write_to_engine(&cmd), true);
+        assert_eq!(should_write_to_engine(true, &cmd), true);
+        assert_eq!(should_write_to_engine(false, &cmd), false);
     }
 
     #[test]
@@ -5375,6 +5406,9 @@ mod tests {
         reg.apply_state.set_applied_index(3);
         router.schedule_task(2, Msg::Registration(reg.dup()));
         validate(&router, 2, move |delegate| {
+            // Migrated to 2021 migration. This let statement is probably not needed, see
+            //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+            let _ = &reg;
             assert_eq!(delegate.id(), 1);
             assert_eq!(delegate.peer, peer);
             assert_eq!(delegate.tag, "[region 2] 1");
@@ -5756,7 +5790,6 @@ mod tests {
                 self.header.clone(),
                 bin,
                 1000,
-                false,
             );
             let (bytes, _) = req_encoder.encode();
             self.entry.set_data(bytes.into());
@@ -6204,7 +6237,7 @@ mod tests {
         // nomral put command, so the first apple_res.exec_res should be empty.
         let apply_res = fetch_apply_res(&rx);
         assert!(apply_res.exec_res.is_empty());
-        // The region was rescheduled low-priority becasuee of ingest command,
+        // The region was rescheduled low-priority because of ingest command,
         // only put entry has been applied;
         let apply_res = fetch_apply_res(&rx);
         assert_eq!(apply_res.applied_term, 3);
@@ -6843,9 +6876,12 @@ mod tests {
             assert!(!resp.get_header().has_error(), "{:?}", resp);
         }
         let mut res = fetch_apply_res(&rx);
-        // There may be one or two ApplyRes which depends on whether these two apply
-        // msgs are batched together.
-        if res.apply_state.get_applied_index() == 3 {
+        // There are five entries [put, ingest, put, ingest, put] in one region.
+        // so the apply results should be notified at index 2/4.
+        if res.apply_state.get_applied_index() == 2 {
+            res = fetch_apply_res(&rx);
+        }
+        if res.apply_state.get_applied_index() == 4 {
             res = fetch_apply_res(&rx);
         }
         assert_eq!(res.apply_state.get_applied_index(), 5);
@@ -6941,7 +6977,7 @@ mod tests {
         router.schedule_task(1, Msg::apply(apply2));
 
         let res = fetch_apply_res(&rx);
-        let bucket_version = res.bucket_stat.unwrap().as_ref().meta.version;
+        let bucket_version = res.bucket_stat.unwrap().meta.version;
 
         assert_eq!(bucket_version, 2);
 
@@ -7108,7 +7144,7 @@ mod tests {
             share_source_region_size: _,
         } = apply_res.exec_res.front().unwrap()
         {
-            let r8 = regions.get(0).unwrap();
+            let r8 = regions.first().unwrap();
             let r1 = regions.get(1).unwrap();
             assert_eq!(r8.get_id(), 8);
             assert_eq!(r1.get_id(), 1);

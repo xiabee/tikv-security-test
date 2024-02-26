@@ -214,7 +214,10 @@ make_static_metric! {
 
     pub label_enum RaftEventDurationType {
         compact_check,
+        periodic_full_compact,
+        load_metrics_window,
         pd_store_heartbeat,
+        pd_report_min_resolved_ts,
         snap_gc,
         compact_lock_cf,
         consistency_check,
@@ -255,6 +258,31 @@ make_static_metric! {
         empty_hottest_key_range,
         // The top hot CPU region could not be split.
         unable_to_split_cpu_top,
+    }
+
+    pub label_enum SnapshotBrWaitApplyEventType {
+        sent,
+        trivial,
+        accepted,
+        term_not_match,
+        epoch_not_match,
+        duplicated,
+        finished,
+    }
+
+    pub struct SnapshotBrWaitApplyEvent : IntCounter {
+        "event" => SnapshotBrWaitApplyEventType
+    }
+
+    pub label_enum SnapshotBrLeaseEventType {
+        create,
+        renew,
+        expired,
+        reset,
+    }
+
+    pub struct SnapshotBrLeaseEvent : IntCounter {
+        "event" => SnapshotBrLeaseEventType
     }
 
     pub struct HibernatedPeerStateGauge: IntGauge {
@@ -420,13 +448,13 @@ lazy_static! {
         register_histogram!(
             "tikv_raftstore_store_wf_commit_log_duration_seconds",
             "Bucketed histogram of proposals' commit and persist duration.",
-            exponential_buckets(0.00001, 2.0, 26).unwrap()
+            exponential_buckets(0.00001, 2.0, 32).unwrap() // 10us ~ 42949s.
         ).unwrap();
     pub static ref STORE_WF_COMMIT_NOT_PERSIST_LOG_DURATION_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_store_wf_commit_not_persist_log_duration_seconds",
             "Bucketed histogram of proposals' commit but not persist duration",
-            exponential_buckets(0.00001, 2.0, 26).unwrap()
+            exponential_buckets(0.00001, 2.0, 32).unwrap() // 10us ~ 42949s.
         ).unwrap();
 
     pub static ref PEER_PROPOSAL_COUNTER_VEC: IntCounterVec =
@@ -458,7 +486,7 @@ lazy_static! {
         register_histogram!(
             "tikv_raftstore_commit_log_duration_seconds",
             "Bucketed histogram of peer commits logs duration.",
-            exponential_buckets(0.00001, 2.0, 26).unwrap()
+            exponential_buckets(0.00001, 2.0, 32).unwrap() // 10us ~ 42949s.
         ).unwrap();
 
     pub static ref STORE_APPLY_LOG_HISTOGRAM: Histogram =
@@ -548,6 +576,13 @@ lazy_static! {
         register_histogram!(
             "tikv_raftstore_request_wait_time_duration_secs",
             "Bucketed histogram of request wait time duration.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+
+    pub static ref RAFT_MESSAGE_WAIT_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_raft_msg_wait_time_duration_secs",
+            "Bucketed histogram of raft message wait time duration.",
             exponential_buckets(0.00001, 2.0, 26).unwrap()
         ).unwrap();
 
@@ -775,7 +810,7 @@ lazy_static! {
         "Total number of pending write tasks from io rescheduling peers"
     ).unwrap();
 
-    pub static ref STORE_INSPECT_DURTION_HISTOGRAM: HistogramVec =
+    pub static ref STORE_INSPECT_DURATION_HISTOGRAM: HistogramVec =
         register_histogram_vec!(
             "tikv_raftstore_inspect_duration_seconds",
             "Bucketed histogram of inspect duration.",
@@ -787,7 +822,7 @@ lazy_static! {
     register_gauge!("tikv_raftstore_slow_score", "Slow score of the store.").unwrap();
 
     pub static ref STORE_SLOW_TREND_GAUGE: Gauge =
-    register_gauge!("tikv_raftstore_slow_trend", "Slow trend changing rate").unwrap();
+    register_gauge!("tikv_raftstore_slow_trend", "Slow trend changing rate.").unwrap();
 
     pub static ref STORE_SLOW_TREND_L0_GAUGE: Gauge =
     register_gauge!("tikv_raftstore_slow_trend_l0", "Slow trend L0 window avg value.").unwrap();
@@ -817,7 +852,7 @@ lazy_static! {
     register_int_gauge_vec!(
         "tikv_raftstore_slow_trend_misc",
         "Slow trend uncatelogued gauge(s)",
-        &["type"]
+        &["window"]
     ).unwrap();
 
     pub static ref STORE_SLOW_TREND_RESULT_VALUE_GAUGE: Gauge =
@@ -885,5 +920,30 @@ lazy_static! {
     pub static ref PEER_IN_FLASHBACK_STATE: IntGauge = register_int_gauge!(
         "tikv_raftstore_peer_in_flashback_state",
         "Total number of peers in the flashback state"
+    ).unwrap();
+
+    pub static ref SNAP_BR_SUSPEND_COMMAND_TYPE: IntCounterVec = register_int_counter_vec!(
+        "tikv_raftstore_snap_br_suspend_command_type",
+        "The statistic of rejecting some admin commands being proposed.",
+        &["type"]
+    ).unwrap();
+
+    pub static ref SNAP_BR_WAIT_APPLY_EVENT: SnapshotBrWaitApplyEvent = register_static_int_counter_vec!(
+        SnapshotBrWaitApplyEvent,
+        "tikv_raftstore_snap_br_wait_apply_event",
+        "The events of wait apply issued by snapshot br.",
+        &["event"]
+    ).unwrap();
+
+    pub static ref SNAP_BR_SUSPEND_COMMAND_LEASE_UNTIL: IntGauge = register_int_gauge!(
+        "tikv_raftstore_snap_br_suspend_command_lease_until",
+        "The lease that snapshot br holds of rejecting some type of commands. (In unix timestamp.)"
+    ).unwrap();
+
+    pub static ref SNAP_BR_LEASE_EVENT: SnapshotBrLeaseEvent = register_static_int_counter_vec!(
+        SnapshotBrLeaseEvent,
+        "tikv_raftstore_snap_br_lease_event",
+        "The events of the lease to denying new admin commands being proposed by snapshot br.",
+        &["event"]
     ).unwrap();
 }

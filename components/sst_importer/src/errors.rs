@@ -118,6 +118,12 @@ pub enum Error {
     #[error("Importing a SST file with imcompatible api version")]
     IncompatibleApiVersion,
 
+    #[error("{0}, please retry write later")]
+    RequestTooNew(String),
+
+    #[error("{0}, please rescan region later")]
+    RequestTooOld(String),
+
     #[error("Key mode mismatched with the request mode, writer: {:?}, storage: {:?}, key: {}", .writer, .storage_api_version, .key)]
     InvalidKeyMode {
         writer: SstWriterType,
@@ -130,6 +136,9 @@ pub enum Error {
 
     #[error("imports are suspended for {time_to_lease_expire:?}")]
     Suspended { time_to_lease_expire: Duration },
+
+    #[error("TiKV disk space is not enough.")]
+    DiskSpaceNotEnough,
 }
 
 impl Error {
@@ -172,6 +181,7 @@ impl From<Error> for import_sstpb::Error {
                 let mut server_is_busy = errorpb::ServerIsBusy::default();
                 server_is_busy.set_backoff_ms(time_to_lease_expire.as_millis() as _);
                 store_err.set_server_is_busy(server_is_busy);
+                store_err.set_message(format!("{}", e));
                 err.set_store_error(store_err);
                 err.set_message(format!("{}", e));
             }
@@ -213,6 +223,9 @@ impl ErrorCodeExt for Error {
             Error::InvalidKeyMode { .. } => error_code::sst_importer::INVALID_KEY_MODE,
             Error::ResourceNotEnough(_) => error_code::sst_importer::RESOURCE_NOT_ENOUTH,
             Error::Suspended { .. } => error_code::sst_importer::SUSPENDED,
+            Error::RequestTooNew(_) => error_code::sst_importer::REQUEST_TOO_NEW,
+            Error::RequestTooOld(_) => error_code::sst_importer::REQUEST_TOO_OLD,
+            Error::DiskSpaceNotEnough => error_code::sst_importer::DISK_SPACE_NOT_ENOUGH,
         }
     }
 }

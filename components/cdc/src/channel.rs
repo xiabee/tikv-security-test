@@ -14,6 +14,7 @@ use grpcio::WriteFlags;
 use kvproto::cdcpb::{ChangeDataEvent, Event, ResolvedTs};
 use protobuf::Message;
 use tikv_util::{
+    future::block_on_timeout,
     impl_display_as_debug,
     memory::{MemoryQuota, MemoryQuotaExceeded},
     time::Instant,
@@ -234,7 +235,7 @@ macro_rules! impl_from_future_send_error {
 
 impl_from_future_send_error! {
     FuturesSendError,
-    TrySendError<(CdcEvent, usize)>,
+    TrySendError<(Instant, CdcEvent, usize)>,
 }
 
 impl From<MemoryQuotaExceeded> for SendError {
@@ -245,8 +246,8 @@ impl From<MemoryQuotaExceeded> for SendError {
 
 #[derive(Clone)]
 pub struct Sink {
-    unbounded_sender: UnboundedSender<(CdcEvent, usize)>,
-    bounded_sender: Sender<(CdcEvent, usize)>,
+    unbounded_sender: UnboundedSender<(Instant, CdcEvent, usize)>,
+    bounded_sender: Sender<(Instant, CdcEvent, usize)>,
     memory_quota: Arc<MemoryQuota>,
 }
 
@@ -257,7 +258,8 @@ impl Sink {
         if bytes != 0 {
             self.memory_quota.alloc(bytes)?;
         }
-        match self.unbounded_sender.unbounded_send((event, bytes)) {
+        let now = Instant::now_coarse();
+        match self.unbounded_sender.unbounded_send((now, event, bytes)) {
             Ok(_) => Ok(()),
             Err(e) => {
                 // Free quota if send fails.
@@ -275,9 +277,11 @@ impl Sink {
             total_bytes += bytes;
         }
         self.memory_quota.alloc(total_bytes as _)?;
+
+        let now = Instant::now_coarse();
         for event in events {
             let bytes = event.size() as usize;
-            if let Err(e) = self.bounded_sender.feed((event, bytes)).await {
+            if let Err(e) = self.bounded_sender.feed((now, event, bytes)).await {
                 // Free quota if send fails.
                 self.memory_quota.free(total_bytes as _);
                 return Err(SendError::from(e));
@@ -293,15 +297,16 @@ impl Sink {
 }
 
 pub struct Drain {
-    unbounded_receiver: UnboundedReceiver<(CdcEvent, usize)>,
-    bounded_receiver: Receiver<(CdcEvent, usize)>,
+    unbounded_receiver: UnboundedReceiver<(Instant, CdcEvent, usize)>,
+    bounded_receiver: Receiver<(Instant, CdcEvent, usize)>,
     memory_quota: Arc<MemoryQuota>,
 }
 
 impl<'a> Drain {
     pub fn drain(&'a mut self) -> impl Stream<Item = (CdcEvent, usize)> + 'a {
         stream::select(&mut self.bounded_receiver, &mut self.unbounded_receiver).map(
-            |(mut event, size)| {
+            |(start, mut event, size)| {
+                CDC_EVENTS_PENDING_DURATION.observe(start.saturating_elapsed_secs() * 1000.0);
                 if let CdcEvent::Barrier(ref mut barrier) = event {
                     if let Some(barrier) = barrier.take() {
                         // Unset barrier when it is received.
@@ -376,22 +381,7 @@ pub fn recv_timeout<S, I>(s: &mut S, dur: std::time::Duration) -> Result<Option<
 where
     S: Stream<Item = I> + Unpin,
 {
-    poll_timeout(&mut s.next(), dur)
-}
-
-pub fn poll_timeout<F, I>(fut: &mut F, dur: std::time::Duration) -> Result<I, ()>
-where
-    F: std::future::Future<Output = I> + Unpin,
-{
-    use futures::FutureExt;
-    let mut timeout = futures_timer::Delay::new(dur).fuse();
-    let mut f = fut.fuse();
-    futures::executor::block_on(async {
-        futures::select! {
-            () = timeout => Err(()),
-            item = f => Ok(item),
-        }
-    })
+    block_on_timeout(s.next(), dur)
 }
 
 #[cfg(test)]

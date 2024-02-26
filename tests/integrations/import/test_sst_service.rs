@@ -8,6 +8,10 @@ use pd_client::PdClient;
 use tempfile::Builder;
 use test_sst_importer::*;
 use tikv::config::TikvConfig;
+use tikv_util::{
+    config::ReadableSize,
+    sys::disk::{set_disk_status, DiskUsage},
+};
 
 use super::util::*;
 
@@ -35,6 +39,14 @@ fn test_upload_sst() {
     let meta = new_sst_meta(0, length);
     assert_to_string_contains!(send_upload_sst(&import, &meta, &data).unwrap_err(), "crc32");
 
+    // diskfull
+    set_disk_status(DiskUsage::AlmostFull);
+    assert_to_string_contains!(
+        send_upload_sst(&import, &meta, &data).unwrap_err(),
+        "DiskSpaceNotEnough"
+    );
+    set_disk_status(DiskUsage::Normal);
+
     let mut meta = new_sst_meta(crc32, length);
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
@@ -47,7 +59,12 @@ fn test_upload_sst() {
     );
 }
 
-fn run_test_write_sst(ctx: Context, tikv: TikvClient, import: ImportSstClient) {
+fn run_test_write_sst(
+    ctx: Context,
+    tikv: TikvClient,
+    import: ImportSstClient,
+    expected_error: &str,
+) {
     let mut meta = new_sst_meta(0, 0);
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
@@ -59,8 +76,13 @@ fn run_test_write_sst(ctx: Context, tikv: TikvClient, import: ImportSstClient) {
         keys.push(vec![i]);
         values.push(vec![i]);
     }
-    let resp = send_write_sst(&import, &meta, keys, values, 1).unwrap();
+    let resp = send_write_sst(&import, &meta, keys, values, 1);
+    if !expected_error.is_empty() {
+        assert_to_string_contains!(resp.unwrap_err(), expected_error);
+        return;
+    }
 
+    let resp = resp.unwrap();
     for m in resp.metas.into_iter() {
         let mut ingest = IngestRequest::default();
         ingest.set_context(ctx.clone());
@@ -75,25 +97,41 @@ fn run_test_write_sst(ctx: Context, tikv: TikvClient, import: ImportSstClient) {
 fn test_write_sst() {
     let (_cluster, ctx, tikv, import) = new_cluster_and_tikv_import_client();
 
-    run_test_write_sst(ctx, tikv, import);
+    run_test_write_sst(ctx, tikv, import, "");
+}
+
+#[test]
+fn test_write_sst_when_disk_full() {
+    set_disk_status(DiskUsage::AlmostFull);
+    let (_cluster, ctx, tikv, import) = new_cluster_and_tikv_import_client();
+    run_test_write_sst(ctx, tikv, import, "DiskSpaceNotEnough");
+    set_disk_status(DiskUsage::Normal);
 }
 
 #[test]
 fn test_write_and_ingest_with_tde() {
     let (_tmp_dir, _cluster, ctx, tikv, import) = new_cluster_and_tikv_import_client_tde();
-    run_test_write_sst(ctx, tikv, import);
+    run_test_write_sst(ctx, tikv, import, "");
 }
 
 #[test]
 fn test_ingest_sst() {
     let mut cfg = TikvConfig::default();
+    let cleanup_interval = Duration::from_millis(10);
+    cfg.raft_store.split_region_check_tick_interval.0 = cleanup_interval;
+    cfg.raft_store.pd_heartbeat_tick_interval.0 = cleanup_interval;
+    cfg.raft_store.report_region_buckets_tick_interval.0 = cleanup_interval;
+    cfg.coprocessor.enable_region_bucket = Some(true);
+    cfg.coprocessor.region_bucket_size = ReadableSize(200);
+    cfg.raft_store.region_split_check_diff = Some(ReadableSize(200));
+    cfg.server.addr = "127.0.0.1:0".to_owned();
     cfg.server.grpc_concurrency = 1;
-    let (_cluster, ctx, _tikv, import) = open_cluster_and_tikv_import_client(Some(cfg));
+    let (cluster, ctx, _tikv, import) = open_cluster_and_tikv_import_client(Some(cfg));
 
     let temp_dir = Builder::new().prefix("test_ingest_sst").tempdir().unwrap();
 
     let sst_path = temp_dir.path().join("test.sst");
-    let sst_range = (0, 100);
+    let sst_range = (0, 255);
     let (mut meta, data) = gen_sst_file(sst_path, sst_range);
 
     // No region id and epoch.
@@ -118,6 +156,107 @@ fn test_ingest_sst() {
     ingest.set_sst(meta);
     let resp = import.ingest(&ingest).unwrap();
     assert!(!resp.has_error(), "{:?}", resp.get_error());
+
+    for _ in 0..10 {
+        let region_keys = cluster
+            .pd_client
+            .get_region_approximate_keys(ctx.get_region_id())
+            .unwrap_or_default();
+        if region_keys != 255 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+
+        let buckets = cluster
+            .pd_client
+            .get_buckets(ctx.get_region_id())
+            .unwrap_or_default();
+        if buckets.meta.keys.len() <= 2 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        return;
+    }
+    panic!("region keys is not 255 or buckets keys len less than 2")
+}
+
+fn switch_mode(import: &ImportSstClient, range: Range, mode: SwitchMode) {
+    let mut switch_req = SwitchModeRequest::default();
+    switch_req.set_mode(mode);
+    switch_req.set_ranges(vec![range].into());
+    let _ = import.switch_mode(&switch_req).unwrap();
+}
+
+#[test]
+fn test_switch_mode_v2() {
+    let mut cfg = TikvConfig::default();
+    cfg.server.grpc_concurrency = 1;
+    cfg.rocksdb.writecf.disable_auto_compactions = true;
+    cfg.raft_store.right_derive_when_split = true;
+    // cfg.rocksdb.writecf.level0_slowdown_writes_trigger = Some(2);
+    let (mut cluster, mut ctx, _tikv, import) = open_cluster_and_tikv_import_client_v2(Some(cfg));
+
+    let region = cluster.get_region(b"");
+    cluster.must_split(&region, &[50]);
+    let region = cluster.get_region(&[50]);
+    ctx.set_region_epoch(region.get_region_epoch().clone());
+
+    let mut key_range = Range::default();
+    key_range.set_start([50].to_vec());
+    switch_mode(&import, key_range.clone(), SwitchMode::Import);
+
+    let temp_dir = Builder::new().prefix("test_ingest_sst").tempdir().unwrap();
+
+    let upload_and_ingest =
+        |sst_range, import: &ImportSstClient, path_name, ctx: &Context| -> IngestResponse {
+            let sst_path = temp_dir.path().join(path_name);
+            let (mut meta, data) = gen_sst_file(sst_path, sst_range);
+            meta.set_cf_name("write".to_string());
+            // Set region id and epoch.
+            meta.set_region_id(ctx.get_region_id());
+            meta.set_region_epoch(ctx.get_region_epoch().clone());
+            send_upload_sst(import, &meta, &data).unwrap();
+            let mut ingest = IngestRequest::default();
+            ingest.set_context(ctx.clone());
+            ingest.set_sst(meta);
+            import.ingest(&ingest).unwrap()
+        };
+
+    // The first one will be ingested at the bottom level. And as the following ssts
+    // are overlapped with the previous one, they will all be ingested at level 0.
+    for i in 0..10 {
+        let resp = upload_and_ingest((50, 100), &import, format!("test{}.sst", i), &ctx);
+        assert!(!resp.has_error());
+    }
+
+    // For this region, it is not in the key range, so it is normal mode.
+    let region = cluster.get_region(&[20]);
+    let mut ctx2 = ctx.clone();
+    ctx2.set_region_id(region.get_id());
+    ctx2.set_region_epoch(region.get_region_epoch().clone());
+    ctx2.set_peer(region.get_peers()[0].clone());
+    for i in 0..6 {
+        let resp = upload_and_ingest((0, 49), &import, format!("test-{}.sst", i), &ctx2);
+        if i < 5 {
+            assert!(!resp.has_error());
+        } else {
+            assert!(resp.get_error().has_server_is_busy());
+        }
+    }
+    // Propose another switch mode request to let this region to ingest.
+    let mut key_range2 = Range::default();
+    key_range2.set_end([50].to_vec());
+    switch_mode(&import, key_range2.clone(), SwitchMode::Import);
+    let resp = upload_and_ingest((0, 49), &import, "test-6.sst".to_string(), &ctx2);
+    assert!(!resp.has_error());
+    // switching back to normal should make further ingest be rejected
+    switch_mode(&import, key_range2, SwitchMode::Normal);
+    let resp = upload_and_ingest((0, 49), &import, "test-7.sst".to_string(), &ctx2);
+    assert!(resp.get_error().has_server_is_busy());
+
+    // switch back to normal, so region 1 also starts to reject
+    switch_mode(&import, key_range, SwitchMode::Normal);
+    let resp = upload_and_ingest((50, 100), &import, "test10".to_string(), &ctx);
+    assert!(resp.get_error().has_server_is_busy());
 }
 
 #[test]
@@ -188,7 +327,7 @@ fn test_download_sst() {
     // Checks that downloading a non-existing storage returns error.
     let mut download = DownloadRequest::default();
     download.set_sst(meta.clone());
-    download.set_storage_backend(external_storage_export::make_local_backend(temp_dir.path()));
+    download.set_storage_backend(external_storage::make_local_backend(temp_dir.path()));
     download.set_name("missing.sst".to_owned());
 
     let result = import.download(&download).unwrap();
@@ -269,6 +408,62 @@ fn test_cleanup_sst() {
     let res = block_on(cluster.pd_client.get_region_by_id(left.get_id()));
     assert_eq!(res.unwrap(), None);
 
+    check_sst_deleted(&import, &meta, &data);
+}
+
+#[test]
+fn test_cleanup_sst_v2() {
+    let (mut cluster, ctx, _, import) = open_cluster_and_tikv_import_client_v2(None);
+
+    let temp_dir = Builder::new().prefix("test_cleanup_sst").tempdir().unwrap();
+
+    let sst_path = temp_dir.path().join("test_split.sst");
+    let sst_range = (0, 100);
+    let (mut meta, data) = gen_sst_file(sst_path, sst_range);
+    meta.set_region_id(ctx.get_region_id());
+    meta.set_region_epoch(ctx.get_region_epoch().clone());
+
+    send_upload_sst(&import, &meta, &data).unwrap();
+
+    // Can not upload the same file when it exists.
+    assert_to_string_contains!(
+        send_upload_sst(&import, &meta, &data).unwrap_err(),
+        "FileExists"
+    );
+
+    // The uploaded SST should be deleted if the region split.
+    let region = cluster.get_region(&[]);
+    cluster.must_split(&region, &[100]);
+
+    check_sst_deleted(&import, &meta, &data);
+
+    // upload an SST of an unexisted region
+    let sst_path = temp_dir.path().join("test_non_exist.sst");
+    let sst_range = (0, 100);
+    let (mut meta, data) = gen_sst_file(sst_path, sst_range);
+    meta.set_region_id(9999);
+    send_upload_sst(&import, &meta, &data).unwrap();
+    // This should be cleanuped
+    check_sst_deleted(&import, &meta, &data);
+
+    let mut key_range = Range::default();
+    key_range.set_start([50].to_vec());
+    key_range.set_start([70].to_vec());
+    // switch to import so that the overlapped sst will not be cleanuped
+    switch_mode(&import, key_range.clone(), SwitchMode::Import);
+    let sst_path = temp_dir.path().join("test_non_exist1.sst");
+    let sst_range = (60, 80);
+    let (mut meta, data) = gen_sst_file(sst_path, sst_range);
+    meta.set_region_id(9999);
+    send_upload_sst(&import, &meta, &data).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_to_string_contains!(
+        send_upload_sst(&import, &meta, &data).unwrap_err(),
+        "FileExists"
+    );
+
+    // switch back to normal mode
+    switch_mode(&import, key_range, SwitchMode::Normal);
     check_sst_deleted(&import, &meta, &data);
 }
 
@@ -443,10 +638,18 @@ fn test_suspend_import() {
     );
     let write_res = write(sst_range);
     write_res.unwrap();
-    let ingest_res = ingest(&sst);
-    assert_to_string_contains!(ingest_res.unwrap_err(), "Suspended");
-    let multi_ingest_res = multi_ingest(&[sst.clone()]);
-    assert_to_string_contains!(multi_ingest_res.unwrap_err(), "Suspended");
+    let ingest_res = ingest(&sst).unwrap();
+    assert!(
+        ingest_res.get_error().has_server_is_busy(),
+        "{:?}",
+        ingest_res
+    );
+    let multi_ingest_res = multi_ingest(&[sst.clone()]).unwrap();
+    assert!(
+        multi_ingest_res.get_error().has_server_is_busy(),
+        "{:?}",
+        multi_ingest_res
+    );
 
     assert!(
         import
@@ -471,7 +674,11 @@ fn test_suspend_import() {
     let write_res = write(sst_range);
     let sst = write_res.unwrap().metas;
     let res = multi_ingest(&sst);
-    assert_to_string_contains!(res.unwrap_err(), "Suspended");
+    assert!(
+        res.as_ref().unwrap().get_error().has_server_is_busy(),
+        "{:?}",
+        res
+    );
     std::thread::sleep(Duration::from_secs(1));
     multi_ingest(&sst).unwrap();
 
