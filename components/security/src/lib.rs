@@ -97,6 +97,7 @@ impl SecurityConfig {
         {
             return Err("ca, cert and private key should be all configured.".into());
         }
+
         Ok(())
     }
 

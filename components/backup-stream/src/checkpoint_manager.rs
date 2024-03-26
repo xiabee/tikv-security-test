@@ -15,7 +15,6 @@ use kvproto::{
 };
 use pd_client::PdClient;
 use tikv_util::{box_err, defer, info, time::Instant, warn, worker::Scheduler};
-use tracing::instrument;
 use txn_types::TimeStamp;
 use uuid::Uuid;
 
@@ -84,7 +83,6 @@ impl SubscriptionManager {
         // NOTE: Maybe close all subscription streams here.
     }
 
-    #[instrument(skip_all, fields(length = events.len()))]
     async fn emit_events(&mut self, events: Box<[FlushEvent]>) {
         let mut canceled = vec![];
         info!("log backup sending events"; "event_len" => %events.len(), "downstream" => %self.subscribers.len());
@@ -109,7 +107,6 @@ impl SubscriptionManager {
         }
     }
 
-    #[instrument(skip(self))]
     async fn remove_subscription(&mut self, id: &Uuid) {
         match self.subscribers.remove(id) {
             Some(sub) => {
@@ -210,7 +207,7 @@ impl CheckpointManager {
 
     /// update a region checkpoint in need.
     #[cfg(test)]
-    fn update_region_checkpoint(&mut self, region: &Region, checkpoint: TimeStamp) {
+    pub fn update_region_checkpoint(&mut self, region: &Region, checkpoint: TimeStamp) {
         Self::update_ts(&mut self.checkpoint_ts, region.clone(), checkpoint)
     }
 
@@ -613,7 +610,6 @@ pub mod tests {
             Self(Arc::new(Mutex::new(inner)))
         }
 
-        #[allow(clippy::unused_async)]
         pub async fn fail(&self, status: RpcStatus) -> crate::errors::Result<()> {
             panic!("failed in a case should never fail: {}", status);
         }

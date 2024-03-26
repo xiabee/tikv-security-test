@@ -25,10 +25,7 @@ command! {
     /// [`Prewrite`](Command::Prewrite).
     TxnHeartBeat:
         cmd_ty => TxnStatus,
-        display => {
-            "kv::command::txn_heart_beat {} @ {} ttl {} | {:?}",
-            (primary_key, start_ts, advise_ttl, ctx),
-        }
+        display => "kv::command::txn_heart_beat {} @ {} ttl {} | {:?}", (primary_key, start_ts, advise_ttl, ctx),
         content => {
             /// The primary key of the transaction.
             primary_key: Key,
@@ -37,9 +34,6 @@ command! {
             /// The new TTL that will be used to update the lock's TTL. If the lock's TTL is already
             /// greater than `advise_ttl`, nothing will happen.
             advise_ttl: u64,
-        }
-        in_heap => {
-            primary_key,
         }
 }
 
@@ -73,7 +67,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
             Some(mut lock) if lock.ts == self.start_ts => {
                 if lock.ttl < self.advise_ttl {
                     lock.ttl = self.advise_ttl;
-                    txn.put_lock(self.primary_key.clone(), &lock, false);
+                    txn.put_lock(self.primary_key.clone(), &lock);
                 }
                 lock
             }
@@ -89,7 +83,6 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
         let pr = ProcessResult::TxnStatus {
             txn_status: TxnStatus::uncommitted(lock, false),
         };
-        let new_acquired_locks = txn.take_new_locks();
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
         write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
@@ -99,10 +92,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
             pr,
             lock_info: vec![],
             released_locks: ReleasedLocks::new(),
-            new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
-            known_txn_status: vec![],
         })
     }
 }
@@ -118,10 +109,7 @@ pub mod tests {
         kv::TestEngineBuilder,
         lock_manager::MockLockManager,
         mvcc::tests::*,
-        txn::{
-            commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*,
-            txn_status_cache::TxnStatusCache,
-        },
+        txn::{commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*},
         Engine,
     };
 
@@ -153,7 +141,6 @@ pub mod tests {
                     statistics: &mut Default::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
-                    txn_status_cache: &TxnStatusCache::new_for_test(),
                 },
             )
             .unwrap();
@@ -196,7 +183,6 @@ pub mod tests {
                         statistics: &mut Default::default(),
                         async_apply_prewrite: false,
                         raw_ext: None,
-                        txn_status_cache: &TxnStatusCache::new_for_test(),
                     },
                 )
                 .is_err()

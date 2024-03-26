@@ -178,17 +178,7 @@ mod tests {
 
     fn new_lock(ts: impl Into<TimeStamp>, primary: &[u8], lock_type: LockType) -> Lock {
         let ts = ts.into();
-        Lock::new(
-            lock_type,
-            primary.to_vec(),
-            ts,
-            0,
-            None,
-            0.into(),
-            1,
-            ts,
-            false,
-        )
+        Lock::new(lock_type, primary.to_vec(), ts, 0, None, 0.into(), 1, ts)
     }
 
     #[tokio::test]

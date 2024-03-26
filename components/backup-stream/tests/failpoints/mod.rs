@@ -25,13 +25,12 @@ mod all {
         GetCheckpointResult, RegionCheckpointOperation, RegionSet, Task,
     };
     use futures::executor::block_on;
-    use raftstore::coprocessor::ObserveHandle;
     use tikv_util::{config::ReadableSize, defer};
 
-    use super::{
-        make_record_key, make_split_key_at_record, mutation, run_async_test, SuiteBuilder,
+    use crate::{
+        make_record_key, make_split_key_at_record, make_table_key, mutation, run_async_test,
+        SuiteBuilder,
     };
-    use crate::make_table_key;
 
     #[test]
     fn failed_register_task() {
@@ -60,7 +59,7 @@ mod all {
 
     #[test]
     fn basic() {
-        let mut suite = SuiteBuilder::new_named("basic").build();
+        let mut suite = super::SuiteBuilder::new_named("basic").build();
         fail::cfg("try_start_observe", "1*return").unwrap();
 
         let (round1, round2) = run_async_test(async {
@@ -82,7 +81,7 @@ mod all {
     }
     #[test]
     fn frequent_initial_scan() {
-        let mut suite = SuiteBuilder::new_named("frequent_initial_scan")
+        let mut suite = super::SuiteBuilder::new_named("frequent_initial_scan")
             .cfg(|c| c.num_threads = 1)
             .build();
         let keys = (1..1024).map(|i| make_record_key(1, i)).collect::<Vec<_>>();
@@ -108,11 +107,9 @@ mod all {
         suite.run(|| {
             Task::ModifyObserve(backup_stream::ObserveOp::Start {
                 region: suite.cluster.get_region(&make_record_key(1, 886)),
-                handle: ObserveHandle::new(),
             })
         });
         fail::cfg("scan_after_get_snapshot", "off").unwrap();
-        std::thread::sleep(Duration::from_secs(1));
         suite.force_flush_files("frequent_initial_scan");
         suite.wait_for_flush();
         std::thread::sleep(Duration::from_secs(1));
@@ -180,8 +177,6 @@ mod all {
 
         suite.must_split(b"SOLE");
         let keys2 = run_async_test(suite.write_records(256, 128, 1));
-        // Let's make sure the retry has been triggered...
-        std::thread::sleep(Duration::from_secs(2));
         suite.force_flush_files("fail_to_refresh_region");
         suite.wait_for_flush();
         suite.check_for_write_records(
@@ -210,8 +205,39 @@ mod all {
         );
     }
     #[test]
+    fn failure_and_split() {
+        let mut suite = super::SuiteBuilder::new_named("failure_and_split")
+            .nodes(1)
+            .build();
+        fail::cfg("try_start_observe0", "pause").unwrap();
+
+        // write data before the task starting, for testing incremental scanning.
+        let round1 = run_async_test(suite.write_records(0, 128, 1));
+        suite.must_register_task(1, "failure_and_split");
+        suite.sync();
+
+        suite.must_split(&make_split_key_at_record(1, 42));
+        suite.sync();
+        std::thread::sleep(Duration::from_millis(200));
+        fail::cfg("try_start_observe", "2*return").unwrap();
+        fail::cfg("try_start_observe0", "off").unwrap();
+
+        let round2 = run_async_test(suite.write_records(256, 128, 1));
+        suite.force_flush_files("failure_and_split");
+        suite.wait_for_flush();
+        suite.check_for_write_records(
+            suite.flushed_files.path(),
+            round1.union(&round2).map(Vec::as_slice),
+        );
+        let cp = suite.global_checkpoint();
+        assert!(cp > 512, "it is {}", cp);
+        suite.cluster.shutdown();
+    }
+    #[test]
     fn test_retry_abort() {
-        let mut suite = SuiteBuilder::new_named("retry_abort").nodes(1).build();
+        let mut suite = super::SuiteBuilder::new_named("retry_abort")
+            .nodes(1)
+            .build();
         defer! {
             fail::list().into_iter().for_each(|(name, _)| fail::remove(name))
         };
@@ -252,37 +278,6 @@ mod all {
         suite.wait_for_flush();
         suite.check_for_write_records(suite.flushed_files.path(), items.iter().map(Vec::as_slice));
     }
-    #[test]
-    fn failure_and_split() {
-        let mut suite = SuiteBuilder::new_named("failure_and_split")
-            .nodes(1)
-            .build();
-        fail::cfg("try_start_observe0", "pause").unwrap();
-
-        // write data before the task starting, for testing incremental scanning.
-        let round1 = run_async_test(suite.write_records(0, 128, 1));
-        suite.must_register_task(1, "failure_and_split");
-        suite.sync();
-
-        suite.must_split(&make_split_key_at_record(1, 42));
-        suite.sync();
-        std::thread::sleep(Duration::from_millis(200));
-        fail::cfg("try_start_observe", "2*return").unwrap();
-        fail::cfg("try_start_observe0", "off").unwrap();
-
-        // Let's wait enough time for observing the split operation.
-        std::thread::sleep(Duration::from_secs(2));
-        let round2 = run_async_test(suite.write_records(256, 128, 1));
-        suite.force_flush_files("failure_and_split");
-        suite.wait_for_flush();
-        suite.check_for_write_records(
-            suite.flushed_files.path(),
-            round1.union(&round2).map(Vec::as_slice),
-        );
-        let cp = suite.global_checkpoint();
-        assert!(cp > 512, "it is {}", cp);
-        suite.cluster.shutdown();
-    }
 
     #[test]
     fn memory_quota() {
@@ -291,6 +286,7 @@ mod all {
             .build();
         let keys = run_async_test(suite.write_records(0, 128, 1));
         let failed = Arc::new(AtomicBool::new(false));
+        fail::cfg("router_on_event_delay_ms", "6*return(1000)").unwrap();
         fail::cfg_callback("scan_and_async_send::about_to_consume", {
             let failed = failed.clone();
             move || {

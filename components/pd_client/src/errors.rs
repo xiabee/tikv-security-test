@@ -24,8 +24,8 @@ pub enum Error {
     RegionNotFound(Vec<u8>),
     #[error("store is tombstone {0:?}")]
     StoreTombstone(String),
-    #[error("required watch revision is smaller than current compact/min revision. {0:?}")]
-    DataCompacted(String),
+    #[error("global config item {0} not found")]
+    GlobalConfigNotFound(String),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -33,13 +33,11 @@ pub type Result<T> = result::Result<T, Error>;
 impl Error {
     pub fn retryable(&self) -> bool {
         match self {
-            Error::Grpc(_)
-            | Error::ClusterNotBootstrapped(_)
-            | Error::StreamDisconnect(_)
-            | Error::DataCompacted(_) => true,
+            Error::Grpc(_) | Error::ClusterNotBootstrapped(_) | Error::StreamDisconnect(_) => true,
             Error::Other(_)
             | Error::RegionNotFound(_)
             | Error::StoreTombstone(_)
+            | Error::GlobalConfigNotFound(_)
             | Error::ClusterBootstrapped(_)
             | Error::Incompatible => false,
         }
@@ -56,7 +54,7 @@ impl ErrorCodeExt for Error {
             Error::StreamDisconnect(_) => error_code::pd::STREAM_DISCONNECT,
             Error::RegionNotFound(_) => error_code::pd::REGION_NOT_FOUND,
             Error::StoreTombstone(_) => error_code::pd::STORE_TOMBSTONE,
-            Error::DataCompacted(_) => error_code::pd::DATA_COMPACTED,
+            Error::GlobalConfigNotFound(_) => error_code::pd::GLOBAL_CONFIG_NOT_FOUND,
             Error::Other(_) => error_code::pd::UNKNOWN,
         }
     }

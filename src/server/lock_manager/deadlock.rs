@@ -361,13 +361,18 @@ impl DetectTable {
 }
 
 /// The role of the detector.
-#[derive(Debug, PartialEq, Clone, Copy, Default)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Role {
     /// The node is the leader of the detector.
     Leader,
     /// The node is a follower of the leader.
-    #[default]
     Follower,
+}
+
+impl Default for Role {
+    fn default() -> Role {
+        Role::Follower
+    }
 }
 
 impl From<StateRole> for Role {
@@ -1114,7 +1119,7 @@ pub mod tests {
     use tikv_util::worker::FutureWorker;
 
     use super::*;
-    use crate::server::resolve;
+    use crate::server::resolve::Callback;
 
     #[test]
     fn test_detect_table() {
@@ -1462,6 +1467,15 @@ pub mod tests {
 
     impl PdClient for MockPdClient {}
 
+    #[derive(Clone)]
+    pub(crate) struct MockResolver;
+
+    impl StoreAddrResolver for MockResolver {
+        fn resolve(&self, _store_id: u64, _cb: Callback) -> Result<()> {
+            Err(Error::Other(box_err!("unimplemented")))
+        }
+    }
+
     fn start_deadlock_detector(
         host: &mut CoprocessorHost<KvTestEngine>,
     ) -> (FutureWorker<Task>, Scheduler) {
@@ -1471,7 +1485,7 @@ pub mod tests {
         let detector_runner = Detector::new(
             1,
             Arc::new(MockPdClient {}),
-            resolve::MockStoreAddrResolver::default(),
+            MockResolver {},
             Arc::new(SecurityManager::new(&SecurityConfig::default()).unwrap()),
             waiter_mgr_scheduler,
             &Config::default(),

@@ -18,10 +18,8 @@ use backup_stream::{
     },
     observer::BackupStreamObserver,
     router::{Router, TaskSelector},
-    utils, BackupStreamResolver, Endpoint, GetCheckpointResult, RegionCheckpointOperation,
-    RegionSet, Service, Task,
+    utils, Endpoint, GetCheckpointResult, RegionCheckpointOperation, RegionSet, Service, Task,
 };
-use engine_rocks::RocksEngine;
 use futures::{executor::block_on, AsyncWriteExt, Future, Stream, StreamExt};
 use grpcio::{ChannelBuilder, Server, ServerBuilder};
 use kvproto::{
@@ -32,9 +30,8 @@ use kvproto::{
     tikvpb::*,
 };
 use pd_client::PdClient;
-use raftstore::{router::CdcRaftRouter, RegionInfoAccessor};
-use resolved_ts::LeadershipResolver;
-use tempfile::TempDir;
+use raftstore::RegionInfoAccessor;
+use tempdir::TempDir;
 use test_pd_client::TestPdClient;
 use test_raftstore::{new_server_cluster, Cluster, ServerCluster};
 use test_util::retry;
@@ -144,7 +141,6 @@ impl SuiteBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn inject_meta_store_error<F>(mut self, f: F) -> Self
     where
         F: Fn(&str) -> Result<()> + Send + Sync + 'static,
@@ -153,7 +149,6 @@ impl SuiteBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn cfg(mut self, f: impl FnOnce(&mut BackupStreamConfig) + 'static) -> Self {
         let old_f = self.cfg;
         self.cfg = Box::new(move |cfg| {
@@ -187,8 +182,8 @@ impl SuiteBuilder {
             env: Arc::new(grpcio::Environment::new(1)),
             cluster,
 
-            temp_files: TempDir::new().unwrap(),
-            flushed_files: TempDir::new().unwrap(),
+            temp_files: TempDir::new("temp").unwrap(),
+            flushed_files: TempDir::new("flush").unwrap(),
             case_name: case,
         };
         for id in 1..=(n as u64) {
@@ -250,7 +245,7 @@ impl<S: MetaStore> MetaStore for ErrorStore<S> {
 pub struct Suite {
     pub endpoints: HashMap<u64, LazyWorker<Task>>,
     pub meta_store: ErrorStore<SlashEtcStore>,
-    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    pub cluster: Cluster<ServerCluster>,
     tikv_cli: HashMap<u64, TikvClient>,
     log_backup_cli: HashMap<u64, LogBackupClient>,
     obs: HashMap<u64, BackupStreamObserver>,
@@ -359,25 +354,12 @@ impl Suite {
         let worker = self.endpoints.get_mut(&id).unwrap();
         let sim = cluster.sim.wl();
         let raft_router = sim.get_server_router(id);
-        let raft_router = CdcRaftRouter(raft_router);
         let cm = sim.get_concurrency_manager(id);
         let regions = sim.region_info_accessors.get(&id).unwrap().clone();
         let ob = self.obs.get(&id).unwrap().clone();
         cfg.enable = true;
         cfg.temp_path = format!("/{}/{}", self.temp_files.path().display(), id);
-        let resolver = LeadershipResolver::new(
-            id,
-            cluster.pd_client.clone(),
-            Arc::clone(&self.env),
-            Arc::clone(&sim.security_mgr),
-            cluster.store_metas[&id]
-                .lock()
-                .unwrap()
-                .region_read_progress
-                .clone(),
-            Duration::from_secs(60),
-        );
-        let endpoint = Endpoint::new(
+        let endpoint: TestEndpoint = Endpoint::new(
             id,
             self.meta_store.clone(),
             cfg,
@@ -387,12 +369,18 @@ impl Suite {
             raft_router,
             cluster.pd_client.clone(),
             cm,
-            BackupStreamResolver::V1(resolver),
+            Arc::clone(&self.env),
+            cluster.store_metas[&id]
+                .lock()
+                .unwrap()
+                .region_read_progress
+                .clone(),
+            Arc::clone(&sim.security_mgr),
         );
         worker.start(endpoint);
     }
 
-    pub fn get_meta_cli(&self) -> MetadataClient<impl MetaStore> {
+    pub fn get_meta_cli(&self) -> MetadataClient<ErrorStore<SlashEtcStore>> {
         MetadataClient::new(self.meta_store.clone(), 0)
     }
 
@@ -522,7 +510,6 @@ impl Suite {
     }
 
     pub fn force_flush_files(&self, task: &str) {
-        // TODO: use the callback to make the test more stable.
         self.run(|| Task::ForceFlush(task.to_owned()));
         self.sync();
     }
@@ -858,7 +845,7 @@ impl Suite {
     }
 
     pub fn wait_with_router(&self, mut cond: impl FnMut(&Router) -> bool + Send + 'static + Clone) {
-        self.wait_with(move |ep| cond(&ep.range_router))
+        self.wait_with(move |ep: &mut TestEndpoint| cond(&ep.range_router))
     }
 
     pub fn wait_for_flush(&self) {

@@ -1,6 +1,6 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use mur3::murmurhash3_x64_128;
+use murmur3::murmur3_x64_128;
 
 /// `CmSketch` is used to estimate point queries.
 /// Refer:[Count-Min Sketch](https://en.wikipedia.org/wiki/Count-min_sketch)
@@ -30,8 +30,9 @@ impl CmSketch {
     }
 
     // `hash` hashes the data into two u64 using murmur hash.
-    fn hash(bytes: &[u8]) -> (u64, u64) {
-        murmurhash3_x64_128(bytes, 0)
+    fn hash(mut bytes: &[u8]) -> (u64, u64) {
+        let out = murmur3_x64_128(&mut bytes, 0).unwrap();
+        (out as u64, (out >> 64) as u64)
     }
 
     // `insert` inserts the data into cm sketch. For each row i, the position at
@@ -58,12 +59,10 @@ impl CmSketch {
     pub fn push_to_top_n(&mut self, b: Vec<u8>, cnt: u64) {
         self.top_n.push((b, cnt))
     }
-}
 
-impl From<CmSketch> for tipb::CmSketch {
-    fn from(cm: CmSketch) -> tipb::CmSketch {
+    pub fn into_proto(self) -> tipb::CmSketch {
         let mut proto = tipb::CmSketch::default();
-        let rows = cm
+        let rows = self
             .table
             .into_iter()
             .map(|row| {
@@ -73,7 +72,7 @@ impl From<CmSketch> for tipb::CmSketch {
             })
             .collect();
         proto.set_rows(rows);
-        let top_n_data = cm
+        let top_n_data = self
             .top_n
             .into_iter()
             .map(|(item, cnt)| {

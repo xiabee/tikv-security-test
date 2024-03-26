@@ -69,13 +69,6 @@ impl CachedEntries {
         }
     }
 
-    pub fn iter_entries(&self, mut f: impl FnMut(&Entry)) {
-        let entries = self.entries.lock().unwrap();
-        for entry in &entries.0 {
-            f(entry);
-        }
-    }
-
     /// Take cached entries and dangle size for them. `dangle` means not in
     /// entry cache.
     pub fn take_entries(&self) -> (Vec<Entry>, usize) {
@@ -960,12 +953,7 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
                 .raft_engine
                 .get_entry(self.region_id, idx)
                 .unwrap()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "region_id={}, peer_id={}, idx={idx}",
-                        self.region_id, self.peer_id
-                    )
-                })
+                .unwrap()
                 .get_term())
         }
     }
@@ -1087,8 +1075,9 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
 
         self.cache.append(self.region_id, self.peer_id, &entries);
 
+        task.entries = entries;
         // Delete any previously appended log entries which never committed.
-        task.set_append(Some(prev_last_index + 1), entries);
+        task.cut_logs = Some((last_index + 1, prev_last_index + 1));
 
         self.raft_state.set_last_index(last_index);
         self.last_term = last_term;
@@ -1177,8 +1166,6 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
                         } else {
                             range.1 == self.last_index() + 1
                         };
-                        // FIXME: the assertion below doesn't hold.
-                        // assert!(is_valid, "the warmup range should still be valid");
                         if !is_valid {
                             error!(
                                 "unexpected warmup state";
@@ -1250,10 +1237,6 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
             let drain_to = if half { cache_len / 2 } else { cache_len - 1 };
             let idx = cache.cache[drain_to].index;
             let mem_size_change = cache.compact_to(idx + 1);
-            RAFT_ENTRIES_EVICT_BYTES.inc_by(mem_size_change);
-        } else if !half {
-            let cache = &mut self.cache;
-            let mem_size_change = cache.compact_to(u64::MAX);
             RAFT_ENTRIES_EVICT_BYTES.inc_by(mem_size_change);
         }
     }
@@ -1336,30 +1319,26 @@ pub mod tests {
         };
 
         // Test the initial data structure size.
-        let (tx, rx) = mpsc::sync_channel(1);
-        let check_mem_size_change = |expect: i64| {
-            assert_eq!(rx.try_recv().unwrap(), expect);
-            rx.try_recv().unwrap_err();
-        };
+        let (tx, rx) = mpsc::sync_channel(8);
         let mut cache = EntryCache::new_with_cb(move |c: i64| tx.send(c).unwrap());
-        check_mem_size_change(0);
+        assert_eq!(rx.try_recv().unwrap(), 896);
 
         cache.append(
             0,
             0,
             &[new_padded_entry(101, 1, 1), new_padded_entry(102, 1, 2)],
         );
-        check_mem_size_change(419);
+        assert_eq!(rx.try_recv().unwrap(), 3);
 
         cache.prepend(vec![new_padded_entry(100, 1, 1)]);
-        check_mem_size_change(1);
+        assert_eq!(rx.try_recv().unwrap(), 1);
         cache.persisted = 100;
         cache.compact_to(101);
-        check_mem_size_change(-1);
+        assert_eq!(rx.try_recv().unwrap(), -1);
 
         // Test size change for one overlapped entry.
         cache.append(0, 0, &[new_padded_entry(102, 2, 3)]);
-        check_mem_size_change(1);
+        assert_eq!(rx.try_recv().unwrap(), 1);
 
         // Test size change for all overlapped entries.
         cache.append(
@@ -1367,42 +1346,42 @@ pub mod tests {
             0,
             &[new_padded_entry(101, 3, 4), new_padded_entry(102, 3, 5)],
         );
-        check_mem_size_change(5);
+        assert_eq!(rx.try_recv().unwrap(), 5);
 
         cache.append(0, 0, &[new_padded_entry(103, 3, 6)]);
-        check_mem_size_change(6);
+        assert_eq!(rx.try_recv().unwrap(), 6);
 
         // Test trace a dangle entry.
         let cached_entries = CachedEntries::new(vec![new_padded_entry(100, 1, 1)]);
         cache.trace_cached_entries(cached_entries);
-        check_mem_size_change(97);
+        assert_eq!(rx.try_recv().unwrap(), 1);
 
         // Test trace an entry which is still in cache.
         let cached_entries = CachedEntries::new(vec![new_padded_entry(102, 3, 5)]);
         cache.trace_cached_entries(cached_entries);
-        check_mem_size_change(0);
+        assert_eq!(rx.try_recv().unwrap(), 0);
 
         // Test compare `cached_last` with `trunc_to_idx` in `EntryCache::append_impl`.
         cache.append(0, 0, &[new_padded_entry(103, 4, 7)]);
-        check_mem_size_change(1);
+        assert_eq!(rx.try_recv().unwrap(), 1);
 
         // Test compact one traced dangle entry and one entry in cache.
         cache.persisted = 101;
         cache.compact_to(102);
-        check_mem_size_change(-5);
+        assert_eq!(rx.try_recv().unwrap(), -5);
 
         // Test compact the last traced dangle entry.
         cache.persisted = 102;
         cache.compact_to(103);
-        check_mem_size_change(-5);
+        assert_eq!(rx.try_recv().unwrap(), -5);
 
         // Test compact all entries.
         cache.persisted = 103;
         cache.compact_to(104);
-        check_mem_size_change(-7);
+        assert_eq!(rx.try_recv().unwrap(), -7);
 
         drop(cache);
-        check_mem_size_change(-512);
+        assert_eq!(rx.try_recv().unwrap(), -896);
     }
 
     #[test]

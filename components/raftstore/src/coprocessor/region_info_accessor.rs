@@ -2,7 +2,7 @@
 
 use std::{
     collections::{
-        BTreeMap, BTreeSet,
+        BTreeMap,
         Bound::{Excluded, Unbounded},
     },
     fmt::{Display, Formatter, Result as FmtResult},
@@ -14,7 +14,6 @@ use collections::{HashMap, HashSet};
 use engine_traits::KvEngine;
 use itertools::Itertools;
 use kvproto::metapb::Region;
-use pd_client::RegionStat;
 use raft::StateRole;
 use tikv_util::{
     box_err, debug, info, warn,
@@ -22,9 +21,8 @@ use tikv_util::{
 };
 
 use super::{
-    dispatcher::BoxRegionHeartbeatObserver, metrics::*, BoxRegionChangeObserver, BoxRoleObserver,
-    Coprocessor, CoprocessorHost, ObserverContext, RegionChangeEvent, RegionChangeObserver,
-    RegionHeartbeatObserver, Result, RoleChange, RoleObserver,
+    metrics::*, BoxRegionChangeObserver, BoxRoleObserver, Coprocessor, CoprocessorHost,
+    ObserverContext, RegionChangeEvent, RegionChangeObserver, Result, RoleChange, RoleObserver,
 };
 
 /// `RegionInfoAccessor` is used to collect all regions' information on this
@@ -48,30 +46,11 @@ use super::{
 /// `RaftStoreEvent` Represents events dispatched from raftstore coprocessor.
 #[derive(Debug)]
 pub enum RaftStoreEvent {
-    CreateRegion {
-        region: Region,
-        role: StateRole,
-    },
-    UpdateRegion {
-        region: Region,
-        role: StateRole,
-    },
-    DestroyRegion {
-        region: Region,
-    },
-    RoleChange {
-        region: Region,
-        role: StateRole,
-        initialized: bool,
-    },
-    UpdateRegionBuckets {
-        region: Region,
-        buckets: usize,
-    },
-    UpdateRegionActivity {
-        region: Region,
-        activity: RegionActivity,
-    },
+    CreateRegion { region: Region, role: StateRole },
+    UpdateRegion { region: Region, role: StateRole },
+    DestroyRegion { region: Region },
+    RoleChange { region: Region, role: StateRole },
+    UpdateRegionBuckets { region: Region, buckets: usize },
 }
 
 impl RaftStoreEvent {
@@ -81,7 +60,6 @@ impl RaftStoreEvent {
             | RaftStoreEvent::UpdateRegion { region, .. }
             | RaftStoreEvent::DestroyRegion { region, .. }
             | RaftStoreEvent::UpdateRegionBuckets { region, .. }
-            | RaftStoreEvent::UpdateRegionActivity { region, .. }
             | RaftStoreEvent::RoleChange { region, .. } => region,
         }
     }
@@ -104,18 +82,8 @@ impl RegionInfo {
     }
 }
 
-/// Region activity data. Used by in-memory cache.
-#[derive(Clone, Debug)]
-pub struct RegionActivity {
-    pub region_stat: RegionStat,
-    // TODO: add region's MVCC version/tombstone count to measure effectiveness of the in-memory
-    // cache for that region's data. This information could be collected from rocksdb, see:
-    // collection_regions_to_compact.
-}
-
 type RegionsMap = HashMap<u64, RegionInfo>;
 type RegionRangesMap = BTreeMap<RangeKey, u64>;
-type RegionActivityMap = HashMap<u64, RegionActivity>;
 
 // RangeKey is a wrapper used to unify the comparison between region start key
 // and region end key. Region end key is special as empty stands for the
@@ -161,10 +129,6 @@ pub enum RegionInfoQuery {
         end_key: Vec<u8>,
         callback: Callback<Vec<Region>>,
     },
-    GetTopRegions {
-        count: usize,
-        callback: Callback<Vec<Region>>,
-    },
     /// Gets all contents from the collection. Only used for testing.
     DebugDump(mpsc::Sender<(RegionsMap, RegionRangesMap)>),
 }
@@ -187,9 +151,6 @@ impl Display for RegionInfoQuery {
                 &log_wrappers::Value::key(start_key),
                 &log_wrappers::Value::key(end_key)
             ),
-            RegionInfoQuery::GetTopRegions { count, .. } => {
-                write!(f, "GetTopRegions(count: {})", count)
-            }
             RegionInfoQuery::DebugDump(_) => write!(f, "DebugDump"),
         }
     }
@@ -200,7 +161,6 @@ impl Display for RegionInfoQuery {
 #[derive(Clone)]
 struct RegionEventListener {
     scheduler: Scheduler<RegionInfoQuery>,
-    region_stats_manager_enabled_cb: RegionStatsManagerEnabledCb,
 }
 
 impl Coprocessor for RegionEventListener {}
@@ -231,30 +191,7 @@ impl RoleObserver for RegionEventListener {
     fn on_role_change(&self, context: &mut ObserverContext<'_>, role_change: &RoleChange) {
         let region = context.region().clone();
         let role = role_change.state;
-        let event = RaftStoreEvent::RoleChange {
-            region,
-            role,
-            initialized: role_change.initialized,
-        };
-        self.scheduler
-            .schedule(RegionInfoQuery::RaftStoreEvent(event))
-            .unwrap();
-    }
-}
-
-impl RegionHeartbeatObserver for RegionEventListener {
-    fn on_region_heartbeat(&self, context: &mut ObserverContext<'_>, region_stat: &RegionStat) {
-        if !(self.region_stats_manager_enabled_cb)() {
-            // Region stats manager is disabled, return early.
-            return;
-        }
-        let region = context.region().clone();
-        let region_stat = region_stat.clone();
-        let event = RaftStoreEvent::UpdateRegionActivity {
-            region,
-            activity: RegionActivity { region_stat },
-        };
-
+        let event = RaftStoreEvent::RoleChange { region, role };
         self.scheduler
             .schedule(RegionInfoQuery::RaftStoreEvent(event))
             .unwrap();
@@ -265,20 +202,13 @@ impl RegionHeartbeatObserver for RegionEventListener {
 fn register_region_event_listener(
     host: &mut CoprocessorHost<impl KvEngine>,
     scheduler: Scheduler<RegionInfoQuery>,
-    region_stats_manager_enabled_cb: RegionStatsManagerEnabledCb,
 ) {
-    let listener = RegionEventListener {
-        scheduler,
-        region_stats_manager_enabled_cb,
-    };
+    let listener = RegionEventListener { scheduler };
 
     host.registry
         .register_role_observer(1, BoxRoleObserver::new(listener.clone()));
     host.registry
-        .register_region_change_observer(1, BoxRegionChangeObserver::new(listener.clone()));
-
-    host.registry
-        .register_region_heartbeat_observer(1, BoxRegionHeartbeatObserver::new(listener))
+        .register_region_change_observer(1, BoxRegionChangeObserver::new(listener));
 }
 
 /// `RegionCollector` is the place where we hold all region information we
@@ -290,10 +220,7 @@ pub struct RegionCollector {
     regions: RegionsMap,
     // BTreeMap: data_end_key -> region_id
     region_ranges: RegionRangesMap,
-    // HashMap: region_id -> RegionActivity
-    // TODO: add BinaryHeap to keep track of top N regions. Wrap the HashMap and BinaryHeap
-    // together in a struct exposing add, delete, and get_top_regions methods.
-    region_activity: RegionActivityMap,
+
     region_leaders: Arc<RwLock<HashSet<u64>>>,
 }
 
@@ -302,7 +229,6 @@ impl RegionCollector {
         Self {
             region_leaders,
             regions: HashMap::default(),
-            region_activity: HashMap::default(),
             region_ranges: BTreeMap::default(),
         }
     }
@@ -375,12 +301,6 @@ impl RegionCollector {
         }
     }
 
-    fn handle_update_region_activity(&mut self, region_id: u64, region_activity: &RegionActivity) {
-        _ = self
-            .region_activity
-            .insert(region_id, region_activity.clone())
-    }
-
     fn handle_update_region(&mut self, region: Region, role: StateRole) {
         if self.regions.contains_key(&region.get_id()) {
             self.update_region(region);
@@ -413,8 +333,6 @@ impl RegionCollector {
 
             let removed_id = self.region_ranges.remove(&end_key).unwrap();
             assert_eq!(removed_id, region.get_id());
-            // Remove any activity associated with this id.
-            self.region_activity.remove(&removed_id);
         } else {
             // It's possible that the region is already removed because it's end_key is used
             // by another newer region.
@@ -508,10 +426,7 @@ impl RegionCollector {
             // They are impossible to equal, or they cannot overlap.
             assert_ne!(
                 region.get_region_epoch().get_version(),
-                current_region.get_region_epoch().get_version(),
-                "{:?} vs {:?}",
-                region,
-                current_region,
+                current_region.get_region_epoch().get_version()
             );
             // Remove it since it's a out-of-date region info.
             if clear_regions_in_range {
@@ -562,50 +477,6 @@ impl RegionCollector {
         callback(regions);
     }
 
-    /// Used by the in-memory engine (if enabled.)
-    /// If `count` is 0, return all the regions for which this node is the
-    /// leader. Otherwise, return the top `count` regions from
-    /// `self.region_activity`. Top regions are determined by comparing
-    /// `read_keys + written_keys` in each region's most recent region stat.
-    /// If count > 0 and size of `self.region_activity` is `> 0`, remove but the
-    /// top `count` regions from `self.region_activity`.
-    ///
-    /// Note: this function is `O(N log(N))` with respect to size of
-    /// region_activity. This is acceptable, as region_activity is populated
-    /// by heartbeats for this node's region, so N cannot be greater than
-    /// approximately `300_000``.
-    pub fn handle_get_top_regions(&mut self, count: usize, callback: Callback<Vec<Region>>) {
-        let top_regions = if count == 0 {
-            self.regions
-                .values()
-                .filter(|ri| ri.role == StateRole::Leader)
-                .map(|ri| ri.region.clone())
-                .collect::<Vec<_>>()
-        } else {
-            let count = usize::max(count, self.region_activity.len());
-            self.region_activity
-                .iter()
-                .sorted_by(|(_, activity_0), (_, activity_1)| {
-                    // TODO: Make this extensible e.g., allow considering MVCC/tombstone stats.
-                    let a = activity_0.region_stat.read_keys + activity_0.region_stat.written_keys;
-                    let b = activity_1.region_stat.read_keys + activity_1.region_stat.written_keys;
-                    b.cmp(&a)
-                })
-                .take(count)
-                .flat_map(|(id, _)| self.regions.get(id).map(|ri| ri.region.clone()))
-                .collect::<Vec<_>>()
-        };
-        if count > 0 && self.region_activity.len() > count {
-            let top_region_ids = top_regions
-                .iter()
-                .map(Region::get_id)
-                .collect::<BTreeSet<_>>();
-            self.region_activity
-                .retain(|id, _| top_region_ids.contains(id))
-        }
-        callback(top_regions)
-    }
-
     fn handle_raftstore_event(&mut self, event: RaftStoreEvent) {
         {
             let region = event.get_region();
@@ -619,12 +490,6 @@ impl RegionCollector {
                 // Since 0 is actually an invalid value of version, we can simply ignore the
                 // messages with version 0. The region will be created later when the region's
                 // epoch is properly set and an Update message was sent.
-                return;
-            }
-            if let RaftStoreEvent::RoleChange { initialized, .. } = &event
-                && !initialized
-            {
-                // Ignore uninitialized peers.
                 return;
             }
             if !self.check_region_range(region, true) {
@@ -646,14 +511,11 @@ impl RegionCollector {
             RaftStoreEvent::DestroyRegion { region } => {
                 self.handle_destroy_region(region);
             }
-            RaftStoreEvent::RoleChange { region, role, .. } => {
+            RaftStoreEvent::RoleChange { region, role } => {
                 self.handle_role_change(region, role);
             }
             RaftStoreEvent::UpdateRegionBuckets { region, buckets } => {
                 self.handle_update_region_buckets(region, buckets);
-            }
-            RaftStoreEvent::UpdateRegionActivity { region, activity } => {
-                self.handle_update_region_activity(region.get_id(), &activity)
             }
         }
     }
@@ -682,9 +544,6 @@ impl Runnable for RegionCollector {
                 callback,
             } => {
                 self.handle_get_regions_in_range(start_key, end_key, callback);
-            }
-            RegionInfoQuery::GetTopRegions { count, callback } => {
-                self.handle_get_top_regions(count, callback);
             }
             RegionInfoQuery::DebugDump(tx) => {
                 tx.send((self.regions.clone(), self.region_ranges.clone()))
@@ -723,8 +582,6 @@ impl RunnableWithTimer for RegionCollector {
     }
 }
 
-pub type RegionStatsManagerEnabledCb = Arc<dyn Fn() -> bool + Send + Sync>;
-
 /// `RegionInfoAccessor` keeps all region information separately from raftstore
 /// itself.
 #[derive(Clone)]
@@ -748,17 +605,14 @@ impl RegionInfoAccessor {
     /// `RegionInfoAccessor` doesn't need, and should not be created more than
     /// once. If it's needed in different places, just clone it, and their
     /// contents are shared.
-    pub fn new(
-        host: &mut CoprocessorHost<impl KvEngine>,
-        region_stats_manager_enabled_cb: RegionStatsManagerEnabledCb,
-    ) -> Self {
+    pub fn new(host: &mut CoprocessorHost<impl KvEngine>) -> Self {
         let region_leaders = Arc::new(RwLock::new(HashSet::default()));
         let worker = WorkerBuilder::new("region-collector-worker").create();
         let scheduler = worker.start_with_timer(
             "region-collector-worker",
             RegionCollector::new(region_leaders.clone()),
         );
-        register_region_event_listener(host, scheduler.clone(), region_stats_manager_enabled_cb);
+        register_region_event_listener(host, scheduler.clone());
 
         Self {
             worker,
@@ -810,9 +664,6 @@ pub trait RegionInfoProvider: Send + Sync {
     fn get_regions_in_range(&self, _start_key: &[u8], _end_key: &[u8]) -> Result<Vec<Region>> {
         unimplemented!()
     }
-    fn get_top_regions(&self, _count: usize) -> Result<Vec<Region>> {
-        unimplemented!()
-    }
 }
 
 impl RegionInfoProvider for RegionInfoAccessor {
@@ -846,9 +697,7 @@ impl RegionInfoProvider for RegionInfoAccessor {
         self.seek_region(
             key,
             Box::new(move |iter| {
-                if let Some(info) = iter.next()
-                    && info.region.get_start_key() <= key_in_vec.as_slice()
-                {
+                if let Some(info) = iter.next() && info.region.get_start_key() <= key_in_vec.as_slice() {
                     if let Err(e) = tx.send(info.region.clone()) {
                         warn!("failed to send find_region_by_key result: {:?}", e);
                     }
@@ -862,6 +711,7 @@ impl RegionInfoProvider for RegionInfoAccessor {
             )
         })
     }
+
     fn get_regions_in_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<Vec<Region>> {
         let (tx, rx) = mpsc::channel();
         let msg = RegionInfoQuery::GetRegionsInRange {
@@ -880,28 +730,6 @@ impl RegionInfoProvider for RegionInfoAccessor {
                 rx.recv().map_err(|e| {
                     box_err!(
                         "failed to receive get_regions_in_range result from region collector: {:?}",
-                        e
-                    )
-                })
-            })
-    }
-    fn get_top_regions(&self, count: usize) -> Result<Vec<Region>> {
-        let (tx, rx) = mpsc::channel();
-        let msg = RegionInfoQuery::GetTopRegions {
-            count,
-            callback: Box::new(move |regions| {
-                if let Err(e) = tx.send(regions) {
-                    warn!("failed to send get_top_regions result: {:?}", e);
-                }
-            }),
-        };
-        self.scheduler
-            .schedule(msg)
-            .map_err(|e| box_err!("failed to send request to region collector: {:?}", e))
-            .and_then(|_| {
-                rx.recv().map_err(|e| {
-                    box_err!(
-                        "failed to receive get_top_regions result from region_collector: {:?}",
                         e
                     )
                 })
@@ -984,25 +812,6 @@ impl RegionInfoProvider for MockRegionInfoProvider {
             })
             .map(|region_info| region_info.region.clone())
             .ok_or(box_err!("Not found region containing {:?}", key))
-    }
-
-    fn get_top_regions(&self, _count: usize) -> Result<Vec<Region>> {
-        let mut regions = Vec::new();
-        let (tx, rx) = mpsc::channel();
-
-        self.seek_region(
-            b"",
-            Box::new(move |iter| {
-                for region_info in iter {
-                    tx.send(region_info.region.clone()).unwrap();
-                }
-            }),
-        )?;
-
-        for region in rx {
-            regions.push(region);
-        }
-        Ok(regions)
     }
 }
 
@@ -1179,16 +988,10 @@ mod tests {
         }
     }
 
-    fn must_change_role(
-        c: &mut RegionCollector,
-        region: &Region,
-        role: StateRole,
-        initialized: bool,
-    ) {
+    fn must_change_role(c: &mut RegionCollector, region: &Region, role: StateRole) {
         c.handle_raftstore_event(RaftStoreEvent::RoleChange {
             region: region.clone(),
             role,
-            initialized,
         });
 
         if let Some(r) = c.regions.get(&region.get_id()) {
@@ -1234,12 +1037,6 @@ mod tests {
         c.handle_raftstore_event(RaftStoreEvent::RoleChange {
             region: new_region(1, b"k1", b"k2", 0),
             role: StateRole::Leader,
-            initialized: true,
-        });
-        c.handle_raftstore_event(RaftStoreEvent::RoleChange {
-            region: new_region(1, b"", b"", 3),
-            role: StateRole::Leader,
-            initialized: false,
         });
 
         check_collection(&c, &[]);
@@ -1401,15 +1198,9 @@ mod tests {
             &mut c,
             &new_region(1, b"k0", b"k1", 2),
             StateRole::Candidate,
-            true,
         );
         must_create_region(&mut c, &new_region(5, b"k99", b"", 2), StateRole::Follower);
-        must_change_role(
-            &mut c,
-            &new_region(2, b"k2", b"k8", 2),
-            StateRole::Leader,
-            true,
-        );
+        must_change_role(&mut c, &new_region(2, b"k2", b"k8", 2), StateRole::Leader);
         must_update_region(&mut c, &new_region(2, b"k3", b"k7", 3), StateRole::Leader);
         // test region buckets update
         must_update_region_buckets(&mut c, &new_region(2, b"k3", b"k7", 3), 4);
@@ -1552,12 +1343,7 @@ mod tests {
         // which haven't been handled.
         must_create_region(&mut c, &new_region(4, b"k5", b"k9", 2), StateRole::Follower);
         must_update_region(&mut c, &new_region(2, b"k1", b"k9", 1), StateRole::Follower);
-        must_change_role(
-            &mut c,
-            &new_region(2, b"k1", b"k9", 1),
-            StateRole::Leader,
-            true,
-        );
+        must_change_role(&mut c, &new_region(2, b"k1", b"k9", 1), StateRole::Leader);
         must_update_region(&mut c, &new_region(2, b"k1", b"k5", 2), StateRole::Leader);
         // TODO: In fact, region 2's role should be follower. However because it's
         // previous state was removed while creating updating region 4, it can't be
@@ -1578,12 +1364,7 @@ mod tests {
         // handled.
         must_update_region(&mut c, &new_region(2, b"k1", b"k9", 3), StateRole::Leader);
         must_update_region(&mut c, &new_region(4, b"k5", b"k9", 2), StateRole::Follower);
-        must_change_role(
-            &mut c,
-            &new_region(4, b"k5", b"k9", 2),
-            StateRole::Leader,
-            true,
-        );
+        must_change_role(&mut c, &new_region(4, b"k5", b"k9", 2), StateRole::Leader);
         must_destroy_region(&mut c, new_region(4, b"k5", b"k9", 2));
         check_collection(
             &c,

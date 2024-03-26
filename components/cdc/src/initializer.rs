@@ -1,5 +1,5 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use api_version::ApiV2;
 use crossbeam::atomic::AtomicCell;
@@ -17,10 +17,10 @@ use kvproto::{
 };
 use raftstore::{
     coprocessor::ObserveId,
-    router::CdcHandle,
+    router::RaftStoreRouter,
     store::{
         fsm::ChangeObserver,
-        msg::{Callback, ReadResponse},
+        msg::{Callback, ReadResponse, SignificantMsg},
     },
 };
 use resolved_ts::{Resolver, TsSource};
@@ -38,7 +38,7 @@ use tikv_util::{
     debug, defer, error, info,
     memory::MemoryQuota,
     sys::inspector::{self_thread_inspector, ThreadInspector},
-    time::{duration_to_sec, Instant, Limiter},
+    time::{Instant, Limiter},
     warn,
     worker::Scheduler,
     Either,
@@ -48,10 +48,10 @@ use txn_types::{Key, KvPair, Lock, LockType, OldValue, TimeStamp};
 
 use crate::{
     channel::CdcEvent,
-    delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState, ObservedRange},
+    delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState},
     endpoint::Deregister,
     metrics::*,
-    old_value::{near_seek_old_value, OldValueCursors},
+    old_value::{near_seek_old_value, new_old_value_cursor, OldValueCursors},
     service::ConnId,
     Error, Result, Task,
 };
@@ -76,11 +76,10 @@ pub(crate) enum Scanner<S: Snapshot> {
 }
 
 pub(crate) struct Initializer<E> {
-    pub(crate) tablet: Option<E>,
+    pub(crate) engine: E,
     pub(crate) sched: Scheduler<Task>,
     pub(crate) sink: crate::channel::Sink,
 
-    pub(crate) observed_range: ObservedRange,
     pub(crate) region_id: u64,
     pub(crate) region_epoch: RegionEpoch,
     pub(crate) observe_id: ObserveId,
@@ -105,10 +104,10 @@ pub(crate) struct Initializer<E> {
 }
 
 impl<E: KvEngine> Initializer<E> {
-    pub(crate) async fn initialize<T: 'static + CdcHandle<E>>(
+    pub(crate) async fn initialize<T: 'static + RaftStoreRouter<E>>(
         &mut self,
-        change_observer: ChangeObserver,
-        cdc_handle: T,
+        change_cmd: ChangeObserver,
+        raft_router: T,
         concurrency_semaphore: Arc<Semaphore>,
         memory_quota: Arc<MemoryQuota>,
     ) -> Result<()> {
@@ -127,22 +126,24 @@ impl<E: KvEngine> Initializer<E> {
         let (incremental_scan_barrier_cb, incremental_scan_barrier_fut) =
             tikv_util::future::paired_future_callback();
         let barrier = CdcEvent::Barrier(Some(incremental_scan_barrier_cb));
-        if let Err(e) = cdc_handle.capture_change(
+        if let Err(e) = raft_router.significant_send(
             self.region_id,
-            region_epoch,
-            change_observer,
-            Callback::read(Box::new(move |resp| {
-                if let Err(e) = sched.schedule(Task::InitDownstream {
-                    region_id,
-                    downstream_id,
-                    downstream_state,
-                    sink,
-                    incremental_scan_barrier: barrier,
-                    cb: Box::new(move || cb(resp)),
-                }) {
-                    error!("cdc schedule cdc task failed"; "error" => ?e);
-                }
-            })),
+            SignificantMsg::CaptureChange {
+                cmd: change_cmd,
+                region_epoch,
+                callback: Callback::read(Box::new(move |resp| {
+                    if let Err(e) = sched.schedule(Task::InitDownstream {
+                        region_id,
+                        downstream_id,
+                        downstream_state,
+                        sink,
+                        incremental_scan_barrier: barrier,
+                        cb: Box::new(move || cb(resp)),
+                    }) {
+                        error!("cdc schedule cdc task failed"; "error" => ?e);
+                    }
+                })),
+            },
         ) {
             warn!("cdc send capture change cmd failed";
             "region_id" => self.region_id, "error" => ?e);
@@ -210,12 +211,10 @@ impl<E: KvEngine> Initializer<E> {
             return on_cancel();
         }
 
-        self.observed_range.update_region_key_range(&region);
         debug!("cdc async incremental scan";
             "region_id" => region_id,
             "downstream_id" => ?downstream_id,
             "observe_id" => ?self.observe_id,
-            "all_key_covered" => ?self.observed_range.all_key_covered,
             "start_key" => log_wrappers::Value::key(snap.lower_bound().unwrap_or_default()),
             "end_key" => log_wrappers::Value::key(snap.upper_bound().unwrap_or_default()));
 
@@ -229,7 +228,9 @@ impl<E: KvEngine> Initializer<E> {
         let mut scanner = if kv_api == ChangeDataRequestKvApi::TiDb {
             if self.ts_filter_is_helpful(&snap) {
                 hint_min_ts = Some(self.checkpoint_ts);
-                old_value_cursors = Some(OldValueCursors::new(&snap));
+                let wc = new_old_value_cursor(&snap, CF_WRITE);
+                let dc = new_old_value_cursor(&snap, CF_DEFAULT);
+                old_value_cursors = Some(OldValueCursors::new(wc, dc));
             }
 
             // Time range: (checkpoint_ts, max]
@@ -258,7 +259,6 @@ impl<E: KvEngine> Initializer<E> {
         fail_point!("cdc_incremental_scan_start");
         let mut done = false;
         let start = Instant::now_coarse();
-        let mut sink_time = Duration::default();
 
         let curr_state = self.downstream_state.load();
         assert!(matches!(
@@ -281,12 +281,9 @@ impl<E: KvEngine> Initializer<E> {
             }
             debug!("cdc scan entries"; "len" => entries.len(), "region_id" => region_id);
             fail_point!("before_schedule_incremental_scan");
-            let start_sink = Instant::now_coarse();
             self.sink_scan_events(entries, done).await?;
-            sink_time += start_sink.saturating_elapsed();
         }
 
-        fail_point!("before_post_incremental_scan");
         if !post_init_downstream(&self.downstream_state) {
             return on_cancel();
         }
@@ -303,7 +300,6 @@ impl<E: KvEngine> Initializer<E> {
         }
 
         CDC_SCAN_DURATION_HISTOGRAM.observe(takes.as_secs_f64());
-        CDC_SCAN_SINK_DURATION_HISTOGRAM.observe(duration_to_sec(sink_time));
         Ok(())
     }
 
@@ -313,20 +309,16 @@ impl<E: KvEngine> Initializer<E> {
     fn do_scan<S: Snapshot>(
         &self,
         scanner: &mut Scanner<S>,
-        mut old_value_cursors: Option<&mut OldValueCursors<S>>,
+        mut old_value_cursors: Option<&mut OldValueCursors<S::Iter>>,
         entries: &mut Vec<Option<KvEntry>>,
     ) -> Result<ScanStat> {
         let mut read_old_value = |v: &mut OldValue, stats: &mut Statistics| -> Result<()> {
-            let Some(cursors) = old_value_cursors.as_mut() else {
-                return Ok(());
+            let (wc, dc) = match old_value_cursors {
+                Some(ref mut x) => (&mut x.write, &mut x.default),
+                None => return Ok(()),
             };
             if let OldValue::SeekWrite(ref key) = v {
-                match near_seek_old_value(
-                    key,
-                    &mut cursors.write,
-                    Either::<&S, _>::Right(&mut cursors.default),
-                    stats,
-                )? {
+                match near_seek_old_value(key, wc, Either::<&S, _>::Right(dc), stats)? {
                     Some(x) => *v = OldValue::value(x),
                     None => *v = OldValue::None,
                 }
@@ -390,7 +382,7 @@ impl<E: KvEngine> Initializer<E> {
     async fn scan_batch<S: Snapshot>(
         &self,
         scanner: &mut Scanner<S>,
-        old_value_cursors: Option<&mut OldValueCursors<S>>,
+        old_value_cursors: Option<&mut OldValueCursors<S::Iter>>,
         resolver: Option<&mut Resolver>,
     ) -> Result<Vec<Option<KvEntry>>> {
         let mut entries = Vec::with_capacity(self.max_scan_batch_size);
@@ -435,7 +427,6 @@ impl<E: KvEngine> Initializer<E> {
             self.request_id,
             entries,
             self.filter_loop,
-            &self.observed_range,
         )?;
         if done {
             let (cb, fut) = tikv_util::future::paired_future_callback();
@@ -495,10 +486,9 @@ impl<E: KvEngine> Initializer<E> {
             }
         } else {
             Deregister::Downstream {
-                conn_id: self.conn_id,
-                request_id: self.request_id,
                 region_id: self.region_id,
                 downstream_id: self.downstream_id,
+                conn_id: self.conn_id,
                 err: Some(err),
             }
         };
@@ -516,11 +506,7 @@ impl<E: KvEngine> Initializer<E> {
         let start_key = data_key(snap.lower_bound().unwrap_or_default());
         let end_key = data_end_key(snap.upper_bound().unwrap_or_default());
         let range = Range::new(&start_key, &end_key);
-        let tablet = match self.tablet.as_ref() {
-            Some(t) => t,
-            None => return false,
-        };
-        let collection = match tablet.table_properties_collection(CF_WRITE, &[range]) {
+        let collection = match self.engine.table_properties_collection(CF_WRITE, &[range]) {
             Ok(collection) => collection,
             Err(_) => return false,
         };
@@ -579,7 +565,7 @@ mod tests {
         cdcpb::{EventLogType, Event_oneof_event},
         errorpb::Error as ErrorHeader,
     };
-    use raftstore::{coprocessor::ObserveHandle, router::CdcRaftRouter, store::RegionSnapshot};
+    use raftstore::{coprocessor::ObserveHandle, store::RegionSnapshot};
     use resolved_ts::TxnLocks;
     use test_raftstore::MockRaftStoreRouter;
     use tikv::{
@@ -602,7 +588,7 @@ mod tests {
     use tokio::runtime::{Builder, Runtime};
 
     use super::*;
-    use crate::txn_source::TxnSource;
+    use crate::txn_souce::TxnSource;
 
     struct ReceiverRunnable<T: Display + Send> {
         tx: Sender<T>,
@@ -645,20 +631,22 @@ mod tests {
         let pool = Builder::new_multi_thread()
             .thread_name("test-initializer-worker")
             .worker_threads(4)
-            .with_sys_hooks()
+            .after_start_wrapper(|| {})
+            .before_stop_wrapper(|| {})
             .build()
             .unwrap();
         let downstream_state = Arc::new(AtomicCell::new(DownstreamState::Initializing));
         let initializer = Initializer {
-            tablet: engine.or_else(|| {
+            engine: engine.unwrap_or_else(|| {
                 TestEngineBuilder::new()
                     .build_without_cache()
                     .unwrap()
                     .kv_engine()
+                    .unwrap()
             }),
             sched: receiver_worker.scheduler(),
             sink,
-            observed_range: ObservedRange::default(),
+
             region_id: 1,
             region_epoch: RegionEpoch::default(),
             observe_id: ObserveId::new(),
@@ -686,12 +674,6 @@ mod tests {
 
         let mut expected_locks = BTreeMap::<TimeStamp, TxnLocks>::new();
 
-        // Only observe ["", "b\0x90"]
-        let observed_range = ObservedRange::new(
-            Key::from_raw(&[]).into_encoded(),
-            Key::from_raw(&[b'k', 90]).into_encoded(),
-        )
-        .unwrap();
         let mut total_bytes = 0;
         // Pessimistic locks should not be tracked
         for i in 0..10 {
@@ -727,12 +709,12 @@ mod tests {
             ChangeDataRequestKvApi::TiDb,
             false,
         );
-        initializer.observed_range = observed_range.clone();
-        let check_result = || {
+        let check_result = || loop {
             let task = rx.recv().unwrap();
             match task {
                 Task::ResolverReady { resolver, .. } => {
                     assert_eq!(resolver.locks(), &expected_locks);
+                    return;
                 }
                 t => panic!("unexpected task {} received", t),
             }
@@ -740,14 +722,7 @@ mod tests {
         // To not block test by barrier.
         pool.spawn(async move {
             let mut d = drain.drain();
-            while let Some((e, _)) = d.next().await {
-                if let CdcEvent::Event(e) = e {
-                    for e in e.get_entries().get_entries() {
-                        let key = Key::from_raw(&e.key).into_encoded();
-                        assert!(observed_range.contains_encoded_key(&key), "{:?}", e);
-                    }
-                }
-            }
+            while d.next().await.is_some() {}
         });
 
         let memory_quota = Arc::new(MemoryQuota::new(usize::MAX));
@@ -782,11 +757,13 @@ mod tests {
         ))
         .unwrap();
 
-        let task = rx.recv_timeout(Duration::from_millis(100));
-        match task {
-            Ok(t) => panic!("unexpected task {} received", t),
-            Err(RecvTimeoutError::Timeout) => (),
-            Err(e) => panic!("unexpected err {:?}", e),
+        loop {
+            let task = rx.recv_timeout(Duration::from_millis(100));
+            match task {
+                Ok(t) => panic!("unexpected task {} received", t),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(e) => panic!("unexpected err {:?}", e),
+            }
         }
 
         // Test cancellation.
@@ -821,6 +798,7 @@ mod tests {
         let mut engine = TestEngineBuilder::new().build_without_cache().unwrap();
 
         let mut total_bytes = 0;
+
         for i in 10..100 {
             let (k, v) = (&[b'k', i], &[b'v', i]);
             total_bytes += k.len();
@@ -1041,7 +1019,7 @@ mod tests {
             mock_initializer(total_bytes, total_bytes, buffer, None, kv_api, false);
 
         let change_cmd = ChangeObserver::from_cdc(1, ObserveHandle::new());
-        let raft_router = CdcRaftRouter(MockRaftStoreRouter::new());
+        let raft_router = MockRaftStoreRouter::new();
         let concurrency_semaphore = Arc::new(Semaphore::new(1));
         let memory_quota = Arc::new(MemoryQuota::new(usize::MAX));
 
@@ -1094,13 +1072,13 @@ mod tests {
     #[test]
     fn test_scanner_with_titan() {
         let mut cfg = DbConfig::default();
-        cfg.titan.enabled = Some(true);
+        cfg.titan.enabled = true;
         cfg.defaultcf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.defaultcf.titan.min_blob_size = Some(ReadableSize(0));
+        cfg.defaultcf.titan.min_blob_size = ReadableSize(0);
         cfg.writecf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.writecf.titan.min_blob_size = Some(ReadableSize(0));
+        cfg.writecf.titan.min_blob_size = ReadableSize(0);
         cfg.lockcf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.lockcf.titan.min_blob_size = Some(ReadableSize(0));
+        cfg.lockcf.titan.min_blob_size = ReadableSize(0);
         let mut engine = TestEngineBuilder::new().build_with_cfg(&cfg).unwrap();
 
         must_prewrite_put(&mut engine, b"zkey", b"value", b"zkey", 100);

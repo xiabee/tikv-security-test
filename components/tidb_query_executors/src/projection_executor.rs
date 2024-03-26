@@ -97,6 +97,7 @@ impl<Src: BatchExecutor> BatchExecutor for BatchProjectionExecutor<Src> {
             ..
         } = src_result;
         let logical_len = logical_rows.len();
+        let physical_len = src_result.physical_columns.rows_len();
 
         if is_drained.is_ok() && logical_len != 0 {
             for expr in &self.exprs {
@@ -116,18 +117,15 @@ impl<Src: BatchExecutor> BatchExecutor for BatchProjectionExecutor<Src> {
                         if col.is_scalar() {
                             eval_result.push(VectorValue::from_scalar(
                                 col.scalar_value().unwrap(),
-                                logical_len,
+                                physical_len,
                             ));
                         } else {
-                            eval_result.push(col.take_vector_value().unwrap());
+                            // since column often refer to vector values, we can't easily
+                            // transfer the ownership, so we use clone here.
+                            eval_result.push(col.vector_value().unwrap().as_ref().clone());
                         }
                     }
                 }
-            }
-
-            if !self.exprs.is_empty() && is_drained.is_ok() {
-                logical_rows.clear();
-                logical_rows.extend(0..logical_len);
             }
         }
 
@@ -295,11 +293,11 @@ mod tests {
         let mut exec = BatchProjectionExecutor::new_for_test(src_exec, exprs);
         assert_eq!(exec.schema().len(), 1);
         let r = block_on(exec.next_batch(1));
-        assert_eq!(&r.logical_rows, &[0, 1]);
+        assert_eq!(&r.logical_rows, &[2, 0]);
         assert_eq!(r.physical_columns.columns_len(), 1);
         assert_eq!(
             r.physical_columns[0].decoded().to_int_vec(),
-            vec![Some(1), Some(1)]
+            vec![Some(1), Some(1), Some(1), Some(1), Some(1)]
         );
         assert!(r.is_drained.unwrap().is_remain());
 
@@ -309,9 +307,12 @@ mod tests {
         assert!(r.is_drained.unwrap().is_remain());
 
         let r = block_on(exec.next_batch(1));
-        assert_eq!(&r.logical_rows, &[0]);
+        assert_eq!(&r.logical_rows, &[1]);
         assert_eq!(r.physical_columns.columns_len(), 1);
-        assert_eq!(r.physical_columns[0].decoded().to_int_vec(), vec![Some(1)]);
+        assert_eq!(
+            r.physical_columns[0].decoded().to_int_vec(),
+            vec![Some(1), Some(1)]
+        );
         assert!(r.is_drained.unwrap().stop());
     }
 
@@ -329,15 +330,15 @@ mod tests {
         let mut exec = BatchProjectionExecutor::new_for_test(src_exec, exprs);
         assert_eq!(exec.schema().len(), 2);
         let r = block_on(exec.next_batch(1));
-        assert_eq!(&r.logical_rows, &[0, 1]);
+        assert_eq!(&r.logical_rows, &[2, 0]);
         assert_eq!(r.physical_columns.columns_len(), 2);
         assert_eq!(
             r.physical_columns[0].decoded().to_int_vec(),
-            vec![Some(1), None]
+            vec![None, None, Some(1), None, Some(5)]
         );
         assert_eq!(
             r.physical_columns[1].decoded().to_real_vec(),
-            vec![None, Real::new(7.0).ok()]
+            vec![Real::new(7.0).ok(), Real::new(-5.0).ok(), None, None, None]
         );
         assert!(r.is_drained.unwrap().is_remain());
 
@@ -347,10 +348,16 @@ mod tests {
         assert!(r.is_drained.unwrap().is_remain());
 
         let r = block_on(exec.next_batch(1));
-        assert_eq!(&r.logical_rows, &[0]);
+        assert_eq!(&r.logical_rows, &[1]);
         assert_eq!(r.physical_columns.columns_len(), 2);
-        assert_eq!(r.physical_columns[0].decoded().to_int_vec(), vec![None]);
-        assert_eq!(r.physical_columns[1].decoded().to_real_vec(), vec![None]);
+        assert_eq!(
+            r.physical_columns[0].decoded().to_int_vec(),
+            vec![Some(1), None]
+        );
+        assert_eq!(
+            r.physical_columns[1].decoded().to_real_vec(),
+            vec![None, None]
+        );
         assert!(r.is_drained.unwrap().stop());
     }
 
@@ -432,14 +439,11 @@ mod tests {
             .push_column_ref_for_test(2)
             .push_fn_call_for_test(is_even_fn_meta(), 1, FieldTypeTp::LongLong)
             .build_for_test();
-        let expr3 = RpnExpressionBuilder::new_for_test()
-            .push_constant_for_test(-100i64)
-            .build_for_test();
 
-        let mut exec = BatchProjectionExecutor::new_for_test(src_exec, vec![expr1, expr2, expr3]);
+        let mut exec = BatchProjectionExecutor::new_for_test(src_exec, vec![expr1, expr2]);
         let r = block_on(exec.next_batch(1));
-        assert_eq!(&r.logical_rows, &[0, 1, 2, 3]);
-        assert_eq!(r.physical_columns.columns_len(), 3);
+        assert_eq!(&r.logical_rows, &[3, 4, 0, 2]);
+        assert_eq!(r.physical_columns.columns_len(), 2);
         assert_eq!(
             r.physical_columns[0].decoded().to_int_vec(),
             vec![Some(1), None, Some(1), None]
@@ -447,10 +451,6 @@ mod tests {
         assert_eq!(
             r.physical_columns[1].decoded().to_int_vec(),
             vec![Some(0), Some(1), Some(0), Some(1)]
-        );
-        assert_eq!(
-            r.physical_columns[2].decoded().to_int_vec(),
-            vec![Some(-100), Some(-100), Some(-100), Some(-100)]
         );
         assert!(r.is_drained.unwrap().is_remain());
 
@@ -460,13 +460,8 @@ mod tests {
 
         let r = block_on(exec.next_batch(1));
         assert_eq!(r.logical_rows, &[0]);
-        assert_eq!(r.physical_columns.columns_len(), 3);
         assert_eq!(r.physical_columns[0].decoded().to_int_vec(), vec![None]);
         assert_eq!(r.physical_columns[1].decoded().to_int_vec(), vec![Some(1)]);
-        assert_eq!(
-            r.physical_columns[2].decoded().to_int_vec(),
-            vec![Some(-100)]
-        );
         assert!(r.is_drained.unwrap().stop());
     }
 

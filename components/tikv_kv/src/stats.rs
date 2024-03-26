@@ -24,7 +24,7 @@ const STAT_SEEK_FOR_PREV_TOMBSTONE: &str = "seek_for_prev_tombstone";
 const STAT_RAW_VALUE_TOMBSTONE: &str = "raw_value_tombstone";
 
 thread_local! {
-    pub static RAW_VALUE_TOMBSTONE : RefCell<usize> = const{ RefCell::new(0)};
+    pub static RAW_VALUE_TOMBSTONE : RefCell<usize> = RefCell::new(0);
 }
 
 pub enum StatsKind {
@@ -176,7 +176,7 @@ impl CfStatistics {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct Statistics {
     pub lock: CfStatistics,
     pub write: CfStatistics,
@@ -190,43 +190,9 @@ pub struct Statistics {
     // Note that a value comes from either write cf (due to it's a short value) or default cf, we
     // can't embed this `processed_size` field into `CfStatistics`.
     pub processed_size: usize,
-
-    // When getting data from default cf, we can check write cf statistics to decide which method
-    // should be used to get the data.
-    load_data_hint: LoadDataHintStatistics,
-}
-
-#[derive(Default, Debug)]
-struct LoadDataHintStatistics {
-    // The value of `over_seek_bound` when the last time calling `load_data_hint()`.
-    last_write_over_seek_bound: usize,
-}
-
-#[derive(Default, PartialEq, Debug, Clone)]
-pub enum LoadDataHint {
-    #[default]
-    NearSeek,
-    Seek,
 }
 
 impl Statistics {
-    // Use write cf stats to decide load action for default cf
-    pub fn load_data_hint(&mut self) -> LoadDataHint {
-        let stats = &mut self.load_data_hint;
-
-        let hint = if self.write.over_seek_bound != stats.last_write_over_seek_bound {
-            // Over seek bound indicates the next valid key may be far away from current
-            // position, so use seek directly
-            LoadDataHint::Seek
-        } else {
-            // The next valid key may be around current position, so use near seek which
-            // calls next() multiple times before calling seek()
-            LoadDataHint::NearSeek
-        };
-        stats.last_write_over_seek_bound = self.write.over_seek_bound;
-        hint
-    }
-
     pub fn details(&self) -> [(&'static str, [(&'static str, usize); STATS_COUNT]); 3] {
         [
             (CF_DEFAULT, self.data.details()),
@@ -317,8 +283,8 @@ impl StatisticsSummary {
 /// ```
 #[derive(Debug, Default, Copy, Clone)]
 pub struct StageLatencyStats {
-    pub schedule_wait_time_ns: u64,
-    pub snapshot_wait_time_ns: u64,
-    pub wait_wall_time_ns: u64,
-    pub process_wall_time_ns: u64,
+    pub schedule_wait_time_ms: u64,
+    pub snapshot_wait_time_ms: u64,
+    pub wait_wall_time_ms: u64,
+    pub process_wall_time_ms: u64,
 }

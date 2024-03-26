@@ -2,10 +2,7 @@
 
 use std::ops::Deref;
 
-use engine_traits::{
-    CfNamesExt, IterOptions, Iterable, Iterator, Peekable, ReadOptions, Result, Snapshot,
-    SnapshotMiscExt,
-};
+use engine_traits::{IterOptions, Iterable, Iterator, Peekable, ReadOptions, Result, Snapshot};
 
 use crate::{db_vector::PanicDbVector, engine::PanicEngine};
 
@@ -35,12 +32,6 @@ impl Iterable for PanicSnapshot {
     type Iterator = PanicSnapshotIterator;
 
     fn iterator_opt(&self, cf: &str, opts: IterOptions) -> Result<Self::Iterator> {
-        panic!()
-    }
-}
-
-impl CfNamesExt for PanicSnapshot {
-    fn cf_names(&self) -> Vec<&str> {
         panic!()
     }
 }
@@ -78,12 +69,6 @@ impl Iterator for PanicSnapshotIterator {
     }
 
     fn valid(&self) -> Result<bool> {
-        panic!()
-    }
-}
-
-impl SnapshotMiscExt for PanicSnapshot {
-    fn sequence_number(&self) -> u64 {
         panic!()
     }
 }

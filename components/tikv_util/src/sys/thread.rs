@@ -7,7 +7,6 @@
 use std::{io, io::Result, sync::Mutex, thread};
 
 use collections::HashMap;
-use tikv_alloc::{add_thread_memory_accessor, remove_thread_memory_accessor};
 
 /// A cross-platform CPU statistics data structure.
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
@@ -374,32 +373,17 @@ pub trait StdThreadBuildWrapper {
 }
 
 pub trait ThreadBuildWrapper {
-    /// Register all system hooks along with a custom hook pair.
-    fn with_sys_and_custom_hooks<F1, F2>(&mut self, after_start: F1, before_end: F2) -> &mut Self
+    fn after_start_wrapper<F>(&mut self, f: F) -> &mut Self
     where
-        F1: Fn() + Send + Sync + 'static,
-        F2: Fn() + Send + Sync + 'static;
+        F: Fn() + Send + Sync + 'static;
 
-    /// Register some generic hooks like memory tracing or thread lifetime
-    /// tracing.
-    fn with_sys_hooks(&mut self) -> &mut Self {
-        self.with_sys_and_custom_hooks(|| {}, || {})
-    }
+    fn before_stop_wrapper<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static;
 }
 
 lazy_static::lazy_static! {
     pub static ref THREAD_NAME_HASHMAP: Mutex<HashMap<Pid, String>> = Mutex::new(HashMap::default());
-    pub static ref THREAD_START_HOOKS: Mutex<Vec<Box<dyn Fn() + Sync + Send>>> = Mutex::new(Vec::new());
-}
-
-pub fn hook_thread_start(f: Box<dyn Fn() + Sync + Send>) {
-    THREAD_START_HOOKS.lock().unwrap().push(f);
-}
-
-pub(crate) fn call_thread_start_hooks() {
-    for f in THREAD_START_HOOKS.lock().unwrap().iter() {
-        f();
-    }
 }
 
 pub(crate) fn add_thread_name_to_map() {
@@ -427,67 +411,58 @@ impl StdThreadBuildWrapper for std::thread::Builder {
     {
         #[allow(clippy::disallowed_methods)]
         self.spawn(|| {
-            call_thread_start_hooks();
-            // SAFETY: we will call `remove_thread_memory_accessor` at defer.
-            unsafe { add_thread_memory_accessor() };
             add_thread_name_to_map();
-            defer! {{
-                remove_thread_name_from_map();
-                remove_thread_memory_accessor();
-            }};
-            f()
+            let res = f();
+            remove_thread_name_from_map();
+            res
         })
     }
 }
 
 impl ThreadBuildWrapper for tokio::runtime::Builder {
-    fn with_sys_and_custom_hooks<F1, F2>(&mut self, start: F1, end: F2) -> &mut Self
+    fn after_start_wrapper<F>(&mut self, f: F) -> &mut Self
     where
-        F1: Fn() + Send + Sync + 'static,
-        F2: Fn() + Send + Sync + 'static,
+        F: Fn() + Send + Sync + 'static,
     {
         #[allow(clippy::disallowed_methods)]
         self.on_thread_start(move || {
-            call_thread_start_hooks();
-            // SAFETY: we will call `remove_thread_memory_accessor` at
-            // `before-stop_wrapper`.
-            // FIXME: What if the user only calls `after_start_wrapper`?
-            unsafe {
-                add_thread_memory_accessor();
-            }
             add_thread_name_to_map();
-            start();
+            f();
         })
-        .on_thread_stop(move || {
-            end();
+    }
+
+    fn before_stop_wrapper<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        #[allow(clippy::disallowed_methods)]
+        self.on_thread_stop(move || {
+            f();
             remove_thread_name_from_map();
-            remove_thread_memory_accessor();
         })
     }
 }
 
 impl ThreadBuildWrapper for futures::executor::ThreadPoolBuilder {
-    fn with_sys_and_custom_hooks<F1, F2>(&mut self, start: F1, end: F2) -> &mut Self
+    fn after_start_wrapper<F>(&mut self, f: F) -> &mut Self
     where
-        F1: Fn() + Send + Sync + 'static,
-        F2: Fn() + Send + Sync + 'static,
+        F: Fn() + Send + Sync + 'static,
     {
         #[allow(clippy::disallowed_methods)]
         self.after_start(move |_| {
-            call_thread_start_hooks();
-            // SAFETY: we will call `remove_thread_memory_accessor` at
-            // `before-stop_wrapper`.
-            // FIXME: What if the user only calls `after_start_wrapper`?
-            unsafe {
-                add_thread_memory_accessor();
-            }
             add_thread_name_to_map();
-            start();
+            f();
         })
-        .before_stop(move |_| {
-            end();
+    }
+
+    fn before_stop_wrapper<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        #[allow(clippy::disallowed_methods)]
+        self.before_stop(move |_| {
+            f();
             remove_thread_name_from_map();
-            remove_thread_memory_accessor();
         })
     }
 }
@@ -610,7 +585,8 @@ mod tests {
         block_on(
             tokio::runtime::Builder::new_multi_thread()
                 .thread_name(thread_name)
-                .with_sys_hooks()
+                .after_start_wrapper(|| {})
+                .before_stop_wrapper(|| {})
                 .build()
                 .unwrap()
                 .spawn(async move { get_name_fn() }),

@@ -1,9 +1,8 @@
 [package]
-edition = "2021"
+edition = "2018"
 name = "concurrency_manager"
 publish = false
 version = "0.0.1"
-license = "Apache-2.0"
 
 [dependencies]
 crossbeam-skiplist = "0.1"
