@@ -53,7 +53,7 @@ resource_metering = { workspace = true }
 slog = "2.3"
 smallvec = "1.4"
 tikv_util = { workspace = true }
-time = "0.1"
+time = "0.2"
 tracker = { workspace = true }
 txn_types = { workspace = true }
 yatp = { git = "https://github.com/tikv/yatp.git", branch = "master" }

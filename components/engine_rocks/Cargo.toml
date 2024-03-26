@@ -50,7 +50,7 @@ slog_derive = "0.2"
 tempfile = "3.0"
 tikv_alloc = { workspace = true }
 tikv_util = { workspace = true }
-time = "0.1"
+time = "0.2"
 tracker = { workspace = true }
 txn_types = { workspace = true }
 
