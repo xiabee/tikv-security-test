@@ -35,7 +35,8 @@ make_auto_flush_static_metric! {
         compact,
         transfer_leader,
         prepare_flashback,
-        finish_flashback
+        finish_flashback,
+        batch_switch_witness : "batch-switch-witness",
     }
 
     pub label_enum AdminCmdStatus {
@@ -177,6 +178,8 @@ make_static_metric! {
         region_nonexistent,
         applying_snap,
         disk_full,
+        non_witness,
+        recovery,
         unsafe_vote,
     }
 
@@ -205,7 +208,8 @@ make_static_metric! {
         force_leader,
         witness,
         flashback_in_progress,
-        flashback_not_prepared
+        flashback_not_prepared,
+        non_witness,
     }
 
     pub label_enum RaftEventDurationType {
@@ -251,31 +255,6 @@ make_static_metric! {
         empty_hottest_key_range,
         // The top hot CPU region could not be split.
         unable_to_split_cpu_top,
-    }
-
-    pub label_enum SnapshotBrWaitApplyEventType {
-        sent,
-        trivial,
-        accepted,
-        term_not_match,
-        epoch_not_match,
-        duplicated,
-        finished,
-    }
-
-    pub struct SnapshotBrWaitApplyEvent : IntCounter {
-        "event" => SnapshotBrWaitApplyEventType
-    }
-
-    pub label_enum SnapshotBrLeaseEventType {
-        create,
-        renew,
-        expired,
-        reset,
-    }
-
-    pub struct SnapshotBrLeaseEvent : IntCounter {
-        "event" => SnapshotBrLeaseEventType
     }
 
     pub struct HibernatedPeerStateGauge: IntGauge {
@@ -807,6 +786,76 @@ lazy_static! {
     pub static ref STORE_SLOW_SCORE_GAUGE: Gauge =
     register_gauge!("tikv_raftstore_slow_score", "Slow score of the store.").unwrap();
 
+    pub static ref STORE_SLOW_TREND_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend", "Slow trend changing rate").unwrap();
+
+    pub static ref STORE_SLOW_TREND_L0_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_l0", "Slow trend L0 window avg value.").unwrap();
+    pub static ref STORE_SLOW_TREND_L1_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_l1", "Slow trend L1 window avg value.").unwrap();
+    pub static ref STORE_SLOW_TREND_L2_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_l2", "Slow trend L2 window avg value.").unwrap();
+
+    pub static ref STORE_SLOW_TREND_L0_L1_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_l0_l1", "Slow trend changing rate: L0/L1.").unwrap();
+    pub static ref STORE_SLOW_TREND_L1_L2_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_l1_l2", "Slow trend changing rate: L1/L2.").unwrap();
+
+    pub static ref STORE_SLOW_TREND_L1_MARGIN_ERROR_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_l1_margin_error", "Slow trend: L1 margin error range").unwrap();
+    pub static ref STORE_SLOW_TREND_L2_MARGIN_ERROR_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_l2_margin_error", "Slow trend: L2 margin error range").unwrap();
+
+    pub static ref STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC: IntGaugeVec =
+    register_int_gauge_vec!(
+        "tikv_raftstore_slow_trend_margin_error_gap",
+        "Slow trend: the gap between margin window time and current sampling time",
+        &["window"]
+    ).unwrap();
+
+    pub static ref STORE_SLOW_TREND_MISC_GAUGE_VEC: IntGaugeVec =
+    register_int_gauge_vec!(
+        "tikv_raftstore_slow_trend_misc",
+        "Slow trend uncatelogued gauge(s)",
+        &["type"]
+    ).unwrap();
+
+    pub static ref STORE_SLOW_TREND_RESULT_VALUE_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result_value", "Store slow trend result meantime value").unwrap();
+    pub static ref STORE_SLOW_TREND_RESULT_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result", "Store slow trend result changing rate").unwrap();
+
+    pub static ref STORE_SLOW_TREND_RESULT_L0_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result_l0", "Slow trend result L0 window avg value.").unwrap();
+    pub static ref STORE_SLOW_TREND_RESULT_L1_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result_l1", "Slow trend result L1 window avg value.").unwrap();
+    pub static ref STORE_SLOW_TREND_RESULT_L2_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result_l2", "Slow trend result L2 window avg value.").unwrap();
+
+    pub static ref STORE_SLOW_TREND_RESULT_L0_L1_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result_l0_l1", "Slow trend result changing rate: L0/L1.").unwrap();
+    pub static ref STORE_SLOW_TREND_RESULT_L1_L2_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result_l1_l2", "Slow trend result changing rate: L1/L2.").unwrap();
+
+    pub static ref STORE_SLOW_TREND_RESULT_L1_MARGIN_ERROR_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result_l1_margin_error", "Slow trend result: L1 margin error range").unwrap();
+    pub static ref STORE_SLOW_TREND_RESULT_L2_MARGIN_ERROR_GAUGE: Gauge =
+    register_gauge!("tikv_raftstore_slow_trend_result_l2_margin_error", "Slow trend result: L2 margin error range").unwrap();
+
+    pub static ref STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC: IntGaugeVec =
+    register_int_gauge_vec!(
+        "tikv_raftstore_slow_trend_result_margin_error_gap",
+        "Slow trend result: the gap between margin window time and current sampling time",
+        &["window"]
+    ).unwrap();
+
+    pub static ref STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC: IntGaugeVec =
+    register_int_gauge_vec!(
+        "tikv_raftstore_slow_trend_result_misc",
+        "Slow trend result uncatelogued gauge(s)",
+        &["type"]
+    ).unwrap();
+
     pub static ref RAFT_LOG_GC_SKIPPED_VEC: IntCounterVec = register_int_counter_vec!(
         "tikv_raftstore_raft_log_gc_skipped",
         "Total number of skipped raft log gc.",
@@ -836,30 +885,5 @@ lazy_static! {
     pub static ref PEER_IN_FLASHBACK_STATE: IntGauge = register_int_gauge!(
         "tikv_raftstore_peer_in_flashback_state",
         "Total number of peers in the flashback state"
-    ).unwrap();
-
-    pub static ref SNAP_BR_SUSPEND_COMMAND_TYPE: IntCounterVec = register_int_counter_vec!(
-        "tikv_raftstore_snap_br_suspend_command_type",
-        "The statistic of rejecting some admin commands being proposed.",
-        &["type"]
-    ).unwrap();
-
-    pub static ref SNAP_BR_WAIT_APPLY_EVENT: SnapshotBrWaitApplyEvent = register_static_int_counter_vec!(
-        SnapshotBrWaitApplyEvent,
-        "tikv_raftstore_snap_br_wait_apply_event",
-        "The events of wait apply issued by snapshot br.",
-        &["event"]
-    ).unwrap();
-
-    pub static ref SNAP_BR_SUSPEND_COMMAND_LEASE_UNTIL: IntGauge = register_int_gauge!(
-        "tikv_raftstore_snap_br_suspend_command_lease_until",
-        "The lease that snapshot br holds of rejecting some type of commands. (In unix timestamp.)"
-    ).unwrap();
-
-    pub static ref SNAP_BR_LEASE_EVENT: SnapshotBrLeaseEvent = register_static_int_counter_vec!(
-        SnapshotBrLeaseEvent,
-        "tikv_raftstore_snap_br_lease_event",
-        "The events of the lease to denying new admin commands being proposed by snapshot br.",
-        &["event"]
     ).unwrap();
 }

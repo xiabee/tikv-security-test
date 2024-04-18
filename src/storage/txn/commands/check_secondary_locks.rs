@@ -58,6 +58,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
     fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
         // It is not allowed for commit to overwrite a protected rollback. So we update
         // max_ts to prevent this case from happening.
+        let region_id = self.ctx.get_region_id();
         context.concurrency_manager.update_max_ts(self.start_ts);
 
         let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
@@ -77,7 +78,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
                 Some(lock) if lock.ts == self.start_ts => {
                     if lock.lock_type == LockType::Pessimistic {
                         released_lock = txn.unlock_key(key.clone(), true, TimeStamp::zero());
-                        let overlapped_write = reader.get_txn_commit_record(&key)?.unwrap_none();
+                        let overlapped_write =
+                            reader.get_txn_commit_record(&key)?.unwrap_none(region_id);
                         (SecondaryLockStatus::RolledBack, true, overlapped_write)
                     } else {
                         (SecondaryLockStatus::Locked(lock), false, None)
@@ -146,6 +148,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
             rows = 1;
         }
         let pr = ProcessResult::SecondaryLocksStatus { status: result };
+        let new_acquired_locks = txn.take_new_locks();
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
         write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
@@ -155,6 +158,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
             pr,
             lock_info: vec![],
             released_locks,
+            new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
         })

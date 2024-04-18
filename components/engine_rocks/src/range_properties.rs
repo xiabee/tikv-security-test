@@ -7,7 +7,10 @@ use engine_traits::{
 };
 use tikv_util::{box_err, box_try, debug, info};
 
-use crate::{engine::RocksEngine, get_range_stats, properties::RangeProperties};
+use crate::{
+    engine::RocksEngine,
+    properties::{get_range_stats, RangeProperties},
+};
 
 impl RangePropertiesExt for RocksEngine {
     fn get_range_approximate_keys(&self, range: Range<'_>, large_threshold: u64) -> Result<u64> {

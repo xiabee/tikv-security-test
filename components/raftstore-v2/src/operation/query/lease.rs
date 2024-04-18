@@ -1,13 +1,20 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use engine_traits::{KvEngine, RaftEngine};
 use kvproto::raft_cmdpb::RaftCmdRequest;
-use raftstore::store::{
-    can_amend_read, fsm::apply::notify_stale_req, metrics::RAFT_READ_INDEX_PENDING_COUNT,
-    msg::ReadCallback, propose_read_index, should_renew_lease, util::LeaseState, ReadDelegate,
-    ReadIndexRequest, ReadProgress, TrackVer, Transport,
+use raft::{
+    eraftpb::{self, MessageType},
+    Storage,
+};
+use raftstore::{
+    store::{
+        can_amend_read, fsm::apply::notify_stale_req, metrics::RAFT_READ_INDEX_PENDING_COUNT,
+        msg::ReadCallback, propose_read_index, should_renew_lease, util::LeaseState, ReadDelegate,
+        ReadIndexRequest, ReadProgress, Transport,
+    },
+    Error, Result,
 };
 use slog::debug;
 use tikv_util::time::monotonic_raw_now;
@@ -22,6 +29,72 @@ use crate::{
 };
 
 impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
+    pub fn on_step_read_index<T>(
+        &mut self,
+        ctx: &mut StoreContext<EK, ER, T>,
+        m: &mut eraftpb::Message,
+    ) -> bool {
+        assert_eq!(m.get_msg_type(), MessageType::MsgReadIndex);
+
+        fail::fail_point!("on_step_read_index_msg");
+        ctx.coprocessor_host
+            .on_step_read_index(m, self.state_role());
+        // Must use the commit index of `PeerStorage` instead of the commit index
+        // in raft-rs which may be greater than the former one.
+        // For more details, see the annotations above `on_leader_commit_idx_changed`.
+        let index = self.storage().entry_storage().commit_index();
+        // Check if the log term of this index is equal to current term, if so,
+        // this index can be used to reply the read index request if the leader holds
+        // the lease. Please also take a look at raft-rs.
+        if self.storage().term(index).unwrap() == self.term() {
+            let state = self.inspect_lease();
+            if let LeaseState::Valid = state {
+                // If current peer has valid lease, then we could handle the
+                // request directly, rather than send a heartbeat to check quorum.
+                let mut resp = eraftpb::Message::default();
+                resp.set_msg_type(MessageType::MsgReadIndexResp);
+                resp.term = self.term();
+                resp.to = m.from;
+
+                resp.index = index;
+                resp.set_entries(m.take_entries());
+
+                self.raft_group_mut().raft.msgs.push(resp);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn pre_read_index(&self) -> Result<()> {
+        fail::fail_point!("before_propose_readindex", |s| if s
+            .map_or(true, |s| s.parse().unwrap_or(true))
+        {
+            Ok(())
+        } else {
+            Err(tikv_util::box_err!(
+                "[{}] {} can not read due to injected failure",
+                self.region_id(),
+                self.peer_id()
+            ))
+        });
+
+        // See more in ready_to_handle_read().
+        if self.proposal_control().is_splitting() {
+            return Err(Error::ReadIndexNotReady {
+                reason: "can not read index due to split",
+                region_id: self.region_id(),
+            });
+        }
+        if self.proposal_control().is_merging() {
+            return Err(Error::ReadIndexNotReady {
+                reason: "can not read index due to merge",
+                region_id: self.region_id(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_index_leader<T: Transport>(
         &mut self,
         ctx: &mut StoreContext<EK, ER, T>,
@@ -56,7 +129,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             .get_mut(0)
             .filter(|req| req.has_read_index())
             .map(|req| req.take_read_index());
-        let (id, dropped) = propose_read_index(self.raft_group_mut(), request.as_ref(), None);
+        let (id, dropped) = propose_read_index(self.raft_group_mut(), request.as_ref());
         if dropped {
             // The message gets dropped silently, can't be handled anymore.
             notify_stale_req(self.term(), ch);
@@ -99,10 +172,9 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
     ///
     /// awake the read tasks waiting in frontend (such as unified thread pool)
     /// In v1, it's named as response_read.
-    pub(crate) fn respond_read_index<T>(
+    pub(crate) fn respond_read_index(
         &self,
         read_index_req: &mut ReadIndexRequest<QueryResChannel>,
-        ctx: &mut StoreContext<EK, ER, T>,
     ) {
         debug!(
             self.logger,
@@ -111,9 +183,9 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         );
         RAFT_READ_INDEX_PENDING_COUNT.sub(read_index_req.cmds().len() as i64);
         let time = monotonic_raw_now();
-        for (req, ch, mut read_index) in read_index_req.take_cmds().drain(..) {
+        for (_, ch, mut read_index) in read_index_req.take_cmds().drain(..) {
             ch.read_tracker().map(|tracker| {
-                GLOBAL_TRACKERS.with_tracker(*tracker, |t| {
+                GLOBAL_TRACKERS.with_tracker(tracker, |t| {
                     t.metrics.read_index_confirm_wait_nanos = (time - read_index_req.propose_time)
                         .to_std()
                         .unwrap()
@@ -167,50 +239,26 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             let term = self.term();
             self.leader_lease_mut()
                 .maybe_new_remote_lease(term)
-                .map(ReadProgress::leader_lease)
+                .map(ReadProgress::set_leader_lease)
         };
         if let Some(progress) = progress {
             let mut meta = store_meta.lock().unwrap();
-            let reader = meta.readers.get_mut(&self.region_id()).unwrap();
+            let reader = &mut meta.readers.get_mut(&self.region_id()).unwrap().0;
             self.maybe_update_read_progress(reader, progress);
         }
         if let Some(progress) = read_progress {
-            // TODO: remove it
-            self.add_reader_if_necessary(store_meta);
-
             let mut meta = store_meta.lock().unwrap();
-            let reader = meta.readers.get_mut(&self.region_id()).unwrap();
+            let reader = &mut meta.readers.get_mut(&self.region_id()).unwrap().0;
             self.maybe_update_read_progress(reader, progress);
         }
     }
 
-    // TODO: remove this block of code when snapshot is done; add the logic into
-    // on_persist_snapshot.
-    pub(crate) fn add_reader_if_necessary(&mut self, store_meta: &Mutex<StoreMeta<EK>>) {
+    // Expire lease and unset lease in read delegate on role changed to follower.
+    pub(crate) fn expire_lease_on_became_follower(&mut self, store_meta: &Mutex<StoreMeta<EK>>) {
+        self.leader_lease_mut().expire();
         let mut meta = store_meta.lock().unwrap();
-        // TODO: remove this block of code when snapshot is done; add the logic into
-        // on_persist_snapshot.
-        let reader = meta.readers.get_mut(&self.region_id());
-        if reader.is_none() {
-            let region = self.region().clone();
-            let region_id = region.get_id();
-            let peer_id = self.peer_id();
-            let delegate = ReadDelegate {
-                region: Arc::new(region),
-                peer_id,
-                term: self.term(),
-                applied_term: self.entry_storage().applied_term(),
-                leader_lease: None,
-                last_valid_ts: Timespec::new(0, 0),
-                tag: format!("[region {}] {}", region_id, peer_id),
-                read_progress: self.read_progress().clone(),
-                pending_remove: false,
-                bucket_meta: None,
-                txn_extra_op: Default::default(),
-                txn_ext: Default::default(),
-                track_ver: TrackVer::new(),
-            };
-            meta.readers.insert(self.region_id(), delegate);
+        if let Some((reader, _)) = meta.readers.get_mut(&self.region_id()) {
+            self.maybe_update_read_progress(reader, ReadProgress::unset_leader_lease());
         }
     }
 

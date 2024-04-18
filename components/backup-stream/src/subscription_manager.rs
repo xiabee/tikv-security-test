@@ -10,9 +10,9 @@ use pd_client::PdClient;
 use raft::StateRole;
 use raftstore::{
     coprocessor::{ObserveHandle, RegionInfoProvider},
-    store::{fsm::ChangeObserver, SignificantRouter},
+    router::CdcHandle,
+    store::fsm::ChangeObserver,
 };
-use resolved_ts::LeadershipResolver;
 use tikv::storage::Statistics;
 use tikv_util::{
     box_err, debug, info, sys::thread::ThreadBuildWrapper, time::Instant, warn, worker::Scheduler,
@@ -22,7 +22,7 @@ use txn_types::TimeStamp;
 
 use crate::{
     annotate,
-    endpoint::ObserveOp,
+    endpoint::{BackupStreamResolver, ObserveOp},
     errors::{Error, Result},
     event_loader::InitialDataLoader,
     future,
@@ -32,7 +32,7 @@ use crate::{
     router::{Router, TaskSelector},
     subscription_track::{CheckpointType, ResolveResult, SubscriptionTracer},
     try_send,
-    utils::{self, CallbackWaitGroup, Work},
+    utils::{self, FutureWaitGroup, Work},
     Task,
 };
 
@@ -137,7 +137,7 @@ trait InitialScan: Clone + Sync + Send + 'static {
 impl<E, RT> InitialScan for InitialDataLoader<E, RT>
 where
     E: KvEngine,
-    RT: SignificantRouter<E> + Sync + Clone + 'static,
+    RT: CdcHandle<E> + Sync + 'static,
 {
     async fn do_initial_scan(
         &self,
@@ -295,7 +295,7 @@ pub struct RegionSubscriptionManager<S, R, PDC> {
 
     messenger: Sender<ObserveOp>,
     scan_pool_handle: Arc<ScanPoolHandle>,
-    scans: Arc<CallbackWaitGroup>,
+    scans: Arc<FutureWaitGroup>,
 }
 
 impl<S, R, PDC> Clone for RegionSubscriptionManager<S, R, PDC>
@@ -316,7 +316,7 @@ where
             subs: self.subs.clone(),
             messenger: self.messenger.clone(),
             scan_pool_handle: self.scan_pool_handle.clone(),
-            scans: CallbackWaitGroup::new(),
+            scans: FutureWaitGroup::new(),
         }
     }
 }
@@ -347,18 +347,19 @@ where
     ///
     /// a two-tuple, the first is the handle to the manager, the second is the
     /// operator loop future.
-    pub fn start<E, HInit>(
+    pub fn start<E, HInit, HChkLd>(
         initial_loader: InitialDataLoader<E, HInit>,
         regions: R,
         observer: BackupStreamObserver,
         meta_cli: MetadataClient<S>,
         pd_client: Arc<PDC>,
         scan_pool_size: usize,
-        leader_checker: LeadershipResolver,
+        resolver: BackupStreamResolver<HChkLd, E>,
     ) -> (Self, future![()])
     where
         E: KvEngine,
-        HInit: SignificantRouter<E> + Clone + Sync + 'static,
+        HInit: CdcHandle<E> + Sync + 'static,
+        HChkLd: CdcHandle<E> + 'static,
     {
         let (tx, rx) = channel(MESSAGE_BUFFER_SIZE);
         let scan_pool_handle = spawn_executors(initial_loader.clone(), scan_pool_size);
@@ -372,9 +373,9 @@ where
             subs: initial_loader.tracing,
             messenger: tx,
             scan_pool_handle: Arc::new(scan_pool_handle),
-            scans: CallbackWaitGroup::new(),
+            scans: FutureWaitGroup::new(),
         };
-        let fut = op.clone().region_operator_loop(rx, leader_checker);
+        let fut = op.clone().region_operator_loop(rx, resolver);
         (op, fut)
     }
 
@@ -389,16 +390,21 @@ where
     }
 
     /// wait initial scanning get finished.
-    pub fn wait(&self, timeout: Duration) -> future![bool] {
-        tokio::time::timeout(timeout, self.scans.wait()).map(|result| result.is_err())
+    pub async fn wait(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.scans.wait())
+            .map(move |result| result.is_err())
+            .await
     }
 
     /// the handler loop.
-    async fn region_operator_loop(
+    async fn region_operator_loop<E, RT>(
         self,
         mut message_box: Receiver<ObserveOp>,
-        mut leader_checker: LeadershipResolver,
-    ) {
+        mut resolver: BackupStreamResolver<RT, E>,
+    ) where
+        E: KvEngine,
+        RT: CdcHandle<E> + 'static,
+    {
         while let Some(op) = message_box.recv().await {
             // Skip some trivial resolve commands.
             if !matches!(op, ObserveOp::ResolveRegions { .. }) {
@@ -459,15 +465,14 @@ where
                     }
                 }
                 ObserveOp::ResolveRegions { callback, min_ts } => {
+                    fail::fail_point!("subscription_manager_resolve_regions");
                     let now = Instant::now();
                     let timedout = self.wait(Duration::from_secs(5)).await;
                     if timedout {
                         warn!("waiting for initial scanning done timed out, forcing progress!"; 
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
-                    let regions = leader_checker
-                        .resolve(self.subs.current_regions(), min_ts)
-                        .await;
+                    let regions = resolver.resolve(self.subs.current_regions(), min_ts).await;
                     let cps = self.subs.resolve_with(min_ts, regions);
                     let min_region = cps.iter().min_by_key(|rs| rs.checkpoint);
                     // If there isn't any region observed, the `min_ts` can be used as resolved ts
@@ -753,7 +758,7 @@ mod test {
         use std::time::Duration;
 
         use super::ScanCmd;
-        use crate::{subscription_manager::spawn_executors, utils::CallbackWaitGroup};
+        use crate::{subscription_manager::spawn_executors, utils::FutureWaitGroup};
 
         fn should_finish_in(f: impl FnOnce() + Send + 'static, d: std::time::Duration) {
             let (tx, rx) = futures::channel::oneshot::channel();
@@ -770,7 +775,7 @@ mod test {
         }
 
         let pool = spawn_executors(NoopInitialScan, 1);
-        let wg = CallbackWaitGroup::new();
+        let wg = FutureWaitGroup::new();
         fail::cfg("execute_scan_command_sleep_100", "return").unwrap();
         for _ in 0..100 {
             let wg = wg.clone();

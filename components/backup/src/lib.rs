@@ -5,7 +5,6 @@
 #[allow(unused_extern_crates)]
 extern crate tikv_alloc;
 
-pub mod disk_snap;
 mod endpoint;
 mod errors;
 mod metrics;

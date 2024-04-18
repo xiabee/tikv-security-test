@@ -5,58 +5,51 @@
 #[macro_use]
 extern crate log;
 
+mod cmd;
+mod executor;
+mod util;
+
 use std::{
     borrow::ToOwned,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read},
     path::Path,
-    process, str,
+    str,
     string::ToString,
-    sync::{Arc, Mutex, RwLock},
+    sync::Arc,
     thread,
     time::Duration,
     u64,
 };
 
-use collections::HashMap;
 use encryption_export::{
     create_backend, data_key_manager_from_config, from_engine_encryption_method, DataKeyManager,
     DecrypterReader, Iv,
 };
 use engine_rocks::get_env;
-use engine_traits::{EncryptionKeyManager, Peekable, TabletFactory};
+use engine_traits::EncryptionKeyManager;
 use file_system::calc_crc32;
-use futures::{executor::block_on, future::try_join_all};
+use futures::executor::block_on;
 use gag::BufferRedirect;
 use grpcio::{CallOption, ChannelBuilder, Environment};
 use kvproto::{
     debugpb::{Db as DbType, *},
     encryptionpb::EncryptionMethod,
     kvrpcpb::SplitRegionRequest,
-    raft_serverpb::{SnapshotMeta, StoreIdent},
+    raft_serverpb::SnapshotMeta,
     tikvpb::TikvClient,
 };
 use pd_client::{Config as PdConfig, PdClient, RpcClient};
 use protobuf::Message;
-use raft_engine::RecoveryMode;
 use raft_log_engine::ManagedFileSystem;
-use raftstore::store::util::build_key_range;
 use regex::Regex;
 use security::{SecurityConfig, SecurityManager};
 use structopt::{clap::ErrorKind, StructOpt};
-use tikv::{
-    config::TikvConfig,
-    server::{debug::BottommostLevelCompaction, KvEngineFactoryBuilder},
-};
+use tikv::{config::TikvConfig, server::debug::BottommostLevelCompaction};
 use tikv_util::{escape, run_and_wait_child_process, sys::thread::StdThreadBuildWrapper, unescape};
 use txn_types::Key;
 
 use crate::{cmd::*, executor::*, util::*};
-
-mod cmd;
-mod executor;
-mod fork_readonly_tikv;
-mod util;
 
 fn main() {
     let opt = Opt::from_args();
@@ -242,122 +235,6 @@ fn main() {
             let key = unescape(&key);
             split_region(&pd_client, mgr, region_id, key);
         }
-        Cmd::ShowClusterId { data_dir } => {
-            if opt.config.is_none() {
-                clap::Error {
-                    message: String::from("(--config) must be specified"),
-                    kind: ErrorKind::MissingRequiredArgument,
-                    info: None,
-                }
-                .exit();
-            }
-            if data_dir.is_empty() {
-                clap::Error {
-                    message: String::from("(--data-dir) must be specified"),
-                    kind: ErrorKind::MissingRequiredArgument,
-                    info: None,
-                }
-                .exit();
-            }
-            cfg.storage.data_dir = data_dir;
-            // Disable auto compactions and GCs to avoid modifications.
-            cfg.rocksdb.defaultcf.disable_auto_compactions = true;
-            cfg.rocksdb.writecf.disable_auto_compactions = true;
-            cfg.rocksdb.lockcf.disable_auto_compactions = true;
-            cfg.rocksdb.raftcf.disable_auto_compactions = true;
-            cfg.raftdb.defaultcf.disable_auto_compactions = true;
-            cfg.rocksdb.titan.disable_gc = true;
-            match read_cluster_id(&cfg) {
-                Ok(id) => {
-                    println!("cluster-id: {}", id);
-                    process::exit(0);
-                }
-                Err(e) => {
-                    eprintln!("read cluster ID fail: {}", e);
-                    process::exit(-1);
-                }
-            }
-        }
-        Cmd::ForkReadonlyTikv {
-            data_dir,
-            agent_dir,
-            snaps,
-            rocksdb_files,
-        } => {
-            if opt.config.is_none() {
-                clap::Error {
-                    message: String::from("(--config) must be specified"),
-                    kind: ErrorKind::MissingRequiredArgument,
-                    info: None,
-                }
-                .exit();
-            }
-            if data_dir.is_empty() {
-                clap::Error {
-                    message: String::from("(--data-dir) must be specified"),
-                    kind: ErrorKind::MissingRequiredArgument,
-                    info: None,
-                }
-                .exit();
-            }
-            cfg.storage.data_dir = data_dir;
-            if cfg.raft_engine.config().enable_log_recycle {
-                clap::Error {
-                    message: String::from("raft-engine.enable-log-recycle can only be false"),
-                    kind: ErrorKind::InvalidValue,
-                    info: None,
-                }
-                .exit();
-            }
-            if cfg.raft_engine.config().recovery_mode != RecoveryMode::TolerateTailCorruption {
-                clap::Error {
-                    message: String::from(
-                        "raft-engine.recovery-mode can only be tolerate-tail-corruption",
-                    ),
-                    kind: ErrorKind::InvalidValue,
-                    info: None,
-                }
-                .exit();
-            }
-            if snaps != fork_readonly_tikv::SYMLINK && snaps != fork_readonly_tikv::COPY {
-                clap::Error {
-                    message: String::from("(--snaps) can only be symlink or copy"),
-                    kind: ErrorKind::InvalidValue,
-                    info: None,
-                }
-                .exit();
-            }
-            if rocksdb_files != fork_readonly_tikv::SYMLINK
-                && rocksdb_files != fork_readonly_tikv::COPY
-            {
-                clap::Error {
-                    message: String::from("(--rocksdb_files) can only be symlink or copy"),
-                    kind: ErrorKind::InvalidValue,
-                    info: None,
-                }
-                .exit();
-            }
-            fork_readonly_tikv::run(&cfg, &agent_dir, &snaps, &rocksdb_files)
-        }
-        Cmd::Flashback {
-            version,
-            regions,
-            start,
-            end,
-        } => {
-            let start_key = from_hex(&start).unwrap();
-            let end_key = from_hex(&end).unwrap();
-            let pd_client = get_pd_rpc_client(opt.pd, Arc::clone(&mgr));
-            flashback_whole_cluster(
-                pd_client,
-                &cfg,
-                Arc::clone(&mgr),
-                regions.unwrap_or_default(),
-                version,
-                start_key,
-                end_key,
-            );
-        }
         // Commands below requires either the data dir or the host.
         cmd => {
             let data_dir = opt.data_dir.as_deref();
@@ -372,9 +249,8 @@ fn main() {
                 .exit();
             }
 
-            let skip_paranoid_checks = opt.skip_paranoid_checks;
-            let debug_executor =
-                new_debug_executor(&cfg, data_dir, skip_paranoid_checks, host, Arc::clone(&mgr));
+            cfg.rocksdb.paranoid_checks = Some(!opt.skip_paranoid_checks);
+            let debug_executor = new_debug_executor(&cfg, data_dir, host, Arc::clone(&mgr));
 
             match cmd {
                 Cmd::Print { cf, key } => {
@@ -788,7 +664,7 @@ fn compact_whole_cluster(
             .name(format!("compact-{}", addr))
             .spawn_wrapper(move || {
                 tikv_alloc::add_thread_memory_accessor();
-                let debug_executor = new_debug_executor(&cfg, None, false, Some(&addr), mgr);
+                let debug_executor = new_debug_executor(&cfg, None, Some(&addr), mgr);
                 for cf in cfs {
                     debug_executor.compact(
                         Some(&addr),
@@ -806,237 +682,9 @@ fn compact_whole_cluster(
         handles.push(h);
     }
 
-    handles.into_iter().for_each(|h| h.join().unwrap());
-}
-
-const FLASHBACK_TIMEOUT: u64 = 1800; // 1800s
-const WAIT_APPLY_FLASHBACK_STATE: u64 = 100; // 100ms
-
-fn flashback_whole_cluster(
-    pd_client: RpcClient,
-    cfg: &TikvConfig,
-    mgr: Arc<SecurityManager>,
-    region_ids: Vec<u64>,
-    version: u64,
-    start_key: Vec<u8>,
-    end_key: Vec<u8>,
-) {
-    println!(
-        "flashback whole cluster with version {} from {:?} to {:?}",
-        version, start_key, end_key
-    );
-    let cfg = cfg.clone();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("flashback")
-        .enable_time()
-        .build()
-        .unwrap();
-
-    block_on(runtime.spawn(async move {
-        // Pre-create the debug executors for all stores.
-        let stores = match pd_client.get_all_stores(false) {
-            Ok(stores) => stores,
-            Err(e) => {
-                println!("failed to load all stores: {:?}", e);
-                return;
-            }
-        };
-        let debuggers = Mutex::new(stores
-            .into_iter()
-            .map(|s| {
-                let addr = pd_client.get_store(s.get_id()).unwrap().address;
-                let cfg_inner = cfg.clone();
-                let mgr = Arc::clone(&mgr);
-                let debug_executor = new_debug_executor(&cfg_inner, None,false, Some(&addr), mgr);
-                (s.get_id(), debug_executor)
-            } )
-            .collect::<HashMap<_, _>>());
-        // Prepare flashback.
-        let start_ts = pd_client.get_tso().await.unwrap();
-        let key_range_to_prepare = RwLock::new(load_key_range(&pd_client, start_key, end_key));
-        // Need to retry if all regions are not finish.
-        let mut key_range_to_finish = key_range_to_prepare.read().unwrap().clone();
-        loop {
-            // Traverse all regions and prepare flashback.
-            let mut futures = Vec::default();
-            let read_result = key_range_to_prepare.read().unwrap().clone();
-            read_result.into_iter().
-            filter(|(_, (region_id, _))| {
-                region_ids.is_empty() || region_ids.contains(region_id)
-            })
-            .for_each(|((start_key, end_key), (region_id, store_id))| {
-                let debuggers = &debuggers;
-                let key_range_to_prepare = &key_range_to_prepare;
-                let key_range = build_key_range(&start_key, &end_key, false);
-                let f = async move {
-                    let debuggers = debuggers.lock().unwrap();
-                    match debuggers.get(&store_id).unwrap().flashback_to_version(
-                        version,
-                        region_id,
-                        key_range,
-                        start_ts.into_inner(),
-                        0,
-                    ) {
-                        Ok(_) => {
-                            key_range_to_prepare
-                                .write()
-                                .unwrap()
-                                .remove(&(start_key, end_key));
-                            Ok(())
-                        }
-                        Err(err) => {
-                            println!(
-                                "prepare flashback region {} with start_ts {:?} to version {} failed, error: {:?}",
-                                region_id, start_ts, version, err
-                            );
-                            Err(err)
-                        },
-                    }
-                };
-                futures.push(f);
-            });
-
-            // Wait for finishing prepare flashback.
-            match tokio::time::timeout(
-                Duration::from_secs(FLASHBACK_TIMEOUT),
-                try_join_all(futures),
-            )
-            .await
-            {
-                Ok(res) => {
-                    if let Err((key_range, _)) = res {
-                        // Retry specific key range to prepare flashback.
-                        let stale_key_range = (key_range.start_key.clone(), key_range.end_key.clone());
-                        let mut key_range_to_prepare = key_range_to_prepare.write().unwrap();
-                        // Remove stale key range.
-                        key_range_to_prepare.remove(&stale_key_range);
-                        key_range_to_finish.remove(&stale_key_range);
-                        load_key_range(&pd_client, stale_key_range.0.clone(), stale_key_range.1.clone())
-                            .into_iter().for_each(|(key_range, region_info)| {
-                                // Need to update `key_range_to_prepare` to replace stale key range.
-                                key_range_to_prepare.insert(key_range.clone(), region_info);
-                                // Need to update `key_range_to_finish` as well.
-                                key_range_to_finish.insert(key_range, region_info);
-                            });
-                        thread::sleep(Duration::from_micros(WAIT_APPLY_FLASHBACK_STATE));
-                        continue;
-                    }
-                    break;
-                }
-                Err(e) => {
-                    println!(
-                        "prepare flashback with start_ts {:?} timeout. err: {:?}",
-                        start_ts, e
-                    );
-                    return;
-                }
-            }
-        }
-
-        // Flashback for all regions.
-        let commit_ts = pd_client.get_tso().await.unwrap();
-        let key_range_to_finish = RwLock::new(key_range_to_finish);
-        loop {
-            let mut futures = Vec::default();
-            let read_result = key_range_to_finish.read().unwrap().clone();
-            read_result.into_iter()
-            .filter(|(_, (region_id, _))| {
-                region_ids.is_empty() || region_ids.contains(region_id)
-            })
-            .for_each(|((start_key, end_key), (region_id, store_id))| {
-                let debuggers = &debuggers;
-                let key_range_to_finish = &key_range_to_finish;
-                let key_range = build_key_range(&start_key, &end_key, false);
-                let f = async move {
-                    let debuggers = debuggers.lock().unwrap();
-                    match debuggers.get(&store_id).unwrap().flashback_to_version(
-                        version,
-                        region_id,
-                        key_range,
-                        start_ts.into_inner(),
-                        commit_ts.into_inner(),
-                    ) {
-                        Ok(_) => {
-                            key_range_to_finish
-                                .write()
-                                .unwrap()
-                                .remove(&(start_key, end_key));
-                            Ok(())
-                        }
-                        Err(err) => {
-                            println!(
-                                "finish flashback region {} with start_ts {:?} to version {} failed, error: {:?}",
-                                region_id, start_ts, version, err
-                            );
-                            Err(err)
-                        },
-                    }
-                };
-                futures.push(f);
-            });
-
-            // Wait for finishing flashback to version.
-            match tokio::time::timeout(
-                Duration::from_secs(FLASHBACK_TIMEOUT),
-                try_join_all(futures),
-            )
-            .await
-            {
-                Ok(res) => match res {
-                    Ok(_) => break,
-                    Err((key_range, err)) => {
-                        // Retry `NotLeader` or `RegionNotFound`.
-                        if err.to_string().contains("not leader") || err.to_string().contains("not found") {
-                            // When finished `PrepareFlashback`, the region may change leader in the `flashback in progress`
-                            // Neet to retry specific key range to finish flashback.
-                            let stale_key_range = (key_range.start_key.clone(), key_range.end_key.clone());
-                            let mut key_range_to_finish = key_range_to_finish.write().unwrap();
-                            // Remove stale key range.
-                            key_range_to_finish.remove(&stale_key_range);
-                            load_key_range(&pd_client, stale_key_range.0.clone(), stale_key_range.1.clone())
-                                .into_iter().for_each(|(key_range, region_info)| {
-                                // Need to update `key_range_to_finish` to replace stale key range.
-                                key_range_to_finish.insert(key_range, region_info);
-                            });
-                        }
-                        thread::sleep(Duration::from_micros(WAIT_APPLY_FLASHBACK_STATE));
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    println!(
-                        "finish flashback with start_ts {:?}, commit_ts: {:?} timeout. err: {:?}",
-                        e, start_ts, commit_ts
-                    );
-                    return;
-                }
-            }
-        }
-    }))
-    .unwrap();
-
-    println!("flashback all stores success!");
-}
-
-// Load (region_id, leader's store id) in the cluster with key ranges.
-fn load_key_range(
-    pd_client: &RpcClient,
-    start_key: Vec<u8>,
-    end_key: Vec<u8>,
-) -> HashMap<(Vec<u8>, Vec<u8>), (u64, u64)> {
-    // Get all regions in the cluster.
-    let res = pd_client.batch_load_regions(start_key, end_key);
-    res.into_iter()
-        .flatten()
-        .map(|r| {
-            let cur_region = r.get_region();
-            let start_key = cur_region.get_start_key().to_owned();
-            let end_key = cur_region.get_end_key().to_owned();
-            let region_id = cur_region.get_id();
-            let leader_store_id = r.get_leader().get_store_id();
-            ((start_key, end_key), (region_id, leader_store_id))
-        })
-        .collect::<HashMap<_, _>>()
+    for h in handles {
+        h.join().unwrap();
+    }
 }
 
 fn read_fail_file(path: &str) -> Vec<(String, String)> {
@@ -1055,20 +703,21 @@ fn read_fail_file(path: &str) -> Vec<(String, String)> {
     list
 }
 
-fn run_ldb_command(args: Vec<String>, cfg: &TikvConfig) {
+fn build_rocks_opts(cfg: &TikvConfig) -> engine_rocks::RocksDbOptions {
     let key_manager = data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
         .unwrap()
         .map(Arc::new);
     let env = get_env(key_manager, None /* io_rate_limiter */).unwrap();
-    let mut opts = cfg.rocksdb.build_opt();
-    opts.set_env(env);
+    let resource = cfg.rocksdb.build_resources(env);
+    cfg.rocksdb.build_opt(&resource, cfg.storage.engine)
+}
 
-    engine_rocks::raw::run_ldb_tool(&args, &opts);
+fn run_ldb_command(args: Vec<String>, cfg: &TikvConfig) {
+    engine_rocks::raw::run_ldb_tool(&args, &build_rocks_opts(cfg));
 }
 
 fn run_sst_dump_command(args: Vec<String>, cfg: &TikvConfig) {
-    let opts = cfg.rocksdb.build_opt();
-    engine_rocks::raw::run_sst_dump_tool(&args, &opts);
+    engine_rocks::raw::run_sst_dump_tool(&args, &build_rocks_opts(cfg));
 }
 
 fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, cfg: &TikvConfig) {
@@ -1087,7 +736,7 @@ fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, 
 
     let stderr = BufferRedirect::stderr().unwrap();
     let stdout = BufferRedirect::stdout().unwrap();
-    let opts = cfg.rocksdb.build_opt();
+    let opts = build_rocks_opts(cfg);
 
     match run_and_wait_child_process(|| engine_rocks::raw::run_sst_dump_tool(&args, &opts)) {
         Ok(code) => {
@@ -1302,19 +951,4 @@ fn flush_std_buffer_to_log(
     err_buffer.read_to_string(&mut err).unwrap();
     out_buffer.read_to_string(&mut out).unwrap();
     println!("{}, err redirect:{}, out redirect:{}", msg, err, out);
-}
-
-fn read_cluster_id(config: &TikvConfig) -> Result<u64, String> {
-    let env = config
-        .build_shared_rocks_env(None, None)
-        .map_err(|e| format!("build_shared_rocks_env fail: {}", e))?;
-    let kv_engine = KvEngineFactoryBuilder::new(env, config, &config.storage.data_dir)
-        .build()
-        .create_shared_db()
-        .map_err(|e| format!("create_shared_db fail: {}", e))?;
-    let ident = kv_engine
-        .get_msg::<StoreIdent>(keys::STORE_IDENT_KEY)
-        .unwrap()
-        .unwrap();
-    Ok(ident.cluster_id)
 }

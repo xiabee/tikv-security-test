@@ -1,6 +1,7 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
+    borrow::BorrowMut,
     cell::UnsafeCell,
     sync::{
         atomic::{AtomicU8, Ordering},
@@ -50,28 +51,6 @@ where
         arg_on_drop,
     );
     (callback, future)
-}
-
-// Run a future with a timeout on the current thread. Returns Err if times out.
-#[allow(clippy::result_unit_err)]
-pub fn block_on_timeout<F>(fut: F, dur: std::time::Duration) -> Result<F::Output, ()>
-where
-    F: std::future::Future,
-{
-    use futures_util::compat::Future01CompatExt;
-
-    let mut timeout = GLOBAL_TIMER_HANDLE
-        .delay(std::time::Instant::now() + dur)
-        .compat()
-        .fuse();
-    futures::pin_mut!(fut);
-    let mut f = fut.fuse();
-    futures::executor::block_on(async {
-        futures::select! {
-            _ = timeout => Err(()),
-            item = f => Ok(item),
-        }
-    })
 }
 
 /// Create a stream proxy with buffer representing the remote stream. The
@@ -227,6 +206,28 @@ pub fn try_poll<T>(f: impl Future<Output = T>) -> Option<T> {
         futures::select_biased! {
             res = f.fuse() => Some(res),
             _ = futures::future::ready(()).fuse() => None,
+        }
+    })
+}
+
+// Run a future with a timeout on the current thread. Returns Err if times out.
+#[allow(clippy::result_unit_err)]
+pub fn block_on_timeout<B, F, I>(mut fut: B, dur: std::time::Duration) -> Result<I, ()>
+where
+    F: std::future::Future<Output = I> + Unpin,
+    B: BorrowMut<F>,
+{
+    use futures_util::compat::Future01CompatExt;
+
+    let mut timeout = GLOBAL_TIMER_HANDLE
+        .delay(std::time::Instant::now() + dur)
+        .compat()
+        .fuse();
+    let mut f = fut.borrow_mut().fuse();
+    futures::executor::block_on(async {
+        futures::select! {
+            _ = timeout => Err(()),
+            item = f => Ok(item),
         }
     })
 }

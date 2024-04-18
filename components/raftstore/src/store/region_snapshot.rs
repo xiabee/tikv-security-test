@@ -86,6 +86,11 @@ where
     }
 
     #[inline]
+    pub fn set_apply_index(&self, apply_index: u64) {
+        self.apply_index.store(apply_index, Ordering::SeqCst);
+    }
+
+    #[inline]
     pub fn get_apply_index(&self) -> Result<u64> {
         let apply_index = self.apply_index.load(Ordering::SeqCst);
         if apply_index == 0 {
@@ -460,7 +465,7 @@ mod tests {
             let db = &engines.kv;
             for &(ref k, level) in &levels {
                 db.put(&data_key(k), k).unwrap();
-                db.flush_cfs(true).unwrap();
+                db.flush_cfs(&[], true).unwrap();
                 data.push((k.to_vec(), k.to_vec()));
                 db.compact_files_in_range(Some(&data_key(k)), Some(&data_key(k)), Some(level))
                     .unwrap();

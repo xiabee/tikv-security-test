@@ -17,10 +17,10 @@ use kvproto::{
 };
 use raftstore::{
     coprocessor::ObserveId,
-    router::RaftStoreRouter,
+    router::CdcHandle,
     store::{
         fsm::ChangeObserver,
-        msg::{Callback, ReadResponse, SignificantMsg},
+        msg::{Callback, ReadResponse},
     },
 };
 use resolved_ts::{Resolver, TsSource};
@@ -48,7 +48,7 @@ use txn_types::{Key, KvPair, Lock, LockType, OldValue, TimeStamp};
 
 use crate::{
     channel::CdcEvent,
-    delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState},
+    delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState, ObservedRange},
     endpoint::Deregister,
     metrics::*,
     old_value::{near_seek_old_value, new_old_value_cursor, OldValueCursors},
@@ -76,10 +76,11 @@ pub(crate) enum Scanner<S: Snapshot> {
 }
 
 pub(crate) struct Initializer<E> {
-    pub(crate) engine: E,
+    pub(crate) tablet: Option<E>,
     pub(crate) sched: Scheduler<Task>,
     pub(crate) sink: crate::channel::Sink,
 
+    pub(crate) observed_range: ObservedRange,
     pub(crate) region_id: u64,
     pub(crate) region_epoch: RegionEpoch,
     pub(crate) observe_id: ObserveId,
@@ -104,10 +105,10 @@ pub(crate) struct Initializer<E> {
 }
 
 impl<E: KvEngine> Initializer<E> {
-    pub(crate) async fn initialize<T: 'static + RaftStoreRouter<E>>(
+    pub(crate) async fn initialize<T: 'static + CdcHandle<E>>(
         &mut self,
-        change_cmd: ChangeObserver,
-        raft_router: T,
+        change_observer: ChangeObserver,
+        cdc_handle: T,
         concurrency_semaphore: Arc<Semaphore>,
         memory_quota: Arc<MemoryQuota>,
     ) -> Result<()> {
@@ -126,24 +127,22 @@ impl<E: KvEngine> Initializer<E> {
         let (incremental_scan_barrier_cb, incremental_scan_barrier_fut) =
             tikv_util::future::paired_future_callback();
         let barrier = CdcEvent::Barrier(Some(incremental_scan_barrier_cb));
-        if let Err(e) = raft_router.significant_send(
+        if let Err(e) = cdc_handle.capture_change(
             self.region_id,
-            SignificantMsg::CaptureChange {
-                cmd: change_cmd,
-                region_epoch,
-                callback: Callback::read(Box::new(move |resp| {
-                    if let Err(e) = sched.schedule(Task::InitDownstream {
-                        region_id,
-                        downstream_id,
-                        downstream_state,
-                        sink,
-                        incremental_scan_barrier: barrier,
-                        cb: Box::new(move || cb(resp)),
-                    }) {
-                        error!("cdc schedule cdc task failed"; "error" => ?e);
-                    }
-                })),
-            },
+            region_epoch,
+            change_observer,
+            Callback::read(Box::new(move |resp| {
+                if let Err(e) = sched.schedule(Task::InitDownstream {
+                    region_id,
+                    downstream_id,
+                    downstream_state,
+                    sink,
+                    incremental_scan_barrier: barrier,
+                    cb: Box::new(move || cb(resp)),
+                }) {
+                    error!("cdc schedule cdc task failed"; "error" => ?e);
+                }
+            })),
         ) {
             warn!("cdc send capture change cmd failed";
             "region_id" => self.region_id, "error" => ?e);
@@ -211,10 +210,12 @@ impl<E: KvEngine> Initializer<E> {
             return on_cancel();
         }
 
+        self.observed_range.update_region_key_range(&region);
         debug!("cdc async incremental scan";
             "region_id" => region_id,
             "downstream_id" => ?downstream_id,
             "observe_id" => ?self.observe_id,
+            "all_key_covered" => ?self.observed_range.all_key_covered,
             "start_key" => log_wrappers::Value::key(snap.lower_bound().unwrap_or_default()),
             "end_key" => log_wrappers::Value::key(snap.upper_bound().unwrap_or_default()));
 
@@ -427,6 +428,7 @@ impl<E: KvEngine> Initializer<E> {
             self.request_id,
             entries,
             self.filter_loop,
+            &self.observed_range,
         )?;
         if done {
             let (cb, fut) = tikv_util::future::paired_future_callback();
@@ -506,7 +508,11 @@ impl<E: KvEngine> Initializer<E> {
         let start_key = data_key(snap.lower_bound().unwrap_or_default());
         let end_key = data_end_key(snap.upper_bound().unwrap_or_default());
         let range = Range::new(&start_key, &end_key);
-        let collection = match self.engine.table_properties_collection(CF_WRITE, &[range]) {
+        let tablet = match self.tablet.as_ref() {
+            Some(t) => t,
+            None => return false,
+        };
+        let collection = match tablet.table_properties_collection(CF_WRITE, &[range]) {
             Ok(collection) => collection,
             Err(_) => return false,
         };
@@ -565,7 +571,7 @@ mod tests {
         cdcpb::{EventLogType, Event_oneof_event},
         errorpb::Error as ErrorHeader,
     };
-    use raftstore::{coprocessor::ObserveHandle, store::RegionSnapshot};
+    use raftstore::{coprocessor::ObserveHandle, router::CdcRaftRouter, store::RegionSnapshot};
     use resolved_ts::TxnLocks;
     use test_raftstore::MockRaftStoreRouter;
     use tikv::{
@@ -588,7 +594,7 @@ mod tests {
     use tokio::runtime::{Builder, Runtime};
 
     use super::*;
-    use crate::txn_souce::TxnSource;
+    use crate::txn_source::TxnSource;
 
     struct ReceiverRunnable<T: Display + Send> {
         tx: Sender<T>,
@@ -637,16 +643,15 @@ mod tests {
             .unwrap();
         let downstream_state = Arc::new(AtomicCell::new(DownstreamState::Initializing));
         let initializer = Initializer {
-            engine: engine.unwrap_or_else(|| {
+            tablet: engine.or_else(|| {
                 TestEngineBuilder::new()
                     .build_without_cache()
                     .unwrap()
                     .kv_engine()
-                    .unwrap()
             }),
             sched: receiver_worker.scheduler(),
             sink,
-
+            observed_range: ObservedRange::default(),
             region_id: 1,
             region_epoch: RegionEpoch::default(),
             observe_id: ObserveId::new(),
@@ -674,6 +679,12 @@ mod tests {
 
         let mut expected_locks = BTreeMap::<TimeStamp, TxnLocks>::new();
 
+        // Only observe ["", "b\0x90"]
+        let observed_range = ObservedRange::new(
+            Key::from_raw(&[]).into_encoded(),
+            Key::from_raw(&[b'k', 90]).into_encoded(),
+        )
+        .unwrap();
         let mut total_bytes = 0;
         // Pessimistic locks should not be tracked
         for i in 0..10 {
@@ -709,6 +720,7 @@ mod tests {
             ChangeDataRequestKvApi::TiDb,
             false,
         );
+        initializer.observed_range = observed_range.clone();
         let check_result = || loop {
             let task = rx.recv().unwrap();
             match task {
@@ -722,7 +734,14 @@ mod tests {
         // To not block test by barrier.
         pool.spawn(async move {
             let mut d = drain.drain();
-            while d.next().await.is_some() {}
+            while let Some((e, _)) = d.next().await {
+                if let CdcEvent::Event(e) = e {
+                    for e in e.get_entries().get_entries() {
+                        let key = Key::from_raw(&e.key).into_encoded();
+                        assert!(observed_range.contains_encoded_key(&key), "{:?}", e);
+                    }
+                }
+            }
         });
 
         let memory_quota = Arc::new(MemoryQuota::new(usize::MAX));
@@ -798,7 +817,6 @@ mod tests {
         let mut engine = TestEngineBuilder::new().build_without_cache().unwrap();
 
         let mut total_bytes = 0;
-
         for i in 10..100 {
             let (k, v) = (&[b'k', i], &[b'v', i]);
             total_bytes += k.len();
@@ -1019,7 +1037,7 @@ mod tests {
             mock_initializer(total_bytes, total_bytes, buffer, None, kv_api, false);
 
         let change_cmd = ChangeObserver::from_cdc(1, ObserveHandle::new());
-        let raft_router = MockRaftStoreRouter::new();
+        let raft_router = CdcRaftRouter(MockRaftStoreRouter::new());
         let concurrency_semaphore = Arc::new(Semaphore::new(1));
         let memory_quota = Arc::new(MemoryQuota::new(usize::MAX));
 

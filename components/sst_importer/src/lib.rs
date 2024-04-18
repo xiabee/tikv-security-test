@@ -24,10 +24,10 @@ pub mod metrics;
 pub mod sst_importer;
 
 pub use self::{
-    config::Config,
+    config::{Config, ConfigManager},
     errors::{error_inc, Error, Result},
     import_file::sst_meta_to_path,
     sst_importer::SstImporter,
     sst_writer::{RawSstWriter, TxnSstWriter},
-    util::{copy_sst_for_ingestion, prepare_sst_for_ingestion},
+    util::prepare_sst_for_ingestion,
 };
