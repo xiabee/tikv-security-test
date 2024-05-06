@@ -1,5 +1,11 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use api_version::ApiV2;
 use crossbeam::atomic::AtomicCell;
@@ -51,7 +57,7 @@ use crate::{
     delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState, ObservedRange},
     endpoint::Deregister,
     metrics::*,
-    old_value::{near_seek_old_value, new_old_value_cursor, OldValueCursors},
+    old_value::{near_seek_old_value, OldValueCursors},
     service::ConnId,
     Error, Result, Task,
 };
@@ -229,9 +235,7 @@ impl<E: KvEngine> Initializer<E> {
         let mut scanner = if kv_api == ChangeDataRequestKvApi::TiDb {
             if self.ts_filter_is_helpful(&snap) {
                 hint_min_ts = Some(self.checkpoint_ts);
-                let wc = new_old_value_cursor(&snap, CF_WRITE);
-                let dc = new_old_value_cursor(&snap, CF_DEFAULT);
-                old_value_cursors = Some(OldValueCursors::new(wc, dc));
+                old_value_cursors = Some(OldValueCursors::new(&snap));
             }
 
             // Time range: (checkpoint_ts, max]
@@ -268,7 +272,23 @@ impl<E: KvEngine> Initializer<E> {
             DownstreamState::Initializing | DownstreamState::Stopped
         ));
 
+        let scan_long_time = AtomicBool::new(false);
+
+        defer!(if scan_long_time.load(Ordering::SeqCst) {
+            CDC_SCAN_LONG_DURATION_REGIONS.dec();
+        });
+
         while !done {
+            // Add metrics to observe long time incremental scan region count
+            if !scan_long_time.load(Ordering::SeqCst)
+                && start.saturating_elapsed() > Duration::from_secs(60)
+            {
+                CDC_SCAN_LONG_DURATION_REGIONS.inc();
+
+                scan_long_time.store(true, Ordering::SeqCst);
+                warn!("cdc incremental scan takes too long"; "region_id" => region_id, "conn_id" => ?self.conn_id, 
+                      "downstream_id" => ?self.downstream_id, "takes" => ?start.saturating_elapsed());
+            }
             // When downstream_state is Stopped, it means the corresponding
             // delegate is stopped. The initialization can be safely canceled.
             if self.downstream_state.load() == DownstreamState::Stopped {
@@ -288,6 +308,7 @@ impl<E: KvEngine> Initializer<E> {
             sink_time += start_sink.saturating_elapsed();
         }
 
+        fail_point!("before_post_incremental_scan");
         if !post_init_downstream(&self.downstream_state) {
             return on_cancel();
         }
@@ -314,16 +335,20 @@ impl<E: KvEngine> Initializer<E> {
     fn do_scan<S: Snapshot>(
         &self,
         scanner: &mut Scanner<S>,
-        mut old_value_cursors: Option<&mut OldValueCursors<S::Iter>>,
+        mut old_value_cursors: Option<&mut OldValueCursors<S>>,
         entries: &mut Vec<Option<KvEntry>>,
     ) -> Result<ScanStat> {
         let mut read_old_value = |v: &mut OldValue, stats: &mut Statistics| -> Result<()> {
-            let (wc, dc) = match old_value_cursors {
-                Some(ref mut x) => (&mut x.write, &mut x.default),
-                None => return Ok(()),
+            let Some(cursors) = old_value_cursors.as_mut() else {
+                return Ok(());
             };
             if let OldValue::SeekWrite(ref key) = v {
-                match near_seek_old_value(key, wc, Either::<&S, _>::Right(dc), stats)? {
+                match near_seek_old_value(
+                    key,
+                    &mut cursors.write,
+                    Either::<&S, _>::Right(&mut cursors.default),
+                    stats,
+                )? {
                     Some(x) => *v = OldValue::value(x),
                     None => *v = OldValue::None,
                 }
@@ -387,7 +412,7 @@ impl<E: KvEngine> Initializer<E> {
     async fn scan_batch<S: Snapshot>(
         &self,
         scanner: &mut Scanner<S>,
-        old_value_cursors: Option<&mut OldValueCursors<S::Iter>>,
+        old_value_cursors: Option<&mut OldValueCursors<S>>,
         resolver: Option<&mut Resolver>,
     ) -> Result<Vec<Option<KvEntry>>> {
         let mut entries = Vec::with_capacity(self.max_scan_batch_size);
@@ -492,9 +517,10 @@ impl<E: KvEngine> Initializer<E> {
             }
         } else {
             Deregister::Downstream {
+                conn_id: self.conn_id,
+                request_id: self.request_id,
                 region_id: self.region_id,
                 downstream_id: self.downstream_id,
-                conn_id: self.conn_id,
                 err: Some(err),
             }
         };
@@ -641,8 +667,7 @@ mod tests {
         let pool = Builder::new_multi_thread()
             .thread_name("test-initializer-worker")
             .worker_threads(4)
-            .after_start_wrapper(|| {})
-            .before_stop_wrapper(|| {})
+            .with_sys_hooks()
             .build()
             .unwrap();
         let downstream_state = Arc::new(AtomicCell::new(DownstreamState::Initializing));
@@ -725,12 +750,11 @@ mod tests {
             false,
         );
         initializer.observed_range = observed_range.clone();
-        let check_result = || loop {
+        let check_result = || {
             let task = rx.recv().unwrap();
             match task {
                 Task::ResolverReady { resolver, .. } => {
                     assert_eq!(resolver.locks(), &expected_locks);
-                    return;
                 }
                 t => panic!("unexpected task {} received", t),
             }
@@ -780,13 +804,11 @@ mod tests {
         ))
         .unwrap();
 
-        loop {
-            let task = rx.recv_timeout(Duration::from_millis(100));
-            match task {
-                Ok(t) => panic!("unexpected task {} received", t),
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(e) => panic!("unexpected err {:?}", e),
-            }
+        let task = rx.recv_timeout(Duration::from_millis(100));
+        match task {
+            Ok(t) => panic!("unexpected task {} received", t),
+            Err(RecvTimeoutError::Timeout) => (),
+            Err(e) => panic!("unexpected err {:?}", e),
         }
 
         // Test cancellation.
@@ -1094,13 +1116,13 @@ mod tests {
     #[test]
     fn test_scanner_with_titan() {
         let mut cfg = DbConfig::default();
-        cfg.titan.enabled = true;
+        cfg.titan.enabled = Some(true);
         cfg.defaultcf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.defaultcf.titan.min_blob_size = ReadableSize(0);
+        cfg.defaultcf.titan.min_blob_size = Some(ReadableSize(0));
         cfg.writecf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.writecf.titan.min_blob_size = ReadableSize(0);
+        cfg.writecf.titan.min_blob_size = Some(ReadableSize(0));
         cfg.lockcf.titan.blob_run_mode = BlobRunMode::Normal;
-        cfg.lockcf.titan.min_blob_size = ReadableSize(0);
+        cfg.lockcf.titan.min_blob_size = Some(ReadableSize(0));
         let mut engine = TestEngineBuilder::new().build_with_cfg(&cfg).unwrap();
 
         must_prewrite_put(&mut engine, b"zkey", b"value", b"zkey", 100);

@@ -888,7 +888,7 @@ pub mod test_utils {
                     cfg.ratio_threshold = ratio_threshold;
                 }
                 cfg.enable_compaction_filter = true;
-                GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)))
+                GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)), None)
             };
             let feature_gate = {
                 let feature_gate = FeatureGate::default();
@@ -1098,6 +1098,7 @@ pub mod tests {
         // Clean the engine, prepare for later tests.
         raw_engine
             .delete_ranges_cf(
+                &WriteOptions::default(),
                 CF_WRITE,
                 DeleteStrategy::DeleteFiles,
                 &[Range::new(b"z", b"zz")],

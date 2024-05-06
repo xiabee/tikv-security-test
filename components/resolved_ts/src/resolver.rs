@@ -5,7 +5,7 @@ use std::{cmp, collections::BTreeMap, sync::Arc, time::Duration};
 use collections::{HashMap, HashMapEntry};
 use raftstore::store::RegionReadProgress;
 use tikv_util::{
-    memory::{HeapSize, MemoryQuota, MemoryQuotaExceeded},
+    memory::{MemoryQuota, MemoryQuotaExceeded},
     time::Instant,
 };
 use txn_types::{Key, TimeStamp};
@@ -92,7 +92,6 @@ pub struct Resolver {
     min_ts: TimeStamp,
     // Whether the `Resolver` is stopped
     stopped: bool,
-
     // The memory quota for the `Resolver` and its lock keys and timestamps.
     memory_quota: Arc<MemoryQuota>,
     // The last attempt of resolve(), used for diagnosis.
@@ -189,8 +188,8 @@ impl Resolver {
             tracked_index: 0,
             min_ts: TimeStamp::zero(),
             stopped: false,
-            last_attempt: None,
             memory_quota,
+            last_attempt: None,
         }
     }
 
@@ -258,7 +257,7 @@ impl Resolver {
         // the same Arc<[u8]>, so lock_ts_heap is negligible. Also, it's hard to
         // track accurate memory usage of lock_ts_heap as a timestamp may have
         // many keys.
-        key.heap_size() + std::mem::size_of::<TimeStamp>()
+        std::mem::size_of_val(key) + std::mem::size_of::<TimeStamp>()
     }
 
     fn shrink_ratio(&mut self, ratio: usize) {
