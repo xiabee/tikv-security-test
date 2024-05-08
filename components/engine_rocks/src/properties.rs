@@ -144,7 +144,10 @@ pub struct RangeProperties {
 
 impl RangeProperties {
     pub fn get(&self, key: &[u8]) -> &RangeOffsets {
-        let idx = self.offsets.binary_search_by_key(&key, |(k, _)| k).unwrap();
+        let idx = self
+            .offsets
+            .binary_search_by_key(&key, |&(ref k, _)| k)
+            .unwrap();
         &self.offsets[idx].1
     }
 
@@ -202,11 +205,11 @@ impl RangeProperties {
         if start == end {
             return (0, 0);
         }
-        let start_offset = match self.offsets.binary_search_by_key(&start, |(k, _)| k) {
+        let start_offset = match self.offsets.binary_search_by_key(&start, |&(ref k, _)| k) {
             Ok(idx) => Some(idx),
             Err(next_idx) => next_idx.checked_sub(1),
         };
-        let end_offset = match self.offsets.binary_search_by_key(&end, |(k, _)| k) {
+        let end_offset = match self.offsets.binary_search_by_key(&end, |&(ref k, _)| k) {
             Ok(idx) => Some(idx),
             Err(next_idx) => next_idx.checked_sub(1),
         };
@@ -222,7 +225,10 @@ impl RangeProperties {
         start_key: &[u8],
         end_key: &[u8],
     ) -> Vec<(Vec<u8>, RangeOffsets)> {
-        let start_offset = match self.offsets.binary_search_by_key(&start_key, |(k, _)| k) {
+        let start_offset = match self
+            .offsets
+            .binary_search_by_key(&start_key, |&(ref k, _)| k)
+        {
             Ok(idx) => {
                 if idx == self.offsets.len() - 1 {
                     return vec![];
@@ -233,7 +239,7 @@ impl RangeProperties {
             Err(next_idx) => next_idx,
         };
 
-        let end_offset = match self.offsets.binary_search_by_key(&end_key, |(k, _)| k) {
+        let end_offset = match self.offsets.binary_search_by_key(&end_key, |&(ref k, _)| k) {
             Ok(idx) => {
                 if idx == 0 {
                     return vec![];
@@ -408,10 +414,7 @@ impl TablePropertiesCollector for MvccPropertiesCollector {
         // TsFilter filters sst based on max_ts and min_ts during iterating.
         // To prevent seeing outdated (GC) records, we should consider
         // RocksDB delete entry type.
-        if entry_type != DBEntryType::Put
-            && entry_type != DBEntryType::Delete
-            && entry_type != DBEntryType::BlobIndex
-        {
+        if entry_type != DBEntryType::Put && entry_type != DBEntryType::Delete {
             return;
         }
 
@@ -449,43 +452,37 @@ impl TablePropertiesCollector for MvccPropertiesCollector {
             self.props.max_row_versions = self.row_versions;
         }
 
-        if entry_type != DBEntryType::BlobIndex {
-            if self.key_mode == KeyMode::Raw {
-                let decode_raw_value = ApiV2::decode_raw_value(value);
-                match decode_raw_value {
-                    Ok(raw_value) => {
-                        if raw_value.is_valid(self.current_ts) {
-                            self.props.num_puts += 1;
-                        } else {
-                            self.props.num_deletes += 1;
-                        }
-                        if let Some(expire_ts) = raw_value.expire_ts {
-                            self.props.ttl.add(expire_ts);
-                        }
+        if self.key_mode == KeyMode::Raw {
+            let decode_raw_value = ApiV2::decode_raw_value(value);
+            match decode_raw_value {
+                Ok(raw_value) => {
+                    if raw_value.is_valid(self.current_ts) {
+                        self.props.num_puts += 1;
+                    } else {
+                        self.props.num_deletes += 1;
                     }
-                    Err(_) => {
-                        self.num_errors += 1;
+                    if let Some(expire_ts) = raw_value.expire_ts {
+                        self.props.ttl.add(expire_ts);
                     }
                 }
-            } else {
-                let write_type = match Write::parse_type(value) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        self.num_errors += 1;
-                        return;
-                    }
-                };
-
-                match write_type {
-                    WriteType::Put => self.props.num_puts += 1,
-                    WriteType::Delete => self.props.num_deletes += 1,
-                    _ => {}
+                Err(_) => {
+                    self.num_errors += 1;
                 }
             }
         } else {
-            // NOTE: if titan is enabled, the entry will always be treated as PUT.
-            // Be careful if you try to enable Titan on CF_WRITE.
-            self.props.num_puts += 1;
+            let write_type = match Write::parse_type(value) {
+                Ok(v) => v,
+                Err(_) => {
+                    self.num_errors += 1;
+                    return;
+                }
+            };
+
+            match write_type {
+                WriteType::Put => self.props.num_puts += 1,
+                WriteType::Delete => self.props.num_deletes += 1,
+                _ => {}
+            }
         }
 
         // Add new row.
@@ -872,7 +869,7 @@ mod tests {
 
         let mut collector = MvccPropertiesCollector::new(KeyMode::Txn);
         b.iter(|| {
-            for (k, v) in &entries {
+            for &(ref k, ref v) in &entries {
                 collector.add(k, v, DBEntryType::Put, 0, 0);
             }
         });

@@ -4,7 +4,6 @@ use std::ops::Deref;
 
 use engine_traits::{
     CfNamesExt, IterOptions, Iterable, Iterator, Peekable, ReadOptions, Result, Snapshot,
-    SnapshotMiscExt,
 };
 
 use crate::{db_vector::PanicDbVector, engine::PanicEngine};
@@ -78,12 +77,6 @@ impl Iterator for PanicSnapshotIterator {
     }
 
     fn valid(&self) -> Result<bool> {
-        panic!()
-    }
-}
-
-impl SnapshotMiscExt for PanicSnapshot {
-    fn sequence_number(&self) -> u64 {
         panic!()
     }
 }

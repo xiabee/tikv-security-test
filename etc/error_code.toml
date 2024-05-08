@@ -258,6 +258,11 @@ error = '''
 KV:Pd:StoreTombstone
 '''
 
+["KV:Pd:GlobalConfigNotFound"]
+error = '''
+KV:Pd:GlobalConfigNotFound
+'''
+
 ["KV:Pd:DataCompacted"]
 error = '''
 KV:Pd:DataCompacted

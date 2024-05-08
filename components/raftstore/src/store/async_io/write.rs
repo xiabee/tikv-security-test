@@ -21,11 +21,7 @@ use engine_traits::{
 use error_code::ErrorCodeExt;
 use fail::fail_point;
 use file_system::{set_io_type, IoType};
-use health_controller::types::LatencyInspector;
-use kvproto::{
-    metapb::RegionEpoch,
-    raft_serverpb::{RaftLocalState, RaftMessage},
-};
+use kvproto::raft_serverpb::{RaftLocalState, RaftMessage};
 use parking_lot::Mutex;
 use protobuf::Message;
 use raft::eraftpb::Entry;
@@ -51,7 +47,9 @@ use crate::{
         local_metrics::{RaftSendMessageMetrics, StoreWriteMetrics, TimeTracker},
         metrics::*,
         transport::Transport,
-        util, PeerMsg,
+        util,
+        util::LatencyInspector,
+        PeerMsg,
     },
     Result,
 };
@@ -202,7 +200,6 @@ where
     pub messages: Vec<RaftMessage>,
     pub trackers: Vec<TimeTracker>,
     pub has_snapshot: bool,
-    pub flushed_epoch: Option<RegionEpoch>,
 }
 
 impl<EK, ER> WriteTask<EK, ER>
@@ -225,7 +222,6 @@ where
             trackers: vec![],
             persisted_cbs: Vec::new(),
             has_snapshot: false,
-            flushed_epoch: None,
         }
     }
 
@@ -289,9 +285,6 @@ where
     ER: RaftEngine,
 {
     fn consume_resource(&self, resource_ctl: &Arc<ResourceController>) -> Option<String> {
-        if !resource_ctl.is_customized() {
-            return None;
-        }
         match self {
             WriteMsg::WriteTask(t) => {
                 let mut dominant_group = "".to_owned();
@@ -421,11 +414,7 @@ where
         }
         self.state_size = 0;
         if let ExtraBatchWrite::V2(_) = self.extra_batch_write {
-            let ExtraBatchWrite::V2(lb) =
-                mem::replace(&mut self.extra_batch_write, ExtraBatchWrite::None)
-            else {
-                unreachable!()
-            };
+            let ExtraBatchWrite::V2(lb) = mem::replace(&mut self.extra_batch_write, ExtraBatchWrite::None) else { unreachable!() };
             wb.merge(lb).unwrap();
         }
     }
@@ -457,10 +446,7 @@ where
             .unwrap();
 
         if let Some(raft_state) = task.raft_state.take()
-            && self
-                .raft_states
-                .insert(task.region_id, raft_state)
-                .is_none()
+            && self.raft_states.insert(task.region_id, raft_state).is_none()
         {
             self.state_size += std::mem::size_of::<RaftLocalState>();
         }
@@ -720,12 +706,10 @@ where
 
         fail_point!("raft_before_save");
 
-        let store_id = self.store_id;
-        fail_point!("raft_before_persist_on_store_1", store_id == 1, |_| {});
-
         let mut write_kv_time = 0f64;
         if let ExtraBatchWrite::V1(kv_wb) = &mut self.batch.extra_batch_write {
             if !kv_wb.is_empty() {
+                let store_id = self.store_id;
                 let raft_before_save_kv_on_store_3 = || {
                     fail_point!("raft_before_save_kv_on_store_3", store_id == 3, |_| {});
                 };

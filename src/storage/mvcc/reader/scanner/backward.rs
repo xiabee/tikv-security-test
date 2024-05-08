@@ -467,7 +467,6 @@ impl<S: Snapshot> BackwardKvScanner<S> {
             }
         }
 
-        self.statistics.write.over_seek_bound += 1;
         // We have not found another user key for now, so we directly `seek_for_prev()`.
         // After that, we must pointing to another key, or out of bound.
         self.write_cursor
@@ -512,14 +511,14 @@ mod tests {
         let ctx = Context::default();
         // Generate REVERSE_SEEK_BOUND / 2 Put for key [10].
         let k = &[10_u8];
-        for ts in 1..=REVERSE_SEEK_BOUND / 2 {
+        for ts in 0..REVERSE_SEEK_BOUND / 2 {
             must_prewrite_put(&mut engine, k, &[ts as u8], k, ts);
             must_commit(&mut engine, k, ts, ts);
         }
 
         // Generate REVERSE_SEEK_BOUND + 1 Put for key [9].
         let k = &[9_u8];
-        for ts in 1..=REVERSE_SEEK_BOUND + 1 {
+        for ts in 0..=REVERSE_SEEK_BOUND {
             must_prewrite_put(&mut engine, k, &[ts as u8], k, ts);
             must_commit(&mut engine, k, ts, ts);
         }
@@ -527,9 +526,9 @@ mod tests {
         // Generate REVERSE_SEEK_BOUND / 2 Put and REVERSE_SEEK_BOUND / 2 + 1 Rollback
         // for key [8].
         let k = &[8_u8];
-        for ts in 1..=REVERSE_SEEK_BOUND + 1 {
+        for ts in 0..=REVERSE_SEEK_BOUND {
             must_prewrite_put(&mut engine, k, &[ts as u8], k, ts);
-            if ts < REVERSE_SEEK_BOUND / 2 + 1 {
+            if ts < REVERSE_SEEK_BOUND / 2 {
                 must_commit(&mut engine, k, ts, ts);
             } else {
                 let modifies = vec![
@@ -548,16 +547,16 @@ mod tests {
         // Generate REVERSE_SEEK_BOUND / 2 Put, 1 Delete and REVERSE_SEEK_BOUND / 2
         // Rollback for key [7].
         let k = &[7_u8];
-        for ts in 1..=REVERSE_SEEK_BOUND / 2 {
+        for ts in 0..REVERSE_SEEK_BOUND / 2 {
             must_prewrite_put(&mut engine, k, &[ts as u8], k, ts);
             must_commit(&mut engine, k, ts, ts);
         }
         {
-            let ts = REVERSE_SEEK_BOUND / 2 + 1;
+            let ts = REVERSE_SEEK_BOUND / 2;
             must_prewrite_delete(&mut engine, k, k, ts);
             must_commit(&mut engine, k, ts, ts);
         }
-        for ts in REVERSE_SEEK_BOUND / 2 + 2..=REVERSE_SEEK_BOUND + 1 {
+        for ts in REVERSE_SEEK_BOUND / 2 + 1..=REVERSE_SEEK_BOUND {
             must_prewrite_put(&mut engine, k, &[ts as u8], k, ts);
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
@@ -573,14 +572,14 @@ mod tests {
 
         // Generate 1 PUT for key [6].
         let k = &[6_u8];
-        for ts in 1..2 {
+        for ts in 0..1 {
             must_prewrite_put(&mut engine, k, &[ts as u8], k, ts);
             must_commit(&mut engine, k, ts, ts);
         }
 
         // Generate REVERSE_SEEK_BOUND + 1 Rollback for key [5].
         let k = &[5_u8];
-        for ts in 1..=REVERSE_SEEK_BOUND + 1 {
+        for ts in 0..=REVERSE_SEEK_BOUND {
             must_prewrite_put(&mut engine, k, &[ts as u8], k, ts);
             let modifies = vec![
                 // ts is rather small, so it is ok to `as u8`
@@ -597,7 +596,7 @@ mod tests {
         // Generate 1 PUT with ts = REVERSE_SEEK_BOUND and 1 PUT
         // with ts = REVERSE_SEEK_BOUND + 1 for key [4].
         let k = &[4_u8];
-        for ts in REVERSE_SEEK_BOUND + 1..REVERSE_SEEK_BOUND + 3 {
+        for ts in REVERSE_SEEK_BOUND..REVERSE_SEEK_BOUND + 2 {
             must_prewrite_put(&mut engine, k, &[ts as u8], k, ts);
             must_commit(&mut engine, k, ts, ts);
         }
@@ -606,7 +605,7 @@ mod tests {
         // 4 4 5 5 5 5 5 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (REVERSE_SEEK_BOUND + 1).into())
+        let mut scanner = ScannerBuilder::new(snapshot, REVERSE_SEEK_BOUND.into())
             .desc(true)
             .range(None, Some(Key::from_raw(&[11_u8])))
             .build()
@@ -626,7 +625,7 @@ mod tests {
             scanner.next().unwrap(),
             Some((
                 Key::from_raw(&[10_u8]),
-                vec![(REVERSE_SEEK_BOUND / 2) as u8]
+                vec![(REVERSE_SEEK_BOUND / 2 - 1) as u8]
             ))
         );
         let statistics = scanner.take_statistics();
@@ -659,7 +658,7 @@ mod tests {
         //                                   ^cursor
         assert_eq!(
             scanner.next().unwrap(),
-            Some((Key::from_raw(&[9_u8]), vec![REVERSE_SEEK_BOUND as u8 + 1]))
+            Some((Key::from_raw(&[9_u8]), vec![REVERSE_SEEK_BOUND as u8]))
         );
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize);
@@ -697,7 +696,10 @@ mod tests {
         //                         ^cursor
         assert_eq!(
             scanner.next().unwrap(),
-            Some((Key::from_raw(&[8_u8]), vec![(REVERSE_SEEK_BOUND / 2) as u8]))
+            Some((
+                Key::from_raw(&[8_u8]),
+                vec![(REVERSE_SEEK_BOUND / 2 - 1) as u8]
+            ))
         );
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize + 1);
@@ -736,7 +738,7 @@ mod tests {
         //             ^cursor
         assert_eq!(
             scanner.next().unwrap(),
-            Some((Key::from_raw(&[6_u8]), vec![1_u8]))
+            Some((Key::from_raw(&[6_u8]), vec![0_u8]))
         );
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize + 2);
@@ -776,7 +778,7 @@ mod tests {
         // ^cursor
         assert_eq!(
             scanner.next().unwrap(),
-            Some((Key::from_raw(&[4_u8]), vec![REVERSE_SEEK_BOUND as u8 + 1]))
+            Some((Key::from_raw(&[4_u8]), vec![REVERSE_SEEK_BOUND as u8]))
         );
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.prev, REVERSE_SEEK_BOUND as usize + 3);

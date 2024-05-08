@@ -16,11 +16,11 @@ pub fn flashback_to_version_read_lock(
     end_key: Option<&Key>,
     flashback_start_ts: TimeStamp,
 ) -> TxnResult<Vec<(Key, Lock)>> {
-    let result = reader.scan_locks_from_storage(
+    let result = reader.scan_locks(
         Some(&next_lock_key),
         end_key,
         // Skip the `prewrite_lock`. This lock will appear when retrying prepare
-        |_, lock| lock.ts != flashback_start_ts,
+        |lock| lock.ts != flashback_start_ts,
         FLASHBACK_BATCH_SIZE,
     );
     let (key_locks, _) = result?;
@@ -185,7 +185,6 @@ pub fn prewrite_flashback_key(
             TimeStamp::zero(),
             1,
             TimeStamp::zero(),
-            false,
         ),
         false, // Assuming flashback transactions won't participate any lock conflicts.
     );
@@ -208,7 +207,7 @@ pub fn commit_flashback_key(
                 flashback_start_ts,
                 lock.short_value.take(),
             )
-            .set_last_change(lock.last_change.clone())
+            .set_last_change(lock.last_change_ts, lock.versions_to_last_change)
             .set_txn_source(lock.txn_source)
             .as_ref()
             .to_bytes(),

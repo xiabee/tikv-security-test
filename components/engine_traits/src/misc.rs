@@ -6,8 +6,7 @@
 //! FIXME: Things here need to be moved elsewhere.
 
 use crate::{
-    cf_names::CfNamesExt, errors::Result, flow_control_factors::FlowControlFactorsExt,
-    range::Range, WriteBatchExt, WriteOptions,
+    cf_names::CfNamesExt, errors::Result, flow_control_factors::FlowControlFactorsExt, range::Range,
 };
 
 #[derive(Clone, Debug)]
@@ -65,7 +64,7 @@ pub struct RangeStats {
     pub num_rows: u64,
 }
 
-pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
+pub trait MiscExt: CfNamesExt + FlowControlFactorsExt {
     type StatisticsReporter: StatisticsReporter<Self>;
 
     /// Flush all specified column families at once.
@@ -75,32 +74,19 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
 
     fn flush_cf(&self, cf: &str, wait: bool) -> Result<()>;
 
-    /// Returns `false` if all memtables are created after `threshold`.
-    fn flush_oldest_cf(&self, wait: bool, threshold: Option<std::time::SystemTime>)
-    -> Result<bool>;
-
-    /// Returns whether there's data written through kv interface.
-    fn delete_ranges_cfs(
-        &self,
-        wopts: &WriteOptions,
-        strategy: DeleteStrategy,
-        ranges: &[Range<'_>],
-    ) -> Result<bool> {
-        let mut written = false;
+    fn delete_ranges_cfs(&self, strategy: DeleteStrategy, ranges: &[Range<'_>]) -> Result<()> {
         for cf in self.cf_names() {
-            written |= self.delete_ranges_cf(wopts, cf, strategy.clone(), ranges)?;
+            self.delete_ranges_cf(cf, strategy.clone(), ranges)?;
         }
-        Ok(written)
+        Ok(())
     }
 
-    /// Returns whether there's data written through kv interface.
     fn delete_ranges_cf(
         &self,
-        wopts: &WriteOptions,
         cf: &str,
         strategy: DeleteStrategy,
         ranges: &[Range<'_>],
-    ) -> Result<bool>;
+    ) -> Result<()>;
 
     /// Return the approximate number of records and size in the range of
     /// memtables of the cf.
@@ -120,12 +106,6 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
     fn path(&self) -> &str;
 
     fn sync_wal(&self) -> Result<()>;
-
-    /// Disable manual compactions, some on-going manual compactions may be
-    /// aborted.
-    fn disable_manual_compaction(&self) -> Result<()>;
-
-    fn enable_manual_compaction(&self) -> Result<()>;
 
     /// Depending on the implementation, some on-going manual compactions may be
     /// aborted.
@@ -154,37 +134,4 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
     fn get_range_stats(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Option<RangeStats>>;
 
     fn is_stalled_or_stopped(&self) -> bool;
-
-    /// Returns size and creation time of active memtable if there's one.
-    fn get_active_memtable_stats_cf(
-        &self,
-        cf: &str,
-    ) -> Result<Option<(u64, std::time::SystemTime)>>;
-
-    /// Whether there's active memtable with creation time older than
-    /// `threshold`.
-    fn has_old_active_memtable(&self, threshold: std::time::SystemTime) -> bool {
-        for cf in self.cf_names() {
-            if let Ok(Some((_, age))) = self.get_active_memtable_stats_cf(cf) {
-                if age < threshold {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    // Global method.
-    fn get_accumulated_flush_count_cf(cf: &str) -> Result<u64>;
-
-    fn get_accumulated_flush_count() -> Result<u64> {
-        let mut n = 0;
-        for cf in crate::ALL_CFS {
-            n += Self::get_accumulated_flush_count_cf(cf)?;
-        }
-        Ok(n)
-    }
-
-    type DiskEngine;
-    fn get_disk_engine(&self) -> &Self::DiskEngine;
 }

@@ -25,10 +25,7 @@ command! {
     /// [`Prewrite`](Command::Prewrite).
     TxnHeartBeat:
         cmd_ty => TxnStatus,
-        display => {
-            "kv::command::txn_heart_beat {} @ {} ttl {} | {:?}",
-            (primary_key, start_ts, advise_ttl, ctx),
-        }
+        display => "kv::command::txn_heart_beat {} @ {} ttl {} | {:?}", (primary_key, start_ts, advise_ttl, ctx),
         content => {
             /// The primary key of the transaction.
             primary_key: Key,
@@ -37,9 +34,6 @@ command! {
             /// The new TTL that will be used to update the lock's TTL. If the lock's TTL is already
             /// greater than `advise_ttl`, nothing will happen.
             advise_ttl: u64,
-        }
-        in_heap => {
-            primary_key,
         }
 }
 
@@ -102,7 +96,6 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
             new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
-            known_txn_status: vec![],
         })
     }
 }
@@ -118,10 +111,7 @@ pub mod tests {
         kv::TestEngineBuilder,
         lock_manager::MockLockManager,
         mvcc::tests::*,
-        txn::{
-            commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*,
-            txn_status_cache::TxnStatusCache,
-        },
+        txn::{commands::WriteCommand, scheduler::DEFAULT_EXECUTION_DURATION_LIMIT, tests::*},
         Engine,
     };
 
@@ -153,7 +143,6 @@ pub mod tests {
                     statistics: &mut Default::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
-                    txn_status_cache: &TxnStatusCache::new_for_test(),
                 },
             )
             .unwrap();
@@ -196,7 +185,6 @@ pub mod tests {
                         statistics: &mut Default::default(),
                         async_apply_prewrite: false,
                         raw_ext: None,
-                        txn_status_cache: &TxnStatusCache::new_for_test(),
                     },
                 )
                 .is_err()

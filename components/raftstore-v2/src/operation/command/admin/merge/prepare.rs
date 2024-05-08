@@ -31,7 +31,6 @@ use std::{mem, time::Duration};
 
 use collections::HashMap;
 use engine_traits::{Checkpointer, KvEngine, RaftEngine, RaftLogBatch, CF_LOCK};
-use futures::channel::oneshot;
 use kvproto::{
     metapb::RegionEpoch,
     raft_cmdpb::{
@@ -50,61 +49,35 @@ use raftstore::{
     store::{metrics::PEER_ADMIN_CMD_COUNTER, util, LocksStatus, ProposalContext, Transport},
     Error, Result,
 };
-use slog::{debug, error, info};
+use slog::{debug, info};
 use tikv_util::{
     box_err, log::SlogFormat, slog_panic, store::region_on_same_stores, time::Instant,
 };
-use txn_types::WriteBatchFlags;
 
-use super::{merge_source_path, CatchUpLogs};
+use super::merge_source_path;
 use crate::{
     batch::StoreContext,
     fsm::ApplyResReporter,
     operation::{command::parse_at, AdminCmdResult, SimpleWriteReqDecoder},
     raft::{Apply, Peer},
-    router::{CmdResChannel, PeerMsg, RaftRequest},
+    router::CmdResChannel,
 };
 
-const TRIM_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const TRIM_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PreProposeContext {
     pub min_matched: u64,
     lock_size_limit: usize,
 }
 
-/// FSM Graph (forward):
-///
-///  +-------+------------------+
-///  |       |                  v
-/// None -> (1) -> (2) ------> (4) -> None(destroyed)
-///  |       |      |           ^
-///  +-------+------+--> (3) ---+
-///
-/// - None->1: `start_check_trim_status` / `already_checked_trim_status`
-/// - 1->2: `check_pessimistic_locks`
-/// - *->3: `on_catch_up_logs`
-/// - *->4: `on_apply_res_prepare_merge` / `Peer::new`
-/// - 4->None: `on_ack_commit_merge`
-///
-/// Additional backward paths to None:
-///
-/// - 1->None: `maybe_clean_up_stale_merge_context` /
-///   `merge_on_availability_response`
-/// - 1/2->None: `update_merge_progress_on_became_follower` /
-///   `propose_prepare_merge`
-/// - *->None: `rollback_merge`
 pub enum PrepareStatus {
-    /// (1)
     WaitForTrimStatus {
         start_time: Instant,
         // Peers that we are not sure if trimmed.
         pending_peers: HashMap<u64, RegionEpoch>,
-        // Only when all peers are trimmed, this proposal will be taken into the tablet flush
-        // callback.
         req: Option<RaftCmdRequest>,
     },
-    /// (2)
     /// When a fence <idx, cmd> is present, we (1) delay the PrepareMerge
     /// command `cmd` until all writes before `idx` are applied (2) reject all
     /// in-coming write proposals.
@@ -122,42 +95,9 @@ pub enum PrepareStatus {
         ctx: PreProposeContext,
         req: Option<RaftCmdRequest>,
     },
-    /// (3)
-    /// Catch up logs after source has committed `PrepareMerge` and target has
-    /// committed `CommitMerge`.
-    CatchUpLogs(CatchUpLogs),
-    /// (4)
     /// In this state, all write proposals except for `RollbackMerge` will be
     /// rejected.
     Applied(MergeState),
-}
-
-impl std::fmt::Debug for PrepareStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            Self::WaitForTrimStatus {
-                start_time,
-                pending_peers,
-                req,
-            } => f
-                .debug_struct("PrepareStatus::WaitForTrimStatus")
-                .field("start_time", start_time)
-                .field("pending_peers", pending_peers)
-                .field("req", req)
-                .finish(),
-            Self::WaitForFence { fence, ctx, req } => f
-                .debug_struct("PrepareStatus::WaitForFence")
-                .field("fence", fence)
-                .field("ctx", ctx)
-                .field("req", req)
-                .finish(),
-            Self::CatchUpLogs(cul) => cul.fmt(f),
-            Self::Applied(state) => f
-                .debug_struct("PrepareStatus::Applied")
-                .field("state", state)
-                .finish(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -182,26 +122,11 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         // (3) `check_pessimistic_locks`
         // Check 1 and 3 are async, they yield by returning
         // `Error::PendingPrepareMerge`.
-        //
-        // Error handling notes:
-        // - `WaitForTrimStatus` can only become `WaitForFence` when both check 2&3
-        // succeed. We need to clean up the status if any of them failed, otherwise we
-        // still can't serve other merge requests (not until status is cleaned up in
-        // `maybe_clean_up_stale_merge_context`).
-        // - `WaitForFence` will always reach proposing phase when committed logs are
-        // applied. No intermediate error.
         let pre_propose = if let Some(r) = self.already_checked_pessimistic_locks()? {
             r
-        } else if self.already_checked_trim_status(&req)? {
-            self.check_logs_before_prepare_merge(store_ctx)
-                .and_then(|r| self.check_pessimistic_locks(r, &mut req))
-                .map_err(|e| {
-                    if !matches!(e, Error::PendingPrepareMerge) {
-                        info!(self.logger, "fail to advance to `WaitForFence`"; "err" => ?e);
-                        self.take_merge_context();
-                    }
-                    e
-                })?
+        } else if self.already_checked_trim_status()? {
+            let r = self.check_logs_before_prepare_merge(store_ctx)?;
+            self.check_pessimistic_locks(r, &mut req)?
         } else {
             return self.start_check_trim_status(store_ctx, &mut req);
         };
@@ -214,12 +139,27 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 let mut proposal_ctx = ProposalContext::empty();
                 proposal_ctx.insert(ProposalContext::PREPARE_MERGE);
                 let data = req.write_to_bytes().unwrap();
-                self.propose_with_ctx(store_ctx, data, proposal_ctx)
+                self.propose_with_ctx(store_ctx, data, proposal_ctx.to_vec())
             });
         if r.is_ok() {
             self.proposal_control_mut().set_pending_prepare_merge(false);
         } else {
-            self.post_prepare_merge_fail();
+            // Match v1::post_propose_fail.
+            // If we just failed to propose PrepareMerge, the pessimistic locks status
+            // may become MergingRegion incorrectly. So, we have to revert it here.
+            // Note: The `is_merging` check from v1 is removed because proposed
+            // `PrepareMerge` rejects all writes (in `ProposalControl::check_conflict`).
+            assert!(
+                !self.proposal_control().is_merging(),
+                "{}",
+                SlogFormat(&self.logger)
+            );
+            self.take_merge_context();
+            self.proposal_control_mut().set_pending_prepare_merge(false);
+            let mut pessimistic_locks = self.txn_context().ext().pessimistic_locks.write();
+            if pessimistic_locks.status == LocksStatus::MergingRegion {
+                pessimistic_locks.status = LocksStatus::Normal;
+            }
         }
         r
     }
@@ -328,9 +268,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 entry.get_data(),
                 entry.get_index(),
                 entry.get_term(),
-            ) else {
-                continue;
-            };
+            ) else { continue };
             let cmd_type = cmd.get_admin_request().get_cmd_type();
             match cmd_type {
                 AdminCmdType::TransferLeader
@@ -390,16 +328,9 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             }
         }
 
-        // Shouldn't enter this call if trim check is already underway.
         let status = &mut self.merge_context_mut().prepare_status;
-        if status.is_some() {
-            let logger = self.logger.clone();
-            panic!(
-                "expect empty prepare merge status {}: {:?}",
-                SlogFormat(&logger),
-                self.merge_context_mut().prepare_status
-            );
-        }
+        // Shouldn't enter this call if trim check is already underway.
+        assert!(status.is_none());
         *status = Some(PrepareStatus::WaitForTrimStatus {
             start_time: Instant::now_coarse(),
             pending_peers,
@@ -414,11 +345,11 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         from_peer: u64,
         resp: &ExtraMessage,
     ) {
-        let region_id = self.region_id();
         if self.merge_context().is_some()
-            && let Some(PrepareStatus::WaitForTrimStatus {
-                pending_peers, req, ..
-            }) = self.merge_context_mut().prepare_status.as_mut()
+            && let Some(PrepareStatus::WaitForTrimStatus { pending_peers, req, .. }) = self
+                .merge_context_mut()
+                .prepare_status
+                .as_mut()
             && req.is_some()
         {
             assert!(resp.has_availability_context());
@@ -442,76 +373,27 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 }
             }
             if pending_peers.is_empty() {
-                let mailbox = match store_ctx.router.mailbox(region_id) {
-                    Some(mailbox) => mailbox,
-                    None => {
-                        assert!(
-                            store_ctx.router.is_shutdown(),
-                            "{} router should have been closed",
-                            SlogFormat(&self.logger)
-                        );
-                        return;
-                    }
-                };
-                let mut req = req.take().unwrap();
-                req.mut_header()
-                    .set_flags(WriteBatchFlags::PRE_FLUSH_FINISHED.bits());
-                let logger = self.logger.clone();
-                let on_flush_finish = move || {
-                    let (ch, _) = CmdResChannel::pair();
-                    if let Err(e) =
-                        mailbox.force_send(PeerMsg::AdminCommand(RaftRequest::new(req, ch)))
-                    {
-                        error!(
-                            logger,
-                            "send PrepareMerge request failed after pre-flush finished";
-                            "err" => ?e,
-                        );
-                        // We rely on `maybe_clean_up_stale_merge_context` to
-                        // clean this up.
-                    }
-                };
-                self.start_pre_flush(
-                    store_ctx,
-                    "prepare_merge",
-                    false,
-                    &self.region().clone(),
-                    Box::new(on_flush_finish),
-                );
+                let (ch, _) = CmdResChannel::pair();
+                let req = req.take().unwrap();
+                self.on_admin_command(store_ctx, req, ch);
             }
         }
     }
 
-    fn already_checked_trim_status(&mut self, req: &RaftCmdRequest) -> Result<bool> {
-        let flushed = WriteBatchFlags::from_bits_truncate(req.get_header().get_flags())
-            .contains(WriteBatchFlags::PRE_FLUSH_FINISHED);
+    fn already_checked_trim_status(&mut self) -> Result<bool> {
         match self
             .merge_context()
             .as_ref()
             .and_then(|c| c.prepare_status.as_ref())
         {
             Some(PrepareStatus::WaitForTrimStatus { pending_peers, .. }) => {
-                // We should wait for the request sent from flush callback.
-                if pending_peers.is_empty() && flushed {
+                if pending_peers.is_empty() {
                     Ok(true)
                 } else {
                     Err(Error::PendingPrepareMerge)
                 }
             }
-            None => {
-                // Pre-flush can only be triggered when the request has checked trim status.
-                if flushed {
-                    self.merge_context_mut().prepare_status =
-                        Some(PrepareStatus::WaitForTrimStatus {
-                            start_time: Instant::now_coarse(),
-                            pending_peers: HashMap::default(),
-                            req: None,
-                        });
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
+            None => Ok(false),
             // Shouldn't reach here after calling `already_checked_pessimistic_locks` first.
             _ => unreachable!(),
         }
@@ -537,16 +419,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         };
         let last_index = self.raft_group().raft.raft_log.last_index();
         if has_locks && self.entry_storage().applied_index() < last_index {
-            let status = &mut self.merge_context_mut().prepare_status;
-            if !matches!(status, Some(PrepareStatus::WaitForTrimStatus { .. })) {
-                let logger = self.logger.clone();
-                panic!(
-                    "expect WaitForTrimStatus {}: {:?}",
-                    SlogFormat(&logger),
-                    self.merge_context_mut().prepare_status
-                );
-            }
-            *status = Some(PrepareStatus::WaitForFence {
+            self.merge_context_mut().prepare_status = Some(PrepareStatus::WaitForFence {
                 fence: last_index,
                 ctx,
                 req: Some(mem::take(req)),
@@ -569,7 +442,6 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             .as_ref()
             .and_then(|c| c.prepare_status.as_ref())
         {
-            Some(PrepareStatus::WaitForTrimStatus { .. }) | None => Ok(None),
             Some(PrepareStatus::WaitForFence { fence, ctx, .. }) => {
                 if applied_index < *fence {
                     info!(
@@ -583,31 +455,25 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                     Ok(Some(ctx.clone()))
                 }
             }
-            Some(PrepareStatus::CatchUpLogs(cul)) => {
-                Err(box_err!("catch up logs is in-progress: {:?}.", cul))
-            }
             Some(PrepareStatus::Applied(state)) => Err(box_err!(
                 "another merge is in-progress, merge_state: {:?}.",
                 state
             )),
+            _ => Ok(None),
         }
     }
 
-    // Free up memory if trim check failed.
     #[inline]
     pub fn maybe_clean_up_stale_merge_context(&mut self) {
         // Check if there's a stale trim check. Ideally this should be implemented as a
         // tick. But this is simpler.
-        // We do not check `req.is_some()` here. When req is taken for propose in flush
-        // callback, it will either trigger a state transition to `WaitForFence` or
-        // abort. If we see the state here, it means the req never made it to
-        // `propose_prepare_merge`.
-        // If the req is still inflight and reaches `propose_prepare_merge` later,
-        // `already_checked_trim_status` will restore the status.
-        if let Some(PrepareStatus::WaitForTrimStatus { start_time, .. }) = self
+        if let Some(PrepareStatus::WaitForTrimStatus {
+            start_time, req, ..
+        }) = self
             .merge_context()
             .as_ref()
             .and_then(|c| c.prepare_status.as_ref())
+            && req.is_some()
             && start_time.saturating_elapsed() > TRIM_CHECK_TIMEOUT
         {
             info!(self.logger, "cancel merge because trim check timed out");
@@ -695,30 +561,11 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         self.propose(store_ctx, cmd.write_to_bytes().unwrap())?;
         Ok(())
     }
-
-    pub fn post_prepare_merge_fail(&mut self) {
-        // Match v1::post_propose_fail.
-        // If we just failed to propose PrepareMerge, the pessimistic locks status
-        // may become MergingRegion incorrectly. So, we have to revert it here.
-        // Note: The `is_merging` check from v1 is removed because proposed
-        // `PrepareMerge` rejects all writes (in `ProposalControl::check_conflict`).
-        assert!(
-            !self.proposal_control().is_merging(),
-            "{}",
-            SlogFormat(&self.logger)
-        );
-        self.take_merge_context();
-        self.proposal_control_mut().set_pending_prepare_merge(false);
-        let mut pessimistic_locks = self.txn_context().ext().pessimistic_locks.write();
-        if pessimistic_locks.status == LocksStatus::MergingRegion {
-            pessimistic_locks.status = LocksStatus::Normal;
-        }
-    }
 }
 
 impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
     // Match v1::exec_prepare_merge.
-    pub async fn apply_prepare_merge(
+    pub fn apply_prepare_merge(
         &mut self,
         req: &AdminRequest,
         log_index: u64,
@@ -756,51 +603,28 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
 
         PEER_ADMIN_CMD_COUNTER.prepare_merge.success.inc();
 
-        info!(
-            self.logger,
-            "execute PrepareMerge";
-            "index" => log_index,
-            "target_region" => ?prepare_merge.get_target(),
-        );
-
         let _ = self.flush();
+        let tablet = self.tablet().clone();
+        let mut checkpointer = tablet.new_checkpointer().unwrap_or_else(|e| {
+            slog_panic!(
+                self.logger,
+                "fails to create checkpoint object";
+                "error" => ?e
+            )
+        });
         let reg = self.tablet_registry();
         let path = merge_source_path(reg, self.region_id(), log_index);
         // We might be replaying this command.
         if !path.exists() {
-            let tablet = self.tablet().clone();
-            let logger = self.logger.clone();
-            let (tx, rx) = oneshot::channel();
-            self.high_priority_pool()
-                .spawn(async move {
-                    let mut checkpointer = tablet.new_checkpointer().unwrap_or_else(|e| {
-                        slog_panic!(
-                            logger,
-                            "fails to create checkpoint object";
-                            "error" => ?e
-                        )
-                    });
-                    checkpointer.create_at(&path, None, 0).unwrap_or_else(|e| {
-                        slog_panic!(
-                            logger,
-                            "fails to create checkpoint";
-                            "path" => %path.display(),
-                            "error" => ?e
-                        )
-                    });
-                    tx.send(()).unwrap();
-                })
-                .unwrap();
-            rx.await.unwrap();
+            checkpointer.create_at(&path, None, 0).unwrap_or_else(|e| {
+                slog_panic!(
+                    self.logger,
+                    "fails to create checkpoint";
+                    "path" => %path.display(),
+                    "error" => ?e
+                )
+            });
         }
-
-        // Notes on the lifetime of this checkpoint:
-        // - Target region is responsible to clean up if it has proposed `CommitMerge`.
-        //   It will destroy the checkpoint if the persisted apply index is advanced. It
-        //   will also destroy the checkpoint before sending `GcPeerResponse` to target
-        //   leader.
-        // - Otherwise, the `PrepareMerge` is rollback-ed. In this case the source
-        //   region is responsible to clean up (see `rollback_merge`).
 
         Ok((
             AdminResponse::default(),
@@ -819,8 +643,6 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         store_ctx: &mut StoreContext<EK, ER, T>,
         res: PrepareMergeResult,
     ) {
-        fail::fail_point!("on_apply_res_prepare_merge");
-
         let region = res.region_state.get_region().clone();
         {
             let mut meta = store_ctx.store_meta.lock().unwrap();
@@ -831,7 +653,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 reader,
                 region,
                 RegionChangeReason::PrepareMerge,
-                self.storage().region_state().get_tablet_index(),
+                res.state.get_commit(),
             );
         }
 
@@ -845,13 +667,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
 
         self.proposal_control_mut()
             .enter_prepare_merge(res.state.get_commit());
-        if let Some(PrepareStatus::CatchUpLogs(cul)) = self
-            .merge_context_mut()
-            .prepare_status
-            .replace(PrepareStatus::Applied(res.state))
-        {
-            self.finish_catch_up_logs(store_ctx, cul);
-        }
+        self.merge_context_mut().prepare_status = Some(PrepareStatus::Applied(res.state));
 
         self.start_commit_merge(store_ctx);
     }

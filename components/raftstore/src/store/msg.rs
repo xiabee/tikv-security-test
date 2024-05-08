@@ -8,9 +8,9 @@ use std::{borrow::Cow, fmt};
 use collections::HashSet;
 use engine_traits::{CompactedEvent, KvEngine, Snapshot};
 use futures::channel::mpsc::UnboundedSender;
-use health_controller::types::LatencyInspector;
 use kvproto::{
     brpb::CheckAdminResponse,
+    import_sstpb::SstMeta,
     kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp},
     metapb,
     metapb::RegionEpoch,
@@ -24,22 +24,19 @@ use pd_client::BucketMeta;
 use raft::SnapshotStatus;
 use resource_control::ResourceMetered;
 use smallvec::{smallvec, SmallVec};
-use strum::{EnumCount, EnumVariantNames};
 use tikv_util::{deadline::Deadline, escape, memory::HeapSize, time::Instant};
 use tracker::{get_tls_tracker_token, TrackerToken};
 
-use super::{
-    local_metrics::TimeTracker, region_meta::RegionMeta,
-    snapshot_backup::SnapshotBrWaitApplyRequest, FetchedLogs, RegionSnapshot,
-};
+use super::{local_metrics::TimeTracker, region_meta::RegionMeta, FetchedLogs, RegionSnapshot};
 use crate::store::{
     fsm::apply::{CatchUpLogs, ChangeObserver, TaskRes as ApplyTaskRes},
     metrics::RaftEventDurationType,
-    unsafe_recovery::{
-        UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryFillOutReportSyncer,
-        UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer,
+    peer::{
+        SnapshotRecoveryWaitApplySyncer, UnsafeRecoveryExecutePlanSyncer,
+        UnsafeRecoveryFillOutReportSyncer, UnsafeRecoveryForceLeaderSyncer,
+        UnsafeRecoveryWaitApplySyncer,
     },
-    util::KeysInfoFormatter,
+    util::{KeysInfoFormatter, LatencyInspector},
     worker::{Bucket, BucketRange},
     SnapKey,
 };
@@ -172,25 +169,19 @@ where
     }
 
     pub fn has_proposed_cb(&self) -> bool {
-        let Callback::Write { proposed_cb, .. } = self else {
-            return false;
-        };
+        let Callback::Write { proposed_cb, .. } = self else { return false; };
         proposed_cb.is_some()
     }
 
     pub fn invoke_proposed(&mut self) {
-        let Callback::Write { proposed_cb, .. } = self else {
-            return;
-        };
+        let Callback::Write { proposed_cb, .. } = self else { return; };
         if let Some(cb) = proposed_cb.take() {
             cb();
         }
     }
 
     pub fn invoke_committed(&mut self) {
-        let Callback::Write { committed_cb, .. } = self else {
-            return;
-        };
+        let Callback::Write { committed_cb, .. } = self else { return; };
         if let Some(cb) = committed_cb.take() {
             cb();
         }
@@ -204,16 +195,12 @@ where
     }
 
     pub fn take_proposed_cb(&mut self) -> Option<ExtCallback> {
-        let Callback::Write { proposed_cb, .. } = self else {
-            return None;
-        };
+        let Callback::Write { proposed_cb, .. } = self else { return None; };
         proposed_cb.take()
     }
 
     pub fn take_committed_cb(&mut self) -> Option<ExtCallback> {
-        let Callback::Write { committed_cb, .. } = self else {
-            return None;
-        };
+        let Callback::Write { committed_cb, .. } = self else { return None; };
         committed_cb.take()
     }
 }
@@ -271,9 +258,7 @@ impl<S: Snapshot> ReadCallback for Callback<S> {
     }
 
     fn read_tracker(&self) -> Option<TrackerToken> {
-        let Callback::Read { tracker, .. } = self else {
-            return None;
-        };
+        let Callback::Read { tracker, .. } = self else { return None; };
         Some(*tracker)
     }
 }
@@ -451,14 +436,11 @@ impl PeerTick {
 #[derive(Debug, Clone, Copy)]
 pub enum StoreTick {
     CompactCheck,
-    PeriodicFullCompact,
-    LoadMetricsWindow,
     PdStoreHeartbeat,
     SnapGc,
     CompactLockCf,
     ConsistencyCheck,
     CleanupImportSst,
-    PdReportMinResolvedTs,
 }
 
 impl StoreTick {
@@ -466,14 +448,11 @@ impl StoreTick {
     pub fn tag(self) -> RaftEventDurationType {
         match self {
             StoreTick::CompactCheck => RaftEventDurationType::compact_check,
-            StoreTick::PeriodicFullCompact => RaftEventDurationType::periodic_full_compact,
             StoreTick::PdStoreHeartbeat => RaftEventDurationType::pd_store_heartbeat,
             StoreTick::SnapGc => RaftEventDurationType::snap_gc,
             StoreTick::CompactLockCf => RaftEventDurationType::compact_lock_cf,
             StoreTick::ConsistencyCheck => RaftEventDurationType::consistency_check,
             StoreTick::CleanupImportSst => RaftEventDurationType::cleanup_import_sst,
-            StoreTick::LoadMetricsWindow => RaftEventDurationType::load_metrics_window,
-            StoreTick::PdReportMinResolvedTs => RaftEventDurationType::pd_report_min_resolved_ts,
         }
     }
 }
@@ -550,7 +529,7 @@ where
     UnsafeRecoveryDestroy(UnsafeRecoveryExecutePlanSyncer),
     UnsafeRecoveryWaitApply(UnsafeRecoveryWaitApplySyncer),
     UnsafeRecoveryFillOutReport(UnsafeRecoveryFillOutReportSyncer),
-    SnapshotBrWaitApply(SnapshotBrWaitApplyRequest),
+    SnapshotRecoveryWaitApply(SnapshotRecoveryWaitApplySyncer),
     CheckPendingAdmin(UnboundedSender<CheckAdminResponse>),
 }
 
@@ -579,14 +558,12 @@ pub enum CasualMessage<EK: KvEngine> {
     /// Approximate size of target region. This message can only be sent by
     /// split-check thread.
     RegionApproximateSize {
-        size: Option<u64>,
-        splitable: Option<bool>,
+        size: u64,
     },
 
     /// Approximate key count of target region.
     RegionApproximateKeys {
-        keys: Option<u64>,
-        splitable: Option<bool>,
+        keys: u64,
     },
     CompactionDeclinedBytes {
         bytes: u64,
@@ -671,19 +648,11 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
                 KeysInfoFormatter(split_keys.iter()),
                 source,
             ),
-            CasualMessage::RegionApproximateSize { size, splitable } => {
-                write!(
-                    fmt,
-                    "Region's approximate size [size: {:?}], [splitable: {:?}]",
-                    size, splitable
-                )
+            CasualMessage::RegionApproximateSize { size } => {
+                write!(fmt, "Region's approximate size [size: {:?}]", size)
             }
-            CasualMessage::RegionApproximateKeys { keys, splitable } => {
-                write!(
-                    fmt,
-                    "Region's approximate keys [keys: {:?}], [splitable: {:?}",
-                    keys, splitable
-                )
+            CasualMessage::RegionApproximateKeys { keys } => {
+                write!(fmt, "Region's approximate keys [keys: {:?}]", keys)
             }
             CasualMessage::CompactionDeclinedBytes { bytes } => {
                 write!(fmt, "compaction declined bytes {}", bytes)
@@ -768,12 +737,11 @@ pub struct InspectedRaftMessage {
 
 /// Message that can be sent to a peer.
 #[allow(clippy::large_enum_variant)]
-#[derive(EnumCount, EnumVariantNames)]
 pub enum PeerMsg<EK: KvEngine> {
     /// Raft message is the message sent between raft nodes in the same
     /// raft group. Messages need to be redirected to raftstore if target
     /// peer doesn't exist.
-    RaftMessage(InspectedRaftMessage, Option<Instant>),
+    RaftMessage(InspectedRaftMessage),
     /// Raft command is the command that is expected to be proposed by the
     /// leader of the target raft group. If it's failed to be sent, callback
     /// usually needs to be called before dropping in case of resource leak.
@@ -811,7 +779,7 @@ impl<EK: KvEngine> ResourceMetered for PeerMsg<EK> {}
 impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PeerMsg::RaftMessage(..) => write!(fmt, "Raft Message"),
+            PeerMsg::RaftMessage(_) => write!(fmt, "Raft Message"),
             PeerMsg::RaftCommand(_) => write!(fmt, "Raft Command"),
             PeerMsg::Tick(tick) => write! {
                 fmt,
@@ -839,23 +807,6 @@ impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
 }
 
 impl<EK: KvEngine> PeerMsg<EK> {
-    pub fn discriminant(&self) -> usize {
-        match self {
-            PeerMsg::RaftMessage(..) => 0,
-            PeerMsg::RaftCommand(_) => 1,
-            PeerMsg::Tick(_) => 2,
-            PeerMsg::SignificantMsg(_) => 3,
-            PeerMsg::ApplyRes { .. } => 4,
-            PeerMsg::Start => 5,
-            PeerMsg::Noop => 6,
-            PeerMsg::Persisted { .. } => 7,
-            PeerMsg::CasualMessage(_) => 8,
-            PeerMsg::HeartbeatPd => 9,
-            PeerMsg::UpdateReplicationMode => 10,
-            PeerMsg::Destroy(_) => 11,
-        }
-    }
-
     /// For some specific kind of messages, it's actually acceptable if failed
     /// to send it by `significant_send`. This function determine if the
     /// current message is acceptable to fail.
@@ -867,12 +818,15 @@ impl<EK: KvEngine> PeerMsg<EK> {
     }
 }
 
-#[derive(EnumCount, EnumVariantNames)]
 pub enum StoreMsg<EK>
 where
     EK: KvEngine,
 {
     RaftMessage(InspectedRaftMessage),
+
+    ValidateSstResult {
+        invalid_ssts: Vec<SstMeta>,
+    },
 
     // Clear region size and keys for all regions in the range, so we can force them to
     // re-calculate their size later.
@@ -900,6 +854,10 @@ where
         inspector: LatencyInspector,
     },
 
+    /// Message only used for test.
+    #[cfg(any(test, feature = "testexport"))]
+    Validate(Box<dyn FnOnce(&crate::store::Config) + Send>),
+
     UnsafeRecoveryReport(pdpb::StoreReport),
     UnsafeRecoveryCreatePeer {
         syncer: UnsafeRecoveryExecutePlanSyncer,
@@ -911,10 +869,6 @@ where
     AwakenRegions {
         abnormal_stores: Vec<u64>,
     },
-
-    /// Message only used for test.
-    #[cfg(any(test, feature = "testexport"))]
-    Validate(Box<dyn FnOnce(&crate::store::Config) + Send>),
 }
 
 impl<EK: KvEngine> ResourceMetered for StoreMsg<EK> {}
@@ -930,6 +884,7 @@ where
                 write!(fmt, "Store {}  is unreachable", store_id)
             }
             StoreMsg::CompactedEvent(ref event) => write!(fmt, "CompactedEvent cf {}", event.cf()),
+            StoreMsg::ValidateSstResult { .. } => write!(fmt, "Validate SST Result"),
             StoreMsg::ClearRegionSizeInRange {
                 ref start_key,
                 ref end_key,
@@ -940,6 +895,8 @@ where
             ),
             StoreMsg::Tick(tick) => write!(fmt, "StoreTick {:?}", tick),
             StoreMsg::Start { ref store } => write!(fmt, "Start store {:?}", store),
+            #[cfg(any(test, feature = "testexport"))]
+            StoreMsg::Validate(_) => write!(fmt, "Validate config"),
             StoreMsg::UpdateReplicationMode(_) => write!(fmt, "UpdateReplicationMode"),
             StoreMsg::LatencyInspect { .. } => write!(fmt, "LatencyInspect"),
             StoreMsg::UnsafeRecoveryReport(..) => write!(fmt, "UnsafeRecoveryReport"),
@@ -948,29 +905,6 @@ where
             }
             StoreMsg::GcSnapshotFinish => write!(fmt, "GcSnapshotFinish"),
             StoreMsg::AwakenRegions { .. } => write!(fmt, "AwakenRegions"),
-            #[cfg(any(test, feature = "testexport"))]
-            StoreMsg::Validate(_) => write!(fmt, "Validate config"),
-        }
-    }
-}
-
-impl<EK: KvEngine> StoreMsg<EK> {
-    pub fn discriminant(&self) -> usize {
-        match self {
-            StoreMsg::RaftMessage(_) => 0,
-            StoreMsg::StoreUnreachable { .. } => 1,
-            StoreMsg::CompactedEvent(_) => 2,
-            StoreMsg::ClearRegionSizeInRange { .. } => 3,
-            StoreMsg::Tick(_) => 4,
-            StoreMsg::Start { .. } => 5,
-            StoreMsg::UpdateReplicationMode(_) => 6,
-            StoreMsg::LatencyInspect { .. } => 7,
-            StoreMsg::UnsafeRecoveryReport(_) => 8,
-            StoreMsg::UnsafeRecoveryCreatePeer { .. } => 9,
-            StoreMsg::GcSnapshotFinish => 10,
-            StoreMsg::AwakenRegions { .. } => 11,
-            #[cfg(any(test, feature = "testexport"))]
-            StoreMsg::Validate(_) => 12, // Please keep this always be the last one.
         }
     }
 }

@@ -479,8 +479,12 @@ fn validate_states<ER: RaftEngine>(
         info!("updating commit index"; "region_id" => region_id, "old" => commit_index, "new" => recorded_commit_index);
         commit_index = recorded_commit_index;
     }
+    // Invariant: applied index <= max(commit index, recorded commit index)
     if apply_state.get_applied_index() > commit_index {
-        info!("applied index is larger than recorded commit index"; "apply" => apply_state.get_applied_index(), "commit" => commit_index);
+        return Err(box_err!(
+            "applied index > max(commit index, recorded commit index), {}",
+            state_str()
+        ));
     }
     // Invariant: max(commit index, recorded commit index) <= last index
     if commit_index > last_index {
@@ -534,7 +538,6 @@ pub fn init_last_term<ER: RaftEngine>(
 pub fn init_applied_term<ER: RaftEngine>(
     raft_engine: &ER,
     region: &metapb::Region,
-    raft_state: &RaftLocalState,
     apply_state: &RaftApplyState,
 ) -> Result<u64> {
     if apply_state.applied_index == RAFT_INIT_LOG_INDEX {
@@ -543,13 +546,6 @@ pub fn init_applied_term<ER: RaftEngine>(
     let truncated_state = apply_state.get_truncated_state();
     if apply_state.applied_index == truncated_state.get_index() {
         return Ok(truncated_state.get_term());
-    }
-
-    // Applied index > last index means that some committed entries have applied but
-    // not persisted, in this case, the raft term must not be changed, so we use the
-    // term persisted in apply_state.
-    if apply_state.applied_index > raft_state.get_last_index() {
-        return Ok(apply_state.commit_term);
     }
 
     match raft_engine.get_entry(region.get_id(), apply_state.applied_index)? {
@@ -666,7 +662,7 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
             ));
         }
         let last_term = init_last_term(&raft_engine, region, &raft_state, &apply_state)?;
-        let applied_term = init_applied_term(&raft_engine, region, &raft_state, &apply_state)?;
+        let applied_term = init_applied_term(&raft_engine, region, &apply_state)?;
         Ok(Self {
             region_id: region.id,
             peer_id,
@@ -1181,8 +1177,6 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
                         } else {
                             range.1 == self.last_index() + 1
                         };
-                        // FIXME: the assertion below doesn't hold.
-                        // assert!(is_valid, "the warmup range should still be valid");
                         if !is_valid {
                             error!(
                                 "unexpected warmup state";
@@ -1340,30 +1334,26 @@ pub mod tests {
         };
 
         // Test the initial data structure size.
-        let (tx, rx) = mpsc::sync_channel(1);
-        let check_mem_size_change = |expect: i64| {
-            assert_eq!(rx.try_recv().unwrap(), expect);
-            rx.try_recv().unwrap_err();
-        };
+        let (tx, rx) = mpsc::sync_channel(8);
         let mut cache = EntryCache::new_with_cb(move |c: i64| tx.send(c).unwrap());
-        check_mem_size_change(0);
+        assert_eq!(rx.try_recv().unwrap(), 896);
 
         cache.append(
             0,
             0,
             &[new_padded_entry(101, 1, 1), new_padded_entry(102, 1, 2)],
         );
-        check_mem_size_change(419);
+        assert_eq!(rx.try_recv().unwrap(), 3);
 
         cache.prepend(vec![new_padded_entry(100, 1, 1)]);
-        check_mem_size_change(1);
+        assert_eq!(rx.try_recv().unwrap(), 1);
         cache.persisted = 100;
         cache.compact_to(101);
-        check_mem_size_change(-1);
+        assert_eq!(rx.try_recv().unwrap(), -1);
 
         // Test size change for one overlapped entry.
         cache.append(0, 0, &[new_padded_entry(102, 2, 3)]);
-        check_mem_size_change(1);
+        assert_eq!(rx.try_recv().unwrap(), 1);
 
         // Test size change for all overlapped entries.
         cache.append(
@@ -1371,42 +1361,42 @@ pub mod tests {
             0,
             &[new_padded_entry(101, 3, 4), new_padded_entry(102, 3, 5)],
         );
-        check_mem_size_change(5);
+        assert_eq!(rx.try_recv().unwrap(), 5);
 
         cache.append(0, 0, &[new_padded_entry(103, 3, 6)]);
-        check_mem_size_change(6);
+        assert_eq!(rx.try_recv().unwrap(), 6);
 
         // Test trace a dangle entry.
         let cached_entries = CachedEntries::new(vec![new_padded_entry(100, 1, 1)]);
         cache.trace_cached_entries(cached_entries);
-        check_mem_size_change(97);
+        assert_eq!(rx.try_recv().unwrap(), 1);
 
         // Test trace an entry which is still in cache.
         let cached_entries = CachedEntries::new(vec![new_padded_entry(102, 3, 5)]);
         cache.trace_cached_entries(cached_entries);
-        check_mem_size_change(0);
+        assert_eq!(rx.try_recv().unwrap(), 0);
 
         // Test compare `cached_last` with `trunc_to_idx` in `EntryCache::append_impl`.
         cache.append(0, 0, &[new_padded_entry(103, 4, 7)]);
-        check_mem_size_change(1);
+        assert_eq!(rx.try_recv().unwrap(), 1);
 
         // Test compact one traced dangle entry and one entry in cache.
         cache.persisted = 101;
         cache.compact_to(102);
-        check_mem_size_change(-5);
+        assert_eq!(rx.try_recv().unwrap(), -5);
 
         // Test compact the last traced dangle entry.
         cache.persisted = 102;
         cache.compact_to(103);
-        check_mem_size_change(-5);
+        assert_eq!(rx.try_recv().unwrap(), -5);
 
         // Test compact all entries.
         cache.persisted = 103;
         cache.compact_to(104);
-        check_mem_size_change(-7);
+        assert_eq!(rx.try_recv().unwrap(), -7);
 
         drop(cache);
-        check_mem_size_change(-512);
+        assert_eq!(rx.try_recv().unwrap(), -896);
     }
 
     #[test]

@@ -1,9 +1,8 @@
 [package]
 name = "engine_rocks"
 version = "0.0.1"
-edition = "2021"
+edition = "2018"
 publish = false
-license = "Apache-2.0"
 
 [features]
 trace-lifetime = []
@@ -43,7 +42,7 @@ online_config = { workspace = true }
 prometheus = { version = "0.13", features = ["nightly"] }
 prometheus-static-metric = "0.5"
 protobuf = "2"
-raft = { workspace = true }
+raft = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
 regex = "1"
 serde = "1.0"
 serde_derive = "1.0"
@@ -53,7 +52,7 @@ slog_derive = "0.2"
 tempfile = "3.0"
 tikv_alloc = { workspace = true }
 tikv_util = { workspace = true }
-time = { workspace = true }
+time = "0.1"
 tracker = { workspace = true }
 txn_types = { workspace = true }
 
@@ -61,8 +60,8 @@ txn_types = { workspace = true }
 git = "https://github.com/tikv/rust-rocksdb.git"
 package = "rocksdb"
 features = ["encryption"]
+branch = "tikv-7.1"
 
 [dev-dependencies]
 rand = "0.8"
 toml = "0.5"
-proptest = "1.0.0"

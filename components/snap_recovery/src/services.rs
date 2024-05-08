@@ -2,13 +2,8 @@
 
 use std::{
     error::Error as StdError,
-    fmt::Display,
-    future::Future,
     result,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::mpsc::{sync_channel, SyncSender},
     thread::Builder,
     time::Instant,
 };
@@ -18,16 +13,14 @@ use engine_rocks::{
     util::get_cf_handle,
     RocksEngine,
 };
-use engine_traits::{CfNamesExt, CfOptionsExt, Engines, KvEngine, RaftEngine};
+use engine_traits::{CfNamesExt, CfOptionsExt, Engines, Peekable, RaftEngine};
 use futures::{
     channel::mpsc,
     executor::{ThreadPool, ThreadPoolBuilder},
-    stream::{AbortHandle, Aborted},
     FutureExt, SinkExt, StreamExt,
 };
 use grpcio::{
-    ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink,
-    UnarySink, WriteFlags,
+    ClientStreamingSink, RequestStream, RpcContext, ServerStreamingSink, UnarySink, WriteFlags,
 };
 use kvproto::{raft_serverpb::StoreIdent, recoverdatapb::*};
 use raftstore::{
@@ -35,14 +28,12 @@ use raftstore::{
     store::{
         fsm::RaftRouter,
         msg::{PeerMsg, SignificantMsg},
-        snapshot_backup::{SnapshotBrWaitApplyRequest, SyncReport},
         transport::SignificantRouter,
-        SnapshotBrWaitApplySyncer,
+        SnapshotRecoveryWaitApplySyncer,
     },
 };
 use thiserror::Error;
 use tikv_util::sys::thread::{StdThreadBuildWrapper, ThreadBuildWrapper};
-use tokio::sync::oneshot::{self, Sender};
 
 use crate::{
     data_resolver::DataResolverManager,
@@ -68,82 +59,37 @@ pub enum Error {
     #[error("{0:?}")]
     Other(#[from] Box<dyn StdError + Sync + Send>),
 }
-
 /// Service handles the recovery messages from backup restore.
 #[derive(Clone)]
-pub struct RecoveryService<EK, ER>
-where
-    EK: KvEngine<DiskEngine = RocksEngine>,
-    ER: RaftEngine,
-{
-    engines: Engines<EK, ER>,
-    router: RaftRouter<EK, ER>,
+pub struct RecoveryService<ER: RaftEngine> {
+    engines: Engines<RocksEngine, ER>,
+    router: RaftRouter<RocksEngine, ER>,
     threads: ThreadPool,
-
-    /// The handle to last call of recover region RPC.
-    ///
-    /// We need to make sure the execution of keeping leader exits before next
-    /// `RecoverRegion` rpc gets in. Or the previous call may stuck at keep
-    /// leader forever, once the second caller request the leader to be at
-    /// another store.
-    // NOTE: Perhaps it would be better to abort the procedure as soon as the client
-    // stream has been closed, but yet it seems there isn't such hook like
-    // `on_client_go` for us, and the current implementation only start
-    // work AFTER the client closes their sender part(!)
-    last_recovery_region_rpc: Arc<Mutex<Option<RecoverRegionState>>>,
 }
 
-struct RecoverRegionState {
-    start_at: Instant,
-    finished: Arc<AtomicBool>,
-    abort: AbortHandle,
-}
-
-impl RecoverRegionState {
-    /// Create the state by wrapping a execution of recover region.
-    fn wrap_task<F: Future<Output = T>, T>(
-        task: F,
-    ) -> (Self, impl Future<Output = std::result::Result<T, Aborted>>) {
-        let finished = Arc::new(AtomicBool::new(false));
-        let (cancelable_task, abort) = futures::future::abortable(task);
-        let state = Self {
-            start_at: Instant::now(),
-            finished: Arc::clone(&finished),
-            abort,
-        };
-        (state, async move {
-            let res = cancelable_task.await;
-            finished.store(true, Ordering::SeqCst);
-            res
-        })
-    }
-}
-
-impl<EK, ER> RecoveryService<EK, ER>
-where
-    EK: KvEngine<DiskEngine = RocksEngine>,
-    ER: RaftEngine,
-{
+impl<ER: RaftEngine> RecoveryService<ER> {
     /// Constructs a new `Service` with `Engines`, a `RaftStoreRouter` and a
     /// `thread pool`.
-    pub fn new(engines: Engines<EK, ER>, router: RaftRouter<EK, ER>) -> RecoveryService<EK, ER> {
+    pub fn new(
+        engines: Engines<RocksEngine, ER>,
+        router: RaftRouter<RocksEngine, ER>,
+    ) -> RecoveryService<ER> {
         let props = tikv_util::thread_group::current_properties();
         let threads = ThreadPoolBuilder::new()
             .pool_size(4)
             .name_prefix("recovery-service")
-            .with_sys_and_custom_hooks(
-                move || {
-                    tikv_util::thread_group::set_properties(props.clone());
-                },
-                || {},
-            )
+            .after_start_wrapper(move || {
+                tikv_util::thread_group::set_properties(props.clone());
+                tikv_alloc::add_thread_memory_accessor();
+            })
+            .before_stop_wrapper(|| tikv_alloc::remove_thread_memory_accessor())
             .create()
             .unwrap();
 
         // config rocksdb l0 to optimize the restore
         // also for massive data applied during the restore, it easy to reach the write
         // stop
-        let db: &RocksEngine = engines.kv.get_disk_engine();
+        let db = engines.kv.clone();
         for cf_name in db.cf_names() {
             Self::set_db_options(cf_name, db.clone()).expect("set db option failure");
         }
@@ -152,7 +98,6 @@ where
             engines,
             router,
             threads,
-            last_recovery_region_rpc: Arc::default(),
         }
     }
 
@@ -194,42 +139,14 @@ where
         Ok(store_id)
     }
 
-    fn abort_last_recover_region(&self, place: impl Display) {
-        let mut last_state_lock = self.last_recovery_region_rpc.lock().unwrap();
-        Self::abort_last_recover_region_of(place, &mut last_state_lock)
-    }
-
-    fn replace_last_recover_region(&self, place: impl Display, new_state: RecoverRegionState) {
-        let mut last_state_lock = self.last_recovery_region_rpc.lock().unwrap();
-        Self::abort_last_recover_region_of(place, &mut last_state_lock);
-        *last_state_lock = Some(new_state);
-    }
-
-    fn abort_last_recover_region_of(
-        place: impl Display,
-        last_state_lock: &mut Option<RecoverRegionState>,
-    ) {
-        if let Some(last_state) = last_state_lock.take() {
-            info!("Another task enter, checking last task.";
-                "finished" => ?last_state.finished,
-                "start_before" => ?last_state.start_at.elapsed(),
-                "abort_by" => %place,
-            );
-            if !last_state.finished.load(Ordering::SeqCst) {
-                last_state.abort.abort();
-                warn!("Last task not finished, aborting it.");
-            }
-        }
-    }
-
     // a new wait apply syncer share with all regions,
     // when all region reached the target index, share reference decreased to 0,
     // trigger closure to send finish info back.
-    pub fn wait_apply_last(router: RaftRouter<EK, ER>, sender: Sender<SyncReport>) {
-        let wait_apply = SnapshotBrWaitApplySyncer::new(0, sender);
+    pub fn wait_apply_last(router: RaftRouter<RocksEngine, ER>, sender: SyncSender<u64>) {
+        let wait_apply = SnapshotRecoveryWaitApplySyncer::new(0, sender);
         router.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(SignificantMsg::SnapshotBrWaitApply(
-                SnapshotBrWaitApplyRequest::relaxed(wait_apply.clone()),
+            PeerMsg::SignificantMsg(SignificantMsg::SnapshotRecoveryWaitApply(
+                wait_apply.clone(),
             ))
         });
     }
@@ -247,7 +164,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
             .name(format!("compact-{}", cf))
             .spawn_wrapper(move || {
                 info!("recovery starts manual compact"; "cf" => cf.clone());
-
+                tikv_alloc::add_thread_memory_accessor();
                 let db = kv_db.as_inner();
                 let handle = get_cf_handle(db, cf.as_str()).unwrap();
                 let mut compact_opts = CompactOptions::new();
@@ -255,6 +172,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
                 compact_opts.set_exclusive_manual_compaction(false);
                 compact_opts.set_bottommost_level_compaction(DBBottommostLevelCompaction::Skip);
                 db.compact_range_cf_opt(handle, &compact_opts, None, None);
+                tikv_alloc::remove_thread_memory_accessor();
 
                 info!("recovery finishes manual compact"; "cf" => cf);
             })
@@ -268,15 +186,11 @@ fn compact(engine: RocksEngine) -> Result<()> {
     Ok(())
 }
 
-impl<EK, ER> RecoverData for RecoveryService<EK, ER>
-where
-    EK: KvEngine<DiskEngine = RocksEngine>,
-    ER: RaftEngine,
-{
+impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
     // 1. br start to ready region meta
     fn read_region_meta(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         _req: ReadRegionMetaRequest,
         mut sink: ServerStreamingSink<RegionMeta>,
     ) {
@@ -301,11 +215,6 @@ where
             }
         });
 
-        // Hacking: Sometimes, the client may omit the RPC call to `recover_region` if
-        // no leader should be register to some (unfortunate) store. So we abort
-        // last recover region here too, anyway this RPC implies a consequent
-        // `recover_region` for now.
-        self.abort_last_recover_region(format_args!("read_region_meta by {}", ctx.peer()));
         self.threads.spawn_ok(send_task);
     }
 
@@ -313,11 +222,11 @@ where
     // assign region leader and wait leader apply to last log
     fn recover_region(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         mut stream: RequestStream<RecoverRegionRequest>,
         sink: ClientStreamingSink<RecoverRegionResponse>,
     ) {
-        let mut raft_router = Mutex::new(self.router.clone());
+        let raft_router = self.router.clone();
         let store_id = self.get_store_id();
         info!("start to recover the region");
         let task = async move {
@@ -332,28 +241,28 @@ where
                 }
             }
 
-            let mut lk = LeaderKeeper::new(&raft_router, leaders.clone());
+            let mut lk = LeaderKeeper::new(raft_router.clone(), leaders.clone());
             // We must use the tokio runtime here because there isn't a `block_in_place`
             // like thing in the futures executor. It simply panics when block
             // on the block_on context.
             // It is also impossible to directly `await` here, because that will make
             // borrowing to the raft router crosses the await point.
-            lk.elect_and_wait_all_ready().await;
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("failed to build temporary tokio runtime.")
+                .block_on(lk.elect_and_wait_all_ready());
             info!("all region leader assigned done"; "count" => %leaders.len());
-            drop(lk);
 
             let now = Instant::now();
             // wait apply to the last log
             let mut rx_apply = Vec::with_capacity(leaders.len());
             for &region_id in &leaders {
-                let (tx, rx) = oneshot::channel();
+                let (tx, rx) = sync_channel(1);
                 REGION_EVENT_COUNTER.start_wait_leader_apply.inc();
-                let wait_apply = SnapshotBrWaitApplySyncer::new(region_id, tx);
-                if let Err(e) = raft_router.get_mut().unwrap().significant_send(
+                let wait_apply = SnapshotRecoveryWaitApplySyncer::new(region_id, tx.clone());
+                if let Err(e) = raft_router.significant_send(
                     region_id,
-                    SignificantMsg::SnapshotBrWaitApply(SnapshotBrWaitApplyRequest::relaxed(
-                        wait_apply.clone(),
-                    )),
+                    SignificantMsg::SnapshotRecoveryWaitApply(wait_apply.clone()),
                 ) {
                     error!(
                         "failed to send wait apply";
@@ -361,21 +270,23 @@ where
                         "err" => ?e,
                     );
                 }
-                rx_apply.push(rx);
+                rx_apply.push(Some(rx));
             }
 
             // leader apply to last log
             for (rid, rx) in leaders.iter().zip(rx_apply) {
-                CURRENT_WAIT_APPLY_LEADER.set(*rid as _);
-                match rx.await {
-                    Ok(_) => {
-                        debug!("leader apply to last log"; "region_id" => rid);
+                if let Some(rx) = rx {
+                    CURRENT_WAIT_APPLY_LEADER.set(*rid as _);
+                    match rx.recv() {
+                        Ok(region_id) => {
+                            debug!("leader apply to last log"; "region_id" => region_id);
+                        }
+                        Err(e) => {
+                            error!("leader failed to apply to last log"; "error" => ?e);
+                        }
                     }
-                    Err(e) => {
-                        error!("leader failed to apply to last log"; "error" => ?e);
-                    }
+                    REGION_EVENT_COUNTER.finish_wait_leader_apply.inc();
                 }
-                REGION_EVENT_COUNTER.finish_wait_leader_apply.inc();
             }
             CURRENT_WAIT_APPLY_LEADER.set(0);
 
@@ -390,20 +301,10 @@ where
                 Err(e) => error!("failed to get store id"; "error" => ?e),
             };
 
-            resp
+            let _ = sink.success(resp).await;
         };
 
-        let (state, task) = RecoverRegionState::wrap_task(task);
-        self.replace_last_recover_region(format!("recover_region by {}", ctx.peer()), state);
-        self.threads.spawn_ok(async move {
-            let res = match task.await {
-                Ok(resp) => sink.success(resp),
-                Err(Aborted) => sink.fail(RpcStatus::new(RpcStatusCode::ABORTED)),
-            };
-            if let Err(err) = res.await {
-                warn!("failed to response recover region rpc"; "err" => %err);
-            }
-        });
+        self.threads.spawn_ok(task);
     }
 
     // 3. ensure all region peer/follower apply to last
@@ -417,11 +318,14 @@ where
         info!("wait_apply start");
         let task = async move {
             let now = Instant::now();
-            let (tx, rx) = oneshot::channel();
-            RecoveryService::wait_apply_last(router, tx);
-            match rx.await {
+            // FIXME: this function will exit once the first region finished apply.
+            // BUT for the flashback resolve KV implementation, that is fine because the
+            // raft log stats is consistent.
+            let (tx, rx) = sync_channel(1);
+            RecoveryService::wait_apply_last(router, tx.clone());
+            match rx.recv() {
                 Ok(id) => {
-                    info!("follower apply to last log"; "report" => ?id);
+                    info!("follower apply to last log"; "error" => id);
                 }
                 Err(e) => {
                     error!("follower failed to apply to last log"; "error" => ?e);
@@ -448,14 +352,10 @@ where
         // implement a resolve/delete data funciton
         let resolved_ts = req.get_resolved_ts();
         let (tx, rx) = mpsc::unbounded();
-        let resolver = DataResolverManager::new(
-            self.engines.kv.get_disk_engine().clone(),
-            tx,
-            resolved_ts.into(),
-        );
+        let resolver = DataResolverManager::new(self.engines.kv.clone(), tx, resolved_ts.into());
         info!("start to resolve kv data");
         resolver.start();
-        let db = self.engines.kv.get_disk_engine().clone();
+        let db = self.engines.kv.clone();
         let store_id = self.get_store_id();
         let send_task = async move {
             let id = store_id?;
@@ -479,34 +379,5 @@ where
         });
 
         self.threads.spawn_ok(send_task);
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::{sync::atomic::Ordering, time::Duration};
-
-    use futures::never::Never;
-
-    use super::RecoverRegionState;
-
-    #[test]
-    fn test_state() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let (state, task) = RecoverRegionState::wrap_task(futures::future::pending::<Never>());
-        let hnd = rt.spawn(task);
-        state.abort.abort();
-        rt.block_on(async { tokio::time::timeout(Duration::from_secs(10), hnd).await })
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-
-        let (state, task) = RecoverRegionState::wrap_task(futures::future::ready(42));
-        assert_eq!(state.finished.load(Ordering::SeqCst), false);
-        assert_eq!(rt.block_on(task), Ok(42));
-        assert_eq!(state.finished.load(Ordering::SeqCst), true);
     }
 }

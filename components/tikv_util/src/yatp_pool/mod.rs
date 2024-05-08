@@ -1,14 +1,14 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 mod future_pool;
-pub mod metrics;
+mod metrics;
 
 use std::sync::Arc;
 
 use fail::fail_point;
 pub use future_pool::{Full, FuturePool};
 use futures::{compat::Stream01CompatExt, StreamExt};
-use prometheus::{local::LocalHistogram, Histogram, HistogramOpts};
+use prometheus::{local::LocalHistogram, Histogram};
 use yatp::{
     pool::{CloneRunnerBuilder, Local, Remote, Runner},
     queue::{multilevel, priority, Extras, QueueType, TaskCell as _},
@@ -17,7 +17,6 @@ use yatp::{
 };
 
 use crate::{
-    resource_control::{priority_from_task_meta, TaskPriority},
     thread_group::GroupProperties,
     time::{Duration, Instant},
     timer::GLOBAL_TIMER_HANDLE,
@@ -166,8 +165,7 @@ pub struct YatpPoolRunner<T: PoolTicker> {
     before_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 
     // Statistics about the schedule wait duration.
-    // local histogram for high,medium,low priority tasks.
-    schedule_wait_durations: [LocalHistogram; TaskPriority::PRIORITY_COUNT],
+    schedule_wait_duration: LocalHistogram,
 }
 
 impl<T: PoolTicker> Runner for YatpPoolRunner<T> {
@@ -183,21 +181,18 @@ impl<T: PoolTicker> Runner for YatpPoolRunner<T> {
         if let Some(f) = self.after_start.take() {
             f();
         }
-        // SAFETY: we will call `remove_thread_memory_accessor` at `end`.
-        unsafe {
-            tikv_alloc::add_thread_memory_accessor();
-        }
+        tikv_alloc::add_thread_memory_accessor()
     }
 
     fn handle(&mut self, local: &mut Local<Self::TaskCell>, mut task_cell: Self::TaskCell) -> bool {
         let extras = task_cell.mut_extras();
         if let Some(schedule_time) = extras.schedule_time() {
-            let idx = priority_from_task_meta(extras.metadata()) as usize;
-            self.schedule_wait_durations[idx].observe(schedule_time.elapsed().as_secs_f64());
+            self.schedule_wait_duration
+                .observe(schedule_time.elapsed().as_secs_f64());
         }
         let finished = self.inner.handle(local, task_cell);
         if self.ticker.try_tick() {
-            self.schedule_wait_durations.iter().for_each(|m| m.flush());
+            self.schedule_wait_duration.flush();
         }
         finished
     }
@@ -231,7 +226,7 @@ impl<T: PoolTicker> YatpPoolRunner<T> {
         after_start: Option<Arc<dyn Fn() + Send + Sync>>,
         before_stop: Option<Arc<dyn Fn() + Send + Sync>>,
         before_pause: Option<Arc<dyn Fn() + Send + Sync>>,
-        schedule_wait_durations: [Histogram; TaskPriority::PRIORITY_COUNT],
+        schedule_wait_duration: Histogram,
     ) -> Self {
         YatpPoolRunner {
             inner,
@@ -240,7 +235,7 @@ impl<T: PoolTicker> YatpPoolRunner<T> {
             after_start,
             before_stop,
             before_pause,
-            schedule_wait_durations: schedule_wait_durations.map(|m| m.local()),
+            schedule_wait_duration: schedule_wait_duration.local(),
         }
     }
 }
@@ -257,10 +252,6 @@ pub struct YatpPoolBuilder<T: PoolTicker> {
     stack_size: usize,
     max_tasks: usize,
     cleanup_method: CleanupMethod,
-
-    // whether to tracker task scheduling wait duration
-    enable_task_wait_metrics: bool,
-    metric_idx_from_task_meta: Option<Arc<dyn Fn(&[u8]) -> usize + Send + Sync>>,
 
     #[cfg(test)]
     background_cleanup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -280,9 +271,6 @@ impl<T: PoolTicker> YatpPoolBuilder<T> {
             stack_size: 0,
             max_tasks: std::usize::MAX,
             cleanup_method: CleanupMethod::InPlace,
-
-            enable_task_wait_metrics: false,
-            metric_idx_from_task_meta: None,
 
             #[cfg(test)]
             background_cleanup_hook: None,
@@ -350,19 +338,6 @@ impl<T: PoolTicker> YatpPoolBuilder<T> {
         F: Fn() + Send + Sync + 'static,
     {
         self.before_pause = Some(Arc::new(f));
-        self
-    }
-
-    pub fn enable_task_wait_metrics(mut self, enable: bool) -> Self {
-        self.enable_task_wait_metrics = enable;
-        self
-    }
-
-    pub fn metric_idx_from_task_meta(
-        mut self,
-        f: Arc<dyn Fn(&[u8]) -> usize + Send + Sync>,
-    ) -> Self {
-        self.metric_idx_from_task_meta = Some(f);
         self
     }
 
@@ -491,21 +466,15 @@ impl<T: PoolTicker> YatpPoolBuilder<T> {
         let after_start = self.after_start.take();
         let before_stop = self.before_stop.take();
         let before_pause = self.before_pause.take();
-        let schedule_wait_durations = if self.enable_task_wait_metrics {
-            TaskPriority::priorities().map(|p| {
-                metrics::YATP_POOL_SCHEDULE_WAIT_DURATION_VEC
-                    .with_label_values(&[&name, p.as_str()])
-            })
-        } else {
-            std::array::from_fn(|_| Histogram::with_opts(HistogramOpts::new("_", "_")).unwrap())
-        };
+        let schedule_wait_duration =
+            metrics::YATP_POOL_SCHEDULE_WAIT_DURATION_VEC.with_label_values(&[&name]);
         let read_pool_runner = YatpPoolRunner::new(
             Default::default(),
             self.ticker.clone(),
             after_start,
             before_stop,
             before_pause,
-            schedule_wait_durations,
+            schedule_wait_duration,
         );
         (builder, read_pool_runner)
     }
@@ -528,7 +497,6 @@ mod tests {
         let name = "test_record_schedule_wait_duration";
         let pool = YatpPoolBuilder::new(DefaultTicker::default())
             .name_prefix(name)
-            .enable_task_wait_metrics(true)
             .build_single_level_pool();
         let (tx, rx) = mpsc::channel();
         for _ in 0..3 {
@@ -547,8 +515,7 @@ mod tests {
         }
         // Drop the pool so the local metrics are flushed.
         drop(pool);
-        let histogram =
-            metrics::YATP_POOL_SCHEDULE_WAIT_DURATION_VEC.with_label_values(&[name, "medium"]);
+        let histogram = metrics::YATP_POOL_SCHEDULE_WAIT_DURATION_VEC.with_label_values(&[name]);
         assert_eq!(histogram.get_sample_count() as u32, 6, "{:?}", histogram);
     }
 

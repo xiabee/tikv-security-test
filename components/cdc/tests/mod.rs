@@ -6,14 +6,13 @@ use std::{
 };
 
 use causal_ts::CausalTsProvider;
-use cdc::{recv_timeout, CdcObserver, Delegate, FeatureGate, Task, Validate};
+use cdc::{recv_timeout, CdcObserver, Delegate, FeatureGate, MemoryQuota, Task, Validate};
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::RocksEngine;
 use futures::executor::block_on;
 use grpcio::{
-    CallOption, ChannelBuilder, ClientDuplexReceiver, ClientDuplexSender, ClientUnaryReceiver,
-    Environment, MetadataBuilder,
+    ChannelBuilder, ClientDuplexReceiver, ClientDuplexSender, ClientUnaryReceiver, Environment,
 };
 use kvproto::{
     cdcpb::{create_change_data, ChangeDataClient, ChangeDataEvent, ChangeDataRequest},
@@ -26,7 +25,6 @@ use test_raftstore::*;
 use tikv::{config::CdcConfig, server::DEFAULT_CLUSTER_ID, storage::kv::LocalTablets};
 use tikv_util::{
     config::ReadableDuration,
-    memory::MemoryQuota,
     worker::{LazyWorker, Runnable},
     HandyRwLock,
 };
@@ -50,6 +48,7 @@ impl ClientReceiver {
         std::mem::replace(&mut *self.receiver.lock().unwrap(), rx)
     }
 }
+
 #[allow(clippy::type_complexity)]
 pub fn new_event_feed(
     client: &ChangeDataClient,
@@ -58,37 +57,7 @@ pub fn new_event_feed(
     ClientReceiver,
     Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
 ) {
-    create_event_feed(client, false)
-}
-
-#[allow(clippy::type_complexity)]
-pub fn new_event_feed_v2(
-    client: &ChangeDataClient,
-) -> (
-    ClientDuplexSender<ChangeDataRequest>,
-    ClientReceiver,
-    Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
-) {
-    create_event_feed(client, true)
-}
-
-#[allow(clippy::type_complexity)]
-fn create_event_feed(
-    client: &ChangeDataClient,
-    stream_multiplexing: bool,
-) -> (
-    ClientDuplexSender<ChangeDataRequest>,
-    ClientReceiver,
-    Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
-) {
-    let (req_tx, resp_rx) = if stream_multiplexing {
-        let mut metadata = MetadataBuilder::with_capacity(1);
-        metadata.add_str("features", "stream-multiplexing").unwrap();
-        let opt = CallOption::default().headers(metadata.build());
-        client.event_feed_v2_opt(opt).unwrap()
-    } else {
-        client.event_feed().unwrap()
-    };
+    let (req_tx, resp_rx) = client.event_feed().unwrap();
     let event_feed_wrap = Arc::new(Mutex::new(Some(resp_rx)));
     let event_feed_wrap_clone = event_feed_wrap.clone();
 
@@ -130,7 +99,7 @@ fn create_event_feed(
 }
 
 pub struct TestSuiteBuilder {
-    cluster: Option<Cluster<RocksEngine, ServerCluster<RocksEngine>>>,
+    cluster: Option<Cluster<ServerCluster>>,
     memory_quota: Option<usize>,
 }
 
@@ -143,10 +112,7 @@ impl TestSuiteBuilder {
     }
 
     #[must_use]
-    pub fn cluster(
-        mut self,
-        cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
-    ) -> TestSuiteBuilder {
+    pub fn cluster(mut self, cluster: Cluster<ServerCluster>) -> TestSuiteBuilder {
         self.cluster = Some(cluster);
         self
     }
@@ -163,7 +129,7 @@ impl TestSuiteBuilder {
 
     pub fn build_with_cluster_runner<F>(self, mut runner: F) -> TestSuite
     where
-        F: FnMut(&mut Cluster<RocksEngine, ServerCluster<RocksEngine>>),
+        F: FnMut(&mut Cluster<ServerCluster>),
     {
         init();
         let memory_quota = self.memory_quota.unwrap_or(usize::MAX);
@@ -171,7 +137,6 @@ impl TestSuiteBuilder {
         let count = cluster.count;
         let pd_cli = cluster.pd_client.clone();
         let mut endpoints = HashMap::default();
-        let mut quotas = HashMap::default();
         let mut obs = HashMap::default();
         let mut concurrency_managers = HashMap::default();
         // Hack! node id are generated from 1..count+1.
@@ -181,14 +146,15 @@ impl TestSuiteBuilder {
             let mut sim = cluster.sim.wl();
 
             // Register cdc service to gRPC server.
-            let memory_quota = Arc::new(MemoryQuota::new(memory_quota));
-            let memory_quota_ = memory_quota.clone();
             let scheduler = worker.scheduler();
             sim.pending_services
                 .entry(id)
                 .or_default()
                 .push(Box::new(move || {
-                    create_change_data(cdc::Service::new(scheduler.clone(), memory_quota_.clone()))
+                    create_change_data(cdc::Service::new(
+                        scheduler.clone(),
+                        MemoryQuota::new(memory_quota),
+                    ))
                 }));
             sim.txn_extra_schedulers.insert(
                 id,
@@ -203,7 +169,6 @@ impl TestSuiteBuilder {
                 },
             ));
             endpoints.insert(id, worker);
-            quotas.insert(id, memory_quota);
         }
 
         runner(&mut cluster);
@@ -228,7 +193,7 @@ impl TestSuiteBuilder {
                 cm.clone(),
                 env,
                 sim.security_mgr.clone(),
-                quotas[id].clone(),
+                MemoryQuota::new(usize::MAX),
                 sim.get_causal_ts_provider(*id),
             );
             let mut updated_cfg = cfg.clone();
@@ -252,7 +217,7 @@ impl TestSuiteBuilder {
 }
 
 pub struct TestSuite {
-    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    pub cluster: Cluster<ServerCluster>,
     pub endpoints: HashMap<u64, LazyWorker<Task>>,
     pub obs: HashMap<u64, CdcObserver>,
     tikv_cli: HashMap<u64, TikvClient>,

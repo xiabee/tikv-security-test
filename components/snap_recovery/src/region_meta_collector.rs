@@ -2,7 +2,8 @@
 
 use std::{cell::RefCell, error::Error as StdError, result, thread::JoinHandle};
 
-use engine_traits::{Engines, KvEngine, RaftEngine, CF_RAFT};
+use engine_rocks::RocksEngine;
+use engine_traits::{Engines, Iterable, Peekable, RaftEngine, CF_RAFT};
 use futures::channel::mpsc::UnboundedSender;
 use kvproto::{
     raft_serverpb::{PeerState, RaftApplyState, RaftLocalState, RegionLocalState},
@@ -29,13 +30,9 @@ pub enum Error {
 }
 
 /// `RegionMetaCollector` is the collector that collector all region meta
-pub struct RegionMetaCollector<EK, ER>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
+pub struct RegionMetaCollector<ER: RaftEngine> {
     /// The engine we are working on
-    engines: Engines<EK, ER>,
+    engines: Engines<RocksEngine, ER>,
     /// region meta report to br
     tx: UnboundedSender<RegionMeta>,
     /// Current working workers
@@ -43,12 +40,8 @@ where
 }
 
 #[allow(dead_code)]
-impl<EK, ER> RegionMetaCollector<EK, ER>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
-    pub fn new(engines: Engines<EK, ER>, tx: UnboundedSender<RegionMeta>) -> Self {
+impl<ER: RaftEngine> RegionMetaCollector<ER> {
+    pub fn new(engines: Engines<RocksEngine, ER>, tx: UnboundedSender<RegionMeta>) -> Self {
         RegionMetaCollector {
             engines,
             tx,
@@ -64,10 +57,13 @@ where
                 .name("collector_region_meta".to_string())
                 .spawn_wrapper(move || {
                     tikv_util::thread_group::set_properties(props);
+                    tikv_alloc::add_thread_memory_accessor();
 
                     worker
                         .collect_report()
                         .expect("collect region meta and report to br failure.");
+
+                    tikv_alloc::remove_thread_memory_accessor();
                 })
                 .expect("failed to spawn collector_region_meta thread"),
         );
@@ -81,22 +77,14 @@ where
     }
 }
 
-struct CollectWorker<EK, ER>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
+struct CollectWorker<ER: RaftEngine> {
     /// The engine we are working on
-    engines: Engines<EK, ER>,
+    engines: Engines<RocksEngine, ER>,
     tx: UnboundedSender<RegionMeta>,
 }
 
-impl<EK, ER> CollectWorker<EK, ER>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
-    pub fn new(engines: Engines<EK, ER>, tx: UnboundedSender<RegionMeta>) -> Self {
+impl<ER: RaftEngine> CollectWorker<ER> {
+    pub fn new(engines: Engines<RocksEngine, ER>, tx: UnboundedSender<RegionMeta>) -> Self {
         CollectWorker { engines, tx }
     }
 
