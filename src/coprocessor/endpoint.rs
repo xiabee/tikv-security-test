@@ -27,10 +27,7 @@ use tokio::sync::Semaphore;
 use txn_types::Lock;
 
 use crate::{
-    coprocessor::{
-        cache::CachedRequestHandler, interceptors::*, metrics::*,
-        statistics::analyze_context::AnalyzeContext, tracker::Tracker, *,
-    },
+    coprocessor::{cache::CachedRequestHandler, interceptors::*, metrics::*, tracker::Tracker, *},
     read_pool::ReadPoolHandle,
     server::Config,
     storage::{
@@ -305,7 +302,7 @@ impl<E: Engine> Endpoint<E> {
                 let quota_limiter = self.quota_limiter.clone();
 
                 builder = Box::new(move |snap, req_ctx| {
-                    AnalyzeContext::<_, F>::new(
+                    statistics::analyze::AnalyzeContext::<_, F>::new(
                         analyze,
                         req_ctx.ranges.clone(),
                         start_ts,
@@ -427,16 +424,15 @@ impl<E: Engine> Endpoint<E> {
 
         // Check if the buckets version is latest.
         // skip if request don't carry this bucket version.
-        if let Some(ref buckets) = latest_buckets
-            && buckets.version > tracker.req_ctx.context.buckets_version
-            && tracker.req_ctx.context.buckets_version != 0
-        {
-            let mut bucket_not_match = errorpb::BucketVersionNotMatch::default();
-            bucket_not_match.set_version(buckets.version);
-            bucket_not_match.set_keys(buckets.keys.clone().into());
-            let mut err = errorpb::Error::default();
-            err.set_bucket_version_not_match(bucket_not_match);
-            return Err(Error::Region(err));
+        if let Some(ref buckets) = latest_buckets&&
+            buckets.version > tracker.req_ctx.context.buckets_version &&
+            tracker.req_ctx.context.buckets_version!=0 {
+                let mut bucket_not_match = errorpb::BucketVersionNotMatch::default();
+                bucket_not_match.set_version(buckets.version);
+                bucket_not_match.set_keys(buckets.keys.clone().into());
+                let mut err = errorpb::Error::default();
+                err.set_bucket_version_not_match(bucket_not_match);
+                return Err(Error::Region(err));
         }
         // When snapshot is retrieved, deadline may exceed.
         tracker.on_snapshot_finished();
@@ -525,6 +521,7 @@ impl<E: Engine> Endpoint<E> {
         });
         // box the tracker so that moving it is cheap.
         let tracker = Box::new(Tracker::new(req_ctx, self.slow_log_threshold));
+
         let res = self
             .read_pool
             .spawn_handle(
@@ -548,7 +545,6 @@ impl<E: Engine> Endpoint<E> {
         mut req: coppb::Request,
         peer: Option<String>,
     ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
-        let now = Instant::now();
         // Check the load of the read pool. If it's too busy, generate and return
         // error in the gRPC thread to avoid waiting in the queue of the read pool.
         if let Err(busy_err) = self.read_pool.check_busy_threshold(Duration::from_millis(
@@ -570,9 +566,6 @@ impl<E: Engine> Endpoint<E> {
         let result_of_future = self
             .parse_request_and_check_memory_locks(req, peer, false)
             .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
-        with_tls_tracker(|tracker| {
-            tracker.metrics.grpc_process_nanos = now.saturating_elapsed().as_nanos() as u64;
-        });
         let fut = async move {
             let res = match result_of_future {
                 Err(e) => {
@@ -586,9 +579,7 @@ impl<E: Engine> Endpoint<E> {
                     let mut res = handle_res.unwrap_or_else(|e| make_error_response(e).into());
                     res.set_batch_responses(batch_res.into());
                     GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                        let exec_detail_v2 = res.mut_exec_details_v2();
-                        tracker.write_scan_detail(exec_detail_v2.mut_scan_detail_v2());
-                        tracker.write_time_detail(exec_detail_v2.mut_time_detail_v2());
+                        tracker.write_scan_detail(res.mut_exec_details_v2().mut_scan_detail_v2());
                     });
                     res
                 }

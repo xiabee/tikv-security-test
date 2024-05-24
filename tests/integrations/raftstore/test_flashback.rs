@@ -239,7 +239,7 @@ fn test_prepare_flashback_after_conf_change() {
     let on_handle_apply_fp = "on_handle_apply";
     fail::cfg(on_handle_apply_fp, "pause").unwrap();
     // Send the conf change msg.
-    let _ = cluster.async_add_peer(region_id, new_peer(2, 2)).unwrap();
+    cluster.async_add_peer(region_id, new_peer(2, 2)).unwrap();
     // Make sure the conf change cmd is ready.
     sleep(Duration::from_millis(100));
     // Send the prepare flashback msg.
@@ -555,11 +555,9 @@ trait ClusterI {
     ) -> raftstore::Result<RaftCmdResponse>;
 }
 
-impl ClusterI for Cluster<RocksEngine, NodeCluster<RocksEngine>> {
+impl ClusterI for Cluster<NodeCluster> {
     fn region_local_state(&self, region_id: u64, store_id: u64) -> RegionLocalState {
-        Cluster::<RocksEngine, NodeCluster<RocksEngine>>::region_local_state(
-            self, region_id, store_id,
-        )
+        Cluster::<NodeCluster>::region_local_state(self, region_id, store_id)
     }
     fn query_leader(
         &self,
@@ -567,16 +565,14 @@ impl ClusterI for Cluster<RocksEngine, NodeCluster<RocksEngine>> {
         region_id: u64,
         timeout: Duration,
     ) -> Option<metapb::Peer> {
-        Cluster::<RocksEngine, NodeCluster<RocksEngine>>::query_leader(
-            self, store_id, region_id, timeout,
-        )
+        Cluster::<NodeCluster>::query_leader(self, store_id, region_id, timeout)
     }
     fn call_command(
         &self,
         request: RaftCmdRequest,
         timeout: Duration,
     ) -> raftstore::Result<RaftCmdResponse> {
-        Cluster::<RocksEngine, NodeCluster<RocksEngine>>::call_command(self, request, timeout)
+        Cluster::<NodeCluster>::call_command(self, request, timeout)
     }
 }
 

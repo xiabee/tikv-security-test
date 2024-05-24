@@ -12,7 +12,8 @@ use async_channel::SendError;
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, SstCompressionType};
-use external_storage::{create_storage, BackendConfig, ExternalStorage, HdfsConfig};
+use external_storage::{BackendConfig, HdfsConfig};
+use external_storage_export::{create_storage, ExternalStorage};
 use futures::{channel::mpsc::*, executor::block_on};
 use kvproto::{
     brpb::*,
@@ -413,7 +414,7 @@ impl BackupRange {
 
             let entries = batch.drain();
             if writer.need_split_keys() {
-                let this_end_key = entries.as_slice().first().map_or_else(
+                let this_end_key = entries.as_slice().get(0).map_or_else(
                     || Err(Error::Other(box_err!("get entry error: nothing in batch"))),
                     |x| {
                         x.to_key().map(|k| k.into_raw().unwrap()).map_err(|e| {
@@ -1314,7 +1315,7 @@ pub mod tests {
     use api_version::{api_v2::RAW_KEY_PREFIX, dispatch_api_version, KvFormat, RawValue};
     use collections::HashSet;
     use engine_traits::MiscExt;
-    use external_storage::{make_local_backend, make_noop_backend};
+    use external_storage_export::{make_local_backend, make_noop_backend};
     use file_system::{IoOp, IoRateLimiter, IoType};
     use futures::{executor::block_on, stream::StreamExt};
     use kvproto::metapb;
@@ -1589,7 +1590,7 @@ pub mod tests {
             };
 
         // Test whether responses contain correct range.
-        #[allow(clippy::blocks_in_conditions)]
+        #[allow(clippy::blocks_in_if_conditions)]
         let test_handle_backup_task_range =
             |start_key: &[u8], end_key: &[u8], expect: Vec<(&[u8], &[u8])>| {
                 let tmp = TempDir::new().unwrap();
@@ -1836,7 +1837,7 @@ pub mod tests {
             };
 
         // Test whether responses contain correct range.
-        #[allow(clippy::blocks_in_conditions)]
+        #[allow(clippy::blocks_in_if_conditions)]
         let test_handle_backup_task_ranges =
             |sub_ranges: Vec<(&[u8], &[u8])>, expect: Vec<(&[u8], &[u8])>| {
                 let tmp = TempDir::new().unwrap();
@@ -2505,8 +2506,8 @@ pub mod tests {
     fn test_backup_file_name() {
         let region = metapb::Region::default();
         let store_id = 1;
-        let test_cases = ["s3", "local", "gcs", "azure", "hdfs"];
-        let test_target = [
+        let test_cases = vec!["s3", "local", "gcs", "azure", "hdfs"];
+        let test_target = vec![
             "1/0_0_000",
             "1/0_0_000",
             "1_0_0_000",
@@ -2525,7 +2526,7 @@ pub mod tests {
             assert_eq!(target.to_string(), prefix_arr.join(delimiter));
         }
 
-        let test_target = ["1/0_0", "1/0_0", "1_0_0", "1_0_0", "1_0_0"];
+        let test_target = vec!["1/0_0", "1/0_0", "1_0_0", "1_0_0", "1_0_0"];
         for (storage_name, target) in test_cases.iter().zip(test_target.iter()) {
             let key = None;
             let filename = backup_file_name(store_id, &region, key, storage_name);

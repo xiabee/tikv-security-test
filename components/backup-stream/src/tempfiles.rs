@@ -686,7 +686,6 @@ mod test {
     use std::{
         io::Read,
         mem::ManuallyDrop,
-        ops::Deref,
         path::Path,
         pin::Pin,
         sync::{
@@ -697,7 +696,7 @@ mod test {
 
     use async_compression::tokio::bufread::ZstdDecoder;
     use kvproto::brpb::CompressionType;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
     use walkdir::WalkDir;
 
@@ -712,38 +711,23 @@ mod test {
             .unwrap()
     }
 
-    #[derive(Clone)]
-    struct TestPool {
-        _tmpdir: Arc<TempDir>,
-        pool: Arc<TempFilePool>,
-    }
-
-    impl Deref for TestPool {
-        type Target = Arc<TempFilePool>;
-
-        fn deref(&self) -> &Self::Target {
-            &self.pool
-        }
-    }
-
-    fn test_pool_with_modify(m: impl FnOnce(&mut Config)) -> TestPool {
-        let tmp = tempdir().unwrap();
+    fn simple_pool_with_modify(m: impl FnOnce(&mut Config)) -> Arc<TempFilePool> {
         let mut cfg = Config {
             cache_size: AtomicUsize::new(100000),
-            swap_files: tmp.path().to_owned(),
+            swap_files: std::env::temp_dir().join(format!(
+                "backup_stream::tempfiles::test::{}",
+                std::process::id()
+            )),
             content_compression: CompressionType::Unknown,
             minimal_swap_out_file_size: 8192,
             write_buffer_size: 4096,
         };
         m(&mut cfg);
-        TestPool {
-            _tmpdir: Arc::new(tmp),
-            pool: Arc::new(TempFilePool::new(cfg).unwrap()),
-        }
+        Arc::new(TempFilePool::new(cfg).unwrap())
     }
 
-    fn test_pool_with_soft_max(soft_max: usize) -> TestPool {
-        test_pool_with_modify(|cfg| {
+    fn simple_pool_with_soft_max(soft_max: usize) -> Arc<TempFilePool> {
+        simple_pool_with_modify(|cfg| {
             cfg.cache_size = AtomicUsize::new(soft_max);
             cfg.minimal_swap_out_file_size = 8192.min(soft_max)
         })
@@ -751,7 +735,7 @@ mod test {
 
     #[test]
     fn test_read() {
-        let pool = test_pool_with_soft_max(255);
+        let pool = simple_pool_with_soft_max(255);
         let mut f = pool.open_for_write("hello.txt".as_ref()).unwrap();
         let rt = rt_for_test();
         rt.block_on(f.write(b"Hello, world.")).unwrap();
@@ -775,7 +759,7 @@ mod test {
 
     #[test]
     fn test_swapout() {
-        let pool = test_pool_with_modify(|cfg| {
+        let pool = simple_pool_with_modify(|cfg| {
             cfg.cache_size = AtomicUsize::new(30);
             cfg.minimal_swap_out_file_size = 30;
             cfg.write_buffer_size = 30;
@@ -783,7 +767,7 @@ mod test {
         let mut f = pool.open_for_write("world.txt".as_ref()).unwrap();
         let rt = rt_for_test();
         rt.block_on(f.write(b"Once the word count...")).unwrap();
-        rt.block_on(f.write(b"Reaches 30. The content of files shall be swaped out to the disk."))
+        rt.block_on(f.write(b"Reachs 30. The content of files shall be swaped out to the disk."))
             .unwrap();
         rt.block_on(f.write(b"Isn't it? This swap will be finished in this call."))
             .unwrap();
@@ -791,7 +775,7 @@ mod test {
         let mut cur = pool.open_raw_for_read("world.txt".as_ref()).unwrap();
         let mut buf = vec![];
         rt.block_on(cur.read_to_end(&mut buf)).unwrap();
-        let excepted = b"Once the word count...Reaches 30. The content of files shall be swaped out to the disk.Isn't it? This swap will be finished in this call.";
+        let excepted = b"Once the word count...Reachs 30. The content of files shall be swaped out to the disk.Isn't it? This swap will be finished in this call.";
         assert_eq!(
             excepted,
             buf.as_slice(),
@@ -801,7 +785,7 @@ mod test {
         );
 
         // The newly written bytes would be kept in memory.
-        let excepted = b"Once the word count...Reaches 30. The content of files shall be swaped out to the disk.";
+        let excepted = b"Once the word count...Reachs 30. The content of files shall be swaped out to the disk.";
         let mut local_file = pool
             .open_relative("world.txt".as_ref())
             .unwrap()
@@ -820,7 +804,7 @@ mod test {
 
     #[test]
     fn test_compression() {
-        let pool = test_pool_with_modify(|cfg| {
+        let pool = simple_pool_with_modify(|cfg| {
             cfg.content_compression = CompressionType::Zstd;
             cfg.cache_size = AtomicUsize::new(15);
             cfg.minimal_swap_out_file_size = 15;
@@ -854,11 +838,11 @@ mod test {
 
     #[test]
     fn test_write_many_times() {
-        let mut pool = test_pool_with_modify(|cfg| {
+        let mut pool = simple_pool_with_modify(|cfg| {
             cfg.cache_size = AtomicUsize::new(15);
             cfg.minimal_swap_out_file_size = 15;
         });
-        Arc::get_mut(&mut pool.pool).unwrap().override_swapout = Some(Box::new(|p| {
+        Arc::get_mut(&mut pool).unwrap().override_swapout = Some(Box::new(|p| {
             println!("creating {}", p.display());
             Box::pin(ThrottleWrite(tokio::fs::File::from_std(
                 std::fs::File::create(p).unwrap(),
@@ -912,7 +896,7 @@ mod test {
 
     #[test]
     fn test_read_many_times() {
-        let pool = test_pool_with_modify(|cfg| {
+        let pool = simple_pool_with_modify(|cfg| {
             cfg.cache_size = AtomicUsize::new(15);
             cfg.minimal_swap_out_file_size = 15;
         });
@@ -955,7 +939,7 @@ mod test {
     fn test_not_leaked() {
         // Open a distinct dir for this case.
         let tmp = tempdir().unwrap();
-        let pool = test_pool_with_modify(|cfg| {
+        let pool = simple_pool_with_modify(|cfg| {
             cfg.cache_size = AtomicUsize::new(15);
             cfg.minimal_swap_out_file_size = 15;
             cfg.swap_files = tmp.path().to_owned();
@@ -991,7 +975,7 @@ mod test {
     #[test]
     fn test_panic_not_leaked() {
         let tmp = tempdir().unwrap();
-        let pool = test_pool_with_modify(|cfg| {
+        let pool = simple_pool_with_modify(|cfg| {
             cfg.cache_size = AtomicUsize::new(15);
             cfg.minimal_swap_out_file_size = 15;
             cfg.swap_files = tmp.path().to_owned();
@@ -1011,7 +995,7 @@ mod test {
         // TiKV panicked!
         let _ = ManuallyDrop::new(pool);
 
-        let pool = test_pool_with_modify(|cfg| {
+        let pool = simple_pool_with_modify(|cfg| {
             cfg.swap_files = tmp.path().to_owned();
         });
         assert_dir_empty(tmp.path());

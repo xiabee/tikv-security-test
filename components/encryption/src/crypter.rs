@@ -1,17 +1,36 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::fmt::{self, Debug, Formatter};
-
 use byteorder::{BigEndian, ByteOrder};
 use cloud::kms::PlainKey;
+use engine_traits::EncryptionMethod as EtEncryptionMethod;
 use kvproto::encryptionpb::EncryptionMethod;
-use openssl::{
-    rand,
-    symm::{self, Cipher as OCipher},
-};
+use openssl::symm::{self, Cipher as OCipher};
+use rand::{rngs::OsRng, RngCore};
 use tikv_util::box_err;
 
 use crate::{Error, Result};
+
+pub fn to_engine_encryption_method(method: EncryptionMethod) -> EtEncryptionMethod {
+    match method {
+        EncryptionMethod::Plaintext => EtEncryptionMethod::Plaintext,
+        EncryptionMethod::Aes128Ctr => EtEncryptionMethod::Aes128Ctr,
+        EncryptionMethod::Aes192Ctr => EtEncryptionMethod::Aes192Ctr,
+        EncryptionMethod::Aes256Ctr => EtEncryptionMethod::Aes256Ctr,
+        EncryptionMethod::Sm4Ctr => EtEncryptionMethod::Sm4Ctr,
+        EncryptionMethod::Unknown => EtEncryptionMethod::Unknown,
+    }
+}
+
+pub fn from_engine_encryption_method(method: EtEncryptionMethod) -> EncryptionMethod {
+    match method {
+        EtEncryptionMethod::Plaintext => EncryptionMethod::Plaintext,
+        EtEncryptionMethod::Aes128Ctr => EncryptionMethod::Aes128Ctr,
+        EtEncryptionMethod::Aes192Ctr => EncryptionMethod::Aes192Ctr,
+        EtEncryptionMethod::Aes256Ctr => EncryptionMethod::Aes256Ctr,
+        EtEncryptionMethod::Sm4Ctr => EncryptionMethod::Sm4Ctr,
+        EtEncryptionMethod::Unknown => EncryptionMethod::Unknown,
+    }
+}
 
 pub fn get_method_key_length(method: EncryptionMethod) -> usize {
     match method {
@@ -21,40 +40,6 @@ pub fn get_method_key_length(method: EncryptionMethod) -> usize {
         EncryptionMethod::Aes256Ctr => 32,
         EncryptionMethod::Sm4Ctr => 16,
         unknown => panic!("bad EncryptionMethod {:?}", unknown),
-    }
-}
-
-#[derive(Clone, PartialEq)]
-pub struct FileEncryptionInfo {
-    pub method: EncryptionMethod,
-    pub key: Vec<u8>,
-    pub iv: Vec<u8>,
-}
-impl Default for FileEncryptionInfo {
-    fn default() -> Self {
-        FileEncryptionInfo {
-            method: EncryptionMethod::Unknown,
-            key: vec![],
-            iv: vec![],
-        }
-    }
-}
-
-impl Debug for FileEncryptionInfo {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "FileEncryptionInfo [method={:?}, key=...<{} bytes>, iv=...<{} bytes>]",
-            self.method,
-            self.key.len(),
-            self.iv.len()
-        )
-    }
-}
-
-impl FileEncryptionInfo {
-    pub fn is_empty(&self) -> bool {
-        self.key.is_empty() && self.iv.is_empty()
     }
 }
 
@@ -72,17 +57,17 @@ pub enum Iv {
 
 impl Iv {
     /// Generate a random IV for AES-GCM.
-    pub fn new_gcm() -> Result<Iv> {
+    pub fn new_gcm() -> Iv {
         let mut iv = [0u8; GCM_IV_12];
-        rand::rand_bytes(&mut iv)?;
-        Ok(Iv::Gcm(iv))
+        OsRng.fill_bytes(&mut iv);
+        Iv::Gcm(iv)
     }
 
     /// Generate a random IV for AES-CTR.
-    pub fn new_ctr() -> Result<Iv> {
+    pub fn new_ctr() -> Iv {
         let mut iv = [0u8; CTR_IV_16];
-        rand::rand_bytes(&mut iv)?;
-        Ok(Iv::Ctr(iv))
+        OsRng.fill_bytes(&mut iv);
+        Iv::Ctr(iv)
     }
 
     pub fn from_slice(src: &[u8]) -> Result<Iv> {
@@ -214,9 +199,9 @@ mod tests {
         let mut ivs = Vec::with_capacity(100);
         for c in 0..100 {
             if c % 2 == 0 {
-                ivs.push(Iv::new_ctr().unwrap());
+                ivs.push(Iv::new_ctr());
             } else {
-                ivs.push(Iv::new_gcm().unwrap());
+                ivs.push(Iv::new_gcm());
             }
         }
         ivs.dedup_by(|a, b| a.as_slice() == b.as_slice());

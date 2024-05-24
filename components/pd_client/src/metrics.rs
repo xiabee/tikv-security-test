@@ -15,6 +15,9 @@ make_static_metric! {
         put_store,
         get_all_stores,
         get_store_and_stats,
+        store_global_config,
+        load_global_config,
+        watch_global_config,
         bootstrap_cluster,
         is_cluster_bootstrapped,
         get_cluster_config,
@@ -34,7 +37,6 @@ make_static_metric! {
 
         meta_storage_put,
         meta_storage_get,
-        meta_storage_delete,
         meta_storage_watch,
     }
 

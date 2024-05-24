@@ -253,7 +253,8 @@
 #![feature(assert_matches)]
 #![feature(linked_list_cursors)]
 #![feature(let_chains)]
-#![feature(str_split_remainder)]
+#![feature(str_split_as_str)]
+#![feature(drain_filter)]
 
 #[macro_use(fail_point)]
 extern crate fail;
@@ -294,6 +295,8 @@ mod sst;
 pub use crate::sst::*;
 mod write_batch;
 pub use crate::write_batch::*;
+mod encryption;
+pub use crate::encryption::*;
 mod mvcc_properties;
 mod sst_partitioner;
 pub use crate::sst_partitioner::*;
@@ -311,8 +314,6 @@ mod table_properties;
 pub use crate::table_properties::*;
 mod checkpoint;
 pub use crate::checkpoint::*;
-mod range_cache_engine;
-pub use range_cache_engine::{CacheRange, FailedReason, RangeCacheEngine, RangeHintService};
 
 // These modules contain more general traits, some of which may be implemented
 // by multiple types.

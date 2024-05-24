@@ -1,6 +1,6 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::{errors::Result, options::WriteOptions, CacheRange};
+use crate::{errors::Result, options::WriteOptions};
 
 /// Engines that can create write batches
 pub trait WriteBatchExt: Sized {
@@ -74,9 +74,9 @@ pub trait WriteBatch: Mutable {
     fn write_opt(&mut self, opts: &WriteOptions) -> Result<u64>;
 
     // TODO: it should be `FnOnce`.
-    fn write_callback_opt(&mut self, opts: &WriteOptions, mut cb: impl FnMut(u64)) -> Result<u64> {
+    fn write_callback_opt(&mut self, opts: &WriteOptions, mut cb: impl FnMut()) -> Result<u64> {
         let seq = self.write_opt(opts)?;
-        cb(seq);
+        cb();
         Ok(seq)
     }
 
@@ -123,8 +123,4 @@ pub trait WriteBatch: Mutable {
 
     /// Merge another WriteBatch to itself
     fn merge(&mut self, src: Self) -> Result<()>;
-
-    /// It declares that the following consecutive write will be within this
-    /// range.
-    fn prepare_for_range(&mut self, _: CacheRange) {}
 }

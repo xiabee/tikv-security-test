@@ -4,13 +4,10 @@ use std::time::{Duration, Instant};
 
 use engine_traits::{KvEngine, RaftEngine};
 use fail::fail_point;
-use health_controller::{
-    trend::{RequestPerSecRecorder, Trend},
-    types::RaftstoreDuration,
-};
 use kvproto::pdpb;
 use pd_client::PdClient;
-use raftstore::store::{metrics::*, Config};
+use raftstore::store::{metrics::*, util::RaftstoreDuration, Config};
+use tikv_util::trend::{RequestPerSecRecorder, Trend};
 
 use super::Runner;
 pub struct SlownessStatistics {

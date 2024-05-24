@@ -165,10 +165,6 @@ pub enum ForceLeaderState {
         failed_stores: HashSet<u64>,
         ticks: usize,
     },
-    WaitForceCompact {
-        syncer: UnsafeRecoveryForceLeaderSyncer,
-        failed_stores: HashSet<u64>,
-    },
     PreForceLeader {
         syncer: UnsafeRecoveryForceLeaderSyncer,
         failed_stores: HashSet<u64>,

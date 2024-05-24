@@ -13,7 +13,8 @@ use pd_client::{Feature, FeatureGate};
 use prometheus::local::*;
 use raftstore::store::WriteStats;
 use resource_control::{
-    with_resource_limiter, ControlledFuture, ResourceController, ResourceGroupManager, TaskMetadata,
+    priority_from_task_meta, with_resource_limiter, ControlledFuture, ResourceController,
+    ResourceGroupManager, TaskMetadata,
 };
 use tikv_util::{
     sys::SysQuota,
@@ -187,7 +188,8 @@ impl SchedPool {
                     destroy_tls_engine::<E>();
                     tls_flush(&reporter);
                 })
-                .enable_task_wait_metrics(true)
+                .enable_task_wait_metrics()
+                .metric_idx_from_task_meta(Arc::new(priority_from_task_meta))
         };
         let vanilla = VanillaQueue {
             worker_pool: builder(pool_size, "sched-worker-pool").build_future_pool(),
@@ -275,7 +277,7 @@ pub fn tls_collect_scan_details(cmd: &'static str, stats: &Statistics) {
         m.borrow_mut()
             .local_scan_details
             .entry(cmd)
-            .or_default()
+            .or_insert_with(Default::default)
             .add(stats);
     });
 }

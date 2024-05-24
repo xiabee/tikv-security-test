@@ -27,6 +27,5 @@ define_error_codes!(
         "this request has been suspended.",
         "Probably there are some export tools don't support exporting data inserted by `ingest`(say, snapshot backup). Check the user manual and stop them."),
     REQUEST_TOO_NEW => ("RequestTooNew", "", ""),
-    REQUEST_TOO_OLD => ("RequestTooOld", "", ""),
-    DISK_SPACE_NOT_ENOUGH => ("DiskSpaceNotEnough", "", "")
+    REQUEST_TOO_OLD => ("RequestTooOld", "", "")
 );

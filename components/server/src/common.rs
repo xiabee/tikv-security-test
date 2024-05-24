@@ -23,15 +23,13 @@ use engine_rocks::{
 };
 use engine_traits::{
     data_cf_offset, CachedTablet, CfOptions, CfOptionsExt, FlowControlFactorsExt, KvEngine,
-    RaftEngine, RangeCacheEngine, StatisticsReporter, TabletRegistry, CF_DEFAULT, DATA_CFS,
+    RaftEngine, StatisticsReporter, TabletRegistry, CF_DEFAULT, DATA_CFS,
 };
 use error_code::ErrorCodeExt;
 use file_system::{get_io_rate_limiter, set_io_rate_limiter, BytesFetcher, File, IoBudgetAdjustor};
 use grpcio::Environment;
-use hybrid_engine::HybridEngine;
 use pd_client::{PdClient, RpcClient};
 use raft_log_engine::RaftLogEngine;
-use region_cache_memory_engine::{EngineConfig, RangeCacheMemoryEngine};
 use security::SecurityManager;
 use tikv::{
     config::{ConfigController, DbConfigManger, DbType, TikvConfig},
@@ -448,7 +446,7 @@ const RESERVED_OPEN_FDS: u64 = 1000;
 pub fn check_system_config(config: &TikvConfig) {
     info!("beginning system configuration check");
     let mut rocksdb_max_open_files = config.rocksdb.max_open_files;
-    if let Some(true) = config.rocksdb.titan.enabled {
+    if config.rocksdb.titan.enabled {
         // Titan engine maintains yet another pool of blob files and uses the same max
         // number of open files setup as rocksdb does. So we double the max required
         // open files here
@@ -560,9 +558,7 @@ impl EnginesResourceInfo {
             });
 
         for (_, cache) in cached_latest_tablets.iter_mut() {
-            let Some(tablet) = cache.latest() else {
-                continue;
-            };
+            let Some(tablet) = cache.latest() else { continue };
             for cf in DATA_CFS {
                 fetch_engine_cf(tablet, cf);
             }
@@ -696,32 +692,6 @@ impl Stop for Worker {
 impl<T: fmt::Display + Send + 'static> Stop for LazyWorker<T> {
     fn stop(self: Box<Self>) {
         self.stop_worker();
-    }
-}
-
-pub trait KvEngineBuilder: KvEngine {
-    fn build(disk_engine: RocksEngine, pd_client: Option<Arc<RpcClient>>) -> Self;
-}
-
-impl KvEngineBuilder for RocksEngine {
-    fn build(disk_engine: RocksEngine, _pd_client: Option<Arc<RpcClient>>) -> Self {
-        disk_engine
-    }
-}
-
-impl KvEngineBuilder for HybridEngine<RocksEngine, RangeCacheMemoryEngine> {
-    fn build(disk_engine: RocksEngine, pd_client: Option<Arc<RpcClient>>) -> Self {
-        // todo(SpadeA): add config for it
-        let mut memory_engine = RangeCacheMemoryEngine::new(EngineConfig::default());
-        memory_engine.set_disk_engine(disk_engine.clone());
-        if let Some(pd_client) = pd_client.as_ref() {
-            memory_engine.start_hint_service(
-                <RangeCacheMemoryEngine as RangeCacheEngine>::RangeHintService::from(
-                    pd_client.clone(),
-                ),
-            )
-        }
-        HybridEngine::new(disk_engine, memory_engine)
     }
 }
 

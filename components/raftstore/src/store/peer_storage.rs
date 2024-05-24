@@ -96,7 +96,7 @@ impl PartialEq for SnapState {
             (&SnapState::Relax, &SnapState::Relax)
             | (&SnapState::ApplyAborted, &SnapState::ApplyAborted)
             | (&SnapState::Generating { .. }, &SnapState::Generating { .. }) => true,
-            (SnapState::Applying(b1), SnapState::Applying(b2)) => {
+            (&SnapState::Applying(ref b1), &SnapState::Applying(ref b2)) => {
                 b1.load(Ordering::Relaxed) == b2.load(Ordering::Relaxed)
             }
             _ => false,
@@ -372,7 +372,7 @@ where
 
     #[inline]
     pub fn raw_snapshot(&self) -> EK::Snapshot {
-        self.engines.kv.snapshot(None)
+        self.engines.kv.snapshot()
     }
 
     #[inline]
@@ -1609,7 +1609,7 @@ pub mod tests {
             .unwrap()
             .unwrap();
         gen_task.generate_and_schedule_snapshot::<KvTestEngine>(
-            engines.kv.clone().snapshot(None),
+            engines.kv.clone().snapshot(),
             entry.get_term(),
             apply_state,
             sched,
@@ -2146,15 +2146,25 @@ pub mod tests {
         lb.put_raft_state(1, &raft_state).unwrap();
         engines.raft.consume(&mut lb, false).unwrap();
 
-        // It should not recover if corresponding log doesn't exist.
-        engines.raft.gc(1, 14, 15, &mut lb).unwrap();
-        engines.raft.consume(&mut lb, false).unwrap();
+        // applied_index > commit_index is invalid.
         let mut apply_state = RaftApplyState::default();
         apply_state.set_applied_index(13);
         apply_state.mut_truncated_state().set_index(13);
+        apply_state
+            .mut_truncated_state()
+            .set_term(RAFT_INIT_LOG_TERM);
+        let apply_state_key = keys::apply_state_key(1);
+        engines
+            .kv
+            .put_msg_cf(CF_RAFT, &apply_state_key, &apply_state)
+            .unwrap();
+        assert!(build_storage().is_err());
+
+        // It should not recover if corresponding log doesn't exist.
+        engines.raft.gc(1, 14, 15, &mut lb).unwrap();
+        engines.raft.consume(&mut lb, false).unwrap();
         apply_state.set_commit_index(14);
         apply_state.set_commit_term(RAFT_INIT_LOG_TERM);
-        let apply_state_key = keys::apply_state_key(1);
         engines
             .kv
             .put_msg_cf(CF_RAFT, &apply_state_key, &apply_state)
