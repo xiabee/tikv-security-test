@@ -18,8 +18,7 @@ use backup_stream::{
     },
     observer::BackupStreamObserver,
     router::{Router, TaskSelector},
-    utils, BackupStreamResolver, Endpoint, GetCheckpointResult, RegionCheckpointOperation,
-    RegionSet, Service, Task,
+    utils, Endpoint, GetCheckpointResult, RegionCheckpointOperation, RegionSet, Service, Task,
 };
 use futures::{executor::block_on, AsyncWriteExt, Future, Stream, StreamExt};
 use grpcio::{ChannelBuilder, Server, ServerBuilder};
@@ -31,8 +30,7 @@ use kvproto::{
     tikvpb::*,
 };
 use pd_client::PdClient;
-use raftstore::{router::CdcRaftRouter, RegionInfoAccessor};
-use resolved_ts::LeadershipResolver;
+use raftstore::RegionInfoAccessor;
 use tempdir::TempDir;
 use test_pd_client::TestPdClient;
 use test_raftstore::{new_server_cluster, Cluster, ServerCluster};
@@ -143,7 +141,6 @@ impl SuiteBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn inject_meta_store_error<F>(mut self, f: F) -> Self
     where
         F: Fn(&str) -> Result<()> + Send + Sync + 'static,
@@ -152,7 +149,6 @@ impl SuiteBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn cfg(mut self, f: impl FnOnce(&mut BackupStreamConfig) + 'static) -> Self {
         let old_f = self.cfg;
         self.cfg = Box::new(move |cfg| {
@@ -263,9 +259,6 @@ pub struct Suite {
 }
 
 impl Suite {
-    pub const PROMISED_SHORT_VALUE: &'static [u8] = b"hello, world";
-    pub const PROMISED_LONG_VALUE: &'static [u8] = &[0xbb; 4096];
-
     pub fn simple_task(&self, name: &str) -> StreamTask {
         let mut task = StreamTask::default();
         task.info.set_name(name.to_owned());
@@ -350,6 +343,7 @@ impl Suite {
         let (_, port) = server.bind_addrs().next().unwrap();
         let addr = format!("127.0.0.1:{}", port);
         let channel = ChannelBuilder::new(self.env.clone()).connect(&addr);
+        println!("connecting channel to {} for store {}", addr, id);
         let client = LogBackupClient::new(channel);
         self.servers.push(server);
         client
@@ -360,25 +354,12 @@ impl Suite {
         let worker = self.endpoints.get_mut(&id).unwrap();
         let sim = cluster.sim.wl();
         let raft_router = sim.get_server_router(id);
-        let raft_router = CdcRaftRouter(raft_router);
         let cm = sim.get_concurrency_manager(id);
         let regions = sim.region_info_accessors.get(&id).unwrap().clone();
         let ob = self.obs.get(&id).unwrap().clone();
         cfg.enable = true;
         cfg.temp_path = format!("/{}/{}", self.temp_files.path().display(), id);
-        let resolver = LeadershipResolver::new(
-            id,
-            cluster.pd_client.clone(),
-            Arc::clone(&self.env),
-            Arc::clone(&sim.security_mgr),
-            cluster.store_metas[&id]
-                .lock()
-                .unwrap()
-                .region_read_progress
-                .clone(),
-            Duration::from_secs(60),
-        );
-        let endpoint = Endpoint::new(
+        let endpoint: TestEndpoint = Endpoint::new(
             id,
             self.meta_store.clone(),
             cfg,
@@ -388,12 +369,18 @@ impl Suite {
             raft_router,
             cluster.pd_client.clone(),
             cm,
-            BackupStreamResolver::V1(resolver),
+            Arc::clone(&self.env),
+            cluster.store_metas[&id]
+                .lock()
+                .unwrap()
+                .region_read_progress
+                .clone(),
+            Arc::clone(&sim.security_mgr),
         );
         worker.start(endpoint);
     }
 
-    pub fn get_meta_cli(&self) -> MetadataClient<impl MetaStore> {
+    pub fn get_meta_cli(&self) -> MetadataClient<ErrorStore<SlashEtcStore>> {
         MetadataClient::new(self.meta_store.clone(), 0)
     }
 
@@ -473,9 +460,9 @@ impl Suite {
             let ts = ts as u64;
             let key = make_record_key(for_table, ts);
             let value = if ts % 4 == 0 {
-                Self::PROMISED_SHORT_VALUE.to_vec()
+                b"hello, world".to_vec()
             } else {
-                Self::PROMISED_LONG_VALUE.to_vec()
+                [0xdd; 4096].to_vec()
             };
             let muts = vec![mutation(key.clone(), value)];
             let enc_key = Key::from_raw(&key).into_encoded();
@@ -523,7 +510,6 @@ impl Suite {
     }
 
     pub fn force_flush_files(&self, task: &str) {
-        // TODO: use the callback to make the test more stable.
         self.run(|| Task::ForceFlush(task.to_owned()));
         self.sync();
     }
@@ -538,6 +524,7 @@ impl Suite {
         let mut res = LogFiles::default();
         for entry in WalkDir::new(path.join("v1/backupmeta")) {
             let entry = entry?;
+            println!("reading {}", entry.path().display());
             if entry.file_name().to_str().unwrap().ends_with(".meta") {
                 let content = std::fs::read(entry.path())?;
                 let meta = protobuf::parse_from_bytes::<Metadata>(&content)?;
@@ -625,7 +612,7 @@ impl Suite {
 
                         default_keys.insert(key.into_encoded());
                     } else {
-                        assert_eq!(wf.short_value, Some(Self::PROMISED_SHORT_VALUE));
+                        assert_eq!(wf.short_value, Some(b"hello, world" as &[u8]));
                     }
                 }
             }
@@ -649,7 +636,7 @@ impl Suite {
                     }
 
                     let value = iter.value();
-                    assert_eq!(value, Self::PROMISED_LONG_VALUE);
+                    assert_eq!(value, &[0xdd; 4096]);
                 }
             }
         }
@@ -858,7 +845,7 @@ impl Suite {
     }
 
     pub fn wait_with_router(&self, mut cond: impl FnMut(&Router) -> bool + Send + 'static + Clone) {
-        self.wait_with(move |ep| cond(&ep.range_router))
+        self.wait_with(move |ep: &mut TestEndpoint| cond(&ep.range_router))
     }
 
     pub fn wait_for_flush(&self) {

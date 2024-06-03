@@ -18,9 +18,9 @@ use online_config::{self, ConfigChange, ConfigManager, OnlineConfig};
 use pd_client::PdClient;
 use raftstore::{
     coprocessor::{CmdBatch, ObserveHandle, ObserveId},
-    router::CdcHandle,
+    router::RaftStoreRouter,
     store::{
-        fsm::store::StoreRegionMeta,
+        fsm::StoreMeta,
         util::{
             self, ReadState, RegionReadProgress, RegionReadProgressCore, RegionReadProgressRegistry,
         },
@@ -138,11 +138,12 @@ impl ResolverStatus {
         } = self else {
             panic!("region {:?} resolver has ready", region_id)
         };
+        let memory_quota = memory_quota.clone();
         // Must take locks, otherwise it may double free memory quota on drop.
         let locks = std::mem::take(locks);
         (
             *tracked_index,
-            locks.into_iter().map(|lock| {
+            locks.into_iter().map(move |lock| {
                 memory_quota.free(lock.heap_size());
                 lock
             }),
@@ -366,12 +367,12 @@ impl ObserveRegion {
     }
 }
 
-pub struct Endpoint<T, E: KvEngine, S> {
+pub struct Endpoint<T, E: KvEngine> {
     store_id: Option<u64>,
     cfg: ResolvedTsConfig,
     memory_quota: Arc<MemoryQuota>,
     advance_notify: Arc<Notify>,
-    store_meta: Arc<Mutex<S>>,
+    store_meta: Arc<Mutex<StoreMeta>>,
     region_read_progress: RegionReadProgressRegistry,
     regions: HashMap<u64, ObserveRegion>,
     scanner_pool: ScannerPool<T, E>,
@@ -382,11 +383,10 @@ pub struct Endpoint<T, E: KvEngine, S> {
 }
 
 // methods that are used for metrics and logging
-impl<T, E, S> Endpoint<T, E, S>
+impl<T, E> Endpoint<T, E>
 where
-    T: 'static + CdcHandle<E>,
+    T: 'static + RaftStoreRouter<E>,
     E: KvEngine,
-    S: StoreRegionMeta,
 {
     fn collect_stats(&mut self) -> Stats {
         fn is_leader(store_id: Option<u64>, leader_store_id: Option<u64>) -> bool {
@@ -395,6 +395,7 @@ where
 
         let store_id = self.get_or_init_store_id();
         let mut stats = Stats::default();
+        let regions = &mut self.regions;
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
                 let (leader_info, leader_store_id) = read_progress.dump_leader_info();
@@ -410,7 +411,7 @@ where
                 if is_leader(store_id, leader_store_id) {
                     // leader resolved-ts
                     if resolved_ts < stats.min_leader_resolved_ts.resolved_ts {
-                        let resolver = self.regions.get_mut(region_id).map(|x| &mut x.resolver);
+                        let resolver = regions.get_mut(region_id).map(|x| &mut x.resolver);
                         stats
                             .min_leader_resolved_ts
                             .set(*region_id, resolver, &core, &leader_info);
@@ -638,17 +639,16 @@ where
     }
 }
 
-impl<T, E, S> Endpoint<T, E, S>
+impl<T, E> Endpoint<T, E>
 where
-    T: 'static + CdcHandle<E>,
+    T: 'static + RaftStoreRouter<E>,
     E: KvEngine,
-    S: StoreRegionMeta,
 {
     pub fn new(
         cfg: &ResolvedTsConfig,
         scheduler: Scheduler<Task>,
-        cdc_handle: T,
-        store_meta: Arc<Mutex<S>>,
+        raft_router: T,
+        store_meta: Arc<Mutex<StoreMeta>>,
         pd_client: Arc<dyn PdClient>,
         concurrency_manager: ConcurrencyManager,
         env: Arc<Environment>,
@@ -656,14 +656,14 @@ where
     ) -> Self {
         let (region_read_progress, store_id) = {
             let meta = store_meta.lock().unwrap();
-            (meta.region_read_progress().clone(), meta.store_id())
+            (meta.region_read_progress.clone(), meta.store_id)
         };
         let advance_worker =
             AdvanceTsWorker::new(pd_client.clone(), scheduler.clone(), concurrency_manager);
-        let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, cdc_handle);
+        let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, raft_router);
         let store_resolver_gc_interval = Duration::from_secs(60);
         let leader_resolver = LeadershipResolver::new(
-            store_id,
+            store_id.unwrap(),
             pd_client.clone(),
             env,
             security_mgr,
@@ -672,7 +672,7 @@ where
         );
         let scan_concurrency_semaphore = Arc::new(Semaphore::new(cfg.incremental_scan_concurrency));
         let ep = Self {
-            store_id: Some(store_id),
+            store_id,
             cfg: cfg.clone(),
             memory_quota: Arc::new(MemoryQuota::new(cfg.memory_quota.0 as usize)),
             advance_notify: Arc::new(Notify::new()),
@@ -832,8 +832,8 @@ where
             let region;
             {
                 let meta = self.store_meta.lock().unwrap();
-                match meta.reader(region_id) {
-                    Some(r) => region = r.region.as_ref().clone(),
+                match meta.regions.get(&region_id) {
+                    Some(r) => region = r.clone(),
                     None => return,
                 }
             }
@@ -956,8 +956,8 @@ where
     fn get_or_init_store_id(&mut self) -> Option<u64> {
         self.store_id.or_else(|| {
             let meta = self.store_meta.lock().unwrap();
-            self.store_id = Some(meta.store_id());
-            self.store_id
+            self.store_id = meta.store_id;
+            meta.store_id
         })
     }
 
@@ -1099,11 +1099,10 @@ impl fmt::Display for Task {
     }
 }
 
-impl<T, E, S> Runnable for Endpoint<T, E, S>
+impl<T, E> Runnable for Endpoint<T, E>
 where
-    T: 'static + CdcHandle<E>,
+    T: 'static + RaftStoreRouter<E>,
     E: KvEngine,
-    S: StoreRegionMeta,
 {
     type Task = Task;
 
@@ -1288,11 +1287,10 @@ struct ResolverStats {
 
 const METRICS_FLUSH_INTERVAL: u64 = 10_000; // 10s
 
-impl<T, E, S> RunnableWithTimer for Endpoint<T, E, S>
+impl<T, E> RunnableWithTimer for Endpoint<T, E>
 where
-    T: 'static + CdcHandle<E>,
+    T: 'static + RaftStoreRouter<E>,
     E: KvEngine,
-    S: StoreRegionMeta,
 {
     fn on_timeout(&mut self) {
         let stats = self.collect_stats();

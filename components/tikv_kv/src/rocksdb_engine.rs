@@ -114,6 +114,7 @@ impl RocksEngine {
         path: &str,
         db_opts: Option<RocksDbOptions>,
         cfs_opts: Vec<(CfName, RocksCfOptions)>,
+        shared_block_cache: bool,
         io_rate_limiter: Option<Arc<IoRateLimiter>>,
     ) -> Result<RocksEngine> {
         info!("RocksEngine: creating for path"; "path" => path);
@@ -133,7 +134,11 @@ impl RocksEngine {
         let db = engine_rocks::util::new_engine_opt(&path, db_opts, cfs_opts)?;
         // It does not use the raft_engine, so it is ok to fill with the same
         // rocksdb.
-        let engines = Engines::new(db.clone(), db);
+        let mut kv_engine = db.clone();
+        let mut raft_engine = db;
+        kv_engine.set_shared_block_cache(shared_block_cache);
+        raft_engine.set_shared_block_cache(shared_block_cache);
+        let engines = Engines::new(kv_engine, raft_engine);
         let sched = worker.start("engine-rocksdb", Runner(engines.clone()));
         Ok(RocksEngine {
             sched,
@@ -233,8 +238,8 @@ impl<RE: RaftExtension + 'static> Engine for RocksEngine<RE> {
     }
 
     type RaftExtension = RE;
-    fn raft_extension(&self) -> Self::RaftExtension {
-        self.ext.clone()
+    fn raft_extension(&self) -> &Self::RaftExtension {
+        &self.ext
     }
 
     fn modify_on_kv_engine(&self, region_modifies: HashMap<u64, Vec<Modify>>) -> Result<()> {

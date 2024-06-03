@@ -16,7 +16,7 @@ use futures::channel::oneshot::{self, Canceled};
 use futures_util::future::FutureExt;
 use prometheus::{IntCounter, IntGauge};
 use tracker::TrackedFuture;
-use yatp::{queue::Extras, task::future};
+use yatp::task::future;
 
 pub type ThreadPool = yatp::ThreadPool<future::TaskCell>;
 
@@ -29,8 +29,6 @@ struct Env {
 }
 
 #[derive(Clone)]
-// FuturePool wraps a yatp thread pool providing task count metrics and gate
-// maximum running tasks.
 pub struct FuturePool {
     inner: Arc<PoolInner>,
 }
@@ -85,14 +83,7 @@ impl FuturePool {
     where
         F: Future + Send + 'static,
     {
-        self.inner.spawn(TrackedFuture::new(future), None)
-    }
-
-    pub fn spawn_with_extras<F>(&self, future: F, extras: Extras) -> Result<(), Full>
-    where
-        F: Future + Send + 'static,
-    {
-        self.inner.spawn(TrackedFuture::new(future), Some(extras))
+        self.inner.spawn(TrackedFuture::new(future))
     }
 
     /// Spawns a future in the pool and returns a handle to the result of the
@@ -108,22 +99,6 @@ impl FuturePool {
         F::Output: Send,
     {
         self.inner.spawn_handle(TrackedFuture::new(future))
-    }
-
-    /// Return the min thread count and the max thread count that this pool can
-    /// scale to.
-    pub fn thread_count_limit(&self) -> (usize, usize) {
-        self.inner.pool.thread_count_limit()
-    }
-
-    /// Cancel all pending futures and join all threads.
-    pub fn shutdown(&self) {
-        self.inner.pool.shutdown();
-    }
-
-    //  Get a remote queue for spawning tasks without owning the thread pool.
-    pub fn remote(&self) -> &yatp::Remote<future::TaskCell> {
-        self.inner.pool.remote()
     }
 }
 
@@ -169,7 +144,7 @@ impl PoolInner {
         }
     }
 
-    fn spawn<F>(&self, future: F, extras: Option<Extras>) -> Result<(), Full>
+    fn spawn<F>(&self, future: F) -> Result<(), Full>
     where
         F: Future + Send + 'static,
     {
@@ -188,11 +163,7 @@ impl PoolInner {
             metrics_running_task_count.dec();
         });
 
-        if let Some(extras) = extras {
-            self.pool.spawn(future::TaskCell::new(f, extras));
-        } else {
-            self.pool.spawn(f);
-        }
+        self.pool.spawn(f);
         Ok(())
     }
 

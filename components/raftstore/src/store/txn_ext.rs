@@ -311,7 +311,6 @@ mod tests {
     use std::sync::Mutex;
 
     use tikv_util::defer;
-    use txn_types::LastChange;
 
     use super::*;
 
@@ -326,8 +325,8 @@ mod tests {
             ttl: 3000,
             for_update_ts: 110.into(),
             min_commit_ts: 110.into(),
-            last_change: LastChange::make_exist(105.into(), 2),
-            is_locked_with_conflict: false,
+            last_change_ts: 105.into(),
+            versions_to_last_change: 2,
         }
     }
 
@@ -428,8 +427,8 @@ mod tests {
                         ttl: 1000,
                         for_update_ts: 10.into(),
                         min_commit_ts: 20.into(),
-                        last_change: LastChange::make_exist(5.into(), 2),
-                        is_locked_with_conflict: false,
+                        last_change_ts: 5.into(),
+                        versions_to_last_change: 2,
                     },
                     deleted,
                 ),

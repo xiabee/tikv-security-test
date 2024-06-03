@@ -133,6 +133,8 @@ pub trait ConfigManager: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryFrom;
+
     use serde::Serialize;
 
     use super::*;
@@ -140,8 +142,6 @@ mod tests {
 
     #[derive(Clone, OnlineConfig, Debug, Default, PartialEq)]
     pub struct TestConfig {
-        // Test doc hidden fields support online config change.
-        #[doc(hidden)]
         field1: usize,
         field2: String,
         optional_field1: Option<usize>,

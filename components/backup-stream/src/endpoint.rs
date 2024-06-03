@@ -5,6 +5,7 @@ use std::{
     collections::HashSet,
     fmt,
     marker::PhantomData,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -13,17 +14,20 @@ use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
 use error_code::ErrorCodeExt;
 use futures::{stream::AbortHandle, FutureExt, TryFutureExt};
+use grpcio::Environment;
 use kvproto::{
     brpb::{StreamBackupError, StreamBackupTaskInfo},
     metapb::Region,
 };
+use online_config::ConfigChange;
 use pd_client::PdClient;
 use raft::StateRole;
 use raftstore::{
     coprocessor::{CmdBatch, ObserveHandle, RegionInfoProvider},
-    router::CdcHandle,
+    store::{RegionReadProgressRegistry, SignificantRouter},
 };
-use resolved_ts::{resolve_by_raft, LeadershipResolver};
+use resolved_ts::LeadershipResolver;
+use security::SecurityManager;
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
     box_err,
@@ -39,7 +43,7 @@ use tikv_util::{
 use tokio::{
     io::Result as TokioResult,
     runtime::{Handle, Runtime},
-    sync::Semaphore,
+    sync::{oneshot, Semaphore},
 };
 use tokio_stream::StreamExt;
 use txn_types::TimeStamp;
@@ -57,7 +61,7 @@ use crate::{
     metadata::{store::MetaStore, MetadataClient, MetadataEvent, StreamTask},
     metrics::{self, TaskStatus},
     observer::BackupStreamObserver,
-    router::{self, ApplyEvents, Router, TaskSelector},
+    router::{ApplyEvents, Router, TaskSelector},
     subscription_manager::{RegionSubscriptionManager, ResolvedRegions},
     subscription_track::{Ref, RefMut, ResolveResult, SubscriptionTracer},
     try_send,
@@ -91,7 +95,7 @@ pub struct Endpoint<S, R, E: KvEngine, PDC> {
     // We holds the config before, even it is useless for now,
     // however probably it would be useful in the future.
     config: BackupStreamConfig,
-    pub checkpoint_mgr: CheckpointManager,
+    checkpoint_mgr: CheckpointManager,
 
     // Runtime status:
     /// The handle to abort last save storage safe point.
@@ -108,7 +112,7 @@ where
     PDC: PdClient + 'static,
     S: MetaStore + 'static,
 {
-    pub fn new<RT: CdcHandle<E> + 'static>(
+    pub fn new<RT: SignificantRouter<E> + 'static>(
         store_id: u64,
         store: S,
         config: BackupStreamConfig,
@@ -118,14 +122,22 @@ where
         router: RT,
         pd_client: Arc<PDC>,
         concurrency_manager: ConcurrencyManager,
-        resolver: BackupStreamResolver<RT, E>,
+        // Required by Leadership Resolver.
+        env: Arc<Environment>,
+        region_read_progress: RegionReadProgressRegistry,
+        security_mgr: Arc<SecurityManager>,
     ) -> Self {
         crate::metrics::STREAM_ENABLED.inc();
         let pool = create_tokio_runtime((config.num_threads / 2).max(1), "backup-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
 
         let meta_client = MetadataClient::new(store, store_id);
-        let range_router = Router::new(scheduler.clone(), router::Config::from(config.clone()));
+        let range_router = Router::new(
+            PathBuf::from(config.temp_path.clone()),
+            scheduler.clone(),
+            config.file_size_limit.0,
+            config.max_flush_interval.0,
+        );
 
         // spawn a worker to watch task changes from etcd periodically.
         let meta_client_clone = meta_client.clone();
@@ -151,6 +163,14 @@ where
         let initial_scan_throughput_quota = Limiter::new(limit);
         info!("the endpoint of stream backup started"; "path" => %config.temp_path);
         let subs = SubscriptionTracer::default();
+        let leadership_resolver = LeadershipResolver::new(
+            store_id,
+            Arc::clone(&pd_client) as _,
+            env,
+            security_mgr,
+            region_read_progress,
+            Duration::from_secs(60),
+        );
 
         let initial_scan_semaphore = Arc::new(Semaphore::new(config.initial_scan_concurrency));
         let (region_operator, op_loop) = RegionSubscriptionManager::start(
@@ -171,7 +191,7 @@ where
             meta_client.clone(),
             pd_client.clone(),
             ((config.num_threads + 1) / 2).max(1),
-            resolver,
+            leadership_resolver,
         );
         pool.spawn(op_loop);
         let mut checkpoint_mgr = CheckpointManager::default();
@@ -346,7 +366,7 @@ where
             let mut watcher = match watcher {
                 Ok(w) => w,
                 Err(e) => {
-                    e.report("failed to start watch task");
+                    e.report("failed to start watch pause");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -355,12 +375,11 @@ where
 
             loop {
                 if let Some(event) = watcher.stream.next().await {
-                    info!("backup stream watch task from etcd"; "event" => ?event);
+                    info!("backup stream watch event from etcd"; "event" => ?event);
 
                     let revision = meta_client.get_reversion().await;
                     if let Ok(r) = revision {
                         revision_new = r;
-                        info!("update the revision"; "revision" => revision_new);
                     }
 
                     match event {
@@ -406,11 +425,10 @@ where
 
             loop {
                 if let Some(event) = watcher.stream.next().await {
-                    info!("backup stream watch pause from etcd"; "event" => ?event);
+                    info!("backup stream watch event from etcd"; "event" => ?event);
                     let revision = meta_client.get_reversion().await;
                     if let Ok(r) = revision {
                         revision_new = r;
-                        info!("update the revision"; "revision" => revision_new);
                     }
 
                     match event {
@@ -493,11 +511,6 @@ where
             let total_size = kvs.size();
             metrics::HEAP_MEMORY
                 .add(total_size as _);
-            #[cfg(feature = "failpoints")]
-            tokio::time::sleep(Duration::from_millis((|| {
-                fail::fail_point!("log_backup_batch_delay", |val| val.and_then( |x| x.parse::<u64>().ok()).unwrap_or(0));
-                0
-            })())).await;
             utils::handle_on_event_result(&sched, router.on_events(kvs).await);
             metrics::HEAP_MEMORY
                 .sub(total_size as _);
@@ -557,7 +570,7 @@ where
             .await;
         match range_init_result {
             Ok(()) => {
-                info!("backup stream success to initialize";
+                info!("backup stream success to initialize"; 
                         "start_key" => utils::redact(&start_key),
                         "end_key" => utils::redact(&end_key),
                         "take" => ?start.saturating_elapsed(),)
@@ -646,6 +659,7 @@ where
             let task_clone = task.clone();
             let run = async move {
                 let task_name = task.info.get_name();
+                cli.init_task(&task.info).await?;
                 let ranges = cli.ranges_of_task(task_name).await?;
                 fail::fail_point!("load_task::error_when_fetching_ranges", |_| {
                     Err(Error::Other("what range? no such thing, go away.".into()))
@@ -653,7 +667,7 @@ where
                 info!(
                     "register backup stream ranges";
                     "task" => ?task,
-                    "ranges_count" => ranges.inner.len(),
+                    "ranges-count" => ranges.inner.len(),
                 );
                 let ranges = ranges
                     .inner
@@ -708,7 +722,7 @@ where
             Err(err) => {
                 err.report(format!("failed to resume backup stream task {}", task_name));
                 let sched = self.scheduler.clone();
-                self.pool.spawn(async move {
+                tokio::task::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     sched
                         .schedule(Task::WatchTask(TaskOp::ResumeTask(task_name)))
@@ -763,11 +777,29 @@ where
         }
     }
 
-    fn do_flush(&self, task: String, mut resolved: ResolvedRegions) -> future![Result<()>] {
+    fn get_resolved_regions(&self, min_ts: TimeStamp) -> future![Result<ResolvedRegions>] {
+        let (tx, rx) = oneshot::channel();
+        let op = self.region_operator.clone();
+        async move {
+            let req = ObserveOp::ResolveRegions {
+                callback: Box::new(move |rs| {
+                    let _ = tx.send(rs);
+                }),
+                min_ts,
+            };
+            op.request(req).await;
+            rx.await
+                .map_err(|err| annotate!(err, "failed to send request for resolve regions"))
+        }
+    }
+
+    fn do_flush(&self, task: String, min_ts: TimeStamp) -> future![Result<()>] {
+        let get_rts = self.get_resolved_regions(min_ts);
         let router = self.range_router.clone();
         let store_id = self.store_id;
         let mut flush_ob = self.flush_observer();
         async move {
+            let mut resolved = get_rts.await?;
             let mut new_rts = resolved.global_checkpoint();
             fail::fail_point!("delay_on_flush");
             flush_ob.before(resolved.take_resolve_result()).await;
@@ -796,37 +828,20 @@ where
             // This should only happen in testing, it would be to unwrap...
             let _ = info.unwrap().set_flushing_status_cas(false, true);
             let mts = self.prepare_min_ts().await;
-            let sched = self.scheduler.clone();
-            self.region_operator
-                .request(ObserveOp::ResolveRegions {
-                    callback: Box::new(move |res| {
-                        try_send!(sched, Task::ExecFlush(task, res));
-                    }),
-                    min_ts: mts,
-                })
-                .await;
+            try_send!(self.scheduler, Task::FlushWithMinTs(task, mts));
         });
     }
 
     pub fn on_flush(&self, task: String) {
         self.pool.block_on(async move {
             let mts = self.prepare_min_ts().await;
-            let sched = self.scheduler.clone();
             info!("min_ts prepared for flushing"; "min_ts" => %mts);
-            self.region_operator
-                .request(ObserveOp::ResolveRegions {
-                    callback: Box::new(move |res| {
-                        try_send!(sched, Task::ExecFlush(task, res));
-                    }),
-                    min_ts: mts,
-                })
-                .await
+            try_send!(self.scheduler, Task::FlushWithMinTs(task, mts));
         })
     }
 
-    fn on_exec_flush(&mut self, task: String, resolved: ResolvedRegions) {
-        self.checkpoint_mgr.freeze();
-        self.pool.spawn(self.do_flush(task, resolved).map(|r| {
+    fn on_flush_with_min_ts(&self, task: String, min_ts: TimeStamp) {
+        self.pool.spawn(self.do_flush(task, min_ts).map(|r| {
             if let Err(err) = r {
                 err.report("during updating flush status")
             }
@@ -861,7 +876,7 @@ where
                             {
                                 warn!("backup stream failed to set global checkpoint.";
                                     "task" => ?task,
-                                    "global_checkpoint" => global_checkpoint,
+                                    "global-checkpoint" => global_checkpoint,
                                     "err" => ?err,
                                 );
                             }
@@ -869,7 +884,7 @@ where
                         Ok(false) => {
                             debug!("backup stream no need update global checkpoint.";
                                 "task" => ?task,
-                                "global_checkpoint" => global_checkpoint,
+                                "global-checkpoint" => global_checkpoint,
                             );
                         }
                         Err(e) => {
@@ -899,6 +914,10 @@ where
         self.abort_last_storage_save = Some(handle);
     }
 
+    // FIXME: while picking #15541, v6.5.x doesn't support online config change.
+    // This stub was kept so once online config change has been picked, we can reuse
+    // this.
+    #[allow(dead_code)]
     fn on_update_change_config(&mut self, cfg: BackupStreamConfig) {
         let concurrency_diff =
             cfg.initial_scan_concurrency as isize - self.config.initial_scan_concurrency as isize;
@@ -907,7 +926,6 @@ where
              "config" => ?cfg,
              "concurrency_diff" => concurrency_diff,
         );
-        self.range_router.udpate_config(&cfg);
         self.update_semaphore_capacity(&self.initial_scan_semaphore, concurrency_diff);
 
         self.config = cfg;
@@ -952,8 +970,8 @@ where
             Task::ModifyObserve(op) => self.on_modify_observe(op),
             Task::ForceFlush(task) => self.on_force_flush(task),
             Task::FatalError(task, err) => self.on_fatal_error(task, err),
-            Task::ChangeConfig(cfg) => {
-                self.on_update_change_config(cfg);
+            Task::ChangeConfig(_) => {
+                warn!("change config online isn't supported for now.")
             }
             Task::Sync(cb, mut cond) => {
                 if cond(self) {
@@ -967,7 +985,7 @@ where
                 }
             }
             Task::MarkFailover(t) => self.failover_time = Some(t),
-            Task::ExecFlush(task, min_ts) => self.on_exec_flush(task, min_ts),
+            Task::FlushWithMinTs(task, min_ts) => self.on_flush_with_min_ts(task, min_ts),
             Task::RegionCheckpointsOp(s) => self.handle_region_checkpoints_op(s),
             Task::UpdateGlobalCheckpoint(task) => self.on_update_global_checkpoint(task),
         }
@@ -996,8 +1014,8 @@ where
                 self.checkpoint_mgr.resolve_regions(checkpoints);
                 metrics::MIN_TS_RESOLVE_DURATION.observe(start_time.saturating_elapsed_secs());
             }
-            RegionCheckpointOperation::FlushWith(checkpoints) => {
-                self.checkpoint_mgr.flush_and_notify(checkpoints);
+            RegionCheckpointOperation::Flush => {
+                self.checkpoint_mgr.flush();
             }
             RegionCheckpointOperation::Get(g, cb) => {
                 let _guard = self.pool.handle().enter();
@@ -1075,7 +1093,7 @@ where
 /// Create a standard tokio runtime
 /// (which allows io and time reactor, involve thread memory accessor),
 fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<Runtime> {
-    info!("create tokio runtime for backup stream"; "thread_name" => thread_name, "thread_count" => thread_count);
+    info!("create tokio runtime for backup stream"; "thread_name" => thread_name, "thread-count" => thread_count);
 
     tokio::runtime::Builder::new_multi_thread()
         .thread_name(thread_name)
@@ -1084,38 +1102,15 @@ fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<R
         // (`File` API in `tokio::io` would use this pool.)
         .max_blocking_threads(thread_count * 8)
         .worker_threads(thread_count)
-        .with_sys_hooks()
         .enable_io()
         .enable_time()
+        .after_start_wrapper(|| {
+            tikv_alloc::add_thread_memory_accessor();
+        })
+        .before_stop_wrapper(|| {
+            tikv_alloc::remove_thread_memory_accessor();
+        })
         .build()
-}
-
-pub enum BackupStreamResolver<RT, EK> {
-    // for raftstore-v1, we use LeadershipResolver to check leadership of a region.
-    V1(LeadershipResolver),
-    // for raftstore-v2, it has less regions. we use CDCHandler to check leadership of a region.
-    V2(RT, PhantomData<EK>),
-}
-
-impl<RT, EK> BackupStreamResolver<RT, EK>
-where
-    RT: CdcHandle<EK> + 'static,
-    EK: KvEngine,
-{
-    pub async fn resolve(
-        &mut self,
-        regions: Vec<u64>,
-        min_ts: TimeStamp,
-        timeout: Option<Duration>,
-    ) -> Vec<u64> {
-        match self {
-            BackupStreamResolver::V1(x) => x.resolve(regions, min_ts, timeout).await,
-            BackupStreamResolver::V2(x, _) => {
-                let x = x.clone();
-                resolve_by_raft(regions, min_ts, x).await
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1127,7 +1122,7 @@ pub enum RegionSet {
 }
 
 pub enum RegionCheckpointOperation {
-    FlushWith(Vec<ResolveResult>),
+    Flush,
     PrepareMinTsForResolve,
     Resolve {
         min_ts: TimeStamp,
@@ -1144,7 +1139,7 @@ pub enum RegionCheckpointOperation {
 impl fmt::Debug for RegionCheckpointOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FlushWith(checkpoints) => f.debug_tuple("FlushWith").field(checkpoints).finish(),
+            Self::Flush => f.debug_tuple("Flush").finish(),
             Self::Get(arg0, _) => f.debug_tuple("Get").field(arg0).finish(),
 
             Self::Subscribe(_) => f.debug_tuple("Subscription").finish(),
@@ -1162,7 +1157,7 @@ impl fmt::Debug for RegionCheckpointOperation {
 pub enum Task {
     WatchTask(TaskOp),
     BatchEvent(Vec<CmdBatch>),
-    ChangeConfig(BackupStreamConfig),
+    ChangeConfig(ConfigChange),
     /// Change the observe status of some region.
     ModifyObserve(ObserveOp),
     /// Convert status of some task into `flushing` and do flush then.
@@ -1189,9 +1184,9 @@ pub enum Task {
     MarkFailover(Instant),
     /// Flush the task with name.
     Flush(String),
-    /// Execute the flush with the calculated resolved result.
+    /// Execute the flush with the calculated `min_ts`.
     /// This is an internal command only issued by the `Flush` task.
-    ExecFlush(String, ResolvedRegions),
+    FlushWithMinTs(String, TimeStamp),
     /// The command for getting region checkpoints.
     RegionCheckpointsOp(RegionCheckpointOperation),
     /// update global-checkpoint-ts to storage.
@@ -1298,10 +1293,10 @@ impl fmt::Debug for Task {
                 .debug_tuple("MarkFailover")
                 .field(&format_args!("{:?} ago", t.saturating_elapsed()))
                 .finish(),
-            Self::ExecFlush(arg0, arg1) => f
-                .debug_tuple("ExecFlush")
+            Self::FlushWithMinTs(arg0, arg1) => f
+                .debug_tuple("FlushWithMinTs")
                 .field(arg0)
-                .field(&arg1.global_checkpoint())
+                .field(arg1)
                 .finish(),
             Self::RegionCheckpointsOp(s) => f.debug_tuple("GetRegionCheckpoints").field(s).finish(),
             Self::UpdateGlobalCheckpoint(task) => {
@@ -1341,7 +1336,7 @@ impl Task {
             Task::FatalError(..) => "fatal_error",
             Task::Sync(..) => "sync",
             Task::MarkFailover(_) => "mark_failover",
-            Task::ExecFlush(..) => "flush_with_min_ts",
+            Task::FlushWithMinTs(..) => "flush_with_min_ts",
             Task::RegionCheckpointsOp(..) => "get_checkpoints",
             Task::UpdateGlobalCheckpoint(..) => "update_global_checkpoint",
         }

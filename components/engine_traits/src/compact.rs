@@ -4,30 +4,17 @@
 
 use std::collections::BTreeMap;
 
-use crate::{errors::Result, CfNamesExt};
+use crate::errors::Result;
 
-pub trait CompactExt: CfNamesExt {
+pub trait CompactExt {
     type CompactedEvent: CompactedEvent;
 
     /// Checks whether any column family sets `disable_auto_compactions` to
     /// `True` or not.
     fn auto_compactions_is_disabled(&self) -> Result<bool>;
 
-    fn compact_range(
-        &self,
-        start_key: Option<&[u8]>,
-        end_key: Option<&[u8]>,
-        exclusive_manual: bool,
-        max_subcompactions: u32,
-    ) -> Result<()> {
-        for cf in self.cf_names() {
-            self.compact_range_cf(cf, start_key, end_key, exclusive_manual, max_subcompactions)?;
-        }
-        Ok(())
-    }
-
     /// Compacts the column families in the specified range by manual or not.
-    fn compact_range_cf(
+    fn compact_range(
         &self,
         cf: &str,
         start_key: Option<&[u8]>,
@@ -45,12 +32,7 @@ pub trait CompactExt: CfNamesExt {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         output_level: Option<i32>,
-    ) -> Result<()> {
-        for cf in self.cf_names() {
-            self.compact_files_in_range_cf(cf, start, end, output_level)?;
-        }
-        Ok(())
-    }
+    ) -> Result<()>;
 
     /// Compacts files in the range and above the output level of the given
     /// column family. Compacts all files to the bottommost level if the
@@ -71,9 +53,6 @@ pub trait CompactExt: CfNamesExt {
         max_subcompactions: u32,
         exclude_l0: bool,
     ) -> Result<()>;
-
-    // Check all data is in the range [start, end).
-    fn check_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()>;
 }
 
 pub trait CompactedEvent: Send {
