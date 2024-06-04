@@ -5,6 +5,7 @@ use std::fmt;
 
 use concurrency_manager::{ConcurrencyManager, KeyHandleGuard};
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
+use kvproto::kvrpcpb::LockInfo;
 use txn_types::{Key, Lock, PessimisticLock, TimeStamp, Value};
 
 use super::metrics::{GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VERSIONS_HISTOGRAM};
@@ -64,6 +65,11 @@ pub struct MvccTxn {
     // `writes`, so it can be further processed. The elements are tuples representing
     // (key, lock, remove_pessimistic_lock)
     pub(crate) locks_for_1pc: Vec<(Key, Lock, bool)>,
+    // Collects the information of locks that are acquired in this MvccTxn. Locks that already
+    // exists but updated in this MvccTxn won't be collected. The collected information will be
+    // used to update the lock waiting information and redo deadlock detection, if there are some
+    // pessimistic lock requests waiting on the keys.
+    pub(crate) new_locks: Vec<LockInfo>,
     // `concurrency_manager` is used to set memory locks for prewritten keys.
     // Prewritten locks of async commit transactions should be visible to
     // readers before they are written to the engine.
@@ -84,7 +90,8 @@ impl MvccTxn {
             start_ts,
             write_size: 0,
             modifies: vec![],
-            locks_for_1pc: Vec::new(),
+            locks_for_1pc: vec![],
+            new_locks: vec![],
             concurrency_manager,
             guards: vec![],
         }
@@ -99,6 +106,10 @@ impl MvccTxn {
         std::mem::take(&mut self.guards)
     }
 
+    pub fn take_new_locks(&mut self) -> Vec<LockInfo> {
+        std::mem::take(&mut self.new_locks)
+    }
+
     pub fn write_size(&self) -> usize {
         self.write_size
     }
@@ -107,7 +118,12 @@ impl MvccTxn {
         self.modifies.len() == 0 && self.locks_for_1pc.len() == 0
     }
 
-    pub(crate) fn put_lock(&mut self, key: Key, lock: &Lock) {
+    // Write a lock. If the key doesn't have lock before, `is_new` should be set.
+    pub(crate) fn put_lock(&mut self, key: Key, lock: &Lock, is_new: bool) {
+        if is_new {
+            self.new_locks
+                .push(lock.clone().into_lock_info(key.to_raw().unwrap()));
+        }
         let write = Modify::Put(CF_LOCK, key, lock.to_bytes());
         self.write_size += write.size();
         self.modifies.push(write);
@@ -117,7 +133,13 @@ impl MvccTxn {
         self.locks_for_1pc.push((key, lock, remove_pessimstic_lock));
     }
 
-    pub(crate) fn put_pessimistic_lock(&mut self, key: Key, lock: PessimisticLock) {
+    // Write a pessimistic lock. If the key doesn't have lock before, `is_new`
+    // should be set.
+    pub(crate) fn put_pessimistic_lock(&mut self, key: Key, lock: PessimisticLock, is_new: bool) {
+        if is_new {
+            self.new_locks
+                .push(lock.to_lock().into_lock_info(key.to_raw().unwrap()));
+        }
         self.modifies.push(Modify::PessimisticLock(key, lock))
     }
 
@@ -198,12 +220,13 @@ impl MvccTxn {
         }
 
         lock.rollback_ts.push(self.start_ts);
-        self.put_lock(key.clone(), &lock);
+        self.put_lock(key.clone(), &lock, false);
     }
 
     pub(crate) fn clear(&mut self) {
         self.write_size = 0;
         self.modifies.clear();
+        self.new_locks.clear();
         self.locks_for_1pc.clear();
         self.guards.clear();
     }
@@ -223,7 +246,7 @@ pub(crate) fn make_txn_error(
 ) -> crate::storage::mvcc::ErrorInner {
     use kvproto::kvrpcpb::WriteConflictReason;
 
-    use crate::storage::mvcc::ErrorInner;
+    use crate::storage::mvcc::{ErrorInner, PessimisticLockNotFoundReason};
     if let Some(s) = s {
         match s.to_ascii_lowercase().as_str() {
             "keyislocked" => {
@@ -283,6 +306,7 @@ pub(crate) fn make_txn_error(
             "pessimisticlocknotfound" => ErrorInner::PessimisticLockNotFound {
                 start_ts,
                 key: key.to_raw().unwrap(),
+                reason: PessimisticLockNotFoundReason::FailpointInjected,
             },
             _ => ErrorInner::Other(box_err!("unexpected error string")),
         }
@@ -519,10 +543,8 @@ pub(crate) mod tests {
 
         // Rollback lock
         must_rollback(&mut engine, k, 15, false);
-        // Rollbacks of optimistic transactions need to be protected
-        // TODO: Re-check how the test can be better written after refinement of
-        // `must_rollback`'s       semantics.
-        must_get_rollback_protected(&mut engine, k, 15, true);
+        // Rollbacks of optimistic transactions needn't be protected
+        must_get_rollback_protected(&mut engine, k, 15, false);
     }
 
     #[test]
@@ -794,6 +816,7 @@ pub(crate) mod tests {
             Mutation::make_put(key.clone(), v.to_vec()),
             &None,
             SkipPessimisticCheck,
+            None,
         )
         .unwrap();
         assert!(txn.write_size() > 0);
@@ -838,6 +861,7 @@ pub(crate) mod tests {
             Mutation::make_put(Key::from_raw(key), value.to_vec()),
             &None,
             SkipPessimisticCheck,
+            None,
         )
         .unwrap_err();
 
@@ -851,6 +875,7 @@ pub(crate) mod tests {
             Mutation::make_put(Key::from_raw(key), value.to_vec()),
             &None,
             SkipPessimisticCheck,
+            None,
         )
         .unwrap();
     }
@@ -871,20 +896,16 @@ pub(crate) mod tests {
     #[test]
     fn test_collapse_prev_rollback() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let (key, pk, value) = (b"key", b"pk", b"value");
-
-        // Worked around the problem that `must_rollback` always protects primary lock
-        // by setting different PK.
-        // TODO: Cover primary when working on https://github.com/tikv/tikv/issues/16625
+        let (key, value) = (b"key", b"value");
 
         // Add a Rollback whose start ts is 1.
-        must_prewrite_put(&mut engine, key, value, pk, 1);
+        must_prewrite_put(&mut engine, key, value, key, 1);
         must_rollback(&mut engine, key, 1, false);
         must_get_rollback_ts(&mut engine, key, 1);
 
         // Add a Rollback whose start ts is 2, the previous Rollback whose
         // start ts is 1 will be collapsed.
-        must_prewrite_put(&mut engine, key, value, pk, 2);
+        must_prewrite_put(&mut engine, key, value, key, 2);
         must_rollback(&mut engine, key, 2, false);
         must_get_none(&mut engine, key, 2);
         must_get_rollback_ts(&mut engine, key, 2);
@@ -1217,7 +1238,7 @@ pub(crate) mod tests {
         must_acquire_pessimistic_lock(&mut engine, k, k, 10, 10);
         must_commit_err(&mut engine, k, 20, 30);
         must_commit(&mut engine, k, 10, 20);
-        must_seek_write(&mut engine, k, 30, 10, 20, WriteType::Lock);
+        must_seek_write_none(&mut engine, k, 30);
     }
 
     #[test]
@@ -1295,6 +1316,7 @@ pub(crate) mod tests {
                 mutation,
                 &Some(vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()]),
                 SkipPessimisticCheck,
+                None,
             )
             .unwrap();
             let modifies = txn.into_modifies();
@@ -1353,6 +1375,7 @@ pub(crate) mod tests {
                 mutation,
                 &Some(vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()]),
                 DoPessimisticCheck,
+                None,
             )
             .unwrap();
             let modifies = txn.into_modifies();
@@ -1422,6 +1445,7 @@ pub(crate) mod tests {
             mutation,
             &Some(vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()]),
             DoPessimisticCheck,
+            None,
         )
         .unwrap();
         assert_eq!(min_commit_ts.into_inner(), 100);

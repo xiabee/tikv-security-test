@@ -4,7 +4,7 @@ use std::{
     collections::{
         BTreeMap,
         Bound::{Excluded, Included, Unbounded},
-        HashMap, VecDeque,
+        VecDeque,
     },
     fmt::{self, Display, Formatter},
     sync::{
@@ -16,6 +16,7 @@ use std::{
     u64,
 };
 
+use collections::HashMap;
 use engine_traits::{DeleteStrategy, KvEngine, Mutable, Range, WriteBatch, CF_LOCK, CF_RAFT};
 use fail::fail_point;
 use file_system::{IoType, WithIoType};
@@ -26,7 +27,7 @@ use tikv_util::{
     box_err, box_try,
     config::VersionTrack,
     defer, error, info, thd_name,
-    time::Instant,
+    time::{Instant, UnixSecs},
     warn,
     worker::{Runnable, RunnableWithTimer},
 };
@@ -241,6 +242,7 @@ struct SnapGenContext<EK, R> {
     engine: EK,
     mgr: SnapManager,
     router: R,
+    start: UnixSecs,
 }
 
 impl<EK, R> SnapGenContext<EK, R>
@@ -269,6 +271,7 @@ where
             last_applied_state,
             for_balance,
             allow_multi_files_snapshot,
+            self.start
         ));
         // Only enable the fail point when the region id is equal to 1, which is
         // the id of bootstrapped region in tests.
@@ -344,7 +347,6 @@ where
 {
     batch_size: usize,
     use_delete_range: bool,
-    ingest_copy_symlink: bool,
     clean_stale_tick: usize,
     clean_stale_check_interval: Duration,
     clean_stale_ranges_tick: usize,
@@ -388,7 +390,6 @@ where
         Runner {
             batch_size: cfg.value().snap_apply_batch_size.0 as usize,
             use_delete_range: cfg.value().use_delete_range,
-            ingest_copy_symlink: cfg.value().snap_apply_copy_symlink,
             clean_stale_tick: 0,
             clean_stale_check_interval: Duration::from_millis(
                 cfg.value().region_worker_tick_interval.as_millis(),
@@ -474,7 +475,6 @@ where
             abort: Arc::clone(&abort),
             write_batch_size: self.batch_size,
             coprocessor_host: self.coprocessor_host.clone(),
-            ingest_copy_symlink: self.ingest_copy_symlink,
         };
         s.apply(options)?;
         self.coprocessor_host
@@ -804,14 +804,10 @@ where
                     } else {
                         let is_tiflash = self.pd_client.as_ref().map_or(false, |pd_client| {
                             if let Ok(s) = pd_client.get_store(to_store_id) {
-                                if let Some(_l) = s.get_labels().iter().find(|l| {
-                                    l.key.to_lowercase() == ENGINE
-                                        && l.value.to_lowercase() == TIFLASH
-                                }) {
-                                    return true;
-                                } else {
-                                    return false;
-                                }
+                                return s.get_labels().iter().any(|label| {
+                                    label.get_key().to_lowercase() == ENGINE
+                                        && label.get_value().to_lowercase() == TIFLASH
+                                });
                             }
                             true
                         });
@@ -824,6 +820,7 @@ where
                     engine: self.engine.clone(),
                     mgr: self.mgr.clone(),
                     router: self.router.clone(),
+                    start: UnixSecs::now(),
                 };
                 self.pool.spawn(async move {
                     tikv_alloc::add_thread_memory_accessor();
@@ -932,14 +929,13 @@ pub(crate) mod tests {
         },
     };
 
-    const PENDING_APPLY_CHECK_INTERVAL: u64 = 200;
+    const PENDING_APPLY_CHECK_INTERVAL: Duration = Duration::from_millis(200);
     const STALE_PEER_CHECK_TICK: usize = 1;
 
     pub fn make_raftstore_cfg(use_delete_range: bool) -> Arc<VersionTrack<Config>> {
         let mut store_cfg = Config::default();
         store_cfg.snap_apply_batch_size = ReadableSize(0);
-        store_cfg.region_worker_tick_interval =
-            ReadableDuration::millis(PENDING_APPLY_CHECK_INTERVAL);
+        store_cfg.region_worker_tick_interval = ReadableDuration(PENDING_APPLY_CHECK_INTERVAL);
         store_cfg.clean_stale_ranges_tick = STALE_PEER_CHECK_TICK;
         store_cfg.use_delete_range = use_delete_range;
         store_cfg.snap_generator_pool_size = 2;
@@ -1144,6 +1140,7 @@ pub(crate) mod tests {
 
         let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
+        mgr.init().unwrap();
         let bg_worker = Worker::new("snap-manager");
         let mut worker = bg_worker.lazy_build("snap-manager");
         let sched = worker.scheduler();
@@ -1352,7 +1349,7 @@ pub(crate) mod tests {
         );
         gen_and_apply_snap(5);
         destroy_region(6);
-        thread::sleep(Duration::from_millis(PENDING_APPLY_CHECK_INTERVAL * 2));
+        thread::sleep(PENDING_APPLY_CHECK_INTERVAL * 2);
         assert!(check_region_exist(6));
         assert_eq!(
             engine
@@ -1409,7 +1406,7 @@ pub(crate) mod tests {
                 .unwrap(),
             2
         );
-        thread::sleep(Duration::from_millis(PENDING_APPLY_CHECK_INTERVAL * 2));
+        thread::sleep(PENDING_APPLY_CHECK_INTERVAL * 2);
         assert!(!check_region_exist(6));
 
         #[cfg(feature = "failpoints")]
@@ -1417,12 +1414,16 @@ pub(crate) mod tests {
             engine.kv.compact_files_in_range(None, None, None).unwrap();
             fail::cfg("handle_new_pending_applies", "return").unwrap();
             gen_and_apply_snap(7);
-            thread::sleep(Duration::from_millis(PENDING_APPLY_CHECK_INTERVAL * 2));
+            thread::sleep(PENDING_APPLY_CHECK_INTERVAL * 2);
             must_not_finish(&[7]);
             fail::remove("handle_new_pending_applies");
-            thread::sleep(Duration::from_millis(PENDING_APPLY_CHECK_INTERVAL * 2));
+            thread::sleep(PENDING_APPLY_CHECK_INTERVAL * 2);
             wait_apply_finish(&[7]);
         }
+        bg_worker.stop();
+        // Wait the timer fired. Otherwise deletion of directory may race with timer
+        // task.
+        thread::sleep(PENDING_APPLY_CHECK_INTERVAL * 2);
     }
 
     #[derive(Clone, Default)]

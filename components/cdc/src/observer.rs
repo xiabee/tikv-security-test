@@ -177,26 +177,20 @@ impl RegionChangeObserver for CdcObserver {
         event: RegionChangeEvent,
         _: StateRole,
     ) {
-        match event {
-            RegionChangeEvent::Destroy
-            | RegionChangeEvent::Update(
-                RegionChangeReason::Split | RegionChangeReason::CommitMerge,
-            ) => {
-                let region_id = ctx.region().get_id();
-                if let Some(observe_id) = self.is_subscribed(region_id) {
-                    // Unregister all downstreams.
-                    let store_err = RaftStoreError::RegionNotFound(region_id);
-                    let deregister = Deregister::Delegate {
-                        region_id,
-                        observe_id,
-                        err: CdcError::request(store_err.into()),
-                    };
-                    if let Err(e) = self.sched.schedule(Task::Deregister(deregister)) {
-                        error!("cdc schedule cdc task failed"; "error" => ?e);
-                    }
+        if let RegionChangeEvent::Destroy = event {
+            let region_id = ctx.region().get_id();
+            if let Some(observe_id) = self.is_subscribed(region_id) {
+                // Unregister all downstreams.
+                let store_err = RaftStoreError::RegionNotFound(region_id);
+                let deregister = Deregister::Delegate {
+                    region_id,
+                    observe_id,
+                    err: CdcError::request(store_err.into()),
+                };
+                if let Err(e) = self.sched.schedule(Task::Deregister(deregister)) {
+                    error!("cdc schedule cdc task failed"; "error" => ?e);
                 }
             }
-            _ => {}
         }
     }
 }
@@ -278,6 +272,8 @@ mod tests {
                 leader_id: 2,
                 prev_lead_transferee: raft::INVALID_ID,
                 vote: raft::INVALID_ID,
+                initialized: true,
+                peer_id: raft::INVALID_ID,
             },
         );
         match rx.recv_timeout(Duration::from_millis(10)).unwrap().unwrap() {
@@ -305,6 +301,8 @@ mod tests {
                 leader_id: raft::INVALID_ID,
                 prev_lead_transferee: 3,
                 vote: 3,
+                initialized: true,
+                peer_id: raft::INVALID_ID,
             },
         );
         match rx.recv_timeout(Duration::from_millis(10)).unwrap().unwrap() {

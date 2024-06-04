@@ -197,6 +197,7 @@ impl From<PrewriteRequest> for TypedCommand<PrewriteResult> {
                 secondary_keys,
                 req.get_try_one_pc(),
                 req.get_assertion_level(),
+                req.take_for_update_ts_constraints().into(),
                 req.take_context(),
             )
         }
@@ -418,6 +419,7 @@ pub struct WriteResult {
     pub pr: ProcessResult,
     pub lock_info: Vec<WriteResultLockInfo>,
     pub released_locks: ReleasedLocks,
+    pub new_acquired_locks: Vec<LockInfo>,
     pub lock_guards: Vec<KeyHandleGuard>,
     pub response_policy: ResponsePolicy,
 }
@@ -715,6 +717,14 @@ impl Command {
         self.command_ext().get_ctx().get_priority()
     }
 
+    pub fn group_name(&self) -> String {
+        self.command_ext()
+            .get_ctx()
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned()
+    }
+
     pub fn need_flow_control(&self) -> bool {
         !self.readonly() && self.priority() != CommandPri::High
     }
@@ -922,6 +932,28 @@ pub mod test_util {
                 for_update_ts.into(),
             )
         };
+        prewrite_command(engine, cm, statistics, cmd)
+    }
+
+    pub fn pessimistic_prewrite_check_for_update_ts<E: Engine>(
+        engine: &mut E,
+        statistics: &mut Statistics,
+        mutations: Vec<(Mutation, PrewriteRequestPessimisticAction)>,
+        primary: Vec<u8>,
+        start_ts: u64,
+        for_update_ts: u64,
+        for_update_ts_constraints: impl IntoIterator<Item = (usize, u64)>,
+    ) -> Result<PrewriteResult> {
+        let cmd = PrewritePessimistic::with_for_update_ts_constraints(
+            mutations,
+            primary,
+            start_ts.into(),
+            for_update_ts.into(),
+            for_update_ts_constraints
+                .into_iter()
+                .map(|(size, ts)| (size, TimeStamp::from(ts))),
+        );
+        let cm = ConcurrencyManager::new(start_ts.into());
         prewrite_command(engine, cm, statistics, cmd)
     }
 

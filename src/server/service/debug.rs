@@ -2,8 +2,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use api_version::KvFormat;
-use engine_traits::{MiscExt, RaftEngine};
 use futures::{
     future::{Future, FutureExt, TryFutureExt},
     sink::SinkExt,
@@ -14,22 +12,18 @@ use grpcio::{
     WriteFlags,
 };
 use kvproto::debugpb::{self, *};
-use raftstore::store::fsm::StoreMeta;
-use tikv_kv::{Engine, RaftExtension};
+use raftstore::store::fsm::store::StoreRegionMeta;
+use tikv_kv::RaftExtension;
 use tikv_util::{future::paired_future_callback, metrics};
 use tokio::runtime::Handle;
 
-use crate::{
-    server::debug::{Debugger, Error, Result},
-    storage::lock_manager::LockManager,
-};
+use crate::server::debug::{Debugger, Error, Result};
 
 fn error_to_status(e: Error) -> RpcStatus {
     let (code, msg) = match e {
         Error::NotFound(msg) => (RpcStatusCode::NOT_FOUND, msg),
         Error::InvalidArgument(msg) => (RpcStatusCode::INVALID_ARGUMENT, msg),
         Error::Other(e) => (RpcStatusCode::UNKNOWN, format!("{:?}", e)),
-        Error::FlashbackFailed(msg) => (RpcStatusCode::UNKNOWN, msg),
     };
     RpcStatus::with_message(code, msg)
 }
@@ -67,37 +61,49 @@ pub type ScheduleResolvedTsTask = Arc<
 >;
 
 /// Service handles the RPC messages for the `Debug` service.
-#[derive(Clone)]
-pub struct Service<ER, T, E, L, K>
+pub struct Service<T, D, S>
 where
-    ER: RaftEngine,
     T: RaftExtension + Clone,
-    E: Engine,
-    L: LockManager,
-    K: KvFormat,
+    D: Debugger + Clone,
+    S: StoreRegionMeta,
 {
     pool: Handle,
-    debugger: Debugger<ER, E, L, K>,
+    debugger: D,
     raft_router: T,
-    store_meta: Arc<Mutex<StoreMeta>>,
+    store_meta: Arc<Mutex<S>>,
     resolved_ts_scheduler: ScheduleResolvedTsTask,
 }
 
-impl<ER, T, E, L, K> Service<ER, T, E, L, K>
+impl<T, D, S> Clone for Service<T, D, S>
 where
-    ER: RaftEngine,
     T: RaftExtension + Clone,
-    E: Engine,
-    L: LockManager,
-    K: KvFormat,
+    D: Debugger + Clone,
+    S: StoreRegionMeta,
 {
-    /// Constructs a new `Service` with `Engines`, a `RaftExtension`, a
-    /// `GcWorker` and a `RegionInfoAccessor`.
+    fn clone(&self) -> Self {
+        Service {
+            pool: self.pool.clone(),
+            debugger: self.debugger.clone(),
+            raft_router: self.raft_router.clone(),
+            store_meta: self.store_meta.clone(),
+            resolved_ts_scheduler: self.resolved_ts_scheduler.clone(),
+        }
+    }
+}
+
+impl<T, D, S> Service<T, D, S>
+where
+    T: RaftExtension + Clone,
+    D: Debugger + Clone,
+    S: StoreRegionMeta,
+{
+    /// Constructs a new `Service` with `Engines`, a `RaftExtension` and a
+    /// `GcWorker`.
     pub fn new(
-        debugger: Debugger<ER, E, L, K>,
+        debugger: D,
         pool: Handle,
         raft_router: T,
-        store_meta: Arc<Mutex<StoreMeta>>,
+        store_meta: Arc<Mutex<S>>,
         resolved_ts_scheduler: ScheduleResolvedTsTask,
     ) -> Self {
         Service {
@@ -130,13 +136,11 @@ where
     }
 }
 
-impl<ER, T, E, L, K> debugpb::Debug for Service<ER, T, E, L, K>
+impl<T, D, S> debugpb::Debug for Service<T, D, S>
 where
-    ER: RaftEngine,
     T: RaftExtension + 'static,
-    E: Engine,
-    L: LockManager,
-    K: KvFormat,
+    D: Debugger + Clone + Send + 'static,
+    S: StoreRegionMeta,
 {
     fn get(&mut self, ctx: RpcContext<'_>, mut req: GetRequest, sink: UnarySink<GetResponse>) {
         const TAG: &str = "debug_get";
@@ -403,9 +407,8 @@ where
                 resp.set_store_id(debugger.get_store_ident()?.store_id);
                 resp.set_prometheus(metrics::dump(false));
                 if req.get_all() {
-                    let engines = debugger.get_engine();
-                    resp.set_rocksdb_kv(box_try!(MiscExt::dump_stats(&engines.kv)));
-                    resp.set_rocksdb_raft(box_try!(RaftEngine::dump_stats(&engines.raft)));
+                    resp.set_rocksdb_kv(debugger.dump_kv_stats()?);
+                    resp.set_rocksdb_raft(debugger.dump_raft_stats()?);
                     resp.set_jemalloc(tikv_alloc::dump_stats());
                 }
                 Ok(resp)
@@ -568,34 +571,6 @@ where
         sink.success(ResetToVersionResponse::default());
     }
 
-    fn flashback_to_version(
-        &mut self,
-        ctx: RpcContext<'_>,
-        req: FlashbackToVersionRequest,
-        sink: UnarySink<FlashbackToVersionResponse>,
-    ) {
-        let debugger = self.debugger.clone();
-        let f = self
-            .pool
-            .spawn(async move {
-                let check = debugger.key_range_flashback_to_version(
-                    req.get_version(),
-                    req.get_region_id(),
-                    req.get_start_key(),
-                    req.get_end_key(),
-                    req.get_start_ts(),
-                    req.get_commit_ts(),
-                );
-                match check.await {
-                    Ok(_) => Ok(FlashbackToVersionResponse::default()),
-                    Err(err) => Err(err),
-                }
-            })
-            .map(|res| res.unwrap());
-
-        self.handle_response(ctx, sink, f, "debug_flashback_to_version");
-    }
-
     fn get_region_read_progress(
         &mut self,
         ctx: RpcContext<'_>,
@@ -603,7 +578,7 @@ where
         sink: UnarySink<GetRegionReadProgressResponse>,
     ) {
         let store_meta = self.store_meta.lock().unwrap();
-        let rrp = &store_meta.region_read_progress;
+        let rrp = store_meta.region_read_progress();
         let mut resp = GetRegionReadProgressResponse::default();
         rrp.with(|registry| {
             let region = registry.get(&req.get_region_id());
@@ -652,7 +627,7 @@ where
                 match res {
                     Err(e) => {
                         resp.set_error("get resolved-ts info failed".to_owned());
-                        error!("tikv-ctl get resolved-ts info failed"; "err" => ? e);
+                        error!("tikv-ctl get resolved-ts info failed"; "err" => ?e);
                     }
                     Ok(Some((
                         stopped,

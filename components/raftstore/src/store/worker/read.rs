@@ -29,7 +29,6 @@ use tikv_util::{
     time::{monotonic_raw_now, ThreadReadId},
 };
 use time::Timespec;
-use tracker::GLOBAL_TRACKERS;
 use txn_types::TimeStamp;
 
 use super::metrics::*;
@@ -288,7 +287,7 @@ impl Drop for ReadDelegate {
 
 /// #[RaftstoreCommon]
 pub trait ReadExecutorProvider: Send + Clone + 'static {
-    type Executor: ReadExecutor;
+    type Executor;
     type StoreMeta;
 
     fn store_id(&self) -> Option<u64>;
@@ -296,8 +295,6 @@ pub trait ReadExecutorProvider: Send + Clone + 'static {
     /// get the ReadDelegate with region_id and the number of delegates in the
     /// StoreMeta
     fn get_executor_and_len(&self, region_id: u64) -> (usize, Option<Self::Executor>);
-
-    fn store_meta(&self) -> &Self::StoreMeta;
 }
 
 #[derive(Clone)]
@@ -347,10 +344,6 @@ where
             );
         }
         (meta.readers.len(), None)
-    }
-
-    fn store_meta(&self) -> &Self::StoreMeta {
-        &self.store_meta
     }
 }
 
@@ -420,6 +413,8 @@ pub struct ReadDelegate {
     pub txn_ext: Arc<TxnExt>,
     pub read_progress: Arc<RegionReadProgress>,
     pub pending_remove: bool,
+    /// Indicates whether the peer is waiting data. See more in `Peer`.
+    pub wait_data: bool,
 
     // `track_ver` used to keep the local `ReadDelegate` in `LocalReader`
     // up-to-date with the global `ReadDelegate` stored at `StoreMeta`
@@ -443,6 +438,7 @@ impl ReadDelegate {
             txn_ext: peer.txn_ext.clone(),
             read_progress: peer.read_progress.clone(),
             pending_remove: false,
+            wait_data: false,
             bucket_meta: peer.region_buckets.as_ref().map(|b| b.meta.clone()),
             track_ver: TrackVer::new(),
         }
@@ -471,6 +467,7 @@ impl ReadDelegate {
             txn_ext,
             read_progress,
             pending_remove: false,
+            wait_data: false,
             bucket_meta,
             track_ver: TrackVer::new(),
         }
@@ -499,10 +496,13 @@ impl ReadDelegate {
                 self.applied_term = applied_term;
             }
             Progress::LeaderLease(leader_lease) => {
-                self.leader_lease = Some(leader_lease);
+                self.leader_lease = leader_lease;
             }
             Progress::RegionBuckets(bucket_meta) => {
                 self.bucket_meta = Some(bucket_meta);
+            }
+            Progress::WaitData(wait_data) => {
+                self.wait_data = wait_data;
             }
         }
     }
@@ -603,6 +603,7 @@ impl ReadDelegate {
             txn_ext: Default::default(),
             read_progress,
             pending_remove: false,
+            wait_data: false,
             track_ver: TrackVer::new(),
             bucket_meta: None,
         }
@@ -630,8 +631,9 @@ pub enum Progress {
     Region(metapb::Region),
     Term(u64),
     AppliedTerm(u64),
-    LeaderLease(RemoteLease),
+    LeaderLease(Option<RemoteLease>),
     RegionBuckets(Arc<BucketMeta>),
+    WaitData(bool),
 }
 
 impl Progress {
@@ -647,12 +649,20 @@ impl Progress {
         Progress::AppliedTerm(applied_term)
     }
 
-    pub fn leader_lease(lease: RemoteLease) -> Progress {
-        Progress::LeaderLease(lease)
+    pub fn set_leader_lease(lease: RemoteLease) -> Progress {
+        Progress::LeaderLease(Some(lease))
+    }
+
+    pub fn unset_leader_lease() -> Progress {
+        Progress::LeaderLease(None)
     }
 
     pub fn region_buckets(bucket_meta: Arc<BucketMeta>) -> Progress {
         Progress::RegionBuckets(bucket_meta)
+    }
+
+    pub fn wait_data(wait_data: bool) -> Progress {
+        Progress::WaitData(wait_data)
     }
 }
 
@@ -699,11 +709,7 @@ where
 /// #[RaftstoreCommon]: LocalReader is an entry point where local read requests are dipatch to the
 /// relevant regions by LocalReader so that these requests can be handled by the
 /// relevant ReadDelegate respectively.
-pub struct LocalReaderCore<D, S>
-where
-    D: ReadExecutor + Deref<Target = ReadDelegate>,
-    S: ReadExecutorProvider<Executor = D>,
-{
+pub struct LocalReaderCore<D, S> {
     pub store_id: Cell<Option<u64>>,
     store_meta: S,
     pub delegates: LruCache<u64, D>,
@@ -711,7 +717,7 @@ where
 
 impl<D, S> LocalReaderCore<D, S>
 where
-    D: ReadExecutor + Deref<Target = ReadDelegate> + Clone,
+    D: Deref<Target = ReadDelegate> + Clone,
     S: ReadExecutorProvider<Executor = D>,
 {
     pub fn new(store_meta: S) -> Self {
@@ -722,8 +728,8 @@ where
         }
     }
 
-    pub fn store_meta(&self) -> &S::StoreMeta {
-        self.store_meta.store_meta()
+    pub fn store_meta(&self) -> &S {
+        &self.store_meta
     }
 
     // Ideally `get_delegate` should return `Option<&ReadDelegate>`, but if so the
@@ -766,7 +772,7 @@ where
         }
         let store_id = self.store_id.get().unwrap();
 
-        if let Err(e) = util::check_store_id(req, store_id) {
+        if let Err(e) = util::check_store_id(req.get_header(), store_id) {
             TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().reject_reason.store_id_mismatch.inc());
             debug!("rejected by store id not match"; "err" => %e);
             return Err(e);
@@ -786,13 +792,13 @@ where
         fail_point!("localreader_on_find_delegate");
 
         // Check peer id.
-        if let Err(e) = util::check_peer_id(req, delegate.peer_id) {
+        if let Err(e) = util::check_peer_id(req.get_header(), delegate.peer_id) {
             TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().reject_reason.peer_id_mismatch.inc());
             return Err(e);
         }
 
         // Check term.
-        if let Err(e) = util::check_term(req, delegate.term) {
+        if let Err(e) = util::check_term(req.get_header(), delegate.term) {
             debug!(
                 "check term";
                 "delegate_term" => delegate.term,
@@ -803,7 +809,7 @@ where
         }
 
         // Check region epoch.
-        if util::check_region_epoch(req, &delegate.region, false).is_err() {
+        if util::check_req_region_epoch(req, &delegate.region, false).is_err() {
             TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().reject_reason.epoch.inc());
             // Stale epoch, redirect it to raftstore to get the latest region.
             debug!("rejected by epoch not match"; "tag" => &delegate.tag);
@@ -815,7 +821,7 @@ where
             Some(peer) => {
                 if peer.is_witness {
                     TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().reject_reason.witness.inc());
-                    return Err(Error::RecoveryInProgress(region_id));
+                    return Err(Error::IsWitness(region_id));
                 }
             }
             // This (rarely) happen in witness disabled clusters while the conf change applied but
@@ -827,21 +833,42 @@ where
             }
         }
 
+        // Check non-witness hasn't finish applying snapshot yet.
+        if delegate.wait_data {
+            TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().reject_reason.wait_data.inc());
+            return Err(Error::IsWitness(region_id));
+        }
+
         // Check whether the region is in the flashback state and the local read could
         // be performed.
         let is_in_flashback = delegate.region.is_in_flashback;
-        if let Err(e) = util::check_flashback_state(is_in_flashback, req, region_id, false) {
-            TLS_LOCAL_READ_METRICS.with(|m| match e {
+        let flashback_start_ts = delegate.region.flashback_start_ts;
+        let header = req.get_header();
+        let admin_type = req.admin_request.as_ref().map(|req| req.get_cmd_type());
+        if let Err(e) = util::check_flashback_state(
+            is_in_flashback,
+            flashback_start_ts,
+            header,
+            admin_type,
+            region_id,
+            true,
+        ) {
+            debug!("rejected by flashback state";
+                "error" => ?e,
+                "is_in_flashback" => is_in_flashback,
+                "tag" => &delegate.tag);
+            match e {
                 Error::FlashbackNotPrepared(_) => {
-                    m.borrow_mut().reject_reason.flashback_not_prepared.inc()
+                    TLS_LOCAL_READ_METRICS
+                        .with(|m| m.borrow_mut().reject_reason.flashback_not_prepared.inc());
                 }
-                Error::FlashbackInProgress(_) => {
-                    m.borrow_mut().reject_reason.flashback_in_progress.inc()
+                Error::FlashbackInProgress(..) => {
+                    TLS_LOCAL_READ_METRICS
+                        .with(|m| m.borrow_mut().reject_reason.flashback_in_progress.inc());
                 }
-                _ => unreachable!(),
-            });
-            debug!("rejected by flashback state"; "is_in_flashback" => is_in_flashback, "tag" => &delegate.tag);
-            return Ok(None);
+                _ => unreachable!("{:?}", e),
+            };
+            return Err(e);
         }
 
         Ok(Some(delegate))
@@ -850,8 +877,7 @@ where
 
 impl<D, S> Clone for LocalReaderCore<D, S>
 where
-    D: ReadExecutor + Deref<Target = ReadDelegate>,
-    S: ReadExecutorProvider<Executor = D>,
+    S: Clone,
 {
     fn clone(&self) -> Self {
         LocalReaderCore {
@@ -968,8 +994,11 @@ where
                         }
 
                         let region = Arc::clone(&delegate.region);
-                        let response = delegate.execute(&req, &region, None, Some(local_read_ctx));
-
+                        let mut response =
+                            delegate.execute(&req, &region, None, Some(local_read_ctx));
+                        if let Some(snap) = response.snapshot.as_mut() {
+                            snap.bucket_meta = delegate.bucket_meta.clone();
+                        }
                         // Try renew lease in advance
                         delegate.maybe_renew_lease_advance(&self.router, snapshot_ts);
                         response
@@ -993,8 +1022,11 @@ where
 
                         let region = Arc::clone(&delegate.region);
                         // Getting the snapshot
-                        let response = delegate.execute(&req, &region, None, Some(local_read_ctx));
-
+                        let mut response =
+                            delegate.execute(&req, &region, None, Some(local_read_ctx));
+                        if let Some(snap) = response.snapshot.as_mut() {
+                            snap.bucket_meta = delegate.bucket_meta.clone();
+                        }
                         // Double check in case `safe_ts` change after the first check and before
                         // getting snapshot
                         if let Err(resp) = delegate.check_stale_read_safe(read_ts) {
@@ -1011,12 +1043,6 @@ where
                     }
                     _ => unreachable!(),
                 };
-
-                cb.read_tracker().map(|tracker| {
-                    GLOBAL_TRACKERS.with_tracker(*tracker, |t| {
-                        t.metrics.local_read = true;
-                    })
-                });
 
                 TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().local_executed_requests.inc());
                 if !snap_updated {
@@ -1333,6 +1359,7 @@ mod tests {
                 txn_ext: Arc::new(TxnExt::default()),
                 read_progress: read_progress.clone(),
                 pending_remove: false,
+                wait_data: false,
                 track_ver: TrackVer::new(),
                 bucket_meta: None,
             };
@@ -1536,7 +1563,7 @@ mod tests {
         cmd.mut_header().set_term(term6 + 3);
         lease.expire_remote_lease();
         let remote_lease = lease.maybe_new_remote_lease(term6 + 3).unwrap();
-        let pg = Progress::leader_lease(remote_lease);
+        let pg = Progress::set_leader_lease(remote_lease);
         {
             let mut meta = store_meta.lock().unwrap();
             meta.readers.get_mut(&1).unwrap().update(pg);
@@ -1624,6 +1651,7 @@ mod tests {
                 track_ver: TrackVer::new(),
                 read_progress: Arc::new(RegionReadProgress::new(&region, 0, 0, 1)),
                 pending_remove: false,
+                wait_data: false,
                 bucket_meta: None,
             };
             meta.readers.insert(1, read_delegate);
@@ -1667,7 +1695,7 @@ mod tests {
         {
             let mut lease = Lease::new(Duration::seconds(1), Duration::milliseconds(250)); // 1s is long enough.
             let remote = lease.maybe_new_remote_lease(3).unwrap();
-            let pg = Progress::leader_lease(remote);
+            let pg = Progress::set_leader_lease(remote);
             let mut meta = store_meta.lock().unwrap();
             meta.readers.get_mut(&1).unwrap().update(pg);
         }
@@ -1749,6 +1777,7 @@ mod tests {
                 txn_ext: Arc::new(TxnExt::default()),
                 read_progress,
                 pending_remove: false,
+                wait_data: false,
                 track_ver: TrackVer::new(),
                 bucket_meta: None,
             };

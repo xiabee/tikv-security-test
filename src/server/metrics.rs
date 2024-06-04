@@ -77,6 +77,7 @@ make_auto_flush_static_metric! {
     pub label_enum SnapTask {
         send,
         recv,
+        recv_v2,
     }
 
     pub label_enum ResolveStore {
@@ -205,6 +206,12 @@ lazy_static! {
         "tikv_grpc_msg_fail_total",
         "Total number of handle grpc message failure",
         &["type"]
+    )
+    .unwrap();
+    pub static ref GRPC_RESOURCE_GROUP_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
+        "tikv_grpc_resource_group_total",
+        "Total number of handle grpc message for each resource group",
+        &["name"]
     )
     .unwrap();
     pub static ref GRPC_PROXY_MSG_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
@@ -462,19 +469,12 @@ make_auto_flush_static_metric! {
         err_store_not_match,
         err_raft_entry_too_large,
         err_leader_memory_lock_check,
+        err_undetermind,
     }
 
     pub label_enum RequestTypeKind {
         write,
         snapshot,
-        // exclude those handled by raftstore
-        snapshot_local_read,
-        // If async snapshot is involved with read index request(due to lease
-        // expire or explicitly specified), the async snapshot duration will
-        // includes the duration before raft leader propsoe it (snapshot_read_index_propose_wait)
-        // and the time used for checking quorum (snapshot_read_index_confirm).
-        snapshot_read_index_propose_wait,
-        snapshot_read_index_confirm,
     }
 
     pub struct AsyncRequestsCounterVec: LocalIntCounter {

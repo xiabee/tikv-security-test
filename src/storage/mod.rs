@@ -69,14 +69,17 @@ use std::{
         atomic::{self, AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use api_version::{ApiV1, ApiV2, KeyMode, KvFormat, RawValue};
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use collections::HashMap;
 use concurrency_manager::{ConcurrencyManager, KeyHandleGuard};
-use engine_traits::{raw_ttl::ttl_to_expire_ts, CfName, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_CFS};
-use futures::prelude::*;
+use engine_traits::{
+    raw_ttl::ttl_to_expire_ts, CfName, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_CFS, DATA_CFS_LEN,
+};
+use futures::{future::Either, prelude::*};
 use kvproto::{
     kvrpcpb::{
         ApiVersion, ChecksumAlgorithm, CommandPri, Context, GetRequest, IsolationLevel, KeyRange,
@@ -87,6 +90,7 @@ use kvproto::{
 use pd_client::FeatureGate;
 use raftstore::store::{util::build_key_range, ReadStats, TxnExt, WriteStats};
 use rand::prelude::*;
+use resource_control::ResourceController;
 use resource_metering::{FutureExt, ResourceTagFactory};
 use tikv_kv::{OnAppliedCb, SnapshotExt};
 use tikv_util::{
@@ -127,7 +131,7 @@ use crate::{
         txn::{
             commands::{RawAtomicStore, RawCompareAndSwap, TypedCommand},
             flow_controller::{EngineFlowController, FlowController},
-            scheduler::Scheduler as TxnScheduler,
+            scheduler::TxnScheduler,
             Command, ErrorInner as TxnError,
         },
         types::StorageCallbackType,
@@ -136,6 +140,25 @@ use crate::{
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Callback<T> = Box<dyn FnOnce(Result<T>) + Send>;
+
+macro_rules! check_key_size {
+    ($key_iter:expr, $max_key_size:expr, $callback:ident) => {
+        for k in $key_iter {
+            let key_size = k.len();
+            if key_size > $max_key_size {
+                $callback(Err(Error::from(ErrorInner::KeyTooLarge {
+                    size: key_size,
+                    limit: $max_key_size,
+                })));
+                return Ok(());
+            }
+        }
+    };
+}
+
+/// Storage for Api V1
+/// To be convenience for test cases unrelated to RawKV.
+pub type StorageApiV1<E, L> = Storage<E, L, ApiV1>;
 
 /// [`Storage`](Storage) implements transactional KV APIs and raw KV APIs on a
 /// given [`Engine`]. An [`Engine`] provides low level KV functionality.
@@ -192,10 +215,6 @@ pub struct Storage<E: Engine, L: LockManager, F: KvFormat> {
     _phantom: PhantomData<F>,
 }
 
-/// Storage for Api V1
-/// To be convenience for test cases unrelated to RawKV.
-pub type StorageApiV1<E, L> = Storage<E, L, ApiV1>;
-
 impl<E: Engine, L: LockManager, F: KvFormat> Clone for Storage<E, L, F> {
     #[inline]
     fn clone(&self) -> Self {
@@ -215,7 +234,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Clone for Storage<E, L, F> {
             api_version: self.api_version,
             causal_ts_provider: self.causal_ts_provider.clone(),
             resource_tag_factory: self.resource_tag_factory.clone(),
-            quota_limiter: Arc::clone(&self.quota_limiter),
+            quota_limiter: self.quota_limiter.clone(),
             _phantom: PhantomData,
         }
     }
@@ -238,21 +257,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Drop for Storage<E, L, F> {
     }
 }
 
-macro_rules! check_key_size {
-    ($key_iter:expr, $max_key_size:expr, $callback:ident) => {
-        for k in $key_iter {
-            let key_size = k.len();
-            if key_size > $max_key_size {
-                $callback(Err(Error::from(ErrorInner::KeyTooLarge {
-                    size: key_size,
-                    limit: $max_key_size,
-                })));
-                return Ok(());
-            }
-        }
-    };
-}
-
 impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     /// Create a `Storage` from given engine.
     pub fn from_engine<R: FlowStatsReporter>(
@@ -268,6 +272,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         quota_limiter: Arc<QuotaLimiter>,
         feature_gate: FeatureGate,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
+        resource_ctl: Option<Arc<ResourceController>>,
     ) -> Result<Self> {
         assert_eq!(config.api_version(), F::TAG, "Api version not match");
 
@@ -283,6 +288,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             resource_tag_factory.clone(),
             Arc::clone(&quota_limiter),
             feature_gate,
+            resource_ctl,
         );
 
         info!("Storage started.");
@@ -592,6 +598,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let stage_begin_ts = Instant::now();
         const CMD: CommandKind = CommandKind::get;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self.resource_tag_factory.new_tag_with_key_ranges(
             &ctx,
@@ -599,11 +610,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         );
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
         let quota_limiter = self.quota_limiter.clone();
         let mut sample = quota_limiter.new_sample(true);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 let stage_scheduled_ts = Instant::now();
                 tls_collect_query(
@@ -657,13 +670,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             false,
                         );
                         snap_store
-                        .get(&key, &mut statistics)
-                        // map storage::txn::Error -> storage::Error
-                        .map_err(Error::from)
-                        .map(|r| {
-                            KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
-                            r
-                        })
+                    .get(&key, &mut statistics)
+                    // map storage::txn::Error -> storage::Error
+                    .map_err(Error::from)
+                    .map(|r| {
+                        KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
+                        r
+                    })
                     });
                     metrics::tls_collect_scan_details(CMD, &statistics);
                     metrics::tls_collect_read_flow(
@@ -704,10 +717,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     let process_wall_time =
                         stage_finished_ts.saturating_duration_since(stage_snap_recv_ts);
                     let latency_stats = StageLatencyStats {
-                        schedule_wait_time_ms: duration_to_ms(schedule_wait_time),
-                        snapshot_wait_time_ms: duration_to_ms(snapshot_wait_time),
-                        wait_wall_time_ms: duration_to_ms(wait_wall_time),
-                        process_wall_time_ms: duration_to_ms(process_wall_time),
+                        schedule_wait_time_ns: schedule_wait_time.as_nanos() as u64,
+                        snapshot_wait_time_ns: snapshot_wait_time.as_nanos() as u64,
+                        wait_wall_time_ns: wait_wall_time.as_nanos() as u64,
+                        process_wall_time_ns: process_wall_time.as_nanos() as u64,
                     };
                     with_tls_tracker(|tracker| {
                         tracker.metrics.read_pool_schedule_wait_nanos =
@@ -725,11 +738,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     /// Get values of a set of keys with separate context from a snapshot,
@@ -748,8 +758,16 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         const CMD: CommandKind = CommandKind::batch_get_command;
         // all requests in a batch have the same region, epoch, term, replica_read
         let priority = requests[0].get_context().get_priority();
+        let group_name = requests[0]
+            .get_context()
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
+        let busy_threshold =
+            Duration::from_millis(requests[0].get_context().busy_threshold_ms as u64);
 
         // The resource tags of these batched requests are not the same, and it is quite
         // expensive to distinguish them, so we can find random one of them as a
@@ -763,7 +781,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         // Unset the TLS tracker because the future below does not belong to any
         // specific request
         clear_tls_tracker_token();
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 KV_COMMAND_KEYREAD_HISTOGRAM_STATIC
@@ -908,11 +927,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     /// Get values of a set of keys in a batch from the snapshot.
@@ -927,6 +943,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let stage_begin_ts = Instant::now();
         const CMD: CommandKind = CommandKind::batch_get;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let key_ranges = keys
             .iter()
@@ -937,9 +958,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .new_tag_with_key_ranges(&ctx, key_ranges);
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
         let quota_limiter = self.quota_limiter.clone();
         let mut sample = quota_limiter.new_sample(true);
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 let stage_scheduled_ts = Instant::now();
                 let mut key_ranges = vec![];
@@ -1063,10 +1086,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             schedule_wait_time.as_nanos() as u64;
                     });
                     let latency_stats = StageLatencyStats {
-                        schedule_wait_time_ms: duration_to_ms(schedule_wait_time),
-                        snapshot_wait_time_ms: duration_to_ms(snapshot_wait_time),
-                        wait_wall_time_ms: duration_to_ms(wait_wall_time),
-                        process_wall_time_ms: duration_to_ms(process_wall_time),
+                        schedule_wait_time_ns: duration_to_ms(schedule_wait_time),
+                        snapshot_wait_time_ns: duration_to_ms(snapshot_wait_time),
+                        wait_wall_time_ns: duration_to_ms(wait_wall_time),
+                        process_wall_time_ns: duration_to_ms(process_wall_time),
                     };
                     Ok((
                         result?,
@@ -1080,12 +1103,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     /// Scan keys in [`start_key`, `end_key`) up to `limit` keys from the
@@ -1107,6 +1126,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<Result<KvPair>>>> {
         const CMD: CommandKind = CommandKind::scan;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self.resource_tag_factory.new_tag_with_key_ranges(
             &ctx,
@@ -1120,8 +1144,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         );
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 {
                     let end_key = match &end_key {
@@ -1256,12 +1282,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     pub fn scan_lock(
@@ -1274,6 +1296,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<LockInfo>>> {
         const CMD: CommandKind = CommandKind::scan_lock;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self.resource_tag_factory.new_tag_with_key_ranges(
             &ctx,
@@ -1403,6 +1430,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            group_name,
         );
         async move {
             res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
@@ -1491,15 +1519,20 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
     // Schedule raw modify commands, which reuse the scheduler worker pool.
     // TODO: separate the txn and raw commands if needed in the future.
-    fn sched_raw_command<T>(&self, tag: CommandKind, future: T) -> Result<()>
+    fn sched_raw_command<T>(
+        &self,
+        group_name: &str,
+        pri: CommandPri,
+        tag: CommandKind,
+        future: T,
+    ) -> Result<()>
     where
-        T: Future + Send + 'static,
+        T: Future<Output = ()> + Send + 'static,
     {
         SCHED_STAGE_COUNTER_VEC.get(tag).new.inc();
         self.sched
-            .get_sched_pool(CommandPri::Normal)
-            .pool
-            .spawn(future)
+            .get_sched_pool()
+            .spawn(group_name, pri, future)
             .map_err(|_| Error::from(ErrorInner::SchedTooBusy))
     }
 
@@ -1536,7 +1569,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             [(Some(start_key.as_encoded()), Some(end_key.as_encoded()))],
         )?;
 
-        let mut modifies = Vec::with_capacity(DATA_CFS.len());
+        let mut modifies = Vec::with_capacity(DATA_CFS_LEN);
         for cf in DATA_CFS {
             modifies.push(Modify::DeleteRange(
                 cf,
@@ -1573,13 +1606,20 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Option<Vec<u8>>>> {
         const CMD: CommandKind = CommandKind::raw_get;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, vec![(key.clone(), key.clone())]);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -1635,12 +1675,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     /// Get the values of a set of raw keys, return a list of `Result`s.
@@ -1653,8 +1689,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         const CMD: CommandKind = CommandKind::raw_batch_get_command;
         // all requests in a batch have the same region, epoch, term, replica_read
         let priority = gets[0].get_context().get_priority();
+        let group_name = gets[0]
+            .get_context()
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(gets[0].get_context().busy_threshold_ms as u64);
 
         // The resource tags of these batched requests are not the same, and it is quite
         // expensive to distinguish them, so we can find random one of them as a
@@ -1666,7 +1709,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .resource_tag_factory
             .new_tag_with_key_ranges(rand_ctx, vec![(rand_key.clone(), rand_key)]);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -1766,11 +1810,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     /// Get the values of some raw keys in a batch.
@@ -1782,14 +1823,21 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<Result<KvPair>>>> {
         const CMD: CommandKind = CommandKind::raw_batch_get;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let key_ranges = keys.iter().map(|k| (k.clone(), k.clone())).collect();
         let resource_tag = self
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, key_ranges);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 let mut key_ranges = vec![];
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
@@ -1862,12 +1910,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     async fn check_causal_ts_flushed(ctx: &mut Context, tag: CommandKind) -> Result<()> {
@@ -1927,7 +1971,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let provider = self.causal_ts_provider.clone();
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
-        self.sched_raw_command(CMD, async move {
+
+        let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned();
+        self.sched_raw_command(&group_name, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
@@ -2037,7 +2087,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
         let deadline = Self::get_deadline(&ctx);
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned();
+        self.sched_raw_command(&group_name, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
@@ -2100,7 +2155,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
         let deadline = Self::get_deadline(&ctx);
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned();
+        self.sched_raw_command(&group_name, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
@@ -2159,7 +2219,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
         let engine = self.engine.clone();
         let deadline = Self::get_deadline(&ctx);
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned();
+        self.sched_raw_command(&group_name, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
@@ -2205,7 +2270,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
         let deadline = Self::get_deadline(&ctx);
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned();
+        self.sched_raw_command(&group_name, priority, CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
@@ -2268,11 +2338,18 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<Result<KvPair>>>> {
         const CMD: CommandKind = CommandKind::raw_scan;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self.resource_tag_factory.new_tag(&ctx);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -2376,12 +2453,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     /// Scan raw keys in multiple ranges in a batch.
@@ -2396,6 +2469,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Vec<Result<KvPair>>>> {
         const CMD: CommandKind = CommandKind::raw_batch_scan;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let key_ranges = ranges
             .iter()
@@ -2405,8 +2483,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, key_ranges);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -2532,12 +2612,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     /// Get the value of a raw key.
@@ -2549,13 +2625,20 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<Option<u64>>> {
         const CMD: CommandKind = CommandKind::raw_get_key_ttl;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let resource_tag = self
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, vec![(key.clone(), key.clone())]);
         let api_version = self.api_version;
+        let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
 
-        let res = self.read_pool.spawn_handle(
+        self.read_pool_spawn_with_busy_check(
+            busy_threshold,
             async move {
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
@@ -2611,12 +2694,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
-        );
-
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+            group_name,
+        )
     }
 
     pub fn raw_compare_and_swap_atomic(
@@ -2638,7 +2717,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             return Err(Error::from(ErrorInner::TtlNotEnabled));
         }
         let sched = self.get_scheduler();
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned();
+        self.sched_raw_command(&group_name, priority, CMD, async move {
             let key = F::encode_raw_key_owned(key, None);
             let cmd = RawCompareAndSwap::new(cf, key, previous_value, value, ttl, api_version, ctx);
             Self::sched_raw_atomic_command(
@@ -2669,7 +2753,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         Self::check_ttl_valid(pairs.len(), &ttls)?;
 
         let sched = self.get_scheduler();
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned();
+        self.sched_raw_command(&group_name, priority, CMD, async move {
             let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, None);
             let cmd = RawAtomicStore::new(cf, modifies, ctx);
             Self::sched_raw_atomic_command(
@@ -2692,7 +2781,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         Self::check_api_version(self.api_version, ctx.api_version, CMD, &keys)?;
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
         let sched = self.get_scheduler();
-        self.sched_raw_command(CMD, async move {
+        let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .to_owned();
+        self.sched_raw_command(&group_name, priority, CMD, async move {
             // Do NOT encode ts here as RawAtomicStore use key to gen lock
             let modifies = keys
                 .into_iter()
@@ -2715,6 +2809,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     ) -> impl Future<Output = Result<(u64, u64, u64)>> {
         const CMD: CommandKind = CommandKind::raw_checksum;
         let priority = ctx.get_priority();
+        let group_name = ctx
+            .get_resource_control_context()
+            .get_resource_group_name()
+            .as_bytes()
+            .to_owned();
         let priority_tag = get_priority_tag(priority);
         let key_ranges = ranges
             .iter()
@@ -2789,12 +2888,38 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            group_name,
         );
 
         async move {
             res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
                 .await?
         }
+    }
+
+    fn read_pool_spawn_with_busy_check<Fut, T>(
+        &self,
+        busy_threshold: Duration,
+        future: Fut,
+        priority: CommandPri,
+        task_id: u64,
+        group_meta: Vec<u8>,
+    ) -> impl Future<Output = Result<T>>
+    where
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Err(busy_err) = self.read_pool.check_busy_threshold(busy_threshold) {
+            let mut err = kvproto::errorpb::Error::default();
+            err.set_server_is_busy(busy_err);
+            return Either::Left(future::err(Error::from(ErrorInner::Kv(err.into()))));
+        }
+        Either::Right(
+            self.read_pool
+                .spawn_handle(future, priority, task_id, group_meta)
+                .map_err(|_| Error::from(ErrorInner::SchedTooBusy))
+                .and_then(|res| future::ready(res)),
+        )
     }
 }
 
@@ -3147,6 +3272,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             Arc::new(QuotaLimiter::default()),
             latest_feature_gate(),
             ts_provider,
+            None,
         )
     }
 
@@ -3177,6 +3303,41 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             Arc::new(QuotaLimiter::default()),
             latest_feature_gate(),
             None,
+            Some(Arc::new(ResourceController::new("test".to_owned(), false))),
+        )
+    }
+
+    pub fn build_for_resource_controller(
+        self,
+        resource_controller: Arc<ResourceController>,
+    ) -> Result<Storage<TxnTestEngine<E>, L, F>> {
+        let engine = TxnTestEngine {
+            engine: self.engine,
+            txn_ext: Arc::new(TxnExt::default()),
+        };
+        let read_pool = build_read_pool_for_test(
+            &crate::config::StorageReadPoolConfig::default_for_test(),
+            engine.clone(),
+        );
+
+        Storage::from_engine(
+            engine,
+            &self.config,
+            ReadPool::from(read_pool).handle(),
+            self.lock_mgr,
+            ConcurrencyManager::new(1.into()),
+            DynamicConfigs {
+                pipelined_pessimistic_lock: self.pipelined_pessimistic_lock,
+                in_memory_pessimistic_lock: self.in_memory_pessimistic_lock,
+                wake_up_delay_duration_ms: self.wake_up_delay_duration_ms,
+            },
+            Arc::new(FlowController::Singleton(EngineFlowController::empty())),
+            DummyReporter,
+            ResourceTagFactory::new_for_test(),
+            Arc::new(QuotaLimiter::default()),
+            latest_feature_gate(),
+            None,
+            Some(resource_controller),
         )
     }
 }
@@ -3591,6 +3752,7 @@ mod tests {
     use txn_types::{Mutation, PessimisticLock, WriteType, SHORT_VALUE_MAX_LEN};
 
     use super::{
+        config::EngineType,
         mvcc::tests::{must_unlocked, must_written},
         test_util::*,
         txn::{
@@ -4131,24 +4293,36 @@ mod tests {
         let engine = {
             let path = "".to_owned();
             let cfg_rocksdb = db_config;
-            let cache = BlockCacheConfig::default().build_shared_cache();
+            let shared = cfg_rocksdb.build_cf_resources(
+                BlockCacheConfig::default().build_shared_cache(EngineType::RaftKv),
+            );
             let cfs_opts = vec![
                 (
                     CF_DEFAULT,
-                    cfg_rocksdb
-                        .defaultcf
-                        .build_opt(&cache, None, ApiVersion::V1),
+                    cfg_rocksdb.defaultcf.build_opt(
+                        &shared,
+                        None,
+                        ApiVersion::V1,
+                        None,
+                        EngineType::RaftKv,
+                    ),
                 ),
-                (CF_LOCK, cfg_rocksdb.lockcf.build_opt(&cache)),
-                (CF_WRITE, cfg_rocksdb.writecf.build_opt(&cache, None)),
-                (CF_RAFT, cfg_rocksdb.raftcf.build_opt(&cache)),
+                (
+                    CF_LOCK,
+                    cfg_rocksdb
+                        .lockcf
+                        .build_opt(&shared, None, EngineType::RaftKv),
+                ),
+                (
+                    CF_WRITE,
+                    cfg_rocksdb
+                        .writecf
+                        .build_opt(&shared, None, None, EngineType::RaftKv),
+                ),
+                (CF_RAFT, cfg_rocksdb.raftcf.build_opt(&shared)),
             ];
             RocksEngine::new(
-                &path,
-                None,
-                cfs_opts,
-                cache.is_some(),
-                None, // io_rate_limiter
+                &path, None, cfs_opts, None, // io_rate_limiter
             )
         }
         .unwrap();
@@ -8183,6 +8357,7 @@ mod tests {
                     None,
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Context::default(),
                 ),
                 expect_ok_callback(tx.clone(), 0),
@@ -9551,6 +9726,7 @@ mod tests {
                     Some(vec![b"e".to_vec()]),
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Context::default(),
                 ),
                 Box::new(move |res| {
@@ -9649,6 +9825,7 @@ mod tests {
                     None,
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Default::default(),
                 ),
                 expect_ok_callback(tx.clone(), 0),
@@ -9700,6 +9877,7 @@ mod tests {
                     Some(vec![k2.to_vec()]),
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Default::default(),
                 ),
                 expect_ok_callback(tx.clone(), 0),
@@ -10536,6 +10714,7 @@ mod tests {
                     None,
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Context::default(),
                 ),
                 Box::new(move |res| {
@@ -10594,6 +10773,7 @@ mod tests {
                     None,
                     false,
                     AssertionLevel::Off,
+                    vec![],
                     Context::default(),
                 ),
                 Box::new(move |res| {

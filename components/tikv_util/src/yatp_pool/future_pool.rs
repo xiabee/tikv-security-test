@@ -13,10 +13,9 @@ use std::{
 
 use fail::fail_point;
 use futures::channel::oneshot::{self, Canceled};
-use futures_util::future::FutureExt;
 use prometheus::{IntCounter, IntGauge};
 use tracker::TrackedFuture;
-use yatp::task::future;
+use yatp::{queue::Extras, task::future};
 
 pub type ThreadPool = yatp::ThreadPool<future::TaskCell>;
 
@@ -29,6 +28,8 @@ struct Env {
 }
 
 #[derive(Clone)]
+// FuturePool wraps a yatp thread pool providing task count metrics and gate
+// maximum running tasks.
 pub struct FuturePool {
     inner: Arc<PoolInner>,
 }
@@ -83,7 +84,14 @@ impl FuturePool {
     where
         F: Future + Send + 'static,
     {
-        self.inner.spawn(TrackedFuture::new(future))
+        self.inner.spawn(TrackedFuture::new(future), None)
+    }
+
+    pub fn spawn_with_extras<F>(&self, future: F, extras: Extras) -> Result<(), Full>
+    where
+        F: Future + Send + 'static,
+    {
+        self.inner.spawn(TrackedFuture::new(future), Some(extras))
     }
 
     /// Spawns a future in the pool and returns a handle to the result of the
@@ -144,7 +152,7 @@ impl PoolInner {
         }
     }
 
-    fn spawn<F>(&self, future: F) -> Result<(), Full>
+    fn spawn<F>(&self, future: F, extras: Option<Extras>) -> Result<(), Full>
     where
         F: Future + Send + 'static,
     {
@@ -155,15 +163,17 @@ impl PoolInner {
 
         metrics_running_task_count.inc();
 
-        // NB: Prefer FutureExt::map to async block, because an async block
-        // doubles memory usage.
-        // See https://github.com/rust-lang/rust/issues/59087
-        let f = future.map(move |_| {
+        let f = async move {
+            let _ = future.await;
             metrics_handled_task_count.inc();
             metrics_running_task_count.dec();
-        });
+        };
 
-        self.pool.spawn(f);
+        if let Some(extras) = extras {
+            self.pool.spawn(future::TaskCell::new(f, extras));
+        } else {
+            self.pool.spawn(f);
+        }
         Ok(())
     }
 
@@ -182,14 +192,12 @@ impl PoolInner {
 
         let (tx, rx) = oneshot::channel();
         metrics_running_task_count.inc();
-        // NB: Prefer FutureExt::map to async block, because an async block
-        // doubles memory usage.
-        // See https://github.com/rust-lang/rust/issues/59087
-        self.pool.spawn(future.map(move |res| {
+        self.pool.spawn(async move {
+            let res = future.await;
             metrics_handled_task_count.inc();
             metrics_running_task_count.dec();
             let _ = tx.send(res);
-        }));
+        });
         Ok(rx)
     }
 }

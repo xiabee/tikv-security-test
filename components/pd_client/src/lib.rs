@@ -14,15 +14,15 @@ mod util;
 
 mod config;
 pub mod errors;
-use std::{cmp::Ordering, collections::HashMap, ops::Deref, sync::Arc, time::Duration};
+pub mod meta_storage;
+use std::{cmp::Ordering, ops::Deref, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
-use grpcio::ClientSStreamReceiver;
 use kvproto::{
     metapb, pdpb,
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
 };
-use pdpb::{QueryStats, WatchGlobalConfigResponse};
+use pdpb::QueryStats;
 use tikv_util::time::{Instant, UnixSecs};
 use txn_types::TimeStamp;
 
@@ -153,6 +153,33 @@ impl BucketStat {
         }
     }
 
+    pub fn from_meta(meta: Arc<BucketMeta>) -> Self {
+        let stats = new_bucket_stats(&meta);
+        Self::new(meta, stats)
+    }
+
+    pub fn set_meta(&mut self, meta: Arc<BucketMeta>) {
+        self.stats = new_bucket_stats(&meta);
+        self.meta = meta;
+    }
+
+    pub fn clear_stats(&mut self) {
+        self.stats = new_bucket_stats(&self.meta);
+    }
+
+    pub fn merge(&mut self, delta: &BucketStat) {
+        merge_bucket_stats(
+            &self.meta.keys,
+            &mut self.stats,
+            &delta.meta.keys,
+            &delta.stats,
+        );
+    }
+
+    pub fn add_flows<I: AsRef<[u8]>>(&mut self, incoming: &[I], delta_stats: &metapb::BucketStats) {
+        merge_bucket_stats(&self.meta.keys, &mut self.stats, incoming, delta_stats);
+    }
+
     pub fn write_key(&mut self, key: &[u8], value_size: u64) {
         let idx = match util::find_bucket_index(key, &self.meta.keys) {
             Some(idx) => idx,
@@ -201,6 +228,8 @@ impl BucketStat {
 }
 
 pub const INVALID_ID: u64 = 0;
+// TODO: Implementation of config registration for each module
+pub const RESOURCE_CONTROL_CONFIG_PATH: &str = "resource_group/settings";
 
 /// PdClient communicates with Placement Driver (PD).
 /// Because now one PD only supports one cluster, so it is no need to pass
@@ -209,17 +238,28 @@ pub const INVALID_ID: u64 = 0;
 /// all the time.
 pub trait PdClient: Send + Sync {
     /// Load a list of GlobalConfig
-    fn load_global_config(&self, _list: Vec<String>) -> PdFuture<HashMap<String, String>> {
+    fn load_global_config(
+        &self,
+        _config_path: String,
+    ) -> PdFuture<(Vec<pdpb::GlobalConfigItem>, i64)> {
         unimplemented!();
     }
 
     /// Store a list of GlobalConfig
-    fn store_global_config(&self, _list: HashMap<String, String>) -> PdFuture<()> {
+    fn store_global_config(
+        &self,
+        _config_path: String,
+        _items: Vec<pdpb::GlobalConfigItem>,
+    ) -> PdFuture<()> {
         unimplemented!();
     }
 
     /// Watching change of GlobalConfig
-    fn watch_global_config(&self) -> Result<ClientSStreamReceiver<WatchGlobalConfigResponse>> {
+    fn watch_global_config(
+        &self,
+        _config_path: String,
+        _revision: i64,
+    ) -> Result<grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>> {
         unimplemented!();
     }
 
@@ -333,6 +373,11 @@ pub trait PdClient: Send + Sync {
         unimplemented!();
     }
 
+    // Gets Buckets by Region id.
+    fn get_buckets_by_id(&self, _region_id: u64) -> PdFuture<Option<metapb::Buckets>> {
+        unimplemented!();
+    }
+
     /// Gets Region and its leader by Region id.
     fn get_region_leader_by_id(
         &self,
@@ -409,23 +454,6 @@ pub trait PdClient: Send + Sync {
     }
 
     fn get_gc_safe_point(&self) -> PdFuture<u64> {
-        unimplemented!();
-    }
-
-    fn scan_regions(
-        &self,
-        _start_key: &[u8],
-        _end_key: &[u8],
-        _limit: i32,
-    ) -> Result<Vec<pdpb::Region>> {
-        unimplemented!();
-    }
-
-    fn batch_load_regions(
-        &self,
-        mut _start_key: Vec<u8>,
-        mut _end_key: Vec<u8>,
-    ) -> Vec<Vec<pdpb::Region>> {
         unimplemented!();
     }
 

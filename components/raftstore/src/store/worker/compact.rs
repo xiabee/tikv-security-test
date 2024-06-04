@@ -6,7 +6,7 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-use engine_traits::{KvEngine, RangeStats, CF_WRITE};
+use engine_traits::{KvEngine, CF_WRITE};
 use fail::fail_point;
 use thiserror::Error;
 use tikv_util::{box_try, error, info, time::Instant, warn, worker::Runnable};
@@ -27,32 +27,10 @@ pub enum Task {
         cf_names: Vec<String>,
         // Ranges need to check
         ranges: Vec<Key>,
-        // The minimum RocksDB tombstones/duplicate versions a range that need compacting has
-        compact_threshold: CompactThreshold,
-    },
-}
-
-pub struct CompactThreshold {
-    pub tombstones_num_threshold: u64,
-    pub tombstones_percent_threshold: u64,
-    pub redundant_rows_threshold: u64,
-    pub redundant_rows_percent_threshold: u64,
-}
-
-impl CompactThreshold {
-    pub fn new(
+        // The minimum RocksDB tombstones a range that need compacting has
         tombstones_num_threshold: u64,
         tombstones_percent_threshold: u64,
-        redundant_rows_threshold: u64,
-        redundant_rows_percent_threshold: u64,
-    ) -> Self {
-        Self {
-            tombstones_num_threshold,
-            tombstones_percent_threshold,
-            redundant_rows_percent_threshold,
-            redundant_rows_threshold,
-        }
-    }
+    },
 }
 
 impl Display for Task {
@@ -77,7 +55,8 @@ impl Display for Task {
             Task::CheckAndCompact {
                 ref cf_names,
                 ref ranges,
-                ref compact_threshold,
+                tombstones_num_threshold,
+                tombstones_percent_threshold,
             } => f
                 .debug_struct("CheckAndCompact")
                 .field("cf_names", cf_names)
@@ -88,21 +67,10 @@ impl Display for Task {
                         ranges.last().as_ref().map(|k| log_wrappers::Value::key(k)),
                     ),
                 )
-                .field(
-                    "tombstones_num_threshold",
-                    &compact_threshold.tombstones_num_threshold,
-                )
+                .field("tombstones_num_threshold", &tombstones_num_threshold)
                 .field(
                     "tombstones_percent_threshold",
-                    &compact_threshold.tombstones_percent_threshold,
-                )
-                .field(
-                    "redundant_rows_threshold",
-                    &compact_threshold.redundant_rows_threshold,
-                )
-                .field(
-                    "redundant_rows_percent_threshold",
-                    &compact_threshold.redundant_rows_percent_threshold,
+                    &tombstones_percent_threshold,
                 )
                 .finish(),
         }
@@ -141,7 +109,7 @@ where
             .start_coarse_timer();
         box_try!(
             self.engine
-                .compact_range(cf_name, start_key, end_key, false, 1 /* threads */,)
+                .compact_range_cf(cf_name, start_key, end_key, false, 1 /* threads */,)
         );
         compact_range_timer.observe_duration();
         info!(
@@ -177,8 +145,14 @@ where
             Task::CheckAndCompact {
                 cf_names,
                 ranges,
-                compact_threshold,
-            } => match collect_ranges_need_compact(&self.engine, ranges, compact_threshold) {
+                tombstones_num_threshold,
+                tombstones_percent_threshold,
+            } => match collect_ranges_need_compact(
+                &self.engine,
+                ranges,
+                tombstones_num_threshold,
+                tombstones_percent_threshold,
+            ) {
                 Ok(mut ranges) => {
                     for (start, end) in ranges.drain(..) {
                         for cf in &cf_names {
@@ -201,27 +175,28 @@ where
     }
 }
 
-pub fn need_compact(range_stats: &RangeStats, compact_threshold: &CompactThreshold) -> bool {
-    if range_stats.num_entries < range_stats.num_versions {
+fn need_compact(
+    num_entires: u64,
+    num_versions: u64,
+    tombstones_num_threshold: u64,
+    tombstones_percent_threshold: u64,
+) -> bool {
+    if num_entires <= num_versions {
         return false;
     }
 
-    // We trigger region compaction when their are to many tombstones as well as
-    // redundant keys, both of which can severly impact scan operation:
-    let estimate_num_del = range_stats.num_entries - range_stats.num_versions;
-    let redundant_keys = range_stats.num_entries - range_stats.num_rows;
-    (redundant_keys >= compact_threshold.redundant_rows_threshold
-        && redundant_keys * 100
-            >= compact_threshold.redundant_rows_percent_threshold * range_stats.num_entries)
-        || (estimate_num_del >= compact_threshold.tombstones_num_threshold
-            && estimate_num_del * 100
-                >= compact_threshold.tombstones_percent_threshold * range_stats.num_entries)
+    // When the number of tombstones exceed threshold and ratio, this range need
+    // compacting.
+    let estimate_num_del = num_entires - num_versions;
+    estimate_num_del >= tombstones_num_threshold
+        && estimate_num_del * 100 >= tombstones_percent_threshold * num_entires
 }
 
 fn collect_ranges_need_compact(
     engine: &impl KvEngine,
     ranges: Vec<Key>,
-    compact_threshold: CompactThreshold,
+    tombstones_num_threshold: u64,
+    tombstones_percent_threshold: u64,
 ) -> Result<VecDeque<(Key, Key)>, Error> {
     // Check the SST properties for each range, and TiKV will compact a range if the
     // range contains too many RocksDB tombstones. TiKV will merge multiple
@@ -234,7 +209,12 @@ fn collect_ranges_need_compact(
         // be compacted.
         if let Some(range_stats) = box_try!(engine.get_range_stats(CF_WRITE, &range[0], &range[1]))
         {
-            if need_compact(&range_stats, &compact_threshold) {
+            if need_compact(
+                range_stats.num_entries,
+                range_stats.num_versions,
+                tombstones_num_threshold,
+                tombstones_percent_threshold,
+            ) {
                 if compact_start.is_none() {
                     // The previous range doesn't need compacting.
                     compact_start = Some(range[0].clone());
@@ -272,7 +252,6 @@ fn collect_ranges_need_compact(
 mod tests {
     use std::{thread::sleep, time::Duration};
 
-    use engine_rocks::{raw::CompactOptions, util::get_cf_handle};
     use engine_test::{
         ctor::{CfOptions, DbOptions},
         kv::{new_engine, new_engine_opt, KvTestEngine},
@@ -286,65 +265,6 @@ mod tests {
     use txn_types::{Key, TimeStamp, Write, WriteType};
 
     use super::*;
-
-    #[test]
-    fn test_disable_manual_compaction() {
-        let path = Builder::new()
-            .prefix("test_disable_manual_compaction")
-            .tempdir()
-            .unwrap();
-        let db = new_engine(path.path().to_str().unwrap(), &[CF_DEFAULT]).unwrap();
-
-        // Generate the first SST file.
-        let mut wb = db.write_batch();
-        for i in 0..1000 {
-            let k = format!("key_{}", i);
-            wb.put_cf(CF_DEFAULT, k.as_bytes(), b"whatever content")
-                .unwrap();
-        }
-        wb.write().unwrap();
-        db.flush_cf(CF_DEFAULT, true).unwrap();
-
-        // Generate another SST file has the same content with first SST file.
-        let mut wb = db.write_batch();
-        for i in 0..1000 {
-            let k = format!("key_{}", i);
-            wb.put_cf(CF_DEFAULT, k.as_bytes(), b"whatever content")
-                .unwrap();
-        }
-        wb.write().unwrap();
-        db.flush_cf(CF_DEFAULT, true).unwrap();
-
-        // Get the total SST files size.
-        let old_sst_files_size = db.get_total_sst_files_size_cf(CF_DEFAULT).unwrap().unwrap();
-
-        // Stop the assistant.
-        {
-            let _ = db.disable_manual_compaction();
-
-            // Manually compact range.
-            let handle = get_cf_handle(db.as_inner(), CF_DEFAULT).unwrap();
-            db.as_inner()
-                .compact_range_cf_opt(handle, &CompactOptions::new(), None, None);
-
-            // Get the total SST files size after compact range.
-            let new_sst_files_size = db.get_total_sst_files_size_cf(CF_DEFAULT).unwrap().unwrap();
-            assert_eq!(old_sst_files_size, new_sst_files_size);
-        }
-        // Restart the assistant.
-        {
-            let _ = db.enable_manual_compaction();
-
-            // Manually compact range.
-            let handle = get_cf_handle(db.as_inner(), CF_DEFAULT).unwrap();
-            db.as_inner()
-                .compact_range_cf_opt(handle, &CompactOptions::new(), None, None);
-
-            // Get the total SST files size after compact range.
-            let new_sst_files_size = db.get_total_sst_files_size_cf(CF_DEFAULT).unwrap().unwrap();
-            assert!(old_sst_files_size > new_sst_files_size);
-        }
-    }
 
     #[test]
     fn test_compact_range() {
@@ -426,14 +346,13 @@ mod tests {
         for i in 0..5 {
             let (k, v) = (format!("k{}", i), format!("value{}", i));
             mvcc_put(&engine, k.as_bytes(), v.as_bytes(), 1.into(), 2.into());
-            mvcc_put(&engine, k.as_bytes(), v.as_bytes(), 3.into(), 4.into());
         }
         engine.flush_cf(CF_WRITE, true).unwrap();
 
         // gc 0..5
         for i in 0..5 {
             let k = format!("k{}", i);
-            delete(&engine, k.as_bytes(), 4.into());
+            delete(&engine, k.as_bytes(), 2.into());
         }
         engine.flush_cf(CF_WRITE, true).unwrap();
 
@@ -442,32 +361,26 @@ mod tests {
             .get_range_stats(CF_WRITE, &start, &end)
             .unwrap()
             .unwrap();
-        assert_eq!(range_stats.num_entries, 15);
-        assert_eq!(range_stats.num_versions, 10);
-        assert_eq!(range_stats.num_rows, 5);
+        assert_eq!(range_stats.num_entries, 10);
+        assert_eq!(range_stats.num_versions, 5);
 
         // mvcc_put 5..10
         for i in 5..10 {
             let (k, v) = (format!("k{}", i), format!("value{}", i));
             mvcc_put(&engine, k.as_bytes(), v.as_bytes(), 1.into(), 2.into());
         }
-        for i in 5..8 {
-            let (k, v) = (format!("k{}", i), format!("value{}", i));
-            mvcc_put(&engine, k.as_bytes(), v.as_bytes(), 3.into(), 4.into());
-        }
         engine.flush_cf(CF_WRITE, true).unwrap();
 
         let (s, e) = (data_key(b"k5"), data_key(b"k9"));
         let range_stats = engine.get_range_stats(CF_WRITE, &s, &e).unwrap().unwrap();
-        assert_eq!(range_stats.num_entries, 8);
-        assert_eq!(range_stats.num_versions, 8);
-        assert_eq!(range_stats.num_rows, 5);
+        assert_eq!(range_stats.num_entries, 5);
+        assert_eq!(range_stats.num_versions, 5);
 
-        // tombstone triggers compaction
         let ranges_need_to_compact = collect_ranges_need_compact(
             &engine,
             vec![data_key(b"k0"), data_key(b"k5"), data_key(b"k9")],
-            CompactThreshold::new(4, 30, 100, 100),
+            1,
+            50,
         )
         .unwrap();
         let (s, e) = (data_key(b"k0"), data_key(b"k5"));
@@ -475,45 +388,28 @@ mod tests {
         expected_ranges.push_back((s, e));
         assert_eq!(ranges_need_to_compact, expected_ranges);
 
-        // duplicated mvcc triggers compaction
-        let ranges_need_to_compact = collect_ranges_need_compact(
-            &engine,
-            vec![data_key(b"k0"), data_key(b"k5"), data_key(b"k9")],
-            CompactThreshold::new(100, 100, 5, 50),
-        )
-        .unwrap();
-        assert_eq!(ranges_need_to_compact, expected_ranges);
-
-        // gc 5..8
-        for i in 5..8 {
+        // gc 5..10
+        for i in 5..10 {
             let k = format!("k{}", i);
-            delete(&engine, k.as_bytes(), 4.into());
+            delete(&engine, k.as_bytes(), 2.into());
         }
         engine.flush_cf(CF_WRITE, true).unwrap();
 
         let (s, e) = (data_key(b"k5"), data_key(b"k9"));
         let range_stats = engine.get_range_stats(CF_WRITE, &s, &e).unwrap().unwrap();
-        assert_eq!(range_stats.num_entries, 11);
-        assert_eq!(range_stats.num_versions, 8);
-        assert_eq!(range_stats.num_rows, 5);
+        assert_eq!(range_stats.num_entries, 10);
+        assert_eq!(range_stats.num_versions, 5);
 
         let ranges_need_to_compact = collect_ranges_need_compact(
             &engine,
             vec![data_key(b"k0"), data_key(b"k5"), data_key(b"k9")],
-            CompactThreshold::new(3, 25, 100, 100),
+            1,
+            50,
         )
         .unwrap();
         let (s, e) = (data_key(b"k0"), data_key(b"k9"));
         let mut expected_ranges = VecDeque::new();
         expected_ranges.push_back((s, e));
-        assert_eq!(ranges_need_to_compact, expected_ranges);
-
-        let ranges_need_to_compact = collect_ranges_need_compact(
-            &engine,
-            vec![data_key(b"k0"), data_key(b"k5"), data_key(b"k9")],
-            CompactThreshold::new(100, 100, 3, 35),
-        )
-        .unwrap();
         assert_eq!(ranges_need_to_compact, expected_ranges);
     }
 }
