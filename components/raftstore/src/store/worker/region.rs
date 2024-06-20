@@ -10,14 +10,17 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::SyncSender,
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
     u64,
 };
 
 use collections::HashMap;
-use engine_traits::{DeleteStrategy, KvEngine, Mutable, Range, WriteBatch, CF_LOCK, CF_RAFT};
+use engine_traits::{
+    CacheRange, DeleteStrategy, KvEngine, Mutable, Range, WriteBatch, WriteOptions, CF_LOCK,
+    CF_RAFT,
+};
 use fail::fail_point;
 use file_system::{IoType, WithIoType};
 use kvproto::raft_serverpb::{PeerState, RaftApplyState, RegionLocalState};
@@ -26,14 +29,11 @@ use raft::eraftpb::Snapshot as RaftSnapshot;
 use tikv_util::{
     box_err, box_try,
     config::VersionTrack,
-    defer, error, info, thd_name,
+    defer, error, info,
     time::{Instant, UnixSecs},
     warn,
     worker::{Runnable, RunnableWithTimer},
-};
-use yatp::{
-    pool::{Builder, ThreadPool},
-    task::future::TaskCell,
+    yatp_pool::{DefaultTicker, FuturePool, YatpPoolBuilder},
 };
 
 use super::metrics::*;
@@ -47,11 +47,12 @@ use crate::{
         },
         snap::{plain_file_used, Error, Result, SNAPSHOT_CFS},
         transport::CasualRouter,
-        ApplyOptions, CasualMessage, Config, SnapEntry, SnapKey, SnapManager,
+        ApplyOptions, CasualMessage, Config, SnapEntry, SnapError, SnapKey, SnapManager,
     },
 };
 
 const CLEANUP_MAX_REGION_COUNT: usize = 64;
+const SNAP_GENERATOR_MAX_POOL_SIZE: usize = 16;
 
 const TIFLASH: &str = "tiflash";
 const ENGINE: &str = "engine";
@@ -73,6 +74,7 @@ pub enum Task<S> {
         region_id: u64,
         status: Arc<AtomicUsize>,
         peer_id: u64,
+        create_time: Instant,
     },
     /// Destroy data between [start_key, end_key).
     ///
@@ -179,7 +181,7 @@ impl PendingDeleteRanges {
     ) -> Vec<(u64, Vec<u8>, Vec<u8>, u64)> {
         let ranges = self.find_overlap_ranges(start_key, end_key);
 
-        for &(_, ref s_key, ..) in &ranges {
+        for (_, s_key, ..) in &ranges {
             self.ranges.remove(s_key).unwrap();
         }
         ranges
@@ -340,21 +342,12 @@ where
     }
 }
 
-pub struct Runner<EK, R, T>
+struct RegionCleaner<EK>
 where
     EK: KvEngine,
-    T: PdClient + 'static,
 {
-    batch_size: usize,
     use_delete_range: bool,
-    clean_stale_tick: usize,
-    clean_stale_check_interval: Duration,
-    clean_stale_ranges_tick: usize,
-
-    tiflash_stores: HashMap<u64, bool>,
-    // we may delay some apply tasks if level 0 files to write stall threshold,
-    // pending_applies records all delayed apply task, and will check again later
-    pending_applies: VecDeque<Task<EK::Snapshot>>,
+    engine: EK,
     // Ranges that have been logically destroyed at a specific sequence number. We can
     // assume there will be no reader (engine snapshot) newer than that sequence number. Therefore,
     // they can be physically deleted with `DeleteFiles` when we're sure there is no older
@@ -364,177 +357,13 @@ where
     // The sole purpose of maintaining this list is to optimize deletion with `DeleteFiles`
     // whenever we can. Errors while processing them can be ignored.
     pending_delete_ranges: PendingDeleteRanges,
-
-    engine: EK,
     mgr: SnapManager,
-    coprocessor_host: CoprocessorHost<EK>,
-    router: R,
-    pd_client: Option<Arc<T>>,
-    pool: ThreadPool<TaskCell>,
 }
 
-impl<EK, R, T> Runner<EK, R, T>
+impl<EK> RegionCleaner<EK>
 where
     EK: KvEngine,
-    R: CasualRouter<EK>,
-    T: PdClient + 'static,
 {
-    pub fn new(
-        engine: EK,
-        mgr: SnapManager,
-        cfg: Arc<VersionTrack<Config>>,
-        coprocessor_host: CoprocessorHost<EK>,
-        router: R,
-        pd_client: Option<Arc<T>>,
-    ) -> Runner<EK, R, T> {
-        Runner {
-            batch_size: cfg.value().snap_apply_batch_size.0 as usize,
-            use_delete_range: cfg.value().use_delete_range,
-            clean_stale_tick: 0,
-            clean_stale_check_interval: Duration::from_millis(
-                cfg.value().region_worker_tick_interval.as_millis(),
-            ),
-            clean_stale_ranges_tick: cfg.value().clean_stale_ranges_tick,
-            tiflash_stores: HashMap::default(),
-            pending_applies: VecDeque::new(),
-            pending_delete_ranges: PendingDeleteRanges::default(),
-            engine,
-            mgr,
-            coprocessor_host,
-            router,
-            pd_client,
-            pool: Builder::new(thd_name!("snap-generator"))
-                .max_thread_count(cfg.value().snap_generator_pool_size)
-                .build_future_pool(),
-        }
-    }
-
-    fn region_state(&self, region_id: u64) -> Result<RegionLocalState> {
-        let region_key = keys::region_state_key(region_id);
-        let region_state: RegionLocalState =
-            match box_try!(self.engine.get_msg_cf(CF_RAFT, &region_key)) {
-                Some(state) => state,
-                None => {
-                    return Err(box_err!(
-                        "failed to get region_state from {}",
-                        log_wrappers::Value::key(&region_key)
-                    ));
-                }
-            };
-        Ok(region_state)
-    }
-
-    fn apply_state(&self, region_id: u64) -> Result<RaftApplyState> {
-        let state_key = keys::apply_state_key(region_id);
-        let apply_state: RaftApplyState =
-            match box_try!(self.engine.get_msg_cf(CF_RAFT, &state_key)) {
-                Some(state) => state,
-                None => {
-                    return Err(box_err!(
-                        "failed to get apply_state from {}",
-                        log_wrappers::Value::key(&state_key)
-                    ));
-                }
-            };
-        Ok(apply_state)
-    }
-
-    /// Applies snapshot data of the Region.
-    fn apply_snap(&mut self, region_id: u64, peer_id: u64, abort: Arc<AtomicUsize>) -> Result<()> {
-        info!("begin apply snap data"; "region_id" => region_id, "peer_id" => peer_id);
-        fail_point!("region_apply_snap", |_| { Ok(()) });
-        check_abort(&abort)?;
-
-        let mut region_state = self.region_state(region_id)?;
-        let region = region_state.get_region().clone();
-        let start_key = keys::enc_start_key(&region);
-        let end_key = keys::enc_end_key(&region);
-        check_abort(&abort)?;
-        self.clean_overlap_ranges(start_key, end_key)?;
-        check_abort(&abort)?;
-        fail_point!("apply_snap_cleanup_range");
-
-        // apply snapshot
-        let apply_state = self.apply_state(region_id)?;
-        let term = apply_state.get_truncated_state().get_term();
-        let idx = apply_state.get_truncated_state().get_index();
-        let snap_key = SnapKey::new(region_id, term, idx);
-        self.mgr.register(snap_key.clone(), SnapEntry::Applying);
-        defer!({
-            self.mgr.deregister(&snap_key, &SnapEntry::Applying);
-        });
-        let mut s = box_try!(self.mgr.get_snapshot_for_applying(&snap_key));
-        if !s.exists() {
-            return Err(box_err!("missing snapshot file {}", s.path()));
-        }
-        check_abort(&abort)?;
-        let timer = Instant::now();
-        let options = ApplyOptions {
-            db: self.engine.clone(),
-            region: region.clone(),
-            abort: Arc::clone(&abort),
-            write_batch_size: self.batch_size,
-            coprocessor_host: self.coprocessor_host.clone(),
-        };
-        s.apply(options)?;
-        self.coprocessor_host
-            .post_apply_snapshot(&region, peer_id, &snap_key, Some(&s));
-
-        // delete snapshot state.
-        let mut wb = self.engine.write_batch();
-        region_state.set_state(PeerState::Normal);
-        box_try!(wb.put_msg_cf(CF_RAFT, &keys::region_state_key(region_id), &region_state));
-        box_try!(wb.delete_cf(CF_RAFT, &keys::snapshot_raft_state_key(region_id)));
-        wb.write().unwrap_or_else(|e| {
-            panic!("{} failed to save apply_snap result: {:?}", region_id, e);
-        });
-        info!(
-            "apply new data";
-            "region_id" => region_id,
-            "time_takes" => ?timer.saturating_elapsed(),
-        );
-        Ok(())
-    }
-
-    /// Tries to apply the snapshot of the specified Region. It calls
-    /// `apply_snap` to do the actual work.
-    fn handle_apply(&mut self, region_id: u64, peer_id: u64, status: Arc<AtomicUsize>) {
-        let _ = status.compare_exchange(
-            JOB_STATUS_PENDING,
-            JOB_STATUS_RUNNING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-        SNAP_COUNTER.apply.start.inc();
-
-        let start = Instant::now();
-
-        match self.apply_snap(region_id, peer_id, Arc::clone(&status)) {
-            Ok(()) => {
-                status.swap(JOB_STATUS_FINISHED, Ordering::SeqCst);
-                SNAP_COUNTER.apply.success.inc();
-            }
-            Err(Error::Abort) => {
-                warn!("applying snapshot is aborted"; "region_id" => region_id);
-                assert_eq!(
-                    status.swap(JOB_STATUS_CANCELLED, Ordering::SeqCst),
-                    JOB_STATUS_CANCELLING
-                );
-                SNAP_COUNTER.apply.abort.inc();
-            }
-            Err(e) => {
-                error!(%e; "failed to apply snap!!!");
-                status.swap(JOB_STATUS_FAILED, Ordering::SeqCst);
-                SNAP_COUNTER.apply.fail.inc();
-            }
-        }
-
-        SNAP_HISTOGRAM
-            .apply
-            .observe(start.saturating_elapsed_secs());
-        let _ = self.router.send(region_id, CasualMessage::SnapshotApplied);
-    }
-
     /// Tries to clean up files in pending ranges overlapping with the given
     /// bounds. These pending ranges will be removed. Returns an updated range
     /// that also includes these ranges. Caller must ensure the remaining keys
@@ -580,10 +409,15 @@ where
             })
             .collect();
         self.engine
-            .delete_ranges_cfs(DeleteStrategy::DeleteFiles, &df_ranges)
-            .unwrap_or_else(|e| {
+            .delete_ranges_cfs(
+                &WriteOptions::default(),
+                DeleteStrategy::DeleteFiles,
+                &df_ranges,
+            )
+            .map_err(|e| {
                 error!("failed to delete files in range"; "err" => %e);
-            });
+            })
+            .unwrap();
         (start_key, end_key)
     }
 
@@ -644,19 +478,29 @@ where
             .collect();
 
         self.engine
-            .delete_ranges_cfs(DeleteStrategy::DeleteFiles, &ranges)
-            .unwrap_or_else(|e| {
+            .delete_ranges_cfs(
+                &WriteOptions::default(),
+                DeleteStrategy::DeleteFiles,
+                &ranges,
+            )
+            .map_err(|e| {
                 error!("failed to delete files in range"; "err" => %e);
-            });
+            })
+            .unwrap();
         if let Err(e) = self.delete_all_in_range(&ranges) {
             error!("failed to cleanup stale range"; "err" => %e);
             return;
         }
         self.engine
-            .delete_ranges_cfs(DeleteStrategy::DeleteBlobs, &ranges)
-            .unwrap_or_else(|e| {
+            .delete_ranges_cfs(
+                &WriteOptions::default(),
+                DeleteStrategy::DeleteBlobs,
+                &ranges,
+            )
+            .map_err(|e| {
                 error!("failed to delete blobs in range"; "err" => %e);
-            });
+            })
+            .unwrap();
 
         for (_, key, _) in region_ranges {
             assert!(
@@ -683,6 +527,7 @@ where
     }
 
     fn delete_all_in_range(&self, ranges: &[Range<'_>]) -> Result<()> {
+        let wopts = WriteOptions::default();
         for cf in self.engine.cf_names() {
             // CF_LOCK usually contains fewer keys than other CFs, so we delete them by key.
             let strategy = if cf == CF_LOCK {
@@ -694,10 +539,260 @@ where
                     sst_path: self.mgr.get_temp_path_for_ingest(),
                 }
             };
-            box_try!(self.engine.delete_ranges_cf(cf, strategy, ranges));
+            box_try!(self.engine.delete_ranges_cf(&wopts, cf, strategy, ranges));
         }
-
         Ok(())
+    }
+}
+
+pub struct Runner<EK, R, T>
+where
+    EK: KvEngine,
+    T: PdClient + 'static,
+{
+    batch_size: usize,
+    ingest_copy_symlink: bool,
+    clean_stale_tick: usize,
+    clean_stale_check_interval: Duration,
+    clean_stale_ranges_tick: usize,
+
+    tiflash_stores: HashMap<u64, bool>,
+    // we may delay some apply tasks if level 0 files to write stall threshold,
+    // pending_applies records all delayed apply task, and will check again later
+    pending_applies: VecDeque<Task<EK::Snapshot>>,
+
+    engine: EK,
+    mgr: SnapManager,
+    coprocessor_host: CoprocessorHost<EK>,
+    router: R,
+    pd_client: Option<Arc<T>>,
+    snap_gen_pool: FuturePool,
+    region_cleanup_pool: FuturePool,
+    region_cleaner: Arc<Mutex<RegionCleaner<EK>>>,
+}
+
+impl<EK, R, T> Runner<EK, R, T>
+where
+    EK: KvEngine,
+    R: CasualRouter<EK>,
+    T: PdClient + 'static,
+{
+    pub fn new(
+        engine: EK,
+        mgr: SnapManager,
+        cfg: Arc<VersionTrack<Config>>,
+        coprocessor_host: CoprocessorHost<EK>,
+        router: R,
+        pd_client: Option<Arc<T>>,
+    ) -> Runner<EK, R, T> {
+        Runner {
+            batch_size: cfg.value().snap_apply_batch_size.0 as usize,
+            ingest_copy_symlink: cfg.value().snap_apply_copy_symlink,
+            clean_stale_tick: 0,
+            clean_stale_check_interval: Duration::from_millis(
+                cfg.value().region_worker_tick_interval.as_millis(),
+            ),
+            clean_stale_ranges_tick: cfg.value().clean_stale_ranges_tick,
+            tiflash_stores: HashMap::default(),
+            pending_applies: VecDeque::new(),
+            engine: engine.clone(),
+            mgr: mgr.clone(),
+            coprocessor_host,
+            router,
+            pd_client,
+            snap_gen_pool: YatpPoolBuilder::new(DefaultTicker::default())
+                .name_prefix("snap-generator")
+                .thread_count(
+                    1,
+                    cfg.value().snap_generator_pool_size,
+                    SNAP_GENERATOR_MAX_POOL_SIZE,
+                )
+                .build_future_pool(),
+            region_cleanup_pool: YatpPoolBuilder::new(DefaultTicker::default())
+                .name_prefix("region-cleanup")
+                .thread_count(1, 1, 1)
+                .build_future_pool(),
+            region_cleaner: Arc::new(Mutex::new(RegionCleaner {
+                use_delete_range: cfg.value().use_delete_range,
+                engine,
+                pending_delete_ranges: PendingDeleteRanges::default(),
+                mgr,
+            })),
+        }
+    }
+
+    pub fn snap_generator_pool(&self) -> FuturePool {
+        self.snap_gen_pool.clone()
+    }
+
+    fn region_state(&self, region_id: u64) -> Result<RegionLocalState> {
+        let region_key = keys::region_state_key(region_id);
+        let region_state: RegionLocalState =
+            match box_try!(self.engine.get_msg_cf(CF_RAFT, &region_key)) {
+                Some(state) => state,
+                None => {
+                    return Err(box_err!(
+                        "failed to get region_state from {}",
+                        log_wrappers::Value::key(&region_key)
+                    ));
+                }
+            };
+        Ok(region_state)
+    }
+
+    fn apply_state(&self, region_id: u64) -> Result<RaftApplyState> {
+        let state_key = keys::apply_state_key(region_id);
+        let apply_state: RaftApplyState =
+            match box_try!(self.engine.get_msg_cf(CF_RAFT, &state_key)) {
+                Some(state) => state,
+                None => {
+                    return Err(box_err!(
+                        "failed to get apply_state from {}",
+                        log_wrappers::Value::key(&state_key)
+                    ));
+                }
+            };
+        Ok(apply_state)
+    }
+
+    /// Applies snapshot data of the Region.
+    fn apply_snap(&mut self, region_id: u64, peer_id: u64, abort: Arc<AtomicUsize>) -> Result<()> {
+        info!("begin apply snap data"; "region_id" => region_id, "peer_id" => peer_id);
+        fail_point!("region_apply_snap", |_| { Ok(()) });
+        fail_point!("region_apply_snap_io_err", |_| {
+            Err(SnapError::Other(box_err!("io error")))
+        });
+        check_abort(&abort)?;
+
+        let mut region_state = self.region_state(region_id)?;
+        let region = region_state.get_region().clone();
+
+        let range = CacheRange::from_region(&region);
+        info!(
+            "evict range due to apply snap";
+            "range" => ?range,
+        );
+        self.engine.evict_range(&range);
+
+        let start_key = keys::enc_start_key(&region);
+        let end_key = keys::enc_end_key(&region);
+        check_abort(&abort)?;
+        {
+            let mut region_cleaner = self.region_cleaner.lock().unwrap();
+            region_cleaner.clean_overlap_ranges(start_key, end_key)?;
+        }
+        check_abort(&abort)?;
+        fail_point!("apply_snap_cleanup_range");
+
+        // apply snapshot
+        let apply_state = self.apply_state(region_id)?;
+        let term = apply_state.get_truncated_state().get_term();
+        let idx = apply_state.get_truncated_state().get_index();
+        let snap_key = SnapKey::new(region_id, term, idx);
+        self.mgr.register(snap_key.clone(), SnapEntry::Applying);
+        defer!({
+            self.mgr.deregister(&snap_key, &SnapEntry::Applying);
+        });
+        let mut s = box_try!(self.mgr.get_snapshot_for_applying(&snap_key));
+        if !s.exists() {
+            return Err(box_err!("missing snapshot file {}", s.path()));
+        }
+        check_abort(&abort)?;
+        let timer = Instant::now();
+        let options = ApplyOptions {
+            db: self.engine.clone(),
+            region: region.clone(),
+            abort: Arc::clone(&abort),
+            write_batch_size: self.batch_size,
+            coprocessor_host: self.coprocessor_host.clone(),
+            ingest_copy_symlink: self.ingest_copy_symlink,
+        };
+        s.apply(options)?;
+        self.coprocessor_host
+            .post_apply_snapshot(&region, peer_id, &snap_key, Some(&s));
+
+        // delete snapshot state.
+        let mut wb = self.engine.write_batch();
+        region_state.set_state(PeerState::Normal);
+        box_try!(wb.put_msg_cf(CF_RAFT, &keys::region_state_key(region_id), &region_state));
+        box_try!(wb.delete_cf(CF_RAFT, &keys::snapshot_raft_state_key(region_id)));
+        wb.write().unwrap_or_else(|e| {
+            panic!("{} failed to save apply_snap result: {:?}", region_id, e);
+        });
+        info!(
+            "apply new data";
+            "region_id" => region_id,
+            "time_takes" => ?timer.saturating_elapsed(),
+        );
+        Ok(())
+    }
+
+    /// Tries to apply the snapshot of the specified Region. It calls
+    /// `apply_snap` to do the actual work.
+    fn handle_apply(&mut self, region_id: u64, peer_id: u64, status: Arc<AtomicUsize>) {
+        let _ = status.compare_exchange(
+            JOB_STATUS_PENDING,
+            JOB_STATUS_RUNNING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        SNAP_COUNTER.apply.start.inc();
+
+        let start = Instant::now();
+
+        let tombstone = match self.apply_snap(region_id, peer_id, Arc::clone(&status)) {
+            Ok(()) => {
+                status.swap(JOB_STATUS_FINISHED, Ordering::SeqCst);
+                SNAP_COUNTER.apply.success.inc();
+                false
+            }
+            Err(Error::Abort) => {
+                warn!("applying snapshot is aborted"; "region_id" => region_id);
+                self.coprocessor_host
+                    .cancel_apply_snapshot(region_id, peer_id);
+                assert_eq!(
+                    status.swap(JOB_STATUS_CANCELLED, Ordering::SeqCst),
+                    JOB_STATUS_CANCELLING
+                );
+                SNAP_COUNTER.apply.abort.inc();
+                // The snapshot is applied abort, it's not necessary to tombstone the peer.
+                false
+            }
+            Err(e) => {
+                warn!("failed to apply snap!!!"; "region_id" => region_id, "err" => %e);
+                self.coprocessor_host
+                    .cancel_apply_snapshot(region_id, peer_id);
+                status.swap(JOB_STATUS_FAILED, Ordering::SeqCst);
+                SNAP_COUNTER.apply.fail.inc();
+                // As the snapshot failed, the related peer should be marked tombstone.
+                // And as for the abnormal snapshot, it will be automatically cleaned up by
+                // the CleanupWorker later.
+                true
+            }
+        };
+
+        SNAP_HISTOGRAM
+            .apply
+            .observe(start.saturating_elapsed_secs());
+        let _ = self.router.send(
+            region_id,
+            CasualMessage::SnapshotApplied { peer_id, tombstone },
+        );
+    }
+
+    /// Checks the number of files at level 0 to avoid write stall after
+    /// ingesting sst. Returns true if the ingestion causes write stall.
+    fn ingest_maybe_stall(&self) -> bool {
+        for cf in SNAPSHOT_CFS {
+            // no need to check lock cf
+            if plain_file_used(cf) {
+                continue;
+            }
+            if self.engine.ingest_maybe_slowdown_writes(cf).expect("cf") {
+                return true;
+            }
+        }
+        false
     }
 
     /// Calls observer `pre_apply_snapshot` for every task.
@@ -708,6 +803,7 @@ where
                 region_id,
                 status,
                 peer_id,
+                ..
             } => (region_id, status.clone(), peer_id),
             _ => panic!("invalid apply snapshot task"),
         };
@@ -749,28 +845,37 @@ where
             // ingested. check level 0 every time because we can not make sure
             // how does the number of level 0 files change.
             if self.ingest_maybe_stall() {
+                SNAP_COUNTER.apply.ingest_delay.inc();
                 break;
             }
             if let Some(Task::Apply { region_id, .. }) = self.pending_applies.front() {
                 fail_point!("handle_new_pending_applies", |_| {});
-                if !self
-                    .engine
-                    .can_apply_snapshot(is_timeout, new_batch, *region_id)
-                {
+                if !self.engine.can_apply_snapshot(
+                    is_timeout,
+                    new_batch,
+                    *region_id,
+                    self.pending_applies.len(),
+                ) {
                     // KvEngine can't apply snapshot for other reasons.
+                    SNAP_COUNTER.apply.ingest_delay.inc();
                     break;
                 }
                 if let Some(Task::Apply {
                     region_id,
                     status,
                     peer_id,
+                    create_time,
                 }) = self.pending_applies.pop_front()
                 {
+                    SNAP_APPLY_WAIT_DURATION_HISTOGRAM
+                        .observe(create_time.saturating_elapsed_secs());
                     new_batch = false;
                     self.handle_apply(region_id, peer_id, status);
+                    self.mgr.set_pending_apply_count(self.pending_applies.len());
                 }
             }
         }
+        SNAP_PENDING_APPLIES_GAUGE.set(self.pending_applies.len() as i64);
     }
 }
 
@@ -822,8 +927,11 @@ where
                     router: self.router.clone(),
                     start: UnixSecs::now(),
                 };
-                self.pool.spawn(async move {
-                    tikv_alloc::add_thread_memory_accessor();
+                let scheduled_time = Instant::now_coarse();
+                self.snap_gen_pool.spawn(async move {
+                    SNAP_GEN_WAIT_DURATION_HISTOGRAM
+                        .observe(scheduled_time.saturating_elapsed_secs());
+
                     ctx.handle_gen(
                         region_id,
                         last_applied_term,
@@ -834,8 +942,12 @@ where
                         for_balance,
                         allow_multi_files_snapshot,
                     );
-                    tikv_alloc::remove_thread_memory_accessor();
-                });
+                }).unwrap_or_else(
+                    |e| {
+                        error!("failed to generate snapshot"; "region_id" => region_id, "err" => ?e);
+                        SNAP_COUNTER.generate.fail.inc();
+                    },
+                );
             }
             task @ Task::Apply { .. } => {
                 fail_point!("on_region_worker_apply", true, |_| {});
@@ -845,6 +957,7 @@ where
                 SNAP_COUNTER.apply.all.inc();
                 // to makes sure applying snapshots in order.
                 self.pending_applies.push_back(task);
+                self.mgr.set_pending_apply_count(self.pending_applies.len());
                 self.handle_pending_applies(false);
                 if !self.pending_applies.is_empty() {
                     // delay the apply and retry later
@@ -856,17 +969,21 @@ where
                 start_key,
                 end_key,
             } => {
-                fail_point!("on_region_worker_destroy", true, |_| {});
-                // try to delay the range deletion because
-                // there might be a coprocessor request related to this range
-                self.insert_pending_delete_range(region_id, start_key, end_key);
-                self.clean_stale_ranges();
+                let region_cleaner = self.region_cleaner.clone();
+                self.region_cleanup_pool
+                    .spawn(async move {
+                        fail_point!("on_region_worker_destroy", region_id == 1000, |_| {});
+                        let mut region_cleaner = region_cleaner.lock().unwrap();
+                        // try to delay the range deletion because
+                        // there might be a coprocessor request related to this range
+                        region_cleaner.insert_pending_delete_range(region_id, start_key, end_key);
+                        region_cleaner.clean_stale_ranges();
+                    })
+                    .unwrap_or_else(|e| {
+                        error!("failed to destroy region"; "region_id" => region_id, "err" => ?e);
+                    });
             }
         }
-    }
-
-    fn shutdown(&mut self) {
-        self.pool.shutdown();
     }
 }
 
@@ -880,7 +997,7 @@ where
         self.handle_pending_applies(true);
         self.clean_stale_tick += 1;
         if self.clean_stale_tick >= self.clean_stale_ranges_tick {
-            self.clean_stale_ranges();
+            self.region_cleaner.lock().unwrap().clean_stale_ranges();
             self.clean_stale_tick = 0;
         }
     }
@@ -1056,7 +1173,7 @@ pub(crate) mod tests {
             ranges.push(key);
         }
         engine.kv.put(b"k1", b"v1").unwrap();
-        let snap = engine.kv.snapshot();
+        let snap = engine.kv.snapshot(None);
         engine.kv.put(b"k2", b"v2").unwrap();
 
         sched
@@ -1169,7 +1286,7 @@ pub(crate) mod tests {
             sched
                 .schedule(Task::Gen {
                     region_id: id,
-                    kv_snap: engine.kv.snapshot(),
+                    kv_snap: engine.kv.snapshot(None),
                     last_applied_term: entry.get_term(),
                     last_applied_state: apply_state,
                     canceled: Arc::new(AtomicBool::new(false)),
@@ -1215,6 +1332,7 @@ pub(crate) mod tests {
                     region_id: id,
                     status,
                     peer_id: 1,
+                    create_time: Instant::now(),
                 })
                 .unwrap();
         };
@@ -1240,7 +1358,7 @@ pub(crate) mod tests {
         let wait_apply_finish = |ids: &[u64]| {
             for id in ids {
                 match receiver.recv_timeout(Duration::from_secs(5)) {
-                    Ok((region_id, CasualMessage::SnapshotApplied)) => {
+                    Ok((region_id, CasualMessage::SnapshotApplied { .. })) => {
                         assert_eq!(region_id, *id);
                     }
                     msg => panic!("expected {} SnapshotApplied, but got {:?}", id, msg),
@@ -1254,22 +1372,6 @@ pub(crate) mod tests {
                         .unwrap()
                         .get_state(),
                     PeerState::Normal
-                )
-            }
-        };
-
-        #[allow(dead_code)]
-        let must_not_finish = |ids: &[u64]| {
-            for id in ids {
-                let region_key = keys::region_state_key(*id);
-                assert_eq!(
-                    engine
-                        .kv
-                        .get_msg_cf::<RegionLocalState>(CF_RAFT, &region_key)
-                        .unwrap()
-                        .unwrap()
-                        .get_state(),
-                    PeerState::Applying
                 )
             }
         };
@@ -1303,6 +1405,7 @@ pub(crate) mod tests {
             obs.pre_apply_hash.load(Ordering::SeqCst),
             obs.post_apply_hash.load(Ordering::SeqCst)
         );
+        assert_eq!(obs.cancel_apply.load(Ordering::SeqCst), 0);
 
         // the pending apply task should be finished and snapshots are ingested.
         // note that when ingest sst, it may flush memtable if overlap,
@@ -1411,6 +1514,21 @@ pub(crate) mod tests {
 
         #[cfg(feature = "failpoints")]
         {
+            let must_not_finish = |ids: &[u64]| {
+                for id in ids {
+                    let region_key = keys::region_state_key(*id);
+                    assert_eq!(
+                        engine
+                            .kv
+                            .get_msg_cf::<RegionLocalState>(CF_RAFT, &region_key)
+                            .unwrap()
+                            .unwrap()
+                            .get_state(),
+                        PeerState::Applying
+                    )
+                }
+            };
+
             engine.kv.compact_files_in_range(None, None, None).unwrap();
             fail::cfg("handle_new_pending_applies", "return").unwrap();
             gen_and_apply_snap(7);
@@ -1432,6 +1550,7 @@ pub(crate) mod tests {
         pub post_apply_count: Arc<AtomicUsize>,
         pub pre_apply_hash: Arc<AtomicUsize>,
         pub post_apply_hash: Arc<AtomicUsize>,
+        pub cancel_apply: Arc<AtomicUsize>,
     }
 
     impl Coprocessor for MockApplySnapshotObserver {}
@@ -1467,6 +1586,10 @@ pub(crate) mod tests {
 
         fn should_pre_apply_snapshot(&self) -> bool {
             true
+        }
+
+        fn cancel_apply_snapshot(&self, _: u64, _: u64) {
+            self.cancel_apply.fetch_add(1, Ordering::SeqCst);
         }
     }
 }

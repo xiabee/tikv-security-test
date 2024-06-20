@@ -1,5 +1,8 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+#![feature(let_chains)]
+#![feature(noop_waker)]
+
 mod config;
 mod crypter;
 mod encrypted_file;
@@ -14,20 +17,15 @@ use std::{io::ErrorKind, path::Path};
 
 pub use self::{
     config::*,
-    crypter::{
-        from_engine_encryption_method, to_engine_encryption_method, verify_encryption_config,
-        AesGcmCrypter, Iv, PlainKey,
-    },
+    crypter::{verify_encryption_config, AesGcmCrypter, FileEncryptionInfo, Iv},
     encrypted_file::EncryptedFile,
-    errors::{Error, Result, RetryCodedError},
+    errors::{cloud_convert_error, Error, Result, RetryCodedError},
     file_dict_file::FileDictionaryFile,
     io::{
         create_aes_ctr_crypter, DecrypterReader, DecrypterWriter, EncrypterReader, EncrypterWriter,
     },
-    manager::{DataKeyManager, DataKeyManagerArgs},
-    master_key::{
-        Backend, DataKeyPair, EncryptedKey, FileBackend, KmsBackend, KmsProvider, PlaintextBackend,
-    },
+    manager::{DataKeyImporter, DataKeyManager, DataKeyManagerArgs},
+    master_key::{Backend, FileBackend, KmsBackend, PlaintextBackend},
 };
 
 const TRASH_PREFIX: &str = "TRASH-";
