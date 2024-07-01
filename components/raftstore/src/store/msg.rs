@@ -8,7 +8,6 @@ use std::{borrow::Cow, fmt};
 use collections::HashSet;
 use engine_traits::{CompactedEvent, KvEngine, Snapshot};
 use futures::channel::mpsc::UnboundedSender;
-use health_controller::types::LatencyInspector;
 use kvproto::{
     brpb::CheckAdminResponse,
     kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp},
@@ -39,7 +38,7 @@ use crate::store::{
         UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryFillOutReportSyncer,
         UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer,
     },
-    util::KeysInfoFormatter,
+    util::{KeysInfoFormatter, LatencyInspector},
     worker::{Bucket, BucketRange},
     SnapKey,
 };
@@ -172,25 +171,19 @@ where
     }
 
     pub fn has_proposed_cb(&self) -> bool {
-        let Callback::Write { proposed_cb, .. } = self else {
-            return false;
-        };
+        let Callback::Write { proposed_cb, .. } = self else { return false; };
         proposed_cb.is_some()
     }
 
     pub fn invoke_proposed(&mut self) {
-        let Callback::Write { proposed_cb, .. } = self else {
-            return;
-        };
+        let Callback::Write { proposed_cb, .. } = self else { return; };
         if let Some(cb) = proposed_cb.take() {
             cb();
         }
     }
 
     pub fn invoke_committed(&mut self) {
-        let Callback::Write { committed_cb, .. } = self else {
-            return;
-        };
+        let Callback::Write { committed_cb, .. } = self else { return; };
         if let Some(cb) = committed_cb.take() {
             cb();
         }
@@ -204,16 +197,12 @@ where
     }
 
     pub fn take_proposed_cb(&mut self) -> Option<ExtCallback> {
-        let Callback::Write { proposed_cb, .. } = self else {
-            return None;
-        };
+        let Callback::Write { proposed_cb, .. } = self else { return None; };
         proposed_cb.take()
     }
 
     pub fn take_committed_cb(&mut self) -> Option<ExtCallback> {
-        let Callback::Write { committed_cb, .. } = self else {
-            return None;
-        };
+        let Callback::Write { committed_cb, .. } = self else { return None; };
         committed_cb.take()
     }
 }
@@ -271,9 +260,7 @@ impl<S: Snapshot> ReadCallback for Callback<S> {
     }
 
     fn read_tracker(&self) -> Option<TrackerToken> {
-        let Callback::Read { tracker, .. } = self else {
-            return None;
-        };
+        let Callback::Read { tracker, .. } = self else { return None; };
         Some(*tracker)
     }
 }
@@ -451,14 +438,11 @@ impl PeerTick {
 #[derive(Debug, Clone, Copy)]
 pub enum StoreTick {
     CompactCheck,
-    PeriodicFullCompact,
-    LoadMetricsWindow,
     PdStoreHeartbeat,
     SnapGc,
     CompactLockCf,
     ConsistencyCheck,
     CleanupImportSst,
-    PdReportMinResolvedTs,
 }
 
 impl StoreTick {
@@ -466,14 +450,11 @@ impl StoreTick {
     pub fn tag(self) -> RaftEventDurationType {
         match self {
             StoreTick::CompactCheck => RaftEventDurationType::compact_check,
-            StoreTick::PeriodicFullCompact => RaftEventDurationType::periodic_full_compact,
             StoreTick::PdStoreHeartbeat => RaftEventDurationType::pd_store_heartbeat,
             StoreTick::SnapGc => RaftEventDurationType::snap_gc,
             StoreTick::CompactLockCf => RaftEventDurationType::compact_lock_cf,
             StoreTick::ConsistencyCheck => RaftEventDurationType::consistency_check,
             StoreTick::CleanupImportSst => RaftEventDurationType::cleanup_import_sst,
-            StoreTick::LoadMetricsWindow => RaftEventDurationType::load_metrics_window,
-            StoreTick::PdReportMinResolvedTs => RaftEventDurationType::pd_report_min_resolved_ts,
         }
     }
 }
@@ -641,11 +622,7 @@ pub enum CasualMessage<EK: KvEngine> {
     RenewLease,
 
     // Snapshot is applied
-    SnapshotApplied {
-        peer_id: u64,
-        /// Whether the peer is destroyed after applying the snapshot
-        tombstone: bool,
-    },
+    SnapshotApplied,
 
     // Trigger raft to campaign which is used after exiting force leader
     Campaign,
@@ -714,11 +691,7 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
             }
             CasualMessage::RefreshRegionBuckets { .. } => write!(fmt, "RefreshRegionBuckets"),
             CasualMessage::RenewLease => write!(fmt, "RenewLease"),
-            CasualMessage::SnapshotApplied { peer_id, tombstone } => write!(
-                fmt,
-                "SnapshotApplied, peer_id={}, tombstone={}",
-                peer_id, tombstone
-            ),
+            CasualMessage::SnapshotApplied => write!(fmt, "SnapshotApplied"),
             CasualMessage::Campaign => write!(fmt, "Campaign"),
         }
     }
@@ -777,11 +750,12 @@ pub struct InspectedRaftMessage {
 /// Message that can be sent to a peer.
 #[allow(clippy::large_enum_variant)]
 #[derive(EnumCount, EnumVariantNames)]
+#[repr(u8)]
 pub enum PeerMsg<EK: KvEngine> {
     /// Raft message is the message sent between raft nodes in the same
     /// raft group. Messages need to be redirected to raftstore if target
     /// peer doesn't exist.
-    RaftMessage(InspectedRaftMessage, Option<Instant>),
+    RaftMessage(InspectedRaftMessage, Option<Instant>) = 0,
     /// Raft command is the command that is expected to be proposed by the
     /// leader of the target raft group. If it's failed to be sent, callback
     /// usually needs to be called before dropping in case of resource leak.
@@ -978,7 +952,7 @@ impl<EK: KvEngine> StoreMsg<EK> {
             StoreMsg::GcSnapshotFinish => 10,
             StoreMsg::AwakenRegions { .. } => 11,
             #[cfg(any(test, feature = "testexport"))]
-            StoreMsg::Validate(_) => 12, // Please keep this always be the last one.
+            StoreMsg::Validate(_) => 12,
         }
     }
 }

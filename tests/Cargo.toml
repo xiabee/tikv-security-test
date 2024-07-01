@@ -3,7 +3,6 @@ name = "tests"
 version = "0.0.1"
 edition = "2021"
 publish = false
-license = "Apache-2.0"
 
 [[test]]
 name = "failpoints"
@@ -40,14 +39,12 @@ name = "deadlock_detector"
 harness = false
 path = "benches/deadlock_detector/mod.rs"
 
-[[bench]]
-name = "memory"
-harness = false
-path = "benches/memory/mod.rs"
-
 [features]
-default = ["failpoints", "testexport", "test-engine-kv-rocksdb", "test-engine-raft-raft-engine"]
+default = ["failpoints", "testexport", "test-engine-kv-rocksdb", "test-engine-raft-raft-engine", "cloud-aws", "cloud-gcp", "cloud-azure"]
 failpoints = ["fail/failpoints", "tikv/failpoints", "pd_client/failpoints"]
+cloud-aws = ["external_storage_export/cloud-aws"]
+cloud-gcp = ["external_storage_export/cloud-gcp"]
+cloud-azure = ["external_storage_export/cloud-azure"]
 testexport = ["raftstore/testexport", "tikv/testexport", "pd_client/testexport"]
 profiling = ["profiler/profiling"]
 
@@ -86,7 +83,6 @@ file_system = { workspace = true }
 futures = "0.3"
 grpcio = { workspace = true }
 grpcio-health = { workspace = true }
-health_controller = { workspace = true }
 kvproto = { workspace = true }
 libc = "0.2"
 log_wrappers = { workspace = true }
@@ -113,7 +109,7 @@ tidb_query_executors = { workspace = true }
 tidb_query_expr = { workspace = true }
 tikv = { workspace = true }
 tikv_util = { workspace = true }
-time = { workspace = true }
+time = "0.1"
 tipb = { workspace = true }
 toml = "0.5"
 tracker = { workspace = true }
@@ -134,7 +130,7 @@ criterion-cpu-time = "0.1"
 engine_rocks = { workspace = true }
 engine_test = { workspace = true }
 engine_traits = { workspace = true }
-external_storage ={ workspace = true }
+external_storage_export = { workspace = true }
 file_system = { workspace = true }
 hyper = { version = "0.14", default-features = false, features = ["runtime"] }
 keys = { workspace = true }

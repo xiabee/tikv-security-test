@@ -22,7 +22,7 @@ use std::{
 
 use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
-use engine_traits::{CfName, KvEngine, MvccProperties, Snapshot, SnapshotContext};
+use engine_traits::{CfName, KvEngine, MvccProperties, Snapshot};
 use futures::{future::BoxFuture, task::AtomicWaker, Future, Stream, StreamExt, TryFutureExt};
 use kvproto::{
     errorpb,
@@ -581,9 +581,7 @@ where
             tx.notify(res);
         }
         rx.inspect(move |ev| {
-            let WriteEvent::Finished(res) = ev else {
-                return;
-            };
+            let WriteEvent::Finished(res) = ev else { return };
             match res {
                 Ok(()) => {
                     ASYNC_REQUESTS_COUNTER_VEC.write.success.inc();
@@ -646,21 +644,10 @@ where
         }));
         let tracker = store_cb.read_tracker().unwrap();
 
-        let snap_ctx = if self.engine.range_cache_engine_enabled() {
-            // When range cache engine is enabled, we need snapshot context to determine
-            // whether we should use range cache engine snapshot for this request.
-            ctx.start_ts.map(|ts| SnapshotContext {
-                read_ts: ts.into_inner(),
-                range: None,
-            })
-        } else {
-            None
-        };
-
         if res.is_ok() {
             res = self
                 .router
-                .read(snap_ctx, ctx.read_id, cmd, store_cb)
+                .read(ctx.read_id, cmd, store_cb)
                 .map_err(kv::Error::from);
         }
         async move {
@@ -675,7 +662,7 @@ where
             match res {
                 Ok(CmdRes::Resp(mut r)) => {
                     let e = if r
-                        .first()
+                        .get(0)
                         .map(|resp| resp.get_read_index().has_locked())
                         .unwrap_or(false)
                     {

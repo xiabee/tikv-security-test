@@ -63,9 +63,6 @@ make_auto_flush_static_metric! {
         read_index,
         check_leader,
         batch_commands,
-        kv_flush,
-        kv_buffer_batch_get,
-        get_health_feedback,
     }
 
     pub label_enum GcCommandKind {
@@ -100,13 +97,6 @@ make_auto_flush_static_metric! {
     pub label_enum WhetherSuccess {
         success,
         fail,
-    }
-
-    pub label_enum ResourcePriority {
-        high,
-        medium,
-        low,
-        unknown,
     }
 
     pub struct GcCommandCounterVec: LocalIntCounter {
@@ -144,7 +134,6 @@ make_auto_flush_static_metric! {
 
     pub struct GrpcMsgHistogramVec: LocalHistogram {
         "type" => GrpcTypeKind,
-        "priority" => ResourcePriority,
     }
 
     pub struct ReplicaReadLockCheckHistogramVec: LocalHistogram {
@@ -246,7 +235,7 @@ lazy_static! {
     pub static ref GRPC_MSG_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
         "tikv_grpc_msg_duration_seconds",
         "Bucketed histogram of grpc server messages",
-        &["type","priority"],
+        &["type"],
         exponential_buckets(5e-5, 2.0, 22).unwrap() // 50us ~ 104s
     )
     .unwrap();
@@ -413,13 +402,6 @@ lazy_static! {
         &["type", "store_id"]
     )
     .unwrap();
-    pub static ref RAFT_CLIENT_WAIT_CONN_READY_DURATION_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
-        "tikv_server_raft_client_wait_ready_duration",
-        "Duration of wait raft client connection ready",
-        &["to"],
-        exponential_buckets(5e-5, 2.0, 22).unwrap() // 50us ~ 104s
-    )
-    .unwrap();
     pub static ref RAFT_MESSAGE_FLUSH_COUNTER: RaftMessageFlushCounterVec =
         register_static_int_counter_vec!(
             RaftMessageFlushCounterVec,
@@ -465,11 +447,6 @@ lazy_static! {
         "tikv_snapshot_limit_transport_bytes",
         "Total snapshot limit transport used",
         &["type"],
-    )
-    .unwrap();
-    pub static ref MEMORY_LIMIT_GAUGE: Gauge = register_gauge!(
-        "tikv_server_memory_quota_bytes",
-        "Total memory bytes quota for TiKV server"
     )
     .unwrap();
 }
@@ -623,20 +600,4 @@ pub fn record_request_source_metrics(source: String, duration: Duration) {
             metrics.duration_us.flush();
         }
     });
-}
-
-impl From<u64> for ResourcePriority {
-    fn from(priority: u64) -> Self {
-        // the mapping definition of priority in TIDB repo,
-        // see: https://github.com/tikv/tikv/blob/a0dbe2d0b893489015fc99ae73c6646f7989fe32/components/resource_control/src/resource_group.rs#L79-L89
-        if priority == 0 {
-            Self::unknown
-        } else if priority < 6 {
-            Self::low
-        } else if priority < 11 {
-            Self::medium
-        } else {
-            Self::high
-        }
-    }
 }

@@ -23,11 +23,7 @@ use kvproto::{
 use online_config::OnlineConfig;
 use raftstore::{coprocessor::CoprocessorHost, router::CdcRaftRouter};
 use test_raftstore::*;
-use tikv::{
-    config::{CdcConfig, ResolvedTsConfig},
-    server::DEFAULT_CLUSTER_ID,
-    storage::kv::LocalTablets,
-};
+use tikv::{config::CdcConfig, server::DEFAULT_CLUSTER_ID, storage::kv::LocalTablets};
 use tikv_util::{
     config::ReadableDuration,
     memory::MemoryQuota,
@@ -134,7 +130,7 @@ fn create_event_feed(
 }
 
 pub struct TestSuiteBuilder {
-    cluster: Option<Cluster<RocksEngine, ServerCluster<RocksEngine>>>,
+    cluster: Option<Cluster<ServerCluster>>,
     memory_quota: Option<usize>,
 }
 
@@ -147,10 +143,7 @@ impl TestSuiteBuilder {
     }
 
     #[must_use]
-    pub fn cluster(
-        mut self,
-        cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
-    ) -> TestSuiteBuilder {
+    pub fn cluster(mut self, cluster: Cluster<ServerCluster>) -> TestSuiteBuilder {
         self.cluster = Some(cluster);
         self
     }
@@ -167,7 +160,7 @@ impl TestSuiteBuilder {
 
     pub fn build_with_cluster_runner<F>(self, mut runner: F) -> TestSuite
     where
-        F: FnMut(&mut Cluster<RocksEngine, ServerCluster<RocksEngine>>),
+        F: FnMut(&mut Cluster<ServerCluster>),
     {
         init();
         let memory_quota = self.memory_quota.unwrap_or(usize::MAX);
@@ -221,7 +214,6 @@ impl TestSuiteBuilder {
             let mut cdc_endpoint = cdc::Endpoint::new(
                 DEFAULT_CLUSTER_ID,
                 &cfg,
-                &ResolvedTsConfig::default(),
                 false,
                 cluster.cfg.storage.api_version(),
                 pd_cli.clone(),
@@ -257,7 +249,7 @@ impl TestSuiteBuilder {
 }
 
 pub struct TestSuite {
-    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    pub cluster: Cluster<ServerCluster>,
     pub endpoints: HashMap<u64, LazyWorker<Task>>,
     pub obs: HashMap<u64, CdcObserver>,
     tikv_cli: HashMap<u64, TikvClient>,

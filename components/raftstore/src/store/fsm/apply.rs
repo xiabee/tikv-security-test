@@ -29,12 +29,11 @@ use batch_system::{
 use collections::{HashMap, HashMapEntry, HashSet};
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_traits::{
-    util::SequenceNumber, CacheRange, DeleteStrategy, KvEngine, Mutable, PerfContext,
-    PerfContextKind, RaftEngine, RaftEngineReadOnly, Range as EngineRange, Snapshot, SstMetaInfo,
-    WriteBatch, WriteOptions, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
+    util::SequenceNumber, DeleteStrategy, KvEngine, Mutable, PerfContext, PerfContextKind,
+    RaftEngine, RaftEngineReadOnly, Range as EngineRange, Snapshot, SstMetaInfo, WriteBatch,
+    WriteOptions, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
 };
 use fail::fail_point;
-use health_controller::types::LatencyInspector;
 use kvproto::{
     import_sstpb::SstMeta,
     kvrpcpb::ExtraOp as TxnExtraOp,
@@ -93,7 +92,7 @@ use crate::{
         peer_storage::{write_initial_apply_state, write_peer_state},
         util::{
             self, admin_cmd_epoch_lookup, check_flashback_state, check_req_region_epoch,
-            compare_region_epoch, ChangePeerI, ConfChangeKind, KeysInfoFormatter,
+            compare_region_epoch, ChangePeerI, ConfChangeKind, KeysInfoFormatter, LatencyInspector,
         },
         Config, RegionSnapshot, RegionTask, WriteCallback,
     },
@@ -318,9 +317,6 @@ pub enum ExecResult<S> {
     // and try to compact pending gc. If false, raftstore does not do any additional
     // processing.
     HasPendingCompactCmd(bool),
-    UnsafeForceCompact {
-        apply_state: RaftApplyState,
-    },
 }
 
 /// The possible returned value when applying logs.
@@ -396,7 +392,7 @@ where
     tag: String,
     timer: Option<Instant>,
     host: CoprocessorHost<EK>,
-    importer: Arc<SstImporter<EK>>,
+    importer: Arc<SstImporter>,
     region_scheduler: Scheduler<RegionTask<EK::Snapshot>>,
     router: ApplyRouter<EK>,
     notifier: Box<dyn Notifier<EK>>,
@@ -455,8 +451,6 @@ where
     pending_latency_inspect: Vec<LatencyInspector>,
     apply_wait: LocalHistogram,
     apply_time: LocalHistogram,
-    key_size: LocalHistogram,
-    value_size: LocalHistogram,
 
     key_buffer: Vec<u8>,
 
@@ -481,7 +475,7 @@ where
     pub fn new(
         tag: String,
         host: CoprocessorHost<EK>,
-        importer: Arc<SstImporter<EK>>,
+        importer: Arc<SstImporter>,
         region_scheduler: Scheduler<RegionTask<EK::Snapshot>>,
         engine: EK,
         router: ApplyRouter<EK>,
@@ -525,8 +519,6 @@ where
             pending_latency_inspect: vec![],
             apply_wait: APPLY_TASK_WAIT_TIME_HISTOGRAM.local(),
             apply_time: APPLY_TIME_HISTOGRAM.local(),
-            key_size: STORE_APPLY_KEY_SIZE_HISTOGRAM.local(),
-            value_size: STORE_APPLY_VALUE_SIZE_HISTOGRAM.local(),
             key_buffer: Vec::with_capacity(1024),
             disable_wal: false,
             uncommitted_res_count: 0,
@@ -542,8 +534,6 @@ where
     pub fn prepare_for(&mut self, delegate: &mut ApplyDelegate<EK>) {
         self.applied_batch
             .push_batch(&delegate.observe_info, delegate.region.get_id());
-        let range = CacheRange::from_region(&delegate.region);
-        self.kv_wb.prepare_for_range(range);
     }
 
     /// Commits all changes have done for delegate. `persistent` indicates
@@ -656,8 +646,6 @@ where
         }
         self.apply_time.flush();
         self.apply_wait.flush();
-        self.key_size.flush();
-        self.value_size.flush();
         let res_count = self.uncommitted_res_count;
         self.uncommitted_res_count = 0;
         if let Some(seqno) = seqno {
@@ -1282,9 +1270,9 @@ where
             apply_ctx.host.on_empty_cmd(&self.region, index, term);
 
             // 1. When a peer become leader, it will send an empty entry.
-            // 2. When a leader tries to read index during transferring leader, it will also
-            //    propose an empty entry. But that entry will not contain any associated
-            //    callback. So no need to clear callback.
+            // 2. When a leader tries to read index during transferring leader,
+            //    it will also propose an empty entry. But that entry will not contain
+            //    any associated callback. So no need to clear callback.
             while let Some(mut cmd) = self.pending_cmds.pop_normal(u64::MAX, term - 1) {
                 if let Some(cb) = cmd.cb.take() {
                     apply_ctx
@@ -1568,8 +1556,7 @@ where
                 | ExecResult::DeleteRange { .. }
                 | ExecResult::IngestSst { .. }
                 | ExecResult::TransferLeader { .. }
-                | ExecResult::HasPendingCompactCmd(..)
-                | ExecResult::UnsafeForceCompact { .. } => {}
+                | ExecResult::HasPendingCompactCmd(..) => {}
                 ExecResult::SplitRegion { ref derived, .. } => {
                     self.region = derived.clone();
                     self.metrics.size_diff_hint = 0;
@@ -1828,7 +1815,6 @@ where
     EK: KvEngine,
 {
     fn handle_put(&mut self, ctx: &mut ApplyContext<EK>, req: &Request) -> Result<()> {
-        fail::fail_point!("on_handle_put");
         PEER_WRITE_CMD_COUNTER.put.inc();
         let (key, value) = (req.get_put().get_key(), req.get_put().get_value());
         // region key range has no data prefix, so we must use origin key to check.
@@ -1842,8 +1828,6 @@ where
 
         self.metrics.size_diff_hint += key.len() as i64;
         self.metrics.size_diff_hint += value.len() as i64;
-        ctx.key_size.observe(key.len() as f64);
-        ctx.value_size.observe(value.len() as f64);
         if !req.get_put().get_cf().is_empty() {
             let cf = req.get_put().get_cf();
             // TODO: don't allow write preseved cfs.
@@ -2492,8 +2476,8 @@ where
             "region_id" => self.region_id(),
             "peer_id" => self.id(),
             "changes" => ?changes,
-            "original_region" => ?&self.region,
-            "current_region" => ?&region,
+            "original region" => ?&self.region,
+            "current region" => ?&region,
         );
         Ok(region)
     }
@@ -2812,13 +2796,6 @@ where
         fail_point!("apply_after_prepare_merge");
         PEER_ADMIN_CMD_COUNTER.prepare_merge.success.inc();
 
-        let range = CacheRange::from_region(&region);
-        info!(
-            "evict range due to prepare merge";
-            "source_range" => ?range,
-        );
-        ctx.engine.evict_range(&range);
-
         Ok((
             AdminResponse::default(),
             ApplyResult::Res(ExecResult::PrepareMerge {
@@ -2967,13 +2944,6 @@ where
             });
 
         PEER_ADMIN_CMD_COUNTER.commit_merge.success.inc();
-
-        let range = CacheRange::from_region(&region);
-        info!(
-            "evict range due to commit merge";
-            "range" => ?range,
-        );
-        ctx.engine.evict_range(&range);
 
         let resp = AdminResponse::default();
         Ok((
@@ -3284,7 +3254,7 @@ where
                     // open files in rocksdb.
                     // TODO: figure out another way to do consistency check without snapshot
                     // or short life snapshot.
-                    snap: ctx.engine.snapshot(None),
+                    snap: ctx.engine.snapshot(),
                 })
             },
         ))
@@ -3375,8 +3345,8 @@ where
             "region_id" => self.region_id(),
             "peer_id" => self.id(),
             "switches" => ?switches,
-            "original_region" => ?&self.region,
-            "current_region" => ?&region,
+            "original region" => ?&self.region,
+            "current region" => ?&region,
         );
 
         let state = if self.pending_remove {
@@ -3403,10 +3373,10 @@ where
     }
 
     fn update_memory_trace(&mut self, event: &mut TraceEvent) {
-        let pending_cmds = self.pending_cmds.approximate_heap_size();
+        let pending_cmds = self.pending_cmds.heap_size();
         let merge_yield = if let Some(ref mut state) = self.yield_state {
             if state.heap_size.is_none() {
-                state.heap_size = Some(state.approximate_heap_size());
+                state.heap_size = Some(state.heap_size());
             }
             state.heap_size.unwrap()
         } else {
@@ -3663,10 +3633,8 @@ pub struct GenSnapTask {
     snap_notifier: SyncSender<RaftSnapshot>,
     // indicates whether the snapshot is triggered due to load balance
     for_balance: bool,
-    // the peer the snapshot will be sent to
-    pub to_peer: metapb::Peer,
-    // Tracks remaining iterations before sending a snapshot precheck request.
-    pub precheck_remaining_ticks: usize,
+    // the store id the snapshot will be sent to
+    to_store_id: u64,
 }
 
 impl GenSnapTask {
@@ -3675,7 +3643,7 @@ impl GenSnapTask {
         index: Arc<AtomicU64>,
         canceled: Arc<AtomicBool>,
         snap_notifier: SyncSender<RaftSnapshot>,
-        to_peer: metapb::Peer,
+        to_store_id: u64,
     ) -> GenSnapTask {
         GenSnapTask {
             region_id,
@@ -3683,8 +3651,7 @@ impl GenSnapTask {
             canceled,
             snap_notifier,
             for_balance: false,
-            to_peer,
-            precheck_remaining_ticks: 0,
+            to_store_id,
         }
     }
 
@@ -3714,7 +3681,7 @@ impl GenSnapTask {
             // This snapshot may be held for a long time, which may cause too many
             // open files in rocksdb.
             kv_snap,
-            to_store_id: self.to_peer.store_id,
+            to_store_id: self.to_store_id,
         };
         box_try!(region_sched.schedule(snapshot));
         Ok(())
@@ -3802,18 +3769,10 @@ where
         voter_replicated_index: u64,
         voter_replicated_term: u64,
     },
-    UnsafeForceCompact {
-        region_id: u64,
-        term: u64,
-        compact_index: u64,
-    },
 }
 
 impl<EK: KvEngine> ResourceMetered for Msg<EK> {
     fn consume_resource(&self, resource_ctl: &Arc<ResourceController>) -> Option<String> {
-        if !resource_ctl.is_customized() {
-            return None;
-        }
         match self {
             Msg::Apply { apply, .. } => {
                 let mut dominant_group = "".to_owned();
@@ -3895,17 +3854,6 @@ where
                     f,
                     "[region {}] check compact, voter_replicated_index: {}, voter_replicated_term: {}",
                     region_id, voter_replicated_index, voter_replicated_term
-                )
-            }
-            Msg::UnsafeForceCompact {
-                region_id,
-                term,
-                compact_index,
-            } => {
-                write!(
-                    f,
-                    "[region {}] force compact, term: {} compact_index: {}",
-                    region_id, term, compact_index
                 )
             }
         }
@@ -4260,7 +4208,7 @@ where
         }
 
         if let Err(e) = snap_task.generate_and_schedule_snapshot::<EK>(
-            apply_ctx.engine.snapshot(None),
+            apply_ctx.engine.snapshot(),
             self.delegate.applied_term,
             self.delegate.apply_state.clone(),
             &apply_ctx.region_scheduler,
@@ -4332,7 +4280,7 @@ where
                 ReadResponse {
                     response: Default::default(),
                     snapshot: Some(RegionSnapshot::from_snapshot(
-                        Arc::new(apply_ctx.engine.snapshot(None)),
+                        Arc::new(apply_ctx.engine.snapshot()),
                         Arc::new(self.delegate.region.clone()),
                     )),
                     txn_extra_op: TxnExtraOp::Noop,
@@ -4400,30 +4348,6 @@ where
                 "peer_id" => self.delegate.id(),
             ),
         }
-    }
-
-    // Force advance compact index to the current applied_index. This function
-    // should only be used in the online unsafe recovery scenario to recover the
-    // raft state when applied index is larger than raft last index.
-    fn unsafe_force_compact(&mut self, ctx: &mut ApplyContext<EK>, term: u64, compact_index: u64) {
-        assert_eq!(self.delegate.apply_state.applied_index, compact_index);
-        if self.delegate.apply_state.get_truncated_state().index < compact_index {
-            assert!(self.delegate.apply_state.get_truncated_state().term <= term);
-
-            info!("unsafe force compact"; "apply_state" => ?&self.delegate.apply_state, "term" => term,
-                "compact_index" => compact_index);
-
-            self.delegate.apply_state.mut_truncated_state().index = compact_index;
-        }
-
-        if ctx.timer.is_none() {
-            ctx.timer = Some(Instant::now_coarse());
-        }
-        let mut result = VecDeque::with_capacity(1);
-        result.push_back(ExecResult::UnsafeForceCompact {
-            apply_state: self.delegate.apply_state.clone(),
-        });
-        ctx.finish_for(&mut self.delegate, result);
     }
 
     fn handle_tasks(&mut self, apply_ctx: &mut ApplyContext<EK>, msgs: &mut Vec<Msg<EK>>) {
@@ -4511,13 +4435,6 @@ where
                         voter_replicated_index,
                         voter_replicated_term,
                     );
-                }
-                Msg::UnsafeForceCompact {
-                    term,
-                    compact_index,
-                    ..
-                } => {
-                    self.unsafe_force_compact(apply_ctx, term, compact_index);
                 }
             }
         }
@@ -4754,7 +4671,7 @@ pub struct Builder<EK: KvEngine> {
     tag: String,
     cfg: Arc<VersionTrack<Config>>,
     coprocessor_host: CoprocessorHost<EK>,
-    importer: Arc<SstImporter<EK>>,
+    importer: Arc<SstImporter>,
     region_scheduler: Scheduler<RegionTask<<EK as KvEngine>::Snapshot>>,
     engine: EK,
     sender: Box<dyn Notifier<EK>>,
@@ -4880,12 +4797,12 @@ where
                     // command may not read the writes of previous commands and break ACID. If
                     // it's still leader, there are two possibility that mailbox is closed:
                     // 1. The process is shutting down.
-                    // 2. The leader is destroyed. A leader won't propose to destroy itself, so it
-                    //    should either destroyed by older leaders or newer leaders. Leader won't
-                    //    respond to read until it has applied to current term, so no command will
-                    //    be proposed until command from older leaders have applied, which will then
-                    //    stop it from accepting proposals. If the command is proposed by new
-                    //    leader, then it won't be able to propose new proposals.
+                    // 2. The leader is destroyed. A leader won't propose to destroy itself, so
+                    //     it should either destroyed by older leaders or newer leaders. Leader
+                    //     won't respond to read until it has applied to current term, so no
+                    //     command will be proposed until command from older leaders have applied,
+                    //     which will then stop it from accepting proposals. If the command is
+                    //     proposed by new leader, then it won't be able to propose new proposals.
                     // So only shutdown needs to be checked here.
                     if !tikv_util::thread_group::is_shutdown(!cfg!(test)) {
                         for p in apply.cbs.drain(..) {
@@ -4941,11 +4858,6 @@ where
                 }
                 Msg::CheckCompact { region_id, .. } => {
                     info!("target region is not found";
-                            "region_id" => region_id);
-                    return;
-                }
-                Msg::UnsafeForceCompact { region_id, .. } => {
-                    info!("skip force compact because target region is not found";
                             "region_id" => region_id);
                     return;
                 }
@@ -5042,7 +4954,7 @@ mod memtrace {
     }
 
     impl<C> HeapSize for PendingCmdQueue<C> {
-        fn approximate_heap_size(&self) -> usize {
+        fn heap_size(&self) -> usize {
             // Some fields of `PendingCmd` are on stack, but ignore them because they are
             // just some small boxed closures.
             self.normals.capacity() * mem::size_of::<PendingCmd<C>>()
@@ -5053,7 +4965,7 @@ mod memtrace {
     where
         EK: KvEngine,
     {
-        fn approximate_heap_size(&self) -> usize {
+        fn heap_size(&self) -> usize {
             let mut size = self.pending_entries.capacity() * mem::size_of::<Entry>();
             for e in &self.pending_entries {
                 size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
@@ -5061,7 +4973,7 @@ mod memtrace {
 
             size += self.pending_msgs.capacity() * mem::size_of::<Msg<EK>>();
             for msg in &self.pending_msgs {
-                size += msg.approximate_heap_size();
+                size += msg.heap_size();
             }
 
             size
@@ -5073,9 +4985,9 @@ mod memtrace {
         EK: KvEngine,
     {
         /// Only consider large fields in `Msg`.
-        fn approximate_heap_size(&self) -> usize {
+        fn heap_size(&self) -> usize {
             match self {
-                Msg::LogsUpToDate(l) => l.approximate_heap_size(),
+                Msg::LogsUpToDate(l) => l.heap_size(),
                 // For entries in `Msg::Apply`, heap size is already updated when fetching them
                 // from `raft::Storage`. So use `0` here.
                 Msg::Apply { .. } => 0,
@@ -5088,13 +5000,12 @@ mod memtrace {
                 Msg::Validate(..) => 0,
                 Msg::Recover(..) => 0,
                 Msg::CheckCompact { .. } => 0,
-                Msg::UnsafeForceCompact { .. } => 0,
             }
         }
     }
 
     impl HeapSize for CatchUpLogs {
-        fn approximate_heap_size(&self) -> usize {
+        fn heap_size(&self) -> usize {
             let mut size: usize = 0;
             for e in &self.merge.entries {
                 size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
@@ -5151,13 +5062,7 @@ mod tests {
         fn new_for_test(region_id: u64, snap_notifier: SyncSender<RaftSnapshot>) -> GenSnapTask {
             let index = Arc::new(AtomicU64::new(0));
             let canceled = Arc::new(AtomicBool::new(false));
-            Self::new(
-                region_id,
-                index,
-                canceled,
-                snap_notifier,
-                metapb::Peer::default(),
-            )
+            Self::new(region_id, index, canceled, snap_notifier, 0)
         }
     }
 
@@ -5167,7 +5072,7 @@ mod tests {
         (path, engine)
     }
 
-    pub fn create_tmp_importer(path: &str) -> (TempDir, Arc<SstImporter<KvTestEngine>>) {
+    pub fn create_tmp_importer(path: &str) -> (TempDir, Arc<SstImporter>) {
         let dir = Builder::new().prefix(path).tempdir().unwrap();
         let importer = Arc::new(
             SstImporter::new(
@@ -7238,7 +7143,7 @@ mod tests {
             share_source_region_size: _,
         } = apply_res.exec_res.front().unwrap()
         {
-            let r8 = regions.first().unwrap();
+            let r8 = regions.get(0).unwrap();
             let r1 = regions.get(1).unwrap();
             assert_eq!(r8.get_id(), 8);
             assert_eq!(r1.get_id(), 1);

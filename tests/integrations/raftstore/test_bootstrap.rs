@@ -6,12 +6,10 @@ use std::{
 };
 
 use concurrency_manager::ConcurrencyManager;
-use engine_rocks::RocksEngine;
 use engine_traits::{
     DbOptionsExt, Engines, MiscExt, Peekable, RaftEngine, RaftEngineReadOnly, ALL_CFS, CF_DEFAULT,
     CF_LOCK, CF_RAFT, CF_WRITE,
 };
-use health_controller::HealthController;
 use kvproto::{kvrpcpb::ApiVersion, metapb, raft_serverpb::RegionLocalState};
 use raftstore::{
     coprocessor::CoprocessorHost,
@@ -23,13 +21,13 @@ use service::service_manager::GrpcServiceManager;
 use tempfile::Builder;
 use test_pd_client::{bootstrap_with_first_region, TestPdClient};
 use test_raftstore::*;
-use tikv::{import::SstImporter, server::MultiRaftServer};
+use tikv::{import::SstImporter, server::Node};
 use tikv_util::{
     config::VersionTrack,
     worker::{dummy_scheduler, Builder as WorkerBuilder, LazyWorker},
 };
 
-fn test_bootstrap_idempotent<T: Simulator<RocksEngine>>(cluster: &mut Cluster<RocksEngine, T>) {
+fn test_bootstrap_idempotent<T: Simulator>(cluster: &mut Cluster<T>) {
     // assume that there is a node  bootstrap the cluster and add region in pd
     // successfully
     cluster.add_first_region().unwrap();
@@ -51,8 +49,7 @@ fn test_node_bootstrap_with_prepared_data() {
     let cfg = new_tikv_config(0);
 
     let (_, system) = fsm::create_raft_batch_system(&cfg.raft_store, &None);
-    let simulate_trans =
-        SimulateTransport::<_, RocksEngine>::new(ChannelTransport::<RocksEngine>::new());
+    let simulate_trans = SimulateTransport::new(ChannelTransport::new());
     let tmp_path = Builder::new().prefix("test_cluster").tempdir().unwrap();
     let engine =
         engine_rocks::util::new_engine(tmp_path.path().to_str().unwrap(), ALL_CFS).unwrap();
@@ -62,7 +59,7 @@ fn test_node_bootstrap_with_prepared_data() {
     let engines = Engines::new(engine.clone(), raft_engine);
     let tmp_mgr = Builder::new().prefix("test_cluster").tempdir().unwrap();
     let bg_worker = WorkerBuilder::new("background").thread_count(2).create();
-    let mut node = MultiRaftServer::new(
+    let mut node = Node::new(
         system,
         &cfg.server,
         Arc::new(VersionTrack::new(cfg.raft_store.clone())),
@@ -70,7 +67,7 @@ fn test_node_bootstrap_with_prepared_data() {
         Arc::clone(&pd_client),
         Arc::default(),
         bg_worker,
-        HealthController::new(),
+        None,
         None,
     );
     let snap_mgr = SnapManager::new(tmp_mgr.path().to_str().unwrap());
@@ -290,8 +287,8 @@ fn test_flush_before_stop2() {
 // 1. lock `k` with index 6
 // 2. on_applied_res => lockcf's last_modified = 6
 // 3. flush lock cf => lockcf's flushed_index = 6
-// 4. batch {unlock `k`, write `k`} with index 7 (last_modified is updated in
-//    store but RocksDB is modified in apply. So,
+// 4. batch {unlock `k`, write `k`} with index 7
+//    (last_modified is updated in store but RocksDB is modified in apply. So,
 // before on_apply_res, the last_modified is not updated.)
 //
 // flush-before-close:

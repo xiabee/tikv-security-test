@@ -22,10 +22,7 @@ command! {
     /// Resolve locks on `resolve_keys` according to `start_ts` and `commit_ts`.
     ResolveLockLite:
         cmd_ty => (),
-        display => {
-            "kv::resolve_lock_lite resolve_keys({:?}) {} {} | {:?}",
-            (resolve_keys, start_ts, commit_ts, ctx),
-        }
+        display => "kv::resolve_lock_lite resolve_keys({:?}) {} {} | {:?}", (resolve_keys, start_ts, commit_ts, ctx),
         content => {
             /// The transaction timestamp.
             start_ts: TimeStamp,
@@ -33,9 +30,6 @@ command! {
             commit_ts: TimeStamp,
             /// The keys to resolve.
             resolve_keys: Vec<Key>,
-        }
-        in_heap => {
-            resolve_keys,
         }
 }
 

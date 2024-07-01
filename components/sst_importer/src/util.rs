@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use encryption::DataKeyManager;
-use external_storage::ExternalStorage;
+use engine_traits::EncryptionKeyManager;
+use external_storage_export::ExternalStorage;
 use file_system::File;
 
 use super::Result;
@@ -96,7 +97,6 @@ pub fn copy_sst_for_ingestion<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let mut pmts = file_system::metadata(clone)?.permissions();
     if pmts.readonly() {
-        #[allow(clippy::permissions_set_readonly_false)]
         pmts.set_readonly(false);
         file_system::set_permissions(clone, pmts)?;
     }
@@ -127,8 +127,8 @@ mod tests {
         RocksTitanDbOptions,
     };
     use engine_traits::{
-        CfName, CfOptions, DbOptions, ImportExt, Peekable, SstWriter, SstWriterBuilder,
-        TitanCfOptions, CF_DEFAULT,
+        CfName, CfOptions, DbOptions, EncryptionKeyManager, ImportExt, Peekable, SstWriter,
+        SstWriterBuilder, TitanCfOptions, CF_DEFAULT,
     };
     use tempfile::Builder;
     use test_util::encryption::new_test_key_manager;

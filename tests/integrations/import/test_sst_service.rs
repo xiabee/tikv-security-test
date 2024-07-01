@@ -8,10 +8,7 @@ use pd_client::PdClient;
 use tempfile::Builder;
 use test_sst_importer::*;
 use tikv::config::TikvConfig;
-use tikv_util::{
-    config::ReadableSize,
-    sys::disk::{set_disk_status, DiskUsage},
-};
+use tikv_util::config::ReadableSize;
 
 use super::util::*;
 
@@ -39,14 +36,6 @@ fn test_upload_sst() {
     let meta = new_sst_meta(0, length);
     assert_to_string_contains!(send_upload_sst(&import, &meta, &data).unwrap_err(), "crc32");
 
-    // diskfull
-    set_disk_status(DiskUsage::AlmostFull);
-    assert_to_string_contains!(
-        send_upload_sst(&import, &meta, &data).unwrap_err(),
-        "DiskSpaceNotEnough"
-    );
-    set_disk_status(DiskUsage::Normal);
-
     let mut meta = new_sst_meta(crc32, length);
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
@@ -59,12 +48,7 @@ fn test_upload_sst() {
     );
 }
 
-fn run_test_write_sst(
-    ctx: Context,
-    tikv: TikvClient,
-    import: ImportSstClient,
-    expected_error: &str,
-) {
+fn run_test_write_sst(ctx: Context, tikv: TikvClient, import: ImportSstClient) {
     let mut meta = new_sst_meta(0, 0);
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
@@ -76,15 +60,14 @@ fn run_test_write_sst(
         keys.push(vec![i]);
         values.push(vec![i]);
     }
-    let resp = send_write_sst(&import, &meta, keys, values, 1);
-    if !expected_error.is_empty() {
-        assert_to_string_contains!(resp.unwrap_err(), expected_error);
-        return;
-    }
+    let resp = send_write_sst(&import, &meta, keys, values, 1).unwrap();
 
-    let resp = resp.unwrap();
     for m in resp.metas.into_iter() {
-        must_ingest_sst(&import, ctx.clone(), m.clone());
+        let mut ingest = IngestRequest::default();
+        ingest.set_context(ctx.clone());
+        ingest.set_sst(m.clone());
+        let resp = import.ingest(&ingest).unwrap();
+        assert!(!resp.has_error());
     }
     check_ingested_txn_kvs(&tikv, &ctx, sst_range, 2);
 }
@@ -93,21 +76,13 @@ fn run_test_write_sst(
 fn test_write_sst() {
     let (_cluster, ctx, tikv, import) = new_cluster_and_tikv_import_client();
 
-    run_test_write_sst(ctx, tikv, import, "");
-}
-
-#[test]
-fn test_write_sst_when_disk_full() {
-    set_disk_status(DiskUsage::AlmostFull);
-    let (_cluster, ctx, tikv, import) = new_cluster_and_tikv_import_client();
-    run_test_write_sst(ctx, tikv, import, "DiskSpaceNotEnough");
-    set_disk_status(DiskUsage::Normal);
+    run_test_write_sst(ctx, tikv, import);
 }
 
 #[test]
 fn test_write_and_ingest_with_tde() {
     let (_tmp_dir, _cluster, ctx, tikv, import) = new_cluster_and_tikv_import_client_tde();
-    run_test_write_sst(ctx, tikv, import, "");
+    run_test_write_sst(ctx, tikv, import);
 }
 
 #[test]
@@ -133,7 +108,11 @@ fn test_ingest_sst() {
     // No region id and epoch.
     send_upload_sst(&import, &meta, &data).unwrap();
 
-    must_ingest_sst_error(&import, ctx.clone(), meta.clone());
+    let mut ingest = IngestRequest::default();
+    ingest.set_context(ctx.clone());
+    ingest.set_sst(meta.clone());
+    let resp = import.ingest(&ingest).unwrap();
+    assert!(resp.has_error());
 
     // Set region id and epoch.
     meta.set_region_id(ctx.get_region_id());
@@ -144,7 +123,10 @@ fn test_ingest_sst() {
         send_upload_sst(&import, &meta, &data).unwrap_err(),
         "FileExists"
     );
-    must_ingest_sst(&import, ctx.clone(), meta.clone());
+
+    ingest.set_sst(meta);
+    let resp = import.ingest(&ingest).unwrap();
+    assert!(!resp.has_error(), "{:?}", resp.get_error());
 
     for _ in 0..10 {
         let region_keys = cluster
@@ -261,7 +243,11 @@ fn test_upload_and_ingest_with_tde() {
     meta.set_region_epoch(ctx.get_region_epoch().clone());
     send_upload_sst(&import, &meta, &data).unwrap();
 
-    must_ingest_sst(&import, ctx.clone(), meta);
+    let mut ingest = IngestRequest::default();
+    ingest.set_context(ctx.clone());
+    ingest.set_sst(meta);
+    let resp = import.ingest(&ingest).unwrap();
+    assert!(!resp.has_error(), "{:?}", resp.get_error());
 
     check_ingested_kvs(&tikv, &ctx, sst_range);
 }
@@ -285,7 +271,11 @@ fn test_ingest_sst_without_crc32() {
     send_upload_sst(&import, &meta, &data).unwrap();
     meta.set_crc32(0);
 
-    must_ingest_sst(&import, ctx.clone(), meta);
+    let mut ingest = IngestRequest::default();
+    ingest.set_context(ctx.clone());
+    ingest.set_sst(meta);
+    let resp = import.ingest(&ingest).unwrap();
+    assert!(!resp.has_error(), "{:?}", resp.get_error());
 
     // Check ingested kvs
     check_ingested_kvs(&tikv, &ctx, sst_range);
@@ -308,7 +298,7 @@ fn test_download_sst() {
     // Checks that downloading a non-existing storage returns error.
     let mut download = DownloadRequest::default();
     download.set_sst(meta.clone());
-    download.set_storage_backend(external_storage::make_local_backend(temp_dir.path()));
+    download.set_storage_backend(external_storage_export::make_local_backend(temp_dir.path()));
     download.set_name("missing.sst".to_owned());
 
     let result = import.download(&download).unwrap();
@@ -338,7 +328,11 @@ fn test_download_sst() {
 
     // Do an ingest and verify the result is correct.
 
-    must_ingest_sst(&import, ctx.clone(), meta);
+    let mut ingest = IngestRequest::default();
+    ingest.set_context(ctx.clone());
+    ingest.set_sst(meta);
+    let resp = import.ingest(&ingest).unwrap();
+    assert!(!resp.has_error());
 
     check_ingested_kvs(&tikv, &ctx, sst_range);
 }
@@ -526,7 +520,11 @@ fn test_duplicate_and_close() {
         }
         let resp = send_write_sst(&import, &meta, keys, values, commit_ts).unwrap();
         for m in resp.metas.into_iter() {
-            must_ingest_sst(&import, ctx.clone(), m.clone());
+            let mut ingest = IngestRequest::default();
+            ingest.set_context(ctx.clone());
+            ingest.set_sst(m.clone());
+            let resp = import.ingest(&ingest).unwrap();
+            assert!(!resp.has_error());
         }
     }
 

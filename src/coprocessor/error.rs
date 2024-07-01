@@ -2,7 +2,6 @@
 
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use thiserror::Error;
-use tikv_util::memory::MemoryQuotaExceeded;
 
 use crate::{
     storage,
@@ -26,9 +25,6 @@ pub enum Error {
 
     #[error("Coprocessor task canceled due to exceeding max pending tasks")]
     MaxPendingTasksExceeded,
-
-    #[error("Coprocessor task canceled due to exceeding memory quota")]
-    MemoryQuotaExceeded,
 
     #[error("{0}")]
     Other(String),
@@ -121,12 +117,6 @@ impl From<tidb_query_datatype::codec::Error> for Error {
     }
 }
 
-impl From<MemoryQuotaExceeded> for Error {
-    fn from(_: MemoryQuotaExceeded) -> Self {
-        Error::MemoryQuotaExceeded
-    }
-}
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl ErrorCodeExt for Error {
@@ -136,7 +126,6 @@ impl ErrorCodeExt for Error {
             Error::Locked(_) => error_code::coprocessor::LOCKED,
             Error::DeadlineExceeded => error_code::coprocessor::DEADLINE_EXCEEDED,
             Error::MaxPendingTasksExceeded => error_code::coprocessor::MAX_PENDING_TASKS_EXCEEDED,
-            Error::MemoryQuotaExceeded => error_code::coprocessor::MEMORY_QUOTA_EXCEEDED,
             Error::Other(_) => error_code::UNKNOWN,
         }
     }

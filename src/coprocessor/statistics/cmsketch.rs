@@ -58,12 +58,10 @@ impl CmSketch {
     pub fn push_to_top_n(&mut self, b: Vec<u8>, cnt: u64) {
         self.top_n.push((b, cnt))
     }
-}
 
-impl From<CmSketch> for tipb::CmSketch {
-    fn from(cm: CmSketch) -> tipb::CmSketch {
+    pub fn into_proto(self) -> tipb::CmSketch {
         let mut proto = tipb::CmSketch::default();
-        let rows = cm
+        let rows = self
             .table
             .into_iter()
             .map(|row| {
@@ -73,7 +71,7 @@ impl From<CmSketch> for tipb::CmSketch {
             })
             .collect();
         proto.set_rows(rows);
-        let top_n_data = cm
+        let top_n_data = self
             .top_n
             .into_iter()
             .map(|(item, cnt)| {

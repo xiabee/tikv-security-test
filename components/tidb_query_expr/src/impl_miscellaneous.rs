@@ -58,7 +58,7 @@ pub fn inet_aton(addr: BytesRef) -> Result<Option<Int>> {
     }
     let (mut byte_result, mut result, mut dot_count): (u64, u64, usize) = (0, 0, 0);
     for c in addr.chars() {
-        if c.is_ascii_digit() {
+        if ('0'..='9').contains(&c) {
             let digit = c as u64 - '0' as u64;
             byte_result = byte_result * 10 + digit;
             if byte_result > 255 {
@@ -502,8 +502,7 @@ mod tests {
             (Some(hex("0A000509")), Some(b"10.0.5.9".to_vec())),
             (
                 Some(hex("00000000000000000000000001020304")),
-                // See https://github.com/rust-lang/libs-team/issues/239
-                Some(b"::102:304".to_vec()),
+                Some(b"::1.2.3.4".to_vec()),
             ),
             (
                 Some(hex("00000000000000000000FFFF01020304")),
@@ -530,12 +529,12 @@ mod tests {
             (None, None),
         ];
 
-        for (i, (input, expect_output)) in test_cases.into_iter().enumerate() {
+        for (input, expect_output) in test_cases {
             let output = RpnFnScalarEvaluator::new()
                 .push_param(input)
                 .evaluate::<Bytes>(ScalarFuncSig::Inet6Ntoa)
                 .unwrap();
-            assert_eq!(output, expect_output, "case {}", i);
+            assert_eq!(output, expect_output);
         }
     }
 

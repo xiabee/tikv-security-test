@@ -7,7 +7,7 @@
 
 use crate::{
     cf_names::CfNamesExt, errors::Result, flow_control_factors::FlowControlFactorsExt,
-    range::Range, KvEngine, WriteBatchExt, WriteOptions,
+    range::Range, WriteBatchExt, WriteOptions,
 };
 
 #[derive(Clone, Debug)]
@@ -184,7 +184,4 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
         }
         Ok(n)
     }
-
-    type DiskEngine: KvEngine;
-    fn get_disk_engine(&self) -> &Self::DiskEngine;
 }

@@ -6,13 +6,8 @@ use ::tracker::{get_tls_tracker_token, with_tls_tracker};
 use engine_traits::{PerfContext, PerfContextExt, PerfContextKind};
 use kvproto::{kvrpcpb, kvrpcpb::ScanDetailV2};
 use pd_client::BucketMeta;
-use protobuf::Message;
 use tikv_kv::Engine;
-use tikv_util::{
-    memory::HeapSize,
-    time::{self, Duration, Instant},
-};
-use tipb::ResourceGroupTag;
+use tikv_util::time::{self, Duration, Instant};
 use txn_types::Key;
 
 use super::metrics::*;
@@ -271,14 +266,9 @@ impl<E: Engine> Tracker<E> {
 
             let source_stmt = self.req_ctx.context.get_source_stmt();
             with_tls_tracker(|tracker| {
-                let mut req_tag = ResourceGroupTag::new();
-                req_tag
-                    .merge_from_bytes(&tracker.req_info.resource_group_tag)
-                    .unwrap_or_default();
                 info!(#"slow_log", "slow-query";
                     "connection_id" => source_stmt.get_connection_id(),
                     "session_alias" => source_stmt.get_session_alias(),
-                    "query_digest" => hex::encode(req_tag.get_sql_digest()),
                     "region_id" => &self.req_ctx.context.get_region_id(),
                     "remote_host" => &self.req_ctx.peer,
                     "total_lifetime" => ?self.req_lifetime,
@@ -474,16 +464,6 @@ impl<E: Engine> Drop for Tracker<E> {
                 "tag" => self.req_ctx.tag.get_str(),
             );
         }
-    }
-}
-
-impl<E: Engine> HeapSize for Tracker<E> {
-    fn approximate_heap_size(&self) -> usize {
-        self.req_ctx.approximate_heap_size()
-            + self
-                .buckets
-                .as_ref()
-                .map_or(0, |b| b.approximate_heap_size())
     }
 }
 

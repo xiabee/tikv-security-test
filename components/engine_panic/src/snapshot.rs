@@ -3,8 +3,8 @@
 use std::ops::Deref;
 
 use engine_traits::{
-    CfNamesExt, IterMetricsCollector, IterOptions, Iterable, Iterator, MetricsExt, Peekable,
-    ReadOptions, Result, Snapshot, SnapshotMiscExt,
+    CfNamesExt, IterOptions, Iterable, Iterator, Peekable, ReadOptions, Result, Snapshot,
+    SnapshotMiscExt,
 };
 
 use crate::{db_vector::PanicDbVector, engine::PanicEngine};
@@ -84,25 +84,6 @@ impl Iterator for PanicSnapshotIterator {
 
 impl SnapshotMiscExt for PanicSnapshot {
     fn sequence_number(&self) -> u64 {
-        panic!()
-    }
-}
-
-pub struct PanicSnapshotIterMetricsCollector;
-
-impl IterMetricsCollector for PanicSnapshotIterMetricsCollector {
-    fn internal_delete_skipped_count(&self) -> u64 {
-        panic!()
-    }
-
-    fn internal_key_skipped_count(&self) -> u64 {
-        panic!()
-    }
-}
-
-impl MetricsExt for PanicSnapshotIterator {
-    type Collector = PanicSnapshotIterMetricsCollector;
-    fn metrics_collector(&self) -> Self::Collector {
         panic!()
     }
 }
