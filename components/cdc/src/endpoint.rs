@@ -36,7 +36,7 @@ use raftstore::{
 use resolved_ts::{resolve_by_raft, LeadershipResolver, Resolver};
 use security::SecurityManager;
 use tikv::{
-    config::CdcConfig,
+    config::{CdcConfig, ResolvedTsConfig},
     storage::{kv::LocalTablets, Statistics},
 };
 use tikv_util::{
@@ -378,6 +378,7 @@ pub struct Endpoint<T, E, S> {
 
     raftstore_v2: bool,
     config: CdcConfig,
+    resolved_ts_config: ResolvedTsConfig,
     api_version: ApiVersion,
 
     // Incremental scan
@@ -407,6 +408,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
     pub fn new(
         cluster_id: u64,
         config: &CdcConfig,
+        resolved_ts_config: &ResolvedTsConfig,
         raftstore_v2: bool,
         api_version: ApiVersion,
         pd_client: Arc<dyn PdClient>,
@@ -480,6 +482,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             max_scan_batch_bytes,
             max_scan_batch_size,
             config: config.clone(),
+            resolved_ts_config: resolved_ts_config.clone(),
             raftstore_v2,
             api_version,
             workers,
@@ -737,7 +740,9 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             Some(reader) => reader.txn_extra_op.clone(),
             None => {
                 error!("cdc register for a not found region"; "region_id" => region_id);
-                let _ = downstream.sink_region_not_found(region_id);
+                let mut err_event = EventError::default();
+                err_event.mut_region_not_found().region_id = region_id;
+                let _ = downstream.sink_error_event(region_id, err_event);
                 return;
             }
         };
@@ -810,6 +815,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
         let change_cmd = ChangeObserver::from_cdc(region_id, delegate.handle.clone());
         let observed_range = downstream_.observed_range;
         let region_epoch = request.take_region_epoch();
+        let scan_truncated = downstream_.scan_truncated;
         let mut init = Initializer {
             tablet: self.tablets.get(region_id).map(|t| t.into_owned()),
             sched,
@@ -821,6 +827,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             sink: conn.get_sink().clone(),
             request_id: request.get_request_id(),
             downstream_state,
+            scan_truncated,
             scan_speed_limiter: self.scan_speed_limiter.clone(),
             fetch_speed_limiter: self.fetch_speed_limiter.clone(),
             max_scan_batch_bytes: self.max_scan_batch_bytes,
@@ -1130,6 +1137,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
         let causal_ts_provider = self.causal_ts_provider.clone();
         // We use channel to deliver leader_resolver in async block.
         let (leader_resolver_tx, leader_resolver_rx) = bounded(1);
+        let advance_ts_interval = self.resolved_ts_config.advance_ts_interval.0;
 
         let fut = async move {
             let _ = timeout.compat().await;
@@ -1184,7 +1192,9 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             let regions =
                 if hibernate_regions_compatible && gate.can_enable(FEATURE_RESOLVED_TS_STORE) {
                     CDC_RESOLVED_TS_ADVANCE_METHOD.set(1);
-                    leader_resolver.resolve(regions, min_ts, None).await
+                    leader_resolver
+                        .resolve(regions, min_ts, Some(advance_ts_interval))
+                        .await
                 } else {
                     CDC_RESOLVED_TS_ADVANCE_METHOD.set(0);
                     resolve_by_raft(regions, min_ts, cdc_handle).await
@@ -1508,6 +1518,7 @@ mod tests {
         let ep = Endpoint::new(
             DEFAULT_CLUSTER_ID,
             cfg,
+            &ResolvedTsConfig::default(),
             false,
             api_version,
             pd_client,
