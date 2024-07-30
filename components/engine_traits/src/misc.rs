@@ -184,4 +184,7 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
         }
         Ok(n)
     }
+
+    type DiskEngine;
+    fn get_disk_engine(&self) -> &Self::DiskEngine;
 }

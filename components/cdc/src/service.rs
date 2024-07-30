@@ -217,8 +217,8 @@ struct EventFeedHeaders {
 }
 
 impl EventFeedHeaders {
-    const FEATURES_KEY: &str = "features";
-    const STREAM_MULTIPLEXING: &str = "stream-multiplexing";
+    const FEATURES_KEY: &'static str = "features";
+    const STREAM_MULTIPLEXING: &'static str = "stream-multiplexing";
     const FEATURES: &'static [&'static str] = &[Self::STREAM_MULTIPLEXING];
 
     fn parse_features(value: &[u8]) -> Result<Vec<&'static str>, String> {
@@ -575,14 +575,7 @@ mod tests {
         let send = || {
             let rts_ = rts.clone();
             let mut sink_ = sink.clone();
-            Box::pin(async move {
-                sink_
-                    .send_all(
-                        vec![CdcEvent::ResolvedTs(rts_)],
-                        Arc::new(Default::default()),
-                    )
-                    .await
-            })
+            Box::pin(async move { sink_.send_all(vec![CdcEvent::ResolvedTs(rts_)]).await })
         };
         let must_fill_window = || {
             let mut window_size = 0;

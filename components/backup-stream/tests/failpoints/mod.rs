@@ -25,6 +25,7 @@ mod all {
         GetCheckpointResult, RegionCheckpointOperation, RegionSet, Task,
     };
     use futures::executor::block_on;
+    use raftstore::coprocessor::ObserveHandle;
     use tikv_util::{
         config::{ReadableDuration, ReadableSize},
         defer,
@@ -111,9 +112,11 @@ mod all {
         suite.run(|| {
             Task::ModifyObserve(backup_stream::ObserveOp::Start {
                 region: suite.cluster.get_region(&make_record_key(1, 886)),
+                handle: ObserveHandle::new(),
             })
         });
         fail::cfg("scan_after_get_snapshot", "off").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
         suite.force_flush_files("frequent_initial_scan");
         suite.wait_for_flush();
         std::thread::sleep(Duration::from_secs(1));
@@ -181,6 +184,8 @@ mod all {
 
         suite.must_split(b"SOLE");
         let keys2 = run_async_test(suite.write_records(256, 128, 1));
+        // Let's make sure the retry has been triggered...
+        std::thread::sleep(Duration::from_secs(2));
         suite.force_flush_files("fail_to_refresh_region");
         suite.wait_for_flush();
         suite.check_for_write_records(
@@ -269,6 +274,8 @@ mod all {
         fail::cfg("try_start_observe", "2*return").unwrap();
         fail::cfg("try_start_observe0", "off").unwrap();
 
+        // Let's wait enough time for observing the split operation.
+        std::thread::sleep(Duration::from_secs(2));
         let round2 = run_async_test(suite.write_records(256, 128, 1));
         suite.force_flush_files("failure_and_split");
         suite.wait_for_flush();
@@ -288,7 +295,6 @@ mod all {
             .build();
         let keys = run_async_test(suite.write_records(0, 128, 1));
         let failed = Arc::new(AtomicBool::new(false));
-        fail::cfg("router_on_event_delay_ms", "6*return(1000)").unwrap();
         fail::cfg_callback("scan_and_async_send::about_to_consume", {
             let failed = failed.clone();
             move || {
@@ -309,20 +315,6 @@ mod all {
             keys.iter().map(|v| v.as_slice()),
         );
         assert!(!failed.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn failed_to_get_task_when_pausing() {
-        let suite = SuiteBuilder::new_named("resume_error").nodes(1).build();
-        suite.must_register_task(1, "resume_error");
-        let mcli = suite.get_meta_cli();
-        run_async_test(mcli.pause("resume_error")).unwrap();
-        suite.sync();
-        fail::cfg("failed_to_get_task", "1*return").unwrap();
-        run_async_test(mcli.resume("resume_error")).unwrap();
-        suite.sync();
-        // Make sure our suite doesn't panic.
-        suite.sync();
     }
 
     #[test]
@@ -406,5 +398,19 @@ mod all {
             suite.flushed_files.path(),
             std::iter::once(enc_key.as_encoded().as_slice()),
         )
+    }
+
+    #[test]
+    fn failed_to_get_task_when_pausing() {
+        let suite = SuiteBuilder::new_named("resume_error").nodes(1).build();
+        suite.must_register_task(1, "resume_error");
+        let mcli = suite.get_meta_cli();
+        run_async_test(mcli.pause("resume_error")).unwrap();
+        suite.sync();
+        fail::cfg("failed_to_get_task", "1*return").unwrap();
+        run_async_test(mcli.resume("resume_error")).unwrap();
+        suite.sync();
+        // Make sure our suite doesn't panic.
+        suite.sync();
     }
 }

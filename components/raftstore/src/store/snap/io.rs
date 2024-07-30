@@ -8,12 +8,10 @@ use std::{
     usize,
 };
 
-use encryption::{
-    from_engine_encryption_method, DataKeyManager, DecrypterReader, EncrypterWriter, Iv,
-};
+use encryption::{DataKeyManager, DecrypterReader, EncrypterWriter, Iv};
 use engine_traits::{
-    CfName, EncryptionKeyManager, Error as EngineError, Iterable, KvEngine, Mutable,
-    SstCompressionType, SstReader, SstWriter, SstWriterBuilder, WriteBatch,
+    CfName, Error as EngineError, Iterable, KvEngine, Mutable, SstCompressionType, SstReader,
+    SstWriter, SstWriterBuilder, WriteBatch,
 };
 use fail::fail_point;
 use kvproto::encryptionpb::EncryptionMethod;
@@ -61,7 +59,7 @@ where
 
     if let Some(key_mgr) = key_mgr {
         let enc_info = box_try!(key_mgr.new_file(path));
-        let mthd = from_engine_encryption_method(enc_info.method);
+        let mthd = enc_info.method;
         if mthd != EncryptionMethod::Plaintext {
             let writer = box_try!(EncrypterWriter::new(
                 file.take().unwrap(),
@@ -161,12 +159,7 @@ where
             });
         })();
 
-        let sst_reader = if let Some(mgr) = key_mgr {
-            E::SstReader::open_encrypted(&path, mgr)?
-        } else {
-            E::SstReader::open(&path)?
-        };
-
+        let sst_reader = E::SstReader::open(&path, key_mgr)?;
         if let Err(e) = sst_reader.verify_checksum() {
             // use sst reader to verify block checksum, it would detect corrupted SST due to
             // memory bit-flip
@@ -334,7 +327,7 @@ pub fn get_decrypter_reader(
     encryption_key_manager: &DataKeyManager,
 ) -> Result<Box<dyn Read + Send>, Error> {
     let enc_info = box_try!(encryption_key_manager.get_file(file));
-    let mthd = from_engine_encryption_method(enc_info.method);
+    let mthd = enc_info.method;
     debug!(
         "get_decrypter_reader gets enc_info for {:?}, method: {:?}",
         file, mthd
@@ -374,7 +367,7 @@ mod tests {
         for db_creater in db_creaters {
             let (_enc_dir, enc_opts) =
                 gen_db_options_with_encryption("test_cf_build_and_apply_plain_files_enc");
-            for db_opt in vec![None, Some(enc_opts)] {
+            for db_opt in [None, Some(enc_opts)] {
                 let dir = Builder::new().prefix("test-snap-cf-db").tempdir().unwrap();
                 let db: KvTestEngine = db_creater(dir.path(), db_opt.clone(), None).unwrap();
                 // Collect keys via the key_callback into a collection.
@@ -385,7 +378,7 @@ mod tests {
                     .unwrap();
                 let db1: KvTestEngine = open_test_empty_db(dir1.path(), db_opt, None).unwrap();
 
-                let snap = db.snapshot();
+                let snap = db.snapshot(None);
                 for cf in SNAPSHOT_CFS {
                     let snap_cf_dir = Builder::new().prefix("test-snap-cf").tempdir().unwrap();
                     let mut cf_file = CfFile {
@@ -455,7 +448,7 @@ mod tests {
             for db_creater in db_creaters {
                 let (_enc_dir, enc_opts) =
                     gen_db_options_with_encryption("test_cf_build_and_apply_sst_files_enc");
-                for db_opt in vec![None, Some(enc_opts)] {
+                for db_opt in [None, Some(enc_opts)] {
                     let dir = Builder::new().prefix("test-snap-cf-db").tempdir().unwrap();
                     let db = db_creater(dir.path(), db_opt.clone(), None).unwrap();
                     let snap_cf_dir = Builder::new().prefix("test-snap-cf").tempdir().unwrap();
@@ -469,7 +462,7 @@ mod tests {
                     let stats = build_sst_cf_file_list::<KvTestEngine>(
                         &mut cf_file,
                         &db,
-                        &db.snapshot(),
+                        &db.snapshot(None),
                         &keys::data_key(b"a"),
                         &keys::data_key(b"z"),
                         *max_file_size,

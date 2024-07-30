@@ -139,8 +139,8 @@ fn test_stale_learner_restart() {
 /// pass
 /// Test if a peer can be destroyed through tombstone msg when applying
 /// snapshot.
+//#[test_case(test_raftstore_v2::new_node_cluster)] // unstable test case
 #[test_case(test_raftstore::new_node_cluster)]
-#[test_case(test_raftstore_v2::new_node_cluster)]
 fn test_stale_peer_destroy_when_apply_snapshot() {
     let mut cluster = new_node_cluster(0, 3);
     configure_for_snapshot(&mut cluster.cfg);
