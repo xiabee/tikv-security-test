@@ -58,6 +58,7 @@ use raftstore::{
     coprocessor::{Config as CopConfig, RegionInfoAccessor},
     store::{CompactionGuardGeneratorFactory, Config as RaftstoreConfig, SplitConfig},
 };
+use range_cache_memory_engine::RangeCacheEngineConfig;
 use resource_control::Config as ResourceControlConfig;
 use resource_metering::Config as ResourceMeteringConfig;
 use security::SecurityConfig;
@@ -68,7 +69,8 @@ use serde::{
 use serde_json::{to_value, Map, Value};
 use tikv_util::{
     config::{
-        self, LogFormat, RaftDataStateMachine, ReadableDuration, ReadableSize, TomlWriter, MIB,
+        self, LogFormat, RaftDataStateMachine, ReadableDuration, ReadableSchedule, ReadableSize,
+        TomlWriter, MIB,
     },
     logger::{get_level_by_string, get_string_by_level, set_log_level},
     sys::SysQuota,
@@ -1233,7 +1235,10 @@ impl TitanDbConfig {
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct DbConfig {
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     #[online_config(skip)]
+    #[deprecated = "Rocksdb log is replaced by tikv log. Please use `log.file` to config log."]
     pub info_log_level: RocksLogLevel,
     #[serde(with = "rocks_config::recovery_mode_serde")]
     #[online_config(skip)]
@@ -1259,11 +1264,20 @@ pub struct DbConfig {
     #[online_config(skip)]
     pub stats_dump_period: Option<ReadableDuration>,
     pub compaction_readahead_size: ReadableSize,
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     #[online_config(skip)]
+    #[deprecated = "Rocksdb log is replaced by tikv log. Please use `log.file` to config log."]
     pub info_log_max_size: ReadableSize,
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     #[online_config(skip)]
+    #[deprecated = "Rocksdb log is replaced with tikv log. Please use `log.file` to config log."]
     pub info_log_roll_time: ReadableDuration,
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     #[online_config(skip)]
+    #[deprecated = "Rocksdb log is replaced with tikv log. Please use `log.file` to config log."]
     pub info_log_keep_log_file_num: u64,
     #[online_config(skip)]
     pub info_log_dir: String,
@@ -1503,9 +1517,6 @@ impl DbConfig {
             self.stats_dump_period.unwrap_or_default().as_secs() as usize
         );
         opts.set_compaction_readahead_size(self.compaction_readahead_size.0);
-        opts.set_max_log_file_size(self.info_log_max_size.0);
-        opts.set_log_file_time_to_roll(self.info_log_roll_time.as_secs());
-        opts.set_keep_log_file_num(self.info_log_keep_log_file_num);
         opts.set_bytes_per_sync(self.bytes_per_sync.0);
         opts.set_wal_bytes_per_sync(self.wal_bytes_per_sync.0);
         opts.set_max_subcompactions(self.max_sub_compactions);
@@ -1530,7 +1541,6 @@ impl DbConfig {
         if for_engine == EngineType::RaftKv {
             opts.set_info_log(RocksdbLogger);
         }
-        opts.set_info_log_level(self.info_log_level.into());
         if let Some(true) = self.titan.enabled {
             opts.set_titandb_options(&self.titan.build_opts());
         }
@@ -1817,15 +1827,27 @@ pub struct RaftDbConfig {
     #[online_config(skip)]
     pub stats_dump_period: ReadableDuration,
     pub compaction_readahead_size: ReadableSize,
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     #[online_config(skip)]
+    #[deprecated = "Rocksdb log is replaced by tikv log. Please use `log.file` to config log."]
     pub info_log_max_size: ReadableSize,
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     #[online_config(skip)]
+    #[deprecated = "Rocksdb log is replaced by tikv log. Please use `log.file` to config log."]
     pub info_log_roll_time: ReadableDuration,
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     #[online_config(skip)]
+    #[deprecated = "Rocksdb log is replaced by tikv log. Please use `log.file` to config log."]
     pub info_log_keep_log_file_num: u64,
     #[online_config(skip)]
     pub info_log_dir: String,
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     #[online_config(skip)]
+    #[deprecated = "Rocksdb log is replaced by tikv log. Please use `log.file` to config log."]
     pub info_log_level: RocksLogLevel,
     pub max_sub_compactions: u32,
     pub writable_file_max_buffer_size: ReadableSize,
@@ -1855,6 +1877,7 @@ impl Default for RaftDbConfig {
             max_background_gc: bg_job_limits.max_titan_background_gc as i32,
             ..Default::default()
         };
+        #[allow(deprecated)]
         RaftDbConfig {
             wal_recovery_mode: DBRecoveryMode::PointInTime,
             wal_dir: "".to_owned(),
@@ -1910,11 +1933,7 @@ impl RaftDbConfig {
         }
         opts.set_stats_dump_period_sec(self.stats_dump_period.as_secs() as usize);
         opts.set_compaction_readahead_size(self.compaction_readahead_size.0);
-        opts.set_max_log_file_size(self.info_log_max_size.0);
-        opts.set_log_file_time_to_roll(self.info_log_roll_time.as_secs());
-        opts.set_keep_log_file_num(self.info_log_keep_log_file_num);
         opts.set_info_log(RaftDbLogger);
-        opts.set_info_log_level(self.info_log_level.into());
         opts.set_max_subcompactions(self.max_sub_compactions);
         opts.set_writable_file_max_buffer_size(self.writable_file_max_buffer_size.0 as i32);
         opts.set_use_direct_io_for_flush_and_compaction(
@@ -3444,9 +3463,6 @@ pub struct TikvConfig {
     #[online_config(skip)]
     pub memory_usage_high_water: f64,
 
-    // Memory quota used for in-memory engine. 0 means not enable it.
-    pub region_cache_memory_limit: ReadableSize,
-
     #[online_config(submodule)]
     pub log: LogConfig,
 
@@ -3527,6 +3543,9 @@ pub struct TikvConfig {
 
     #[online_config(submodule)]
     pub resource_control: ResourceControlConfig,
+
+    #[online_config(submodule)]
+    pub range_cache_engine: RangeCacheEngineConfig,
 }
 
 impl Default for TikvConfig {
@@ -3546,7 +3565,6 @@ impl Default for TikvConfig {
             abort_on_panic: false,
             memory_usage_limit: None,
             memory_usage_high_water: 0.9,
-            region_cache_memory_limit: ReadableSize::mb(0),
             log: LogConfig::default(),
             memory: MemoryConfig::default(),
             quota: QuotaConfig::default(),
@@ -3573,6 +3591,7 @@ impl Default for TikvConfig {
             log_backup: BackupStreamConfig::default(),
             causal_ts: CausalTsConfig::default(),
             resource_control: ResourceControlConfig::default(),
+            range_cache_engine: RangeCacheEngineConfig::default(),
         }
     }
 }
@@ -3941,6 +3960,7 @@ impl TikvConfig {
         self.resource_metering.validate()?;
         self.quota.validate()?;
         self.causal_ts.validate()?;
+        self.range_cache_engine.validate()?;
 
         // Validate feature TTL with Titan configuration.
         if matches!(self.rocksdb.titan.enabled, Some(true)) && self.storage.enable_ttl {
@@ -4649,7 +4669,11 @@ fn to_change_value(v: &str, typed: &ConfigValue) -> CfgResult<ConfigValue> {
         ConfigValue::Usize(_) => ConfigValue::from(v.parse::<usize>()?),
         ConfigValue::Bool(_) => ConfigValue::from(v.parse::<bool>()?),
         ConfigValue::String(_) => ConfigValue::String(v.to_owned()),
-        _ => unreachable!(),
+        ConfigValue::Schedule(_) => {
+            let schedule = v.parse::<ReadableSchedule>()?;
+            ConfigValue::from(schedule)
+        }
+        ConfigValue::Skip | ConfigValue::None | ConfigValue::Module(_) => unreachable!(),
     };
     Ok(res)
 }
@@ -4718,6 +4742,7 @@ pub enum Module {
     Rocksdb,
     Raftdb,
     RaftEngine,
+    RangeCacheEngine,
     Storage,
     Security,
     Encryption,
@@ -4749,6 +4774,7 @@ impl From<&str> for Module {
             "rocksdb" => Module::Rocksdb,
             "raftdb" => Module::Raftdb,
             "raft_engine" => Module::RaftEngine,
+            "range_cache_engine" => Module::RangeCacheEngine,
             "storage" => Module::Storage,
             "security" => Module::Security,
             "import" => Module::Import,
@@ -4901,10 +4927,12 @@ impl ConfigController {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{mpsc::channel, Arc},
+        time::Duration,
+    };
 
     use api_version::{ApiV1, KvFormat};
-    use case_macros::*;
     use engine_rocks::raw::LRUCacheOptions;
     use engine_traits::{CfOptions as _, CfOptionsExt, DbOptions as _, DbOptionsExt};
     use futures::executor::block_on;
@@ -4959,21 +4987,6 @@ mod tests {
     fn create_mock_kv_data(path: &Path) {
         fs::create_dir_all(path.join("db")).unwrap();
         fs::File::create(path.join("db").join("CURRENT")).unwrap();
-    }
-
-    #[test]
-    fn test_case_macro() {
-        let h = kebab_case!(HelloWorld);
-        assert_eq!(h, "hello-world");
-
-        let h = kebab_case!(WelcomeToMyHouse);
-        assert_eq!(h, "welcome-to-my-house");
-
-        let h = snake_case!(HelloWorld);
-        assert_eq!(h, "hello_world");
-
-        let h = snake_case!(WelcomeToMyHouse);
-        assert_eq!(h, "welcome_to_my_house");
     }
 
     #[test]
@@ -5692,22 +5705,26 @@ mod tests {
         assert_eq!(flow_controller.enabled(), true);
     }
 
+    struct MockCfgManager(Box<dyn Fn(ConfigChange) + Send + Sync>);
+
+    impl ConfigManager for MockCfgManager {
+        fn dispatch(&mut self, change: ConfigChange) -> online_config::Result<()> {
+            (self.0)(change);
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_change_resolved_ts_config() {
-        use crossbeam::channel;
-
-        pub struct TestConfigManager(channel::Sender<ConfigChange>);
-        impl ConfigManager for TestConfigManager {
-            fn dispatch(&mut self, change: ConfigChange) -> online_config::Result<()> {
-                self.0.send(change).unwrap();
-                Ok(())
-            }
-        }
-
         let (cfg, _dir) = TikvConfig::with_tmp().unwrap();
         let cfg_controller = ConfigController::new(cfg);
-        let (tx, rx) = channel::unbounded();
-        cfg_controller.register(Module::ResolvedTs, Box::new(TestConfigManager(tx)));
+        let (tx, rx) = channel();
+        cfg_controller.register(
+            Module::ResolvedTs,
+            Box::new(MockCfgManager(Box::new(move |c| {
+                tx.send(c).unwrap();
+            }))),
+        );
 
         // Return error if try to update not support config or unknow config
         cfg_controller
@@ -6338,12 +6355,14 @@ mod tests {
         let cfg_controller = ConfigController::new(cfg.clone());
         let (scheduler, _receiver) = dummy_scheduler();
         let version_tracker = Arc::new(VersionTrack::new(cfg.server.clone()));
+        let cop_manager = MockCfgManager(Box::new(|_| {}));
         cfg_controller.register(
             Module::Server,
             Box::new(ServerConfigManager::new(
                 scheduler,
                 version_tracker.clone(),
                 ResourceQuota::new(None),
+                Box::new(cop_manager),
             )),
         );
 
@@ -6393,6 +6412,39 @@ mod tests {
             default_cfg.server.end_point_request_max_handle_duration(),
             ReadableDuration::secs(900)
         );
+    }
+
+    #[test]
+    fn test_change_coprocessor_endpoint_config() {
+        let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
+        cfg.validate().unwrap();
+        let cfg_controller = ConfigController::new(cfg.clone());
+        let (scheduler, _receiver) = dummy_scheduler();
+        let version_tracker = Arc::new(VersionTrack::new(cfg.server.clone()));
+
+        let (cop_tx, cop_rx) = channel();
+        let cop_manager = MockCfgManager(Box::new(move |c| {
+            cop_tx.send(c).unwrap();
+        }));
+        cfg_controller.register(
+            Module::Server,
+            Box::new(ServerConfigManager::new(
+                scheduler,
+                version_tracker.clone(),
+                ResourceQuota::new(None),
+                Box::new(cop_manager),
+            )),
+        );
+
+        cfg_controller
+            .update_config("server.end-point-memory-quota", "32MB")
+            .unwrap();
+        let mut change = cop_rx.try_recv().unwrap();
+        let quota = change.remove("end_point_memory_quota").unwrap();
+        let cap: ReadableSize = quota.into();
+        assert_eq!(cap, ReadableSize::mb(32));
+        cfg.server.end_point_memory_quota = ReadableSize::mb(32);
+        assert_eq_debug(&cfg_controller.get_current(), &cfg);
     }
 
     #[test]
@@ -6943,7 +6995,6 @@ mod tests {
         cfg.raftdb.titan.max_background_gc = default_cfg.raftdb.titan.max_background_gc;
         cfg.backup.num_threads = default_cfg.backup.num_threads;
         cfg.log_backup.num_threads = default_cfg.log_backup.num_threads;
-        cfg.raft_store.cmd_batch_concurrent_ready_max_count = 1;
 
         // There is another set of config values that we can't directly compare:
         // When the default values are `None`, but are then resolved to `Some(_)` later
@@ -6967,7 +7018,7 @@ mod tests {
             default_cfg.raft_engine.config().batch_compression_threshold,
             RaftEngineReadableSize::kb(4)
         );
-        default_cfg.security.redact_info_log = Some(false);
+        default_cfg.security.redact_info_log = log_wrappers::RedactOption::default();
         default_cfg.coprocessor.region_max_size = Some(default_cfg.coprocessor.region_max_size());
         default_cfg.coprocessor.region_max_keys = Some(default_cfg.coprocessor.region_max_keys());
         default_cfg.coprocessor.region_split_keys =

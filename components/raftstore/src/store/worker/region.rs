@@ -73,6 +73,7 @@ pub enum Task<S> {
         region_id: u64,
         status: Arc<AtomicUsize>,
         peer_id: u64,
+        create_time: Instant,
     },
     /// Destroy data between [start_key, end_key).
     ///
@@ -454,10 +455,14 @@ where
     fn apply_snap(&mut self, region_id: u64, peer_id: u64, abort: Arc<AtomicUsize>) -> Result<()> {
         info!("begin apply snap data"; "region_id" => region_id, "peer_id" => peer_id);
         fail_point!("region_apply_snap", |_| { Ok(()) });
+        fail_point!("region_apply_snap_io_err", |_| {
+            Err(crate::store::SnapError::Other(box_err!("io error")))
+        });
         check_abort(&abort)?;
 
         let mut region_state = self.region_state(region_id)?;
         let region = region_state.get_region().clone();
+
         let start_key = keys::enc_start_key(&region);
         let end_key = keys::enc_end_key(&region);
         check_abort(&abort)?;
@@ -521,10 +526,11 @@ where
 
         let start = Instant::now();
 
-        match self.apply_snap(region_id, peer_id, Arc::clone(&status)) {
+        let tombstone = match self.apply_snap(region_id, peer_id, Arc::clone(&status)) {
             Ok(()) => {
                 status.swap(JOB_STATUS_FINISHED, Ordering::SeqCst);
                 SNAP_COUNTER.apply.success.inc();
+                false
             }
             Err(Error::Abort) => {
                 warn!("applying snapshot is aborted"; "region_id" => region_id);
@@ -535,18 +541,29 @@ where
                     JOB_STATUS_CANCELLING
                 );
                 SNAP_COUNTER.apply.abort.inc();
+                // The snapshot is applied abort, it's not necessary to tombstone the peer.
+                false
             }
             Err(e) => {
-                error!(%e; "failed to apply snap!!!");
+                warn!("failed to apply snap!!!"; "region_id" => region_id, "err" => %e);
+                self.coprocessor_host
+                    .cancel_apply_snapshot(region_id, peer_id);
                 status.swap(JOB_STATUS_FAILED, Ordering::SeqCst);
                 SNAP_COUNTER.apply.fail.inc();
+                // As the snapshot failed, the related peer should be marked tombstone.
+                // And as for the abnormal snapshot, it will be automatically cleaned up by
+                // the CleanupWorker later.
+                true
             }
-        }
+        };
 
         SNAP_HISTOGRAM
             .apply
             .observe(start.saturating_elapsed_secs());
-        let _ = self.router.send(region_id, CasualMessage::SnapshotApplied);
+        let _ = self.router.send(
+            region_id,
+            CasualMessage::SnapshotApplied { peer_id, tombstone },
+        );
     }
 
     /// Tries to clean up files in pending ranges overlapping with the given
@@ -715,16 +732,27 @@ where
         let wopts = WriteOptions::default();
         for cf in self.engine.cf_names() {
             // CF_LOCK usually contains fewer keys than other CFs, so we delete them by key.
-            let strategy = if cf == CF_LOCK {
-                DeleteStrategy::DeleteByKey
+            let (strategy, observer) = if cf == CF_LOCK {
+                (
+                    DeleteStrategy::DeleteByKey,
+                    &CLEAR_OVERLAP_REGION_DURATION.by_key,
+                )
             } else if self.use_delete_range {
-                DeleteStrategy::DeleteByRange
+                (
+                    DeleteStrategy::DeleteByRange,
+                    &CLEAR_OVERLAP_REGION_DURATION.by_range,
+                )
             } else {
-                DeleteStrategy::DeleteByWriter {
-                    sst_path: self.mgr.get_temp_path_for_ingest(),
-                }
+                (
+                    DeleteStrategy::DeleteByWriter {
+                        sst_path: self.mgr.get_temp_path_for_ingest(),
+                    },
+                    &CLEAR_OVERLAP_REGION_DURATION.by_ingest_files,
+                )
             };
+            let start = Instant::now();
             box_try!(self.engine.delete_ranges_cf(&wopts, cf, strategy, ranges));
+            observer.observe(start.saturating_elapsed_secs());
         }
 
         Ok(())
@@ -738,6 +766,7 @@ where
                 region_id,
                 status,
                 peer_id,
+                ..
             } => (region_id, status.clone(), peer_id),
             _ => panic!("invalid apply snapshot task"),
         };
@@ -779,6 +808,7 @@ where
             // ingested. check level 0 every time because we can not make sure
             // how does the number of level 0 files change.
             if self.ingest_maybe_stall() {
+                SNAP_COUNTER.apply.ingest_delay.inc();
                 break;
             }
             if let Some(Task::Apply { region_id, .. }) = self.pending_applies.front() {
@@ -790,19 +820,25 @@ where
                     self.pending_applies.len(),
                 ) {
                     // KvEngine can't apply snapshot for other reasons.
+                    SNAP_COUNTER.apply.ingest_delay.inc();
                     break;
                 }
                 if let Some(Task::Apply {
                     region_id,
                     status,
                     peer_id,
+                    create_time,
                 }) = self.pending_applies.pop_front()
                 {
+                    SNAP_APPLY_WAIT_DURATION_HISTOGRAM
+                        .observe(create_time.saturating_elapsed_secs());
                     new_batch = false;
                     self.handle_apply(region_id, peer_id, status);
+                    self.mgr.set_pending_apply_count(self.pending_applies.len());
                 }
             }
         }
+        SNAP_PENDING_APPLIES_GAUGE.set(self.pending_applies.len() as i64);
     }
 }
 
@@ -884,6 +920,7 @@ where
                 SNAP_COUNTER.apply.all.inc();
                 // to makes sure applying snapshots in order.
                 self.pending_applies.push_back(task);
+                self.mgr.set_pending_apply_count(self.pending_applies.len());
                 self.handle_pending_applies(false);
                 if !self.pending_applies.is_empty() {
                     // delay the apply and retry later
@@ -1250,6 +1287,7 @@ pub(crate) mod tests {
                     region_id: id,
                     status,
                     peer_id: 1,
+                    create_time: Instant::now(),
                 })
                 .unwrap();
         };
@@ -1275,7 +1313,7 @@ pub(crate) mod tests {
         let wait_apply_finish = |ids: &[u64]| {
             for id in ids {
                 match receiver.recv_timeout(Duration::from_secs(5)) {
-                    Ok((region_id, CasualMessage::SnapshotApplied)) => {
+                    Ok((region_id, CasualMessage::SnapshotApplied { .. })) => {
                         assert_eq!(region_id, *id);
                     }
                     msg => panic!("expected {} SnapshotApplied, but got {:?}", id, msg),

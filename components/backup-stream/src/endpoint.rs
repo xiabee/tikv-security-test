@@ -10,6 +10,7 @@ use std::{
 };
 
 use concurrency_manager::ConcurrencyManager;
+use encryption::DataKeyManager;
 use engine_traits::KvEngine;
 use error_code::ErrorCodeExt;
 use futures::{stream::AbortHandle, FutureExt, TryFutureExt};
@@ -24,7 +25,7 @@ use raftstore::{
     router::CdcHandle,
 };
 use resolved_ts::{resolve_by_raft, LeadershipResolver};
-use tikv::config::BackupStreamConfig;
+use tikv::config::{BackupStreamConfig, ResolvedTsConfig};
 use tikv_util::{
     box_err,
     config::ReadableDuration,
@@ -114,6 +115,7 @@ where
         store_id: u64,
         store: S,
         config: BackupStreamConfig,
+        resolved_ts_config: ResolvedTsConfig,
         scheduler: Scheduler<Task>,
         observer: BackupStreamObserver,
         accessor: R,
@@ -121,13 +123,16 @@ where
         pd_client: Arc<PDC>,
         concurrency_manager: ConcurrencyManager,
         resolver: BackupStreamResolver<RT, E>,
+        data_key_manager: Option<Arc<DataKeyManager>>,
     ) -> Self {
         crate::metrics::STREAM_ENABLED.inc();
         let pool = create_tokio_runtime((config.num_threads / 2).max(1), "backup-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
 
         let meta_client = MetadataClient::new(store, store_id);
-        let range_router = Router::new(scheduler.clone(), router::Config::from(config.clone()));
+        let mut conf = router::Config::from(config.clone());
+        conf.data_key_manager = data_key_manager;
+        let range_router = Router::new(scheduler.clone(), conf);
 
         // spawn a worker to watch task changes from etcd periodically.
         let meta_client_clone = meta_client.clone();
@@ -172,6 +177,7 @@ where
             meta_client.clone(),
             ((config.num_threads + 1) / 2).max(1),
             resolver,
+            resolved_ts_config.advance_ts_interval.0,
         );
         pool.spawn(root!(op_loop));
         let mut checkpoint_mgr = CheckpointManager::default();
@@ -230,7 +236,14 @@ where
                     TimeStamp::new(safepoint.saturating_sub(1)),
                     safepoint_ttl,
                 )
-                .await?;
+                .await
+                .or_else(|err| match err {
+                    pd_client::Error::UnsafeServiceGcSafePoint { .. } => {
+                        warn!("gc safe point exceeds the task checkpoint. skipping uploading"; "err" => %err);
+                        Ok(())
+                    }
+                    _ => Err(err),
+                })?;
                 meta_cli.pause(&t).await?;
                 let mut last_error = StreamBackupError::new();
                 last_error.set_error_code(code);
@@ -261,9 +274,7 @@ where
 
     fn on_fatal_error(&self, select: TaskSelector, err: Box<Error>) {
         err.report_fatal();
-        let tasks = self
-            .pool
-            .block_on(self.range_router.select_task(select.reference()));
+        let tasks = self.range_router.select_task(select.reference());
         warn!("fatal error reporting"; "selector" => ?select, "selected" => ?tasks, "err" => %err);
         for task in tasks {
             // Let's pause the task first.
@@ -790,7 +801,7 @@ where
         // so simply clear all info would be fine.
         self.observer.ranges.wl().clear();
         self.subs.clear();
-        self.pool.block_on(router.unregister_task(task))
+        router.unregister_task(task)
     }
 
     fn prepare_min_ts(&self) -> future![TimeStamp] {
@@ -837,7 +848,7 @@ where
 
     pub fn on_force_flush(&self, task: String) {
         self.pool.block_on(async move {
-            let info = self.range_router.get_task_info(&task).await;
+            let info = self.range_router.get_task_info(&task);
             // This should only happen in testing, it would be to unwrap...
             let _ = info.unwrap().set_flushing_status_cas(false, true);
             let mts = self.prepare_min_ts().await;

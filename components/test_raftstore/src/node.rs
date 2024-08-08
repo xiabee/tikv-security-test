@@ -12,6 +12,7 @@ use engine_rocks::RocksEngine;
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{Engines, KvEngine, SnapshotContext};
 use health_controller::HealthController;
+use hybrid_engine::observer::Observer as HybridEngineObserver;
 use kvproto::{
     kvrpcpb::ApiVersion,
     metapb,
@@ -31,6 +32,7 @@ use raftstore::{
     },
     Result,
 };
+use range_cache_memory_engine::RangeCacheEngineConfig;
 use resource_control::ResourceGroupManager;
 use resource_metering::CollectorRegHandle;
 use service::service_manager::GrpcServiceManager;
@@ -39,7 +41,7 @@ use test_pd_client::TestPdClient;
 use tikv::{
     config::{ConfigController, Module},
     import::SstImporter,
-    server::{raftkv::ReplicaReadLockChecker, Node, Result as ServerResult},
+    server::{raftkv::ReplicaReadLockChecker, MultiRaftServer, Result as ServerResult},
 };
 use tikv_util::{
     config::VersionTrack,
@@ -155,11 +157,12 @@ type SimulateChannelTransport<EK> = SimulateTransport<ChannelTransport<EK>, EK>;
 pub struct NodeCluster<EK: KvEngine> {
     trans: ChannelTransport<EK>,
     pd_client: Arc<TestPdClient>,
-    nodes: HashMap<u64, Node<TestPdClient, EK, RaftTestEngine>>,
+    nodes: HashMap<u64, MultiRaftServer<TestPdClient, EK, RaftTestEngine>>,
     snap_mgrs: HashMap<u64, SnapManager>,
     cfg_controller: HashMap<u64, ConfigController>,
     simulate_trans: HashMap<u64, SimulateChannelTransport<EK>>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
+    importers: HashMap<u64, Arc<SstImporter<EK>>>,
     #[allow(clippy::type_complexity)]
     post_create_coprocessor_host: Option<Box<dyn Fn(u64, &mut CoprocessorHost<EK>)>>,
 }
@@ -174,6 +177,7 @@ impl<EK: KvEngine> NodeCluster<EK> {
             cfg_controller: HashMap::default(),
             simulate_trans: HashMap::default(),
             concurrency_managers: HashMap::default(),
+            importers: HashMap::default(),
             post_create_coprocessor_host: None,
         }
     }
@@ -206,7 +210,7 @@ impl<EK: KvEngine> NodeCluster<EK> {
     pub fn get_node(
         &mut self,
         node_id: u64,
-    ) -> Option<&mut Node<TestPdClient, EK, RaftTestEngine>> {
+    ) -> Option<&mut MultiRaftServer<TestPdClient, EK, RaftTestEngine>> {
         self.nodes.get_mut(&node_id)
     }
 
@@ -216,6 +220,10 @@ impl<EK: KvEngine> NodeCluster<EK> {
 
     pub fn get_cfg_controller(&self, node_id: u64) -> Option<&ConfigController> {
         self.cfg_controller.get(&node_id)
+    }
+
+    pub fn get_importer(&self, node_id: u64) -> Option<Arc<SstImporter<EK>>> {
+        self.importers.get(&node_id).cloned()
     }
 }
 
@@ -247,7 +255,7 @@ impl<EK: KvEngine> Simulator<EK> for NodeCluster<EK> {
             .unwrap();
         let bg_worker = WorkerBuilder::new("background").thread_count(2).create();
         let store_config = Arc::new(VersionTrack::new(raft_store));
-        let mut node = Node::new(
+        let mut node = MultiRaftServer::new(
             system,
             &cfg.server,
             store_config.clone(),
@@ -272,6 +280,7 @@ impl<EK: KvEngine> Simulator<EK> for NodeCluster<EK> {
             let snap_mgr = SnapManagerBuilder::default()
                 .max_write_bytes_per_sec(cfg.server.snap_io_max_bytes_per_sec.0 as i64)
                 .max_total_size(cfg.server.snap_max_total_size.0)
+                .concurrent_recv_snap_limit(cfg.server.concurrent_recv_snap_limit)
                 .encryption_key_manager(key_manager)
                 .max_per_file_size(cfg.raft_store.max_snapshot_file_raw_size.0)
                 .enable_multi_snapshot_files(true)
@@ -293,6 +302,12 @@ impl<EK: KvEngine> Simulator<EK> for NodeCluster<EK> {
             f(node_id, &mut coprocessor_host);
         }
 
+        // Hybrid engine observer.
+        if cfg.tikv.range_cache_engine.enabled {
+            let observer = HybridEngineObserver::new(Arc::new(engines.kv.clone()));
+            observer.register_to(&mut coprocessor_host);
+        }
+
         let cm = ConcurrencyManager::new(1.into());
         self.concurrency_managers.insert(node_id, cm.clone());
         ReplicaReadLockChecker::new(cm.clone()).register(&mut coprocessor_host);
@@ -303,6 +318,7 @@ impl<EK: KvEngine> Simulator<EK> for NodeCluster<EK> {
                 SstImporter::new(&cfg.import, dir, None, cfg.storage.api_version(), false).unwrap(),
             )
         };
+        self.importers.insert(node_id, importer.clone());
 
         let local_reader = LocalReader::new(
             engines.kv.clone(),
@@ -523,6 +539,7 @@ pub fn new_node_cluster_with_hybrid_engine(
     let sim = Arc::new(RwLock::new(NodeCluster::new(Arc::clone(&pd_client))));
     let mut cluster = Cluster::new(id, count, sim, pd_client, ApiVersion::V1);
     cluster.range_cache_engine_enabled_with_whole_range(true);
+    cluster.cfg.tikv.range_cache_engine = RangeCacheEngineConfig::config_for_test();
     cluster
 }
 
@@ -532,7 +549,9 @@ pub fn new_node_cluster_with_hybrid_engine_with_no_range_cache(
 ) -> Cluster<HybridEngineImpl, NodeCluster<HybridEngineImpl>> {
     let pd_client = Arc::new(TestPdClient::new(id, false));
     let sim = Arc::new(RwLock::new(NodeCluster::new(Arc::clone(&pd_client))));
-    Cluster::new(id, count, sim, pd_client, ApiVersion::V1)
+    let mut cluster = Cluster::new(id, count, sim, pd_client, ApiVersion::V1);
+    cluster.cfg.tikv.range_cache_engine = RangeCacheEngineConfig::config_for_test();
+    cluster
 }
 
 // This cluster does not support batch split, we expect it to transfer the

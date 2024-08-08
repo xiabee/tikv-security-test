@@ -37,7 +37,7 @@ use std::{
 
 use collections::HashMap;
 use engine_traits::{
-    CfName, IterOptions, KvEngine as LocalEngine, Mutable, MvccProperties, ReadOptions,
+    CfName, IterOptions, KvEngine as LocalEngine, MetricsExt, Mutable, MvccProperties, ReadOptions,
     TabletRegistry, WriteBatch, CF_DEFAULT, CF_LOCK,
 };
 use error_code::{self, ErrorCode, ErrorCodeExt};
@@ -532,13 +532,20 @@ pub trait SnapshotExt {
     fn get_buckets(&self) -> Option<Arc<BucketMeta>> {
         None
     }
+
+    /// Whether the snapshot acquired hit the cached range in the range cache
+    /// engine. It always returns false if the range cahce engine is not
+    /// enabled.
+    fn range_cache_engine_hit(&self) -> bool {
+        false
+    }
 }
 
 pub struct DummySnapshotExt;
 
 impl SnapshotExt for DummySnapshotExt {}
 
-pub trait Iterator: Send {
+pub trait Iterator: Send + MetricsExt {
     fn next(&mut self) -> Result<bool>;
     fn prev(&mut self) -> Result<bool>;
     fn seek(&mut self, key: &Key) -> Result<bool>;

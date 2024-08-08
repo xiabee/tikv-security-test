@@ -42,6 +42,7 @@ use raftstore::{
     },
     Result,
 };
+use range_cache_memory_engine::RangeCacheEngineConfig;
 use resource_control::ResourceGroupManager;
 use resource_metering::{CollectorRegHandle, ResourceTagFactory};
 use security::SecurityManager;
@@ -62,7 +63,7 @@ use tikv::{
         resolve::{self, StoreAddrResolver},
         service::DebugService,
         tablet_snap::NoSnapshotCache,
-        ConnectionBuilder, Error, Node, PdStoreAddrResolver, RaftClient, RaftKv,
+        ConnectionBuilder, Error, MultiRaftServer, PdStoreAddrResolver, RaftClient, RaftKv,
         Result as ServerResult, Server, ServerTransport,
     },
     storage::{
@@ -73,7 +74,7 @@ use tikv::{
     },
 };
 use tikv_util::{
-    config::{ReadableSize, VersionTrack},
+    config::VersionTrack,
     quota_limiter::QuotaLimiter,
     sys::thread::ThreadBuildWrapper,
     time::ThreadReadId,
@@ -128,7 +129,7 @@ impl StoreAddrResolver for AddressMap {
 }
 
 struct ServerMeta<EK: KvEngine> {
-    node: Node<TestPdClient, EK, RaftTestEngine>,
+    node: MultiRaftServer<TestPdClient, EK, RaftTestEngine>,
     server: Server<PdStoreAddrResolver, SimulateEngine<EK>>,
     sim_router: SimulateStoreTransport<EK>,
     sim_trans: SimulateServerTransport<EK>,
@@ -161,6 +162,7 @@ pub struct ServerCluster<EK: KvEngine> {
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
     env: Arc<Environment>,
     pub causal_ts_providers: HashMap<u64, Arc<CausalTsProviderImpl>>,
+    pub encryption: Option<Arc<DataKeyManager>>,
 }
 
 impl<EK: KvEngineWithRocks> ServerCluster<EK> {
@@ -204,6 +206,7 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
             env,
             txn_extra_schedulers: HashMap::default(),
             causal_ts_providers: HashMap::default(),
+            encryption: None,
         }
     }
 
@@ -268,6 +271,8 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
         system: RaftBatchSystem<EK, RaftTestEngine>,
         resource_manager: &Option<Arc<ResourceGroupManager>>,
     ) -> ServerResult<u64> {
+        self.encryption = key_manager.clone();
+
         let (tmp_str, tmp) = if node_id == 0 || !self.snap_paths.contains_key(&node_id) {
             let p = test_util::temp_dir("test_cluster", cfg.prefer_mem);
             (p.path().to_str().unwrap().to_owned(), Some(p))
@@ -296,7 +301,7 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
 
         // Create coprocessor.
         let enable_region_stats_mgr_cb: Arc<dyn Fn() -> bool + Send + Sync> =
-            if cfg.region_cache_memory_limit != ReadableSize(0) {
+            if cfg.range_cache_engine.enabled {
                 Arc::new(|| true)
             } else {
                 Arc::new(|| false)
@@ -467,6 +472,7 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
         let snap_mgr = SnapManagerBuilder::default()
             .max_write_bytes_per_sec(cfg.server.snap_io_max_bytes_per_sec.0 as i64)
             .max_total_size(cfg.server.snap_max_total_size.0)
+            .concurrent_recv_snap_limit(cfg.server.concurrent_recv_snap_limit)
             .encryption_key_manager(key_manager)
             .max_per_file_size(cfg.raft_store.max_snapshot_file_raw_size.0)
             .enable_multi_snapshot_files(true)
@@ -526,7 +532,7 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
             )
             .unwrap();
         let health_controller = HealthController::new();
-        let mut node = Node::new(
+        let mut node = MultiRaftServer::new(
             system,
             &server_cfg.value().clone(),
             Arc::new(VersionTrack::new(raft_store)),
@@ -890,6 +896,7 @@ pub fn new_server_cluster_with_hybrid_engine(
     let sim = Arc::new(RwLock::new(ServerCluster::new(Arc::clone(&pd_client))));
     let mut cluster = Cluster::new(id, count, sim, pd_client, ApiVersion::V1);
     cluster.range_cache_engine_enabled_with_whole_range(true);
+    cluster.cfg.tikv.range_cache_engine = RangeCacheEngineConfig::config_for_test();
     cluster
 }
 
