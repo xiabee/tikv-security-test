@@ -1230,8 +1230,18 @@ where
                 let raft_msg = self.fsm.peer.build_raft_messages(self.ctx, vec![msg]);
                 self.fsm.peer.send_raft_messages(self.ctx, raft_msg);
             }
-            CasualMessage::SnapshotApplied => {
+            CasualMessage::SnapshotApplied { peer_id, tombstone } => {
                 self.fsm.has_ready = true;
+                // If failed on applying snapshot, it should record the peer as an invalid peer.
+                if tombstone && self.fsm.peer.peer_id() == peer_id && !self.fsm.peer.is_leader() {
+                    info!(
+                        "mark the region damaged on applying snapshot";
+                        "region_id" => self.region_id(),
+                        "peer_id" => peer_id,
+                    );
+                    let mut meta = self.ctx.store_meta.lock().unwrap();
+                    meta.damaged_regions.insert(self.region_id());
+                }
                 if self.fsm.peer.should_destroy_after_apply_snapshot() {
                     self.maybe_destroy();
                 }
@@ -2537,13 +2547,40 @@ where
             "is_initialized_peer" => is_initialized_peer,
         );
 
+        let msg_type = msg.get_message().get_msg_type();
+        let fp_enable = |target_msg_type: MessageType| -> bool {
+            self.fsm.region_id() == 1000
+                && self.store_id() == 2
+                && !is_initialized_peer
+                && msg_type == target_msg_type
+        };
+        fail_point!(
+            "on_snap_msg_1000_2",
+            fp_enable(MessageType::MsgSnapshot),
+            |_| Ok(())
+        );
+        fail_point!(
+            "on_vote_msg_1000_2",
+            fp_enable(MessageType::MsgRequestVote),
+            |_| Ok(())
+        );
+        fail_point!(
+            "on_append_msg_1000_2",
+            fp_enable(MessageType::MsgAppend),
+            |_| Ok(())
+        );
+        fail_point!(
+            "on_heartbeat_msg_1000_2",
+            fp_enable(MessageType::MsgHeartbeat),
+            |_| Ok(())
+        );
+
         if self.fsm.peer.pending_remove || self.fsm.stopped {
             return Ok(());
         }
 
         self.handle_reported_disk_usage(&msg);
 
-        let msg_type = msg.get_message().get_msg_type();
         if matches!(self.ctx.self_disk_usage, DiskUsage::AlreadyFull)
             && MessageType::MsgTimeoutNow == msg_type
         {
@@ -3149,7 +3186,24 @@ where
         }
 
         let mut meta = self.ctx.store_meta.lock().unwrap();
-        if meta.regions[&self.region_id()] != *self.region() {
+        // Check if the region matches the metadata. A mismatch means another
+        // peer has replaced the current peer, which can happen during a split: a
+        // peer is first created via raft message, then replaced by another peer
+        // (of the same region) when the split is applied.
+        let region_mismatch = match meta.regions.get(&self.region_id()) {
+            Some(region) => *region != *self.region(),
+            None => {
+                // If the region doesn't exist, treat it as a mismatch. This can
+                // happen in rare situations (e.g. #17469).
+                warn!(
+                    "region not found in meta";
+                    "region_id" => self.fsm.region_id(),
+                    "peer_id" => self.fsm.peer_id(),
+                );
+                true
+            }
+        };
+        if region_mismatch {
             if !self.fsm.peer.is_initialized() {
                 info!(
                     "stale delegate detected, skip";
@@ -3162,7 +3216,7 @@ where
                 panic!(
                     "{} meta corrupted: {:?} != {:?}",
                     self.fsm.peer.tag,
-                    meta.regions[&self.region_id()],
+                    meta.regions.get(&self.region_id()),
                     self.region()
                 );
             }
@@ -3659,6 +3713,8 @@ where
             );
         })();
         let mut meta = self.ctx.store_meta.lock().unwrap();
+        meta.damaged_regions.remove(&self.fsm.region_id());
+        meta.damaged_regions.shrink_to_fit();
         let is_latest_initialized = {
             if let Some(latest_region_info) = meta.regions.get(&region_id) {
                 util::is_region_initialized(latest_region_info)
