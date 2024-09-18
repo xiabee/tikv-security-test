@@ -50,18 +50,16 @@ RUN ln -s /usr/bin/cmake3 /usr/bin/cmake
 ENV LIBRARY_PATH /usr/local/lib:$LIBRARY_PATH
 ENV LD_LIBRARY_PATH /usr/local/lib:$LD_LIBRARY_PATH
 
-# Install protoc
-RUN curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v3.15.8/protoc-3.15.8-linux-x86_64.zip"
-RUN unzip protoc-3.15.8-linux-x86_64.zip -d /usr/local/
-ENV PATH /usr/local/bin/:$PATH
-
 # Install Rustup
 RUN curl https://sh.rustup.rs -sSf | sh -s -- --no-modify-path --default-toolchain none -y
 ENV PATH /root/.cargo/bin/:$PATH
-RUN rustup self update
 
+# Install the Rust toolchain
 WORKDIR /tikv
-COPY rust-toolchain.toml ./
+COPY rust-toolchain ./
+RUN rustup self update \
+  && rustup set profile minimal \
+  && rustup default $(cat "rust-toolchain")
 
 # For cargo
 COPY scripts ./scripts
@@ -74,7 +72,8 @@ RUN mkdir -p ./cmd/tikv-ctl/src ./cmd/tikv-server/src && \
     echo 'fn main() {}' > ./cmd/tikv-ctl/src/main.rs && \
     echo 'fn main() {}' > ./cmd/tikv-server/src/main.rs && \
     for cargotoml in $(find . -type f -name "Cargo.toml"); do \
-        sed -i '/fuzz/d' ${cargotoml} ; \
+        sed -i '/fuzz/d' ${cargotoml} && \
+        sed -i '/profiler/d' ${cargotoml} ; \
     done
 
 COPY Makefile ./
@@ -106,9 +105,8 @@ FROM pingcap/alpine-glibc
 COPY --from=builder /tikv/target/release/tikv-server /tikv-server
 COPY --from=builder /tikv/target/release/tikv-ctl /tikv-ctl
 
-# FIXME: Figure out why libstdc++ is not staticly linked.
 RUN apk add --no-cache \
-    curl libstdc++
+    curl
 
 EXPOSE 20160 20180
 

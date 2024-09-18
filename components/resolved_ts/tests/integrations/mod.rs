@@ -69,13 +69,10 @@ fn test_resolved_ts_basic() {
     meta.set_region_id(r1.id);
     meta.set_region_epoch(sst_epoch);
 
-    let import = suite.get_import_client(r1.id);
-    send_upload_sst(import, &meta, &data).unwrap();
+    suite.upload_sst(r1.id, &meta, &data).unwrap();
 
     let tracked_index_before = suite.region_tracked_index(r1.id);
-    let ctx = suite.get_context(r1.id);
-    let import = suite.get_import_client(r1.id);
-    must_ingest_sst(import, ctx, meta);
+    suite.must_ingest_sst(r1.id, meta);
     let mut tracked_index_after = suite.region_tracked_index(r1.id);
     for _ in 0..10 {
         if tracked_index_after > tracked_index_before {
@@ -143,6 +140,34 @@ fn test_dynamic_change_advance_ts_interval() {
         region.id,
         block_on(suite.cluster.pd_client.get_tso()).unwrap(),
     );
+
+    suite.stop();
+}
+
+// This case checks resolved ts can still be advanced quickly even if some TiKV
+// stores are partitioned.
+#[test]
+fn test_store_partitioned() {
+    let mut suite = TestSuite::new(3);
+    let r = suite.cluster.get_region(&[]);
+    suite.cluster.must_transfer_leader(r.id, new_peer(1, 1));
+    suite.must_get_rts_ge(r.id, block_on(suite.cluster.pd_client.get_tso()).unwrap());
+
+    suite
+        .cluster
+        .add_send_filter(IsolationFilterFactory::new(3));
+    let tso = block_on(suite.cluster.pd_client.get_tso()).unwrap();
+    for _ in 0..50 {
+        let rts = suite.region_resolved_ts(r.id).unwrap();
+        if rts > tso {
+            if rts.physical() - tso.physical() < 3000 {
+                break;
+            } else {
+                panic!("resolved ts doesn't advance in time")
+            }
+        }
+        sleep_ms(100);
+    }
 
     suite.stop();
 }
@@ -232,34 +257,6 @@ fn test_scan_log_memory_quota_exceeded() {
     );
     let res = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(res.unwrap().1, 0, "{:?}", res);
-
-    suite.stop();
-}
-
-// This case checks resolved ts can still be advanced quickly even if some TiKV
-// stores are partitioned.
-#[test]
-fn test_store_partitioned() {
-    let mut suite = TestSuite::new(3);
-    let r = suite.cluster.get_region(&[]);
-    suite.cluster.must_transfer_leader(r.id, new_peer(1, 1));
-    suite.must_get_rts_ge(r.id, block_on(suite.cluster.pd_client.get_tso()).unwrap());
-
-    suite
-        .cluster
-        .add_send_filter(IsolationFilterFactory::new(3));
-    let tso = block_on(suite.cluster.pd_client.get_tso()).unwrap();
-    for _ in 0..50 {
-        let rts = suite.region_resolved_ts(r.id).unwrap();
-        if rts > tso {
-            if rts.physical() - tso.physical() < 3000 {
-                break;
-            } else {
-                panic!("resolved ts doesn't advance in time")
-            }
-        }
-        sleep_ms(100);
-    }
 
     suite.stop();
 }

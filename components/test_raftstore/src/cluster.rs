@@ -4,27 +4,22 @@ use std::{
     collections::hash_map::Entry as MapEntry,
     error::Error as StdError,
     result,
-    sync::{
-        mpsc::{self, sync_channel},
-        Arc, Mutex, RwLock,
-    },
+    sync::{mpsc, Arc, Mutex, RwLock},
     thread,
     time::Duration,
 };
 
-use ::server::common::KvEngineBuilder;
 use collections::{HashMap, HashSet};
 use crossbeam::channel::TrySendError;
 use encryption_export::DataKeyManager;
-use engine_rocks::{RocksCompactedEvent, RocksEngine, RocksStatistics};
+use engine_rocks::{RocksEngine, RocksSnapshot};
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{
-    CacheRange, Engines, Iterable, KvEngine, ManualCompactionOptions, Mutable, Peekable,
-    RaftEngineReadOnly, SnapshotContext, SyncMutable, WriteBatch, CF_DEFAULT, CF_RAFT,
+    CompactExt, Engines, Iterable, MiscExt, Mutable, Peekable, RaftEngineReadOnly, WriteBatch,
+    WriteBatchExt, CF_DEFAULT, CF_RAFT,
 };
 use file_system::IoRateLimiter;
-use futures::{self, channel::oneshot, executor::block_on, future::BoxFuture, StreamExt};
-use keys::{DATA_MAX_KEY, DATA_MIN_KEY};
+use futures::{self, channel::oneshot, executor::block_on};
 use kvproto::{
     errorpb::Error as PbError,
     kvrpcpb::{ApiVersion, Context, DiskFullOpt},
@@ -47,13 +42,10 @@ use raftstore::{
             RaftBatchSystem, RaftRouter,
         },
         transport::CasualRouter,
-        util::encode_start_ts_into_flag_data,
         *,
     },
     Error, Result,
 };
-use range_cache_memory_engine::RangeCacheMemoryEngine;
-use resource_control::ResourceGroupManager;
 use tempfile::TempDir;
 use test_pd_client::TestPdClient;
 use tikv::{config::TikvConfig, server::Result as ServerResult};
@@ -65,20 +57,15 @@ use tikv_util::{
 };
 use txn_types::WriteBatchFlags;
 
-use self::range_cache_engine::RangCacheEngineExt;
 use super::*;
 use crate::Config;
-
-pub trait KvEngineWithRocks = KvEngine<DiskEngine = RocksEngine, CompactedEvent = RocksCompactedEvent>
-    + KvEngineBuilder
-    + RangCacheEngineExt;
 
 // We simulate 3 or 5 nodes, each has a store.
 // Sometimes, we use fixed id to test, which means the id
 // isn't allocated by pd, and node id, store id are same.
 // E,g, for node 1, the node id and store id are both 1.
 
-pub trait Simulator<EK: KvEngine> {
+pub trait Simulator {
     // Pass 0 to let pd allocate a node id if db is empty.
     // If node id > 0, the node must be created in db already,
     // and the node id must be the same as given argument.
@@ -88,12 +75,11 @@ pub trait Simulator<EK: KvEngine> {
         &mut self,
         node_id: u64,
         cfg: Config,
-        engines: Engines<EK, RaftTestEngine>,
+        engines: Engines<RocksEngine, RaftTestEngine>,
         store_meta: Arc<Mutex<StoreMeta>>,
         key_manager: Option<Arc<DataKeyManager>>,
-        router: RaftRouter<EK, RaftTestEngine>,
-        system: RaftBatchSystem<EK, RaftTestEngine>,
-        resource_manager: &Option<Arc<ResourceGroupManager>>,
+        router: RaftRouter<RocksEngine, RaftTestEngine>,
+        system: RaftBatchSystem<RocksEngine, RaftTestEngine>,
     ) -> ServerResult<u64>;
     fn stop_node(&mut self, node_id: u64);
     fn get_node_ids(&self) -> HashSet<u64>;
@@ -101,7 +87,7 @@ pub trait Simulator<EK: KvEngine> {
         &self,
         node_id: u64,
         request: RaftCmdRequest,
-        cb: Callback<EK::Snapshot>,
+        cb: Callback<RocksSnapshot>,
     ) -> Result<()> {
         self.async_command_on_node_with_opts(node_id, request, cb, Default::default())
     }
@@ -109,13 +95,13 @@ pub trait Simulator<EK: KvEngine> {
         &self,
         node_id: u64,
         request: RaftCmdRequest,
-        cb: Callback<EK::Snapshot>,
+        cb: Callback<RocksSnapshot>,
         opts: RaftCmdExtraOpts,
     ) -> Result<()>;
     fn send_raft_msg(&mut self, msg: RaftMessage) -> Result<()>;
     fn get_snap_dir(&self, node_id: u64) -> String;
     fn get_snap_mgr(&self, node_id: u64) -> &SnapManager;
-    fn get_router(&self, node_id: u64) -> Option<RaftRouter<EK, RaftTestEngine>>;
+    fn get_router(&self, node_id: u64) -> Option<RaftRouter<RocksEngine, RaftTestEngine>>;
     fn add_send_filter(&mut self, node_id: u64, filter: Box<dyn Filter>);
     fn clear_send_filters(&mut self, node_id: u64);
     fn add_recv_filter(&mut self, node_id: u64, filter: Box<dyn Filter>);
@@ -128,25 +114,23 @@ pub trait Simulator<EK: KvEngine> {
 
     fn read(
         &mut self,
-        snap_ctx: Option<SnapshotContext>,
         batch_id: Option<ThreadReadId>,
         request: RaftCmdRequest,
         timeout: Duration,
     ) -> Result<RaftCmdResponse> {
         let node_id = request.get_header().get_peer().get_store_id();
-        let (cb, mut rx) = make_cb::<EK>(&request);
-        self.async_read(snap_ctx, node_id, batch_id, request, cb);
+        let (cb, rx) = make_cb(&request);
+        self.async_read(node_id, batch_id, request, cb);
         rx.recv_timeout(timeout)
             .map_err(|_| Error::Timeout(format!("request timeout for {:?}", timeout)))
     }
 
     fn async_read(
         &mut self,
-        snap_ctx: Option<SnapshotContext>,
         node_id: u64,
         batch_id: Option<ThreadReadId>,
         request: RaftCmdRequest,
-        cb: Callback<EK::Snapshot>,
+        cb: Callback<RocksSnapshot>,
     );
 
     fn call_command_on_node(
@@ -155,7 +139,7 @@ pub trait Simulator<EK: KvEngine> {
         request: RaftCmdRequest,
         timeout: Duration,
     ) -> Result<RaftCmdResponse> {
-        let (cb, mut rx) = make_cb::<EK>(&request);
+        let (cb, rx) = make_cb(&request);
 
         match self.async_command_on_node(node_id, request, cb) {
             Ok(()) => {}
@@ -170,39 +154,27 @@ pub trait Simulator<EK: KvEngine> {
     }
 }
 
-pub struct Cluster<EK: KvEngineWithRocks, T: Simulator<EK>> {
+pub struct Cluster<T: Simulator> {
     pub cfg: Config,
     leaders: HashMap<u64, metapb::Peer>,
     pub count: usize,
 
     pub paths: Vec<TempDir>,
-    pub dbs: Vec<Engines<EK, RaftTestEngine>>,
+    pub dbs: Vec<Engines<RocksEngine, RaftTestEngine>>,
     pub store_metas: HashMap<u64, Arc<Mutex<StoreMeta>>>,
     key_managers: Vec<Option<Arc<DataKeyManager>>>,
     pub io_rate_limiter: Option<Arc<IoRateLimiter>>,
-    pub engines: HashMap<u64, Engines<EK, RaftTestEngine>>,
+    pub engines: HashMap<u64, Engines<RocksEngine, RaftTestEngine>>,
     key_managers_map: HashMap<u64, Option<Arc<DataKeyManager>>>,
     pub labels: HashMap<u64, HashMap<String, String>>,
     group_props: HashMap<u64, GroupProperties>,
     pub sst_workers: Vec<LazyWorker<String>>,
     pub sst_workers_map: HashMap<u64, usize>,
-    pub kv_statistics: Vec<Arc<RocksStatistics>>,
-    pub raft_statistics: Vec<Option<Arc<RocksStatistics>>>,
     pub sim: Arc<RwLock<T>>,
     pub pd_client: Arc<TestPdClient>,
-    resource_manager: Option<Arc<ResourceGroupManager>>,
-
-    // When this is set, the `HybridEngineImpl` will be used as the underlying KvEngine. In
-    // addition, it atomaticaly load the whole range when start. When we want to do something
-    // specific, for example, only load ranges of some regions, we may not set this.
-    range_cache_engine_enabled_with_whole_range: bool,
 }
 
-impl<EK, T> Cluster<EK, T>
-where
-    EK: KvEngineWithRocks,
-    T: Simulator<EK>,
-{
+impl<T: Simulator> Cluster<T> {
     // Create the default Store cluster.
     pub fn new(
         id: u64,
@@ -210,7 +182,7 @@ where
         sim: Arc<RwLock<T>>,
         pd_client: Arc<TestPdClient>,
         api_version: ApiVersion,
-    ) -> Cluster<EK, T> {
+    ) -> Cluster<T> {
         // TODO: In the future, maybe it's better to test both case where
         // `use_delete_range` is true and false
         Cluster {
@@ -230,10 +202,6 @@ where
             pd_client,
             sst_workers: vec![],
             sst_workers_map: HashMap::default(),
-            resource_manager: Some(Arc::new(ResourceGroupManager::default())),
-            kv_statistics: vec![],
-            raft_statistics: vec![],
-            range_cache_engine_enabled_with_whole_range: false,
         }
     }
 
@@ -273,20 +241,13 @@ where
         assert!(self.sst_workers_map.insert(node_id, offset).is_none());
     }
 
-    fn create_engine(&mut self, router: Option<RaftRouter<EK, RaftTestEngine>>) {
-        let (engines, key_manager, dir, sst_worker, kv_statistics, raft_statistics) =
-            create_test_engine(
-                router,
-                self.io_rate_limiter.clone(),
-                self.pd_client.clone(),
-                &self.cfg,
-            );
+    fn create_engine(&mut self, router: Option<RaftRouter<RocksEngine, RaftTestEngine>>) {
+        let (engines, key_manager, dir, sst_worker) =
+            create_test_engine(router, self.io_rate_limiter.clone(), &self.cfg);
         self.dbs.push(engines);
         self.key_managers.push(key_manager);
         self.paths.push(dir);
         self.sst_workers.push(sst_worker);
-        self.kv_statistics.push(kv_statistics);
-        self.raft_statistics.push(raft_statistics);
     }
 
     pub fn create_engines(&mut self) {
@@ -310,8 +271,7 @@ where
 
         // Try start new nodes.
         for _ in 0..self.count - self.engines.len() {
-            let (router, system) =
-                create_raft_batch_system(&self.cfg.raft_store, &self.resource_manager);
+            let (router, system) = create_raft_batch_system(&self.cfg.raft_store);
             self.create_engine(Some(router.clone()));
 
             let engines = self.dbs.last().unwrap().clone();
@@ -330,7 +290,6 @@ where
                 key_mgr.clone(),
                 router,
                 system,
-                &self.resource_manager,
             )?;
             self.group_props.insert(node_id, props);
             self.engines.insert(node_id, engines);
@@ -345,13 +304,7 @@ where
     pub fn compact_data(&self) {
         for engine in self.engines.values() {
             let db = &engine.kv;
-            db.compact_range_cf(
-                CF_DEFAULT,
-                None,
-                None,
-                ManualCompactionOptions::new(false, 1, false),
-            )
-            .unwrap();
+            db.compact_range(CF_DEFAULT, None, None, false, 1).unwrap();
         }
     }
 
@@ -368,11 +321,6 @@ where
         self.create_engines();
         self.bootstrap_region().unwrap();
         self.start().unwrap();
-        if self.range_cache_engine_enabled_with_whole_range {
-            self.engines
-                .iter()
-                .for_each(|(_, engines)| engines.kv.cache_all());
-        }
     }
 
     // Bootstrap the store with fixed ID (like 1, 2, .. 5) and
@@ -392,8 +340,7 @@ where
         debug!("starting node {}", node_id);
         let engines = self.engines[&node_id].clone();
         let key_mgr = self.key_managers_map[&node_id].clone();
-        let (router, system) =
-            create_raft_batch_system(&self.cfg.raft_store, &self.resource_manager);
+        let (router, system) = create_raft_batch_system(&self.cfg.raft_store);
         let mut cfg = self.cfg.clone();
         if let Some(labels) = self.labels.get(&node_id) {
             cfg.server.labels = labels.to_owned();
@@ -413,16 +360,9 @@ where
         tikv_util::thread_group::set_properties(Some(props));
         debug!("calling run node"; "node_id" => node_id);
         // FIXME: rocksdb event listeners may not work, because we change the router.
-        self.sim.wl().run_node(
-            node_id,
-            cfg,
-            engines,
-            store_meta,
-            key_mgr,
-            router,
-            system,
-            &self.resource_manager,
-        )?;
+        self.sim
+            .wl()
+            .run_node(node_id, cfg, engines, store_meta, key_mgr, router, system)?;
         debug!("node {} started", node_id);
         Ok(())
     }
@@ -443,7 +383,7 @@ where
         tikv_util::thread_group::set_properties(previous_prop);
     }
 
-    pub fn get_engine(&self, node_id: u64) -> EK {
+    pub fn get_engine(&self, node_id: u64) -> RocksEngine {
         self.engines[&node_id].kv.clone()
     }
 
@@ -451,7 +391,7 @@ where
         self.engines[&node_id].raft.clone()
     }
 
-    pub fn get_all_engines(&self, node_id: u64) -> Engines<EK, RaftTestEngine> {
+    pub fn get_all_engines(&self, node_id: u64) -> Engines<RocksEngine, RaftTestEngine> {
         self.engines[&node_id].clone()
     }
 
@@ -480,16 +420,11 @@ where
 
     pub fn read(
         &self,
-        snap_ctx: Option<SnapshotContext>,
         batch_id: Option<ThreadReadId>,
         request: RaftCmdRequest,
         timeout: Duration,
     ) -> Result<RaftCmdResponse> {
-        match self
-            .sim
-            .wl()
-            .read(snap_ctx, batch_id, request.clone(), timeout)
-        {
+        match self.sim.wl().read(batch_id, request.clone(), timeout) {
             Err(e) => {
                 warn!("failed to read {:?}: {:?}", request, e);
                 Err(e)
@@ -503,15 +438,6 @@ where
         request: RaftCmdRequest,
         timeout: Duration,
     ) -> Result<RaftCmdResponse> {
-        self.call_command_with_snap_ctx(request, timeout, None)
-    }
-
-    pub fn call_command_with_snap_ctx(
-        &self,
-        request: RaftCmdRequest,
-        timeout: Duration,
-        snap_ctx: Option<SnapshotContext>,
-    ) -> Result<RaftCmdResponse> {
         let mut is_read = false;
         for req in request.get_requests() {
             match req.get_cmd_type() {
@@ -522,7 +448,7 @@ where
             }
         }
         let ret = if is_read {
-            self.sim.wl().read(snap_ctx, None, request.clone(), timeout)
+            self.sim.wl().read(None, request.clone(), timeout)
         } else {
             self.sim.rl().call_command(request.clone(), timeout)
         };
@@ -535,11 +461,10 @@ where
         }
     }
 
-    pub fn call_command_on_leader_with_snap_ctx(
+    pub fn call_command_on_leader(
         &mut self,
         mut request: RaftCmdRequest,
         timeout: Duration,
-        snap_ctx: Option<SnapshotContext>,
     ) -> Result<RaftCmdResponse> {
         let timer = Instant::now();
         let region_id = request.get_header().get_region_id();
@@ -549,11 +474,10 @@ where
                 Some(l) => l,
             };
             request.mut_header().set_peer(leader);
-            let resp =
-                match self.call_command_with_snap_ctx(request.clone(), timeout, snap_ctx.clone()) {
-                    e @ Err(_) => return e,
-                    Ok(resp) => resp,
-                };
+            let resp = match self.call_command(request.clone(), timeout) {
+                e @ Err(_) => return e,
+                Ok(resp) => resp,
+            };
             if self.refresh_leader_if_needed(&resp, region_id)
                 && timer.saturating_elapsed() < timeout
             {
@@ -565,14 +489,6 @@ where
             }
             return Ok(resp);
         }
-    }
-
-    pub fn call_command_on_leader(
-        &mut self,
-        request: RaftCmdRequest,
-        timeout: Duration,
-    ) -> Result<RaftCmdResponse> {
-        self.call_command_on_leader_with_snap_ctx(request, timeout, None)
     }
 
     fn valid_leader_id(&self, region_id: u64, leader_id: u64) -> bool {
@@ -832,7 +748,7 @@ where
         self.leaders.remove(&region_id);
     }
 
-    pub fn assert_quorum<F: FnMut(&EK) -> bool>(&self, mut condition: F) {
+    pub fn assert_quorum<F: FnMut(&RocksEngine) -> bool>(&self, mut condition: F) {
         if self.engines.is_empty() {
             return;
         }
@@ -921,17 +837,6 @@ where
         read_quorum: bool,
         timeout: Duration,
     ) -> RaftCmdResponse {
-        self.request_with_snap_ctx(key, reqs, read_quorum, timeout, None)
-    }
-
-    pub fn request_with_snap_ctx(
-        &mut self,
-        key: &[u8],
-        reqs: Vec<Request>,
-        read_quorum: bool,
-        timeout: Duration,
-        snap_ctx: Option<SnapshotContext>,
-    ) -> RaftCmdResponse {
         let timer = Instant::now();
         let mut tried_times = 0;
         // At least retry once.
@@ -939,16 +844,13 @@ where
             tried_times += 1;
             let mut region = self.get_region(key);
             let region_id = region.get_id();
-            let mut req = new_request(
+            let req = new_request(
                 region_id,
                 region.take_region_epoch(),
                 reqs.clone(),
                 read_quorum,
             );
-            if let Some(ref ctx) = snap_ctx {
-                encode_start_ts_into_flag_data(req.mut_header(), ctx.read_ts);
-            }
-            let result = self.call_command_on_leader_with_snap_ctx(req, timeout, snap_ctx.clone());
+            let result = self.call_command_on_leader(req, timeout);
 
             let resp = match result {
                 e @ Err(Error::Timeout(_))
@@ -1014,48 +916,15 @@ where
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        if !self.range_cache_engine_enabled_with_whole_range {
-            self.get_impl(CF_DEFAULT, key, false)
-        } else {
-            let ctx = SnapshotContext {
-                read_ts: u64::MAX,
-                range: Some(CacheRange::new(
-                    DATA_MIN_KEY.to_vec(),
-                    DATA_MAX_KEY.to_vec(),
-                )),
-            };
-            self.get_cf_with_snap_ctx(CF_DEFAULT, key, true, ctx)
-        }
+        self.get_impl(CF_DEFAULT, key, false)
     }
 
     pub fn get_cf(&mut self, cf: &str, key: &[u8]) -> Option<Vec<u8>> {
-        if !self.range_cache_engine_enabled_with_whole_range {
-            self.get_impl(cf, key, false)
-        } else {
-            let ctx = SnapshotContext {
-                read_ts: u64::MAX,
-                range: Some(CacheRange::new(
-                    DATA_MIN_KEY.to_vec(),
-                    DATA_MAX_KEY.to_vec(),
-                )),
-            };
-            self.get_cf_with_snap_ctx(cf, key, true, ctx)
-        }
+        self.get_impl(cf, key, false)
     }
 
     pub fn must_get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        if !self.range_cache_engine_enabled_with_whole_range {
-            self.get_impl(CF_DEFAULT, key, true)
-        } else {
-            let ctx = SnapshotContext {
-                read_ts: u64::MAX,
-                range: Some(CacheRange::new(
-                    DATA_MIN_KEY.to_vec(),
-                    DATA_MAX_KEY.to_vec(),
-                )),
-            };
-            self.get_cf_with_snap_ctx(CF_DEFAULT, key, true, ctx)
-        }
+        self.get_impl(CF_DEFAULT, key, true)
     }
 
     fn get_impl(&mut self, cf: &str, key: &[u8], read_quorum: bool) -> Option<Vec<u8>> {
@@ -1077,65 +946,10 @@ where
         }
     }
 
-    pub fn get_with_snap_ctx(
-        &mut self,
-        key: &[u8],
-        read_quorum: bool,
-        snap_ctx: SnapshotContext,
-    ) -> Option<Vec<u8>> {
-        self.get_cf_with_snap_ctx(CF_DEFAULT, key, read_quorum, snap_ctx)
-    }
-
-    // called by range cache engine only
-    pub fn get_cf_with_snap_ctx(
-        &mut self,
-        cf: &str,
-        key: &[u8],
-        read_quorum: bool,
-        snap_ctx: SnapshotContext,
-    ) -> Option<Vec<u8>> {
-        let rx = if self.range_cache_engine_enabled_with_whole_range {
-            fail::remove("on_range_cache_get_value");
-            let (tx, rx) = sync_channel(1);
-            fail::cfg_callback("on_range_cache_get_value", move || {
-                tx.send(true).unwrap();
-            })
-            .unwrap();
-            Some(rx)
-        } else {
-            None
-        };
-
-        let mut resp = self.request_with_snap_ctx(
-            key,
-            vec![new_get_cf_cmd(cf, key)],
-            read_quorum,
-            Duration::from_secs(5),
-            Some(snap_ctx),
-        );
-        if resp.get_header().has_error() {
-            panic!("response {:?} has error", resp);
-        }
-        assert_eq!(resp.get_responses().len(), 1);
-        assert_eq!(resp.get_responses()[0].get_cmd_type(), CmdType::Get);
-        let res = if resp.get_responses()[0].has_get() {
-            if let Some(rx) = rx {
-                rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            }
-            Some(resp.mut_responses()[0].mut_get().take_value())
-        } else {
-            None
-        };
-        if self.range_cache_engine_enabled_with_whole_range {
-            fail::remove("on_range_cache_get_value");
-        }
-        res
-    }
-
     pub fn async_request(
         &mut self,
         req: RaftCmdRequest,
-    ) -> Result<BoxFuture<'static, RaftCmdResponse>> {
+    ) -> Result<mpsc::Receiver<RaftCmdResponse>> {
         self.async_request_with_opts(req, Default::default())
     }
 
@@ -1143,24 +957,18 @@ where
         &mut self,
         mut req: RaftCmdRequest,
         opts: RaftCmdExtraOpts,
-    ) -> Result<BoxFuture<'static, RaftCmdResponse>> {
+    ) -> Result<mpsc::Receiver<RaftCmdResponse>> {
         let region_id = req.get_header().get_region_id();
         let leader = self.leader_of_region(region_id).unwrap();
         req.mut_header().set_peer(leader.clone());
-        let (cb, mut rx) = make_cb::<EK>(&req);
+        let (cb, rx) = make_cb(&req);
         self.sim
             .rl()
             .async_command_on_node_with_opts(leader.get_store_id(), req, cb, opts)?;
-        Ok(Box::pin(async move {
-            let fut = rx.next();
-            fut.await.unwrap()
-        }))
+        Ok(rx)
     }
 
-    pub fn async_exit_joint(
-        &mut self,
-        region_id: u64,
-    ) -> Result<BoxFuture<'static, RaftCmdResponse>> {
+    pub fn async_exit_joint(&mut self, region_id: u64) -> Result<mpsc::Receiver<RaftCmdResponse>> {
         let region = block_on(self.pd_client.get_region_by_id(region_id))
             .unwrap()
             .unwrap();
@@ -1176,7 +984,7 @@ where
         &mut self,
         key: &[u8],
         value: &[u8],
-    ) -> Result<BoxFuture<'static, RaftCmdResponse>> {
+    ) -> Result<mpsc::Receiver<RaftCmdResponse>> {
         let mut region = self.get_region(key);
         let reqs = vec![new_put_cmd(key, value)];
         let put = new_request(region.get_id(), region.take_region_epoch(), reqs, false);
@@ -1187,7 +995,7 @@ where
         &mut self,
         region_id: u64,
         peer: metapb::Peer,
-    ) -> Result<BoxFuture<'static, RaftCmdResponse>> {
+    ) -> Result<mpsc::Receiver<RaftCmdResponse>> {
         let region = block_on(self.pd_client.get_region_by_id(region_id))
             .unwrap()
             .unwrap();
@@ -1200,7 +1008,7 @@ where
         &mut self,
         region_id: u64,
         peer: metapb::Peer,
-    ) -> Result<BoxFuture<'static, RaftCmdResponse>> {
+    ) -> Result<mpsc::Receiver<RaftCmdResponse>> {
         let region = block_on(self.pd_client.get_region_by_id(region_id))
             .unwrap()
             .unwrap();
@@ -1455,9 +1263,10 @@ where
                     &keys::region_state_key(region_id),
                 )
                 .unwrap()
-                && state.get_state() == peer_state
             {
-                return;
+                if state.get_state() == peer_state {
+                    return;
+                }
             }
             sleep_ms(10);
         }
@@ -1519,7 +1328,7 @@ where
         }
     }
 
-    pub fn restore_kv_meta(&self, region_id: u64, store_id: u64, snap: &EK::Snapshot) {
+    pub fn restore_kv_meta(&self, region_id: u64, store_id: u64, snap: &RocksSnapshot) {
         let (meta_start, meta_end) = (
             keys::region_meta_prefix(region_id),
             keys::region_meta_prefix(region_id + 1),
@@ -1557,18 +1366,6 @@ where
         kv_wb.write().unwrap();
     }
 
-    pub fn add_send_filter_on_node(&mut self, node_id: u64, filter: Box<dyn Filter>) {
-        self.sim.wl().add_send_filter(node_id, filter);
-    }
-
-    pub fn clear_send_filter_on_node(&mut self, node_id: u64) {
-        self.sim.wl().clear_send_filters(node_id);
-    }
-
-    pub fn add_recv_filter_on_node(&mut self, node_id: u64, filter: Box<dyn Filter>) {
-        self.sim.wl().add_recv_filter(node_id, filter);
-    }
-
     pub fn add_send_filter<F: FilterFactory>(&self, factory: F) {
         let mut sim = self.sim.wl();
         for node_id in sim.get_node_ids() {
@@ -1576,10 +1373,6 @@ where
                 sim.add_send_filter(node_id, filter);
             }
         }
-    }
-
-    pub fn clear_recv_filter_on_node(&mut self, node_id: u64) {
-        self.sim.wl().clear_recv_filters(node_id);
     }
 
     pub fn transfer_leader(&mut self, region_id: u64, leader: metapb::Peer) {
@@ -1647,7 +1440,7 @@ where
         &mut self,
         region: &metapb::Region,
         split_key: &[u8],
-        cb: Callback<EK::Snapshot>,
+        cb: Callback<RocksSnapshot>,
     ) {
         let leader = self.leader_of_region(region.get_id()).unwrap();
         let router = self.sim.rl().get_router(leader.get_store_id()).unwrap();
@@ -1707,7 +1500,8 @@ where
         &mut self,
         region_id: u64,
         cmd_type: AdminCmdType,
-    ) -> BoxFuture<'static, RaftCmdResponse> {
+        cb: Callback<RocksSnapshot>,
+    ) {
         let leader = self.leader_of_region(region_id).unwrap();
         let store_id = leader.get_store_id();
         let region_epoch = self.get_region_epoch(region_id);
@@ -1720,13 +1514,10 @@ where
         req.set_admin_request(admin);
         req.mut_header()
             .set_flags(WriteBatchFlags::FLASHBACK.bits());
-        let (result_tx, result_rx) = oneshot::channel();
         let router = self.sim.rl().get_router(store_id).unwrap();
         if let Err(e) = router.send_command(
             req,
-            Callback::write(Box::new(move |resp| {
-                result_tx.send(resp.response).unwrap();
-            })),
+            cb,
             RaftCmdExtraOpts {
                 deadline: None,
                 disk_full_opt: DiskFullOpt::AllowedOnAlmostFull,
@@ -1737,22 +1528,27 @@ where
                 cmd_type, e
             );
         }
-        Box::pin(async move { result_rx.await.unwrap() })
     }
 
     pub fn must_send_wait_flashback_msg(&mut self, region_id: u64, cmd_type: AdminCmdType) {
         self.wait_applied_to_current_term(region_id, Duration::from_secs(3));
-        let resp = self.must_send_flashback_msg(region_id, cmd_type);
-        block_on(async {
-            let resp = resp.await;
-            if resp.get_header().has_error() {
-                panic!(
-                    "call flashback msg {:?} failed, error: {:?}",
-                    cmd_type,
-                    resp.get_header().get_error()
-                );
-            }
-        });
+        let (result_tx, result_rx) = oneshot::channel();
+        self.must_send_flashback_msg(
+            region_id,
+            cmd_type,
+            Callback::write(Box::new(move |resp| {
+                if resp.response.get_header().has_error() {
+                    result_tx
+                        .send(Some(resp.response.get_header().get_error().clone()))
+                        .unwrap();
+                    return;
+                }
+                result_tx.send(None).unwrap();
+            })),
+        );
+        if let Some(e) = block_on(result_rx).unwrap() {
+            panic!("call flashback msg {:?} failed, error: {:?}", cmd_type, e);
+        }
     }
 
     pub fn wait_applied_to_current_term(&mut self, region_id: u64, timeout: Duration) {
@@ -1872,7 +1668,7 @@ where
         }
     }
 
-    pub fn new_prepare_merge(&self, source: u64, target: u64) -> RaftCmdRequest {
+    fn new_prepare_merge(&self, source: u64, target: u64) -> RaftCmdRequest {
         let region = block_on(self.pd_client.get_region_by_id(target))
             .unwrap()
             .unwrap();
@@ -1887,7 +1683,7 @@ where
         )
     }
 
-    pub fn merge_region(&mut self, source: u64, target: u64, cb: Callback<EK::Snapshot>) {
+    pub fn merge_region(&mut self, source: u64, target: u64, cb: Callback<RocksSnapshot>) {
         let mut req = self.new_prepare_merge(source, target);
         let leader = self.leader_of_region(source).unwrap();
         req.mut_header().set_peer(leader.clone());
@@ -2058,10 +1854,6 @@ where
         ctx
     }
 
-    pub fn get_router(&self, node_id: u64) -> Option<RaftRouter<EK, RaftTestEngine>> {
-        self.sim.rl().get_router(node_id)
-    }
-
     pub fn refresh_region_bucket_keys(
         &mut self,
         region: &metapb::Region,
@@ -2132,108 +1924,18 @@ where
                 start_key: None,
                 end_key: None,
                 policy: CheckPolicy::Scan,
-                source: "bucket",
+                source: "test",
                 cb,
             },
         )
         .unwrap();
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
-
-    pub fn scan<F>(
-        &self,
-        store_id: u64,
-        cf: &str,
-        start_key: &[u8],
-        end_key: &[u8],
-        fill_cache: bool,
-        f: F,
-    ) -> engine_traits::Result<()>
-    where
-        F: FnMut(&[u8], &[u8]) -> engine_traits::Result<bool>,
-    {
-        self.engines[&store_id]
-            .kv
-            .scan(cf, start_key, end_key, fill_cache, f)?;
-
-        Ok(())
-    }
-
-    pub fn range_cache_engine_enabled_with_whole_range(&mut self, v: bool) {
-        self.range_cache_engine_enabled_with_whole_range = v;
-    }
 }
 
-impl<EK: KvEngineWithRocks, T: Simulator<EK>> Drop for Cluster<EK, T> {
+impl<T: Simulator> Drop for Cluster<T> {
     fn drop(&mut self) {
         test_util::clear_failpoints();
         self.shutdown();
-    }
-}
-
-pub trait RawEngine<EK: engine_traits::KvEngine>:
-    Peekable<DbVector = EK::DbVector> + SyncMutable
-{
-    fn range_cache_engine(&self) -> bool {
-        false
-    }
-
-    fn region_local_state(&self, region_id: u64)
-    -> engine_traits::Result<Option<RegionLocalState>>;
-
-    fn raft_apply_state(&self, _region_id: u64) -> engine_traits::Result<Option<RaftApplyState>>;
-
-    fn raft_local_state(&self, _region_id: u64) -> engine_traits::Result<Option<RaftLocalState>>;
-}
-
-impl RawEngine<RocksEngine> for RocksEngine {
-    fn region_local_state(
-        &self,
-        region_id: u64,
-    ) -> engine_traits::Result<Option<RegionLocalState>> {
-        self.get_msg_cf(CF_RAFT, &keys::region_state_key(region_id))
-    }
-
-    fn raft_apply_state(&self, region_id: u64) -> engine_traits::Result<Option<RaftApplyState>> {
-        self.get_msg_cf(CF_RAFT, &keys::apply_state_key(region_id))
-    }
-
-    fn raft_local_state(&self, region_id: u64) -> engine_traits::Result<Option<RaftLocalState>> {
-        self.get_msg_cf(CF_RAFT, &keys::raft_state_key(region_id))
-    }
-}
-
-impl RawEngine<RocksEngine> for HybridEngineImpl {
-    fn range_cache_engine(&self) -> bool {
-        true
-    }
-
-    fn region_local_state(
-        &self,
-        region_id: u64,
-    ) -> engine_traits::Result<Option<RegionLocalState>> {
-        self.disk_engine()
-            .get_msg_cf(CF_RAFT, &keys::region_state_key(region_id))
-    }
-
-    fn raft_apply_state(&self, region_id: u64) -> engine_traits::Result<Option<RaftApplyState>> {
-        self.disk_engine()
-            .get_msg_cf(CF_RAFT, &keys::apply_state_key(region_id))
-    }
-
-    fn raft_local_state(&self, region_id: u64) -> engine_traits::Result<Option<RaftLocalState>> {
-        self.disk_engine()
-            .get_msg_cf(CF_RAFT, &keys::raft_state_key(region_id))
-    }
-}
-
-impl<T: Simulator<HybridEngineImpl>> Cluster<HybridEngineImpl, T> {
-    pub fn get_range_cache_engine(&self, node_id: u64) -> RangeCacheMemoryEngine {
-        self.engines
-            .get(&node_id)
-            .unwrap()
-            .kv
-            .range_cache_engine()
-            .clone()
     }
 }

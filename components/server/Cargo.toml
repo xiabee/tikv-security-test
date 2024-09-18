@@ -2,7 +2,7 @@
 name = "server"
 version = "0.0.1"
 license = "Apache-2.0"
-edition = "2021"
+edition = "2018"
 publish = false
 
 [features]
@@ -12,9 +12,11 @@ mimalloc = ["tikv/mimalloc"]
 snmalloc = ["tikv/snmalloc"]
 portable = ["tikv/portable"]
 sse = ["tikv/sse"]
-memory-engine = []
 mem-profiling = ["tikv/mem-profiling"]
 failpoints = ["tikv/failpoints"]
+cloud-aws = ["encryption_export/cloud-aws"]
+cloud-gcp = ["encryption_export/cloud-gcp"]
+cloud-azure = ["encryption_export/cloud-azure"]
 test-engine-kv-rocksdb = [
   "tikv/test-engine-kv-rocksdb"
 ]
@@ -36,11 +38,11 @@ backup = { workspace = true }
 backup-stream = { workspace = true }
 causal_ts = { workspace = true }
 cdc = { workspace = true }
-chrono = { workspace = true }
-clap = { workspace = true }
+chrono = "0.4"
+clap = "2.32"
 collections = { workspace = true }
 concurrency_manager = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam = "0.8"
 encryption = { workspace = true }
 encryption_export = { workspace = true }
 engine_rocks = { workspace = true }
@@ -52,10 +54,8 @@ file_system = { workspace = true }
 fs2 = "0.4"
 futures = "0.3"
 grpcio = { workspace = true }
-grpcio-health = { workspace = true }
-health_controller = { workspace = true }
+grpcio-health = { version = "0.10", default-features = false, features = ["protobuf-codec"] }
 hex = "0.4"
-hybrid_engine = { workspace = true }
 keys = { workspace = true }
 kvproto = { workspace = true }
 libc = "0.2"
@@ -64,19 +64,17 @@ log_wrappers = { workspace = true }
 pd_client = { workspace = true }
 prometheus = { version = "0.13", features = ["nightly"] }
 protobuf = { version = "2.8", features = ["bytes"] }
-raft = { workspace = true }
+raft = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
 raft_log_engine = { workspace = true }
 raftstore = { workspace = true, features = ["engine_rocks"] }
-raftstore-v2 = { workspace = true }
-range_cache_memory_engine = { workspace = true }
+rand = "0.8"
 resolved_ts = { workspace = true }
-resource_control = { workspace = true }
 resource_metering = { workspace = true }
 security = { workspace = true }
 serde_json = "1.0"
 service = { workspace = true }
-slog = { workspace = true }
-slog-global = { workspace = true }
+slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debug"] }
+slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
 snap_recovery = { workspace = true }
 tempfile = "3.0"
 tikv = { workspace = true }

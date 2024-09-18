@@ -3,7 +3,6 @@
 use std::{sync::Arc, thread, time::Duration};
 
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
-use engine_rocks::RocksEngine;
 use futures::executor::block_on;
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::{
@@ -15,7 +14,7 @@ use test_raftstore::*;
 use tikv_util::{time::Instant, HandyRwLock};
 
 struct TestSuite {
-    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
+    pub cluster: Cluster<ServerCluster>,
     api_version: ApiVersion,
 }
 
@@ -25,7 +24,7 @@ impl TestSuite {
         // Disable background renew by setting `renew_interval` to 0, to make timestamp
         // allocation predictable.
         configure_for_causal_ts(&mut cluster, "0s", 100);
-        configure_for_merge(&mut cluster.cfg);
+        configure_for_merge(&mut cluster);
         cluster.run();
         cluster.pd_client.disable_default_operator();
 
@@ -209,7 +208,7 @@ fn test_leader_transfer() {
 #[test]
 fn test_region_merge() {
     let mut suite = TestSuite::new(3, ApiVersion::V2);
-    let keys = [b"rk0", b"rk1", b"rk2", b"rk3", b"rk4", b"rk5"];
+    let keys = vec![b"rk0", b"rk1", b"rk2", b"rk3", b"rk4", b"rk5"];
 
     suite.must_raw_put(keys[1], b"v1");
     suite.must_raw_put(keys[3], b"v3");
@@ -277,7 +276,7 @@ fn test_region_merge() {
     suite.stop();
 }
 
-// Verify the raw key guard correctness in APIv2.
+// Verify the raw key guard correctness in apiv2
 #[test]
 fn test_raw_put_key_guard() {
     let mut suite = TestSuite::new(3, ApiVersion::V2);
@@ -290,28 +289,19 @@ fn test_raw_put_key_guard() {
     let region_id = region.get_id();
     let client = suite.get_client(region_id);
     let ctx = suite.get_context(region_id);
-    let leader = suite.cluster.leader_of_region(region_id).unwrap();
-    let node_id = leader.get_id();
+    let node_id = region.get_peers()[0].get_id();
     let leader_cm = suite.cluster.sim.rl().get_concurrency_manager(node_id);
     let ts_provider = suite.get_causal_ts_provider(node_id).unwrap();
     let ts = block_on(ts_provider.async_get_ts()).unwrap();
 
     let copy_test_key = test_key.clone();
     let copy_test_value = test_value.clone();
+    let apply_wait_timeout = 2000; // ms, assume send request and apply can be finished in 2s.
     fail::cfg(pause_write_fp, "pause").unwrap();
     let handle = thread::spawn(move || {
         must_raw_put(&client, ctx, copy_test_key, copy_test_value);
     });
-
-    // Wait for global_min_lock_ts.
-    sleep_ms(500);
-    let start = Instant::now();
-    while leader_cm.global_min_lock_ts().is_none() {
-        if start.saturating_elapsed() > Duration::from_secs(5) {
-            panic!("wait for global_min_lock_ts timeout");
-        }
-        sleep_ms(200);
-    }
+    thread::sleep(Duration::from_millis(apply_wait_timeout));
 
     // Before raw_put finish, min_ts should be the ts of "key guard" of the raw_put
     // request.

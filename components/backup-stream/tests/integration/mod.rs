@@ -5,6 +5,7 @@
 
 #[path = "../suite.rs"]
 mod suite;
+pub use suite::*;
 
 mod all {
     use std::time::{Duration, Instant};
@@ -16,12 +17,11 @@ mod all {
     use futures::{Stream, StreamExt};
     use pd_client::PdClient;
     use test_raftstore::IsolationFilterFactory;
-    use tikv::config::BackupStreamConfig;
     use tikv_util::{box_err, defer, info, HandyRwLock};
     use tokio::time::timeout;
     use txn_types::{Key, TimeStamp};
 
-    use super::suite::{
+    use crate::{
         make_record_key, make_split_key_at_record, mutation, run_async_test, SuiteBuilder,
     };
 
@@ -100,7 +100,7 @@ mod all {
     #[test]
     /// This case tests whether the backup can continue when the leader failes.
     fn leader_down() {
-        let mut suite = SuiteBuilder::new_named("leader_down").build();
+        let mut suite = super::SuiteBuilder::new_named("leader_down").build();
         suite.must_register_task(1, "test_leader_down");
         suite.sync();
         let round1 = run_async_test(suite.write_records(0, 128, 1));
@@ -120,7 +120,9 @@ mod all {
     /// This case tests whether the checkpoint ts (next backup ts) can be
     /// advanced correctly when async commit is enabled.
     fn async_commit() {
-        let mut suite = SuiteBuilder::new_named("async_commit").nodes(3).build();
+        let mut suite = super::SuiteBuilder::new_named("async_commit")
+            .nodes(3)
+            .build();
         run_async_test(async {
             suite.must_register_task(1, "test_async_commit");
             suite.sync();
@@ -141,7 +143,9 @@ mod all {
 
     #[test]
     fn fatal_error() {
-        let mut suite = SuiteBuilder::new_named("fatal_error").nodes(3).build();
+        let mut suite = super::SuiteBuilder::new_named("fatal_error")
+            .nodes(3)
+            .build();
         suite.must_register_task(1, "test_fatal_error");
         suite.sync();
         run_async_test(suite.write_records(0, 1, 1));
@@ -176,7 +180,7 @@ mod all {
 
         assert!(
             safepoints.iter().any(|sp| {
-                sp.service.contains(&format!("{}", victim))
+                sp.serivce.contains(&format!("{}", victim))
                     && sp.ttl >= Duration::from_secs(60 * 60 * 24)
                     && sp.safepoint.into_inner() == checkpoint - 1
             }),
@@ -187,7 +191,9 @@ mod all {
 
     #[test]
     fn region_checkpoint_info() {
-        let mut suite = SuiteBuilder::new_named("checkpoint_info").nodes(1).build();
+        let mut suite = super::SuiteBuilder::new_named("checkpoint_info")
+            .nodes(1)
+            .build();
         suite.must_register_task(1, "checkpoint_info");
         suite.must_split(&make_split_key_at_record(1, 42));
         run_async_test(suite.write_records(0, 128, 1));
@@ -307,7 +313,7 @@ mod all {
 
     #[test]
     fn subscribe_flushing() {
-        let mut suite = SuiteBuilder::new_named("sub_flush").build();
+        let mut suite = super::SuiteBuilder::new_named("sub_flush").build();
         let stream = suite.flush_stream(true);
         for i in 1..10 {
             let split_key = make_split_key_at_record(1, i * 20);
@@ -352,7 +358,7 @@ mod all {
 
     #[test]
     fn resolved_follower() {
-        let mut suite = SuiteBuilder::new_named("r").build();
+        let mut suite = super::SuiteBuilder::new_named("r").build();
         let round1 = run_async_test(suite.write_records(0, 128, 1));
         suite.must_register_task(1, "r");
         suite.run(|| Task::RegionCheckpointsOp(RegionCheckpointOperation::PrepareMinTsForResolve));
@@ -387,7 +393,7 @@ mod all {
 
     #[test]
     fn network_partition() {
-        let mut suite = SuiteBuilder::new_named("network_partition")
+        let mut suite = super::SuiteBuilder::new_named("network_partition")
             .nodes(3)
             .build();
         let stream = suite.flush_stream(true);
@@ -428,26 +434,5 @@ mod all {
             suite.flushed_files.path(),
             round1.iter().map(|k| k.as_slice()),
         )
-    }
-
-    #[test]
-    fn update_config() {
-        let suite = SuiteBuilder::new_named("network_partition")
-            .nodes(1)
-            .build();
-        let mut basic_config = BackupStreamConfig::default();
-        basic_config.initial_scan_concurrency = 4;
-        suite.run(|| Task::ChangeConfig(basic_config.clone()));
-        suite.wait_with(|e| {
-            assert_eq!(e.initial_scan_semaphore.available_permits(), 4,);
-            true
-        });
-
-        basic_config.initial_scan_concurrency = 16;
-        suite.run(|| Task::ChangeConfig(basic_config.clone()));
-        suite.wait_with(|e| {
-            assert_eq!(e.initial_scan_semaphore.available_permits(), 16,);
-            true
-        });
     }
 }

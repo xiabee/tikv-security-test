@@ -29,7 +29,7 @@ pub struct RegionSnapshotExt<'a, S: Snapshot> {
 impl<'a, S: Snapshot> SnapshotExt for RegionSnapshotExt<'a, S> {
     #[inline]
     fn get_data_version(&self) -> Option<u64> {
-        self.snapshot.get_data_version().ok()
+        self.snapshot.get_apply_index().ok()
     }
 
     fn is_max_ts_synced(&self) -> bool {
@@ -40,14 +40,8 @@ impl<'a, S: Snapshot> SnapshotExt for RegionSnapshotExt<'a, S> {
             .unwrap_or(false)
     }
 
-    #[inline]
     fn get_term(&self) -> Option<NonZeroU64> {
         self.snapshot.term
-    }
-
-    #[inline]
-    fn get_region_id(&self) -> Option<u64> {
-        Some(self.snapshot.get_region().id)
     }
 
     fn get_txn_extra_op(&self) -> TxnExtraOp {
@@ -60,10 +54,6 @@ impl<'a, S: Snapshot> SnapshotExt for RegionSnapshotExt<'a, S> {
 
     fn get_buckets(&self) -> Option<Arc<BucketMeta>> {
         self.snapshot.bucket_meta.clone()
-    }
-
-    fn range_cache_engine_hit(&self) -> bool {
-        self.snapshot.get_snapshot().range_cache_engine_hit()
     }
 }
 

@@ -2,8 +2,7 @@
 
 // TODO(mornyx): crate doc.
 
-#![feature(hash_extract_if)]
-#![allow(internal_features)]
+#![feature(hash_drain_filter)]
 #![feature(core_intrinsics)]
 
 use std::{
@@ -34,7 +33,6 @@ pub use reporter::{
     ConfigChangeNotifier as ReporterConfigChangeNotifier, Reporter, Task,
 };
 use tikv_util::{
-    memory::HeapSize,
     sys::thread,
     warn,
     worker::{Scheduler, Worker},
@@ -97,12 +95,6 @@ impl ResourceMeteringTag {
 
             Guard
         })
-    }
-}
-
-impl HeapSize for ResourceMeteringTag {
-    fn approximate_heap_size(&self) -> usize {
-        self.infos.approximate_mem_size()
     }
 }
 
@@ -324,12 +316,6 @@ impl TagInfos {
             key_ranges,
             extra_attachment: Vec::from(context.get_resource_group_tag()),
         }
-    }
-}
-
-impl HeapSize for TagInfos {
-    fn approximate_heap_size(&self) -> usize {
-        self.key_ranges.approximate_heap_size() + self.extra_attachment.approximate_heap_size()
     }
 }
 

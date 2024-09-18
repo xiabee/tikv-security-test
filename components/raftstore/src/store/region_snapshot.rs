@@ -11,7 +11,7 @@ use std::{
 
 use engine_traits::{
     util::check_key_in_range, Error as EngineError, IterOptions, Iterable, Iterator, KvEngine,
-    MetricsExt, Peekable, RaftEngine, ReadOptions, Result as EngineResult, Snapshot, CF_RAFT,
+    Peekable, RaftEngine, ReadOptions, Result as EngineResult, Snapshot, CF_RAFT,
 };
 use fail::fail_point;
 use keys::DATA_PREFIX_KEY;
@@ -35,7 +35,6 @@ pub struct RegionSnapshot<S: Snapshot> {
     snap: Arc<S>,
     region: Arc<Region>,
     apply_index: Arc<AtomicU64>,
-    from_v2: bool,
     pub term: Option<NonZeroU64>,
     pub txn_extra_op: TxnExtraOp,
     // `None` means the snapshot does not provide peer related transaction extensions.
@@ -59,7 +58,7 @@ where
     where
         EK: KvEngine,
     {
-        RegionSnapshot::from_snapshot(Arc::new(db.snapshot(None)), Arc::new(region))
+        RegionSnapshot::from_snapshot(Arc::new(db.snapshot()), Arc::new(region))
     }
 
     pub fn from_snapshot(snap: Arc<S>, region: Arc<Region>) -> RegionSnapshot<S> {
@@ -69,7 +68,6 @@ where
             // Use 0 to indicate that the apply index is missing and we need to KvGet it,
             // since apply index must be >= RAFT_INIT_LOG_INDEX.
             apply_index: Arc::new(AtomicU64::new(0)),
-            from_v2: false,
             term: None,
             txn_extra_op: TxnExtraOp::Noop,
             txn_ext: None,
@@ -85,27 +83,6 @@ where
     #[inline]
     pub fn get_snapshot(&self) -> &S {
         self.snap.as_ref()
-    }
-
-    pub fn set_from_v2(&mut self) {
-        self.from_v2 = true;
-    }
-
-    pub fn get_data_version(&self) -> Result<u64> {
-        if self.from_v2 {
-            if self.snap.sequence_number() != 0 {
-                Ok(self.snap.sequence_number())
-            } else {
-                Err(box_err!("Snapshot sequence number 0"))
-            }
-        } else {
-            self.get_apply_index()
-        }
-    }
-
-    #[inline]
-    pub fn set_apply_index(&self, apply_index: u64) {
-        self.apply_index.store(apply_index, Ordering::SeqCst);
     }
 
     #[inline]
@@ -175,11 +152,6 @@ where
     pub fn get_end_key(&self) -> &[u8] {
         self.region.get_end_key()
     }
-
-    #[cfg(test)]
-    pub fn snap(&self) -> Arc<S> {
-        self.snap.clone()
-    }
 }
 
 impl<S> Clone for RegionSnapshot<S>
@@ -191,7 +163,6 @@ where
             snap: self.snap.clone(),
             region: Arc::clone(&self.region),
             apply_index: Arc::clone(&self.apply_index),
-            from_v2: self.from_v2,
             term: self.term,
             txn_extra_op: self.txn_extra_op,
             txn_ext: self.txn_ext.clone(),
@@ -278,13 +249,6 @@ where
 pub struct RegionIterator<S: Snapshot> {
     iter: <S as Iterable>::Iterator,
     region: Arc<Region>,
-}
-
-impl<S: Snapshot> MetricsExt for RegionIterator<S> {
-    type Collector = <<S as Iterable>::Iterator as MetricsExt>::Collector;
-    fn metrics_collector(&self) -> Self::Collector {
-        self.iter.metrics_collector()
-    }
 }
 
 fn update_lower_bound(iter_opt: &mut IterOptions, region: &Region) {
@@ -450,7 +414,7 @@ mod tests {
             (b"a9".to_vec(), b"v9".to_vec()),
         ];
 
-        for (k, v) in &base_data {
+        for &(ref k, ref v) in &base_data {
             engines.kv.put(&data_key(k), v).unwrap();
         }
         let store = new_peer_storage(engines, &r);
@@ -496,7 +460,7 @@ mod tests {
             let db = &engines.kv;
             for &(ref k, level) in &levels {
                 db.put(&data_key(k), k).unwrap();
-                db.flush_cfs(&[], true).unwrap();
+                db.flush_cfs(true).unwrap();
                 data.push((k.to_vec(), k.to_vec()));
                 db.compact_files_in_range(Some(&data_key(k)), Some(&data_key(k)), Some(level))
                     .unwrap();

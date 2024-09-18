@@ -2,9 +2,7 @@
 
 use std::{convert::TryFrom, sync::Arc};
 
-use api_version::KvFormat;
 use fail::fail_point;
-use itertools::Itertools;
 use kvproto::coprocessor::KeyRange;
 use protobuf::Message;
 use tidb_query_common::{
@@ -137,31 +135,28 @@ impl BatchExecutorsRunner<()> {
                         .map_err(|e| other_err!("BatchProjectionExecutor: {}", e))?;
                 }
                 ExecType::TypeJoin => {
-                    return Err(other_err!("Join executor not implemented"));
+                    other_err!("Join executor not implemented");
                 }
                 ExecType::TypeKill => {
-                    return Err(other_err!("Kill executor not implemented"));
+                    other_err!("Kill executor not implemented");
                 }
                 ExecType::TypeExchangeSender => {
-                    return Err(other_err!("ExchangeSender executor not implemented"));
+                    other_err!("ExchangeSender executor not implemented");
                 }
                 ExecType::TypeExchangeReceiver => {
-                    return Err(other_err!("ExchangeReceiver executor not implemented"));
+                    other_err!("ExchangeReceiver executor not implemented");
                 }
                 ExecType::TypePartitionTableScan => {
-                    return Err(other_err!("PartitionTableScan executor not implemented"));
+                    other_err!("PartitionTableScan executor not implemented");
                 }
                 ExecType::TypeSort => {
-                    return Err(other_err!("Sort executor not implemented"));
+                    other_err!("Sort executor not implemented");
                 }
                 ExecType::TypeWindow => {
-                    return Err(other_err!("Window executor not implemented"));
+                    other_err!("Window executor not implemented");
                 }
                 ExecType::TypeExpand => {
-                    return Err(other_err!("Expand executor not implemented"));
-                }
-                ExecType::TypeExpand2 => {
-                    return Err(other_err!("Expand2 executor not implemented"));
+                    other_err!("Expand executor not implemented");
                 }
             }
         }
@@ -171,12 +166,14 @@ impl BatchExecutorsRunner<()> {
 }
 
 #[inline]
-fn is_arrow_encodable<'a>(mut schema: impl Iterator<Item = &'a FieldType>) -> bool {
-    schema.all(|schema| EvalType::try_from(schema.as_accessor().tp()).is_ok())
+fn is_arrow_encodable(schema: &[FieldType]) -> bool {
+    schema
+        .iter()
+        .all(|schema| EvalType::try_from(schema.as_accessor().tp()).is_ok())
 }
 
 #[allow(clippy::explicit_counter_loop)]
-pub fn build_executors<S: Storage + 'static, F: KvFormat>(
+pub fn build_executors<S: Storage + 'static>(
     executor_descriptors: Vec<tipb::Executor>,
     storage: S,
     ranges: Vec<KeyRange>,
@@ -204,7 +201,7 @@ pub fn build_executors<S: Storage + 'static, F: KvFormat>(
             let primary_prefix_column_ids = descriptor.take_primary_prefix_column_ids();
 
             Box::new(
-                BatchTableScanExecutor::<_, F>::new(
+                BatchTableScanExecutor::new(
                     storage,
                     config.clone(),
                     columns_info,
@@ -224,7 +221,7 @@ pub fn build_executors<S: Storage + 'static, F: KvFormat>(
             let columns_info = descriptor.take_columns().into();
             let primary_column_ids_len = descriptor.take_primary_column_ids().len();
             Box::new(
-                BatchIndexScanExecutor::<_, F>::new(
+                BatchIndexScanExecutor::new(
                     storage,
                     config.clone(),
                     columns_info,
@@ -330,39 +327,14 @@ pub fn build_executors<S: Storage + 'static, F: KvFormat>(
             ExecType::TypeLimit => {
                 EXECUTOR_COUNT_METRICS.batch_limit.inc();
 
-                let mut d = ed.take_limit();
-
-                // If there is partition_by field in Limit, we treat it as a
-                // partitionTopN without order_by.
-                // todo: refine those logics.
-                let partition_by = d
-                    .take_partition_by()
-                    .into_iter()
-                    .map(|mut item| item.take_expr())
-                    .collect_vec();
-
-                if partition_by.is_empty() {
-                    Box::new(
-                        BatchLimitExecutor::new(
-                            executor,
-                            d.get_limit() as usize,
-                            is_src_scan_executor,
-                        )?
-                        .collect_summary(summary_slot_index),
-                    )
-                } else {
-                    Box::new(
-                        BatchPartitionTopNExecutor::new(
-                            config.clone(),
-                            executor,
-                            partition_by,
-                            vec![],
-                            vec![],
-                            d.get_limit() as usize,
-                        )?
-                        .collect_summary(summary_slot_index),
-                    )
-                }
+                Box::new(
+                    BatchLimitExecutor::new(
+                        executor,
+                        ed.get_limit().get_limit() as usize,
+                        is_src_scan_executor,
+                    )?
+                    .collect_summary(summary_slot_index),
+                )
             }
             ExecType::TypeTopN => {
                 EXECUTOR_COUNT_METRICS.batch_top_n.inc();
@@ -375,36 +347,17 @@ pub fn build_executors<S: Storage + 'static, F: KvFormat>(
                     order_exprs_def.push(item.take_expr());
                     order_is_desc.push(item.get_desc());
                 }
-                let partition_by = d
-                    .take_partition_by()
-                    .into_iter()
-                    .map(|mut item| item.take_expr())
-                    .collect_vec();
 
-                if partition_by.is_empty() {
-                    Box::new(
-                        BatchTopNExecutor::new(
-                            config.clone(),
-                            executor,
-                            order_exprs_def,
-                            order_is_desc,
-                            d.get_limit() as usize,
-                        )?
-                        .collect_summary(summary_slot_index),
-                    )
-                } else {
-                    Box::new(
-                        BatchPartitionTopNExecutor::new(
-                            config.clone(),
-                            executor,
-                            partition_by,
-                            order_exprs_def,
-                            order_is_desc,
-                            d.get_limit() as usize,
-                        )?
-                        .collect_summary(summary_slot_index),
-                    )
-                }
+                Box::new(
+                    BatchTopNExecutor::new(
+                        config.clone(),
+                        executor,
+                        order_exprs_def,
+                        order_is_desc,
+                        d.get_limit() as usize,
+                    )?
+                    .collect_summary(summary_slot_index),
+                )
             }
             _ => {
                 return Err(other_err!(
@@ -420,7 +373,7 @@ pub fn build_executors<S: Storage + 'static, F: KvFormat>(
 }
 
 impl<SS: 'static> BatchExecutorsRunner<SS> {
-    pub fn from_request<S: Storage<Statistics = SS> + 'static, F: KvFormat>(
+    pub fn from_request<S: Storage<Statistics = SS> + 'static>(
         mut req: DagRequest,
         ranges: Vec<KeyRange>,
         storage: S,
@@ -436,7 +389,7 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
         config.paging_size = paging_size;
         let config = Arc::new(config);
 
-        let out_most_executor = build_executors::<_, F>(
+        let out_most_executor = build_executors(
             req.take_executors().into(),
             storage,
             ranges,
@@ -445,6 +398,12 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
                                                     * executors will continue scan from range
                                                     * end where last scan is finished */
         )?;
+
+        let encode_type = if !is_arrow_encodable(out_most_executor.schema()) {
+            EncodeType::TypeDefault
+        } else {
+            req.get_encode_type()
+        };
 
         // Check output offsets
         let output_offsets = req.take_output_offsets();
@@ -458,16 +417,6 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
                 ));
             }
         }
-
-        // Only check output schema field types
-        let new_schema = output_offsets
-            .iter()
-            .map(|&i| &out_most_executor.schema()[i as usize]);
-        let encode_type = if !is_arrow_encodable(new_schema) {
-            EncodeType::TypeDefault
-        } else {
-            req.get_encode_type()
-        };
 
         let exec_stats = ExecuteStats::new(executors_len);
 

@@ -1,31 +1,11 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{
-    DeleteStrategy, MiscExt, Range, RangeStats, Result, StatisticsReporter, WriteOptions,
-};
+use engine_traits::{DeleteStrategy, MiscExt, Range, RangeStats, Result};
 
 use crate::engine::PanicEngine;
 
-pub struct PanicReporter;
-
-impl StatisticsReporter<PanicEngine> for PanicReporter {
-    fn new(name: &str) -> Self {
-        panic!()
-    }
-
-    fn collect(&mut self, engine: &PanicEngine) {
-        panic!()
-    }
-
-    fn flush(&mut self) {
-        panic!()
-    }
-}
-
 impl MiscExt for PanicEngine {
-    type StatisticsReporter = PanicReporter;
-
-    fn flush_cfs(&self, cfs: &[&str], wait: bool) -> Result<()> {
+    fn flush_cfs(&self, wait: bool) -> Result<()> {
         panic!()
     }
 
@@ -33,21 +13,12 @@ impl MiscExt for PanicEngine {
         panic!()
     }
 
-    fn flush_oldest_cf(
-        &self,
-        wait: bool,
-        age_threshold: Option<std::time::SystemTime>,
-    ) -> Result<bool> {
-        panic!()
-    }
-
     fn delete_ranges_cf(
         &self,
-        wopts: &WriteOptions,
         cf: &str,
         strategy: DeleteStrategy,
         ranges: &[Range<'_>],
-    ) -> Result<bool> {
+    ) -> Result<()> {
         panic!()
     }
 
@@ -75,27 +46,7 @@ impl MiscExt for PanicEngine {
         panic!()
     }
 
-    fn disable_manual_compaction(&self) -> Result<()> {
-        panic!()
-    }
-
-    fn enable_manual_compaction(&self) -> Result<()> {
-        panic!()
-    }
-
-    fn pause_background_work(&self) -> Result<()> {
-        panic!()
-    }
-
-    fn continue_background_work(&self) -> Result<()> {
-        panic!()
-    }
-
     fn exists(path: &str) -> bool {
-        panic!()
-    }
-
-    fn locked(path: &str) -> Result<bool> {
         panic!()
     }
 
@@ -115,10 +66,6 @@ impl MiscExt for PanicEngine {
         panic!()
     }
 
-    fn get_num_keys(&self) -> Result<u64> {
-        panic!()
-    }
-
     fn get_range_stats(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Option<RangeStats>> {
         panic!()
     }
@@ -127,19 +74,11 @@ impl MiscExt for PanicEngine {
         panic!()
     }
 
-    fn get_active_memtable_stats_cf(
-        &self,
-        cf: &str,
-    ) -> Result<Option<(u64, std::time::SystemTime)>> {
+    fn disable_manual_compaction(&self) -> Result<()> {
         panic!()
     }
 
-    fn get_accumulated_flush_count_cf(cf: &str) -> Result<u64> {
-        panic!()
-    }
-
-    type DiskEngine = PanicEngine;
-    fn get_disk_engine(&self) -> &Self::DiskEngine {
+    fn enable_manual_compaction(&self) -> Result<()> {
         panic!()
     }
 }

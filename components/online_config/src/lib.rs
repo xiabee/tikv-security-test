@@ -5,12 +5,9 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
 };
 
-use chrono::{FixedOffset, NaiveTime};
 pub use online_config_derive::*;
 
 pub type ConfigChange = HashMap<String, ConfigValue>;
-pub type OffsetTime = (NaiveTime, FixedOffset);
-pub type Schedule = Vec<OffsetTime>;
 
 #[derive(Clone, PartialEq)]
 pub enum ConfigValue {
@@ -24,9 +21,6 @@ pub enum ConfigValue {
     Bool(bool),
     String(String),
     Module(ConfigChange),
-    // We cannot use Schedule(ReadableSchedule) directly as the module defining `ReadableSchedule`
-    // imports the current module
-    Schedule(Vec<String>),
     Skip,
     None,
 }
@@ -44,7 +38,6 @@ impl Display for ConfigValue {
             ConfigValue::Bool(v) => write!(f, "{}", v),
             ConfigValue::String(v) => write!(f, "{}", v),
             ConfigValue::Module(v) => write!(f, "{:?}", v),
-            ConfigValue::Schedule(v) => write!(f, "{:?}", v),
             ConfigValue::Skip => write!(f, "ConfigValue::Skip"),
             ConfigValue::None => write!(f, ""),
         }
@@ -140,6 +133,8 @@ pub trait ConfigManager: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryFrom;
+
     use serde::Serialize;
 
     use super::*;
@@ -147,8 +142,6 @@ mod tests {
 
     #[derive(Clone, OnlineConfig, Debug, Default, PartialEq)]
     pub struct TestConfig {
-        // Test doc hidden fields support online config change.
-        #[doc(hidden)]
         field1: usize,
         field2: String,
         optional_field1: Option<usize>,

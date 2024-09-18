@@ -1,13 +1,12 @@
 [package]
 name = "tracker"
 version = "0.0.1"
-edition = "2021"
+edition = "2018"
 publish = false
-license = "Apache-2.0"
 
 [dependencies]
 collections = { workspace = true }
-crossbeam-utils = { workspace = true }
+crossbeam-utils = "0.8"
 kvproto = { workspace = true }
 lazy_static = "1"
 parking_lot = "0.12"

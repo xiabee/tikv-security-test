@@ -37,7 +37,7 @@ fn test_check_pending_admin() {
 
     // make a admin request to let leader has pending conf change.
     let leader = new_peer(1, 4);
-    let _ = cluster.async_add_peer(1, leader).unwrap();
+    cluster.async_add_peer(1, leader).unwrap();
 
     std::thread::sleep(Duration::from_millis(800));
 
@@ -45,7 +45,7 @@ fn test_check_pending_admin() {
 
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
     router.broadcast_normal(|| {
-        PeerMsg::SignificantMsg(Box::new(SignificantMsg::CheckPendingAdmin(tx.clone())))
+        PeerMsg::SignificantMsg(SignificantMsg::CheckPendingAdmin(tx.clone()))
     });
     futures::executor::block_on(async {
         let r = rx.next().await;
@@ -61,7 +61,7 @@ fn test_check_pending_admin() {
 
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
     router.broadcast_normal(|| {
-        PeerMsg::SignificantMsg(Box::new(SignificantMsg::CheckPendingAdmin(tx.clone())))
+        PeerMsg::SignificantMsg(SignificantMsg::CheckPendingAdmin(tx.clone()))
     });
     futures::executor::block_on(async {
         let r = rx.next().await;
@@ -93,7 +93,7 @@ fn test_snap_wait_apply() {
     ));
 
     // make a async put request to let leader has inflight raft log.
-    let _ = cluster.async_put(b"k2", b"v2").unwrap();
+    cluster.async_put(b"k2", b"v2").unwrap();
     std::thread::sleep(Duration::from_millis(800));
 
     let router = cluster.sim.wl().get_router(1).unwrap();
@@ -101,9 +101,9 @@ fn test_snap_wait_apply() {
     let (tx, rx) = oneshot::channel();
     let syncer = SnapshotBrWaitApplySyncer::new(1, tx);
     router.broadcast_normal(|| {
-        PeerMsg::SignificantMsg(Box::new(SignificantMsg::SnapshotBrWaitApply(
+        PeerMsg::SignificantMsg(SignificantMsg::SnapshotBrWaitApply(
             SnapshotBrWaitApplyRequest::relaxed(syncer.clone()),
-        )))
+        ))
     });
 
     // we expect recv timeout because the leader peer on store 1 cannot finished the
@@ -119,9 +119,9 @@ fn test_snap_wait_apply() {
     let (tx, rx) = oneshot::channel();
     let syncer = SnapshotBrWaitApplySyncer::new(1, tx);
     router.broadcast_normal(|| {
-        PeerMsg::SignificantMsg(Box::new(SignificantMsg::SnapshotBrWaitApply(
+        PeerMsg::SignificantMsg(SignificantMsg::SnapshotBrWaitApply(
             SnapshotBrWaitApplyRequest::relaxed(syncer.clone()),
-        )))
+        ))
     });
     drop(syncer);
 

@@ -16,13 +16,10 @@ pub mod router;
 mod service;
 mod subscription_manager;
 mod subscription_track;
-mod tempfiles;
 // Publish it for integration test.
 // Perhaps we'd better move some of then into `tikv_util`.
 pub mod utils;
 
 pub use checkpoint_manager::GetCheckpointResult;
-pub use endpoint::{
-    BackupStreamResolver, Endpoint, ObserveOp, RegionCheckpointOperation, RegionSet, Task,
-};
+pub use endpoint::{Endpoint, ObserveOp, RegionCheckpointOperation, RegionSet, Task};
 pub use service::Service;
