@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     fmt,
     io::{self, Write},
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
@@ -11,11 +12,9 @@ use std::{
 
 use api_version::api_v2::TIDB_RANGES_COMPLEMENT;
 use encryption::{DataKeyManager, EncrypterWriter};
-use engine_rocks::{get_env, RocksSstReader};
-use engine_traits::{
-    iter_option, EncryptionKeyManager, Iterator, KvEngine, RefIterable, SstMetaInfo, SstReader,
-};
-use file_system::{get_io_rate_limiter, sync_dir, File, OpenOptions};
+use engine_traits::{iter_option, Iterator, KvEngine, RefIterable, SstMetaInfo, SstReader};
+use file_system::{sync_dir, File, OpenOptions};
+use keys::data_key;
 use kvproto::{import_sstpb::*, kvrpcpb::ApiVersion};
 use tikv_util::time::Instant;
 use uuid::{Builder as UuidBuilder, Uuid};
@@ -65,7 +64,7 @@ impl ImportPath {
             key_manager.link_file(temp_str, save_str)?;
             let r = file_system::rename(&self.temp, &self.save);
             let del_file = if r.is_ok() { temp_str } else { save_str };
-            if let Err(e) = key_manager.delete_file(del_file) {
+            if let Err(e) = key_manager.delete_file(del_file, None) {
                 warn!("fail to remove encryption metadata during 'save'";
                       "file" => ?self, "err" => ?e);
             }
@@ -153,7 +152,7 @@ impl ImportFile {
             manager.link_file(tmp_str, save_str)?;
             let r = file_system::rename(&self.path.temp, &self.path.save);
             let del_file = if r.is_ok() { tmp_str } else { save_str };
-            if let Err(e) = manager.delete_file(del_file) {
+            if let Err(e) = manager.delete_file(del_file, None) {
                 warn!("fail to remove encryption metadata during finishing importing files.";
                       "err" => ?e);
             }
@@ -169,7 +168,7 @@ impl ImportFile {
         let path = &self.path.temp;
         if path.exists() {
             if let Some(ref manager) = self.key_manager {
-                manager.delete_file(path.to_str().unwrap())?;
+                manager.delete_file(path.to_str().unwrap(), None)?;
             }
             file_system::remove_file(path)?;
         }
@@ -214,17 +213,19 @@ impl Drop for ImportFile {
 /// The file being written is stored in `$root/.temp/$file_name`. After writing
 /// is completed, the file is moved to `$root/$file_name`. The file generated
 /// from the ingestion process will be placed in `$root/.clone/$file_name`.
-pub struct ImportDir {
+pub struct ImportDir<E: KvEngine> {
     root_dir: PathBuf,
     temp_dir: PathBuf,
     clone_dir: PathBuf,
+
+    _phantom: PhantomData<E>,
 }
 
-impl ImportDir {
+impl<E: KvEngine> ImportDir<E> {
     const TEMP_DIR: &'static str = ".temp";
     const CLONE_DIR: &'static str = ".clone";
 
-    pub fn new<P: AsRef<Path>>(root: P) -> Result<ImportDir> {
+    pub fn new<P: AsRef<Path>>(root: P) -> Result<Self> {
         let root_dir = root.as_ref().to_owned();
         let temp_dir = root_dir.join(Self::TEMP_DIR);
         let clone_dir = root_dir.join(Self::CLONE_DIR);
@@ -240,6 +241,7 @@ impl ImportDir {
             root_dir,
             temp_dir,
             clone_dir,
+            _phantom: PhantomData,
         })
     }
 
@@ -299,7 +301,7 @@ impl ImportDir {
         if path.exists() {
             file_system::remove_file(path)?;
             if let Some(manager) = key_manager {
-                manager.delete_file(path.to_str().unwrap())?;
+                manager.delete_file(path.to_str().unwrap(), None)?;
             }
         }
 
@@ -326,10 +328,14 @@ impl ImportDir {
     ) -> Result<SstMetaInfo> {
         let path = self.join_for_read(meta)?;
         let path_str = path.save.to_str().unwrap();
-        let env = get_env(key_manager, get_io_rate_limiter())?;
-        let sst_reader = RocksSstReader::open_with_env(path_str, Some(env))?;
+        let sst_reader = E::SstReader::open(path_str, key_manager)?;
         // TODO: check the length and crc32 of ingested file.
-        let meta_info = sst_reader.sst_meta_info(meta.to_owned());
+        let (count, size) = sst_reader.kv_count_and_size();
+        let meta_info = SstMetaInfo {
+            total_kvs: count,
+            total_bytes: size,
+            meta: meta.to_owned(),
+        };
         Ok(meta_info)
     }
 
@@ -353,11 +359,10 @@ impl ImportDir {
                 _ => {
                     let path = self.join_for_read(meta)?;
                     let path_str = path.save.to_str().unwrap();
-                    let env = get_env(key_manager.clone(), get_io_rate_limiter())?;
-                    let sst_reader = RocksSstReader::open_with_env(path_str, Some(env))?;
+                    let sst_reader = E::SstReader::open(path_str, key_manager.clone())?;
 
                     for &(start, end) in TIDB_RANGES_COMPLEMENT {
-                        let opt = iter_option(start, end, false);
+                        let opt = iter_option(&data_key(start), &data_key(end), false);
                         let mut iter = sst_reader.iter(opt)?;
                         if iter.seek(start)? {
                             error!(
@@ -376,7 +381,7 @@ impl ImportDir {
         Ok(true)
     }
 
-    pub fn ingest<E: KvEngine>(
+    pub fn ingest(
         &self,
         metas: &[SstMetaInfo],
         engine: &E,
@@ -426,8 +431,7 @@ impl ImportDir {
         for meta in metas {
             let path = self.join_for_read(meta)?;
             let path_str = path.save.to_str().unwrap();
-            let env = get_env(key_manager.clone(), get_io_rate_limiter())?;
-            let sst_reader = RocksSstReader::open_with_env(path_str, Some(env))?;
+            let sst_reader = E::SstReader::open(path_str, key_manager.clone())?;
             sst_reader.verify_checksum()?;
         }
         Ok(())
@@ -527,6 +531,7 @@ pub fn parse_meta_from_path<P: AsRef<Path>>(path: P) -> Result<(SstMeta, i32)> {
 mod test {
     use std::fs;
 
+    use engine_rocks::RocksEngine;
     use engine_traits::CF_DEFAULT;
 
     use super::*;
@@ -577,7 +582,7 @@ mod test {
         use uuid::Uuid;
 
         let tmp = TempDir::new().unwrap();
-        let dir = ImportDir::new(tmp.path()).unwrap();
+        let dir = ImportDir::<RocksEngine>::new(tmp.path()).unwrap();
         let mut meta = SstMeta::default();
         meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
         let filename_v1 = sst_meta_to_path_v1(&meta).unwrap();

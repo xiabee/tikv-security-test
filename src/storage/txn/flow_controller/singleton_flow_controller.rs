@@ -332,7 +332,7 @@ where
             }
 
             // Split the record into left and right by the middle of time range
-            for (_, r) in self.records.iter().enumerate() {
+            for r in self.records.iter() {
                 let elapsed_secs = r.1.saturating_elapsed_secs();
                 if elapsed_secs > time_span / 2.0 {
                     left += r.0;
@@ -406,7 +406,7 @@ struct CfFlowChecker {
     // When the write flow is about 100MB/s, we observed that the compaction ops
     // is about 2.5, it means there are 750 compaction events in 5 minutes.
     long_term_pending_bytes:
-        Smoother<f64, 1024, SMOOTHER_STALE_RECORD_THRESHOLD, SMOOTHER_TIME_RANGE_THRESHOLD>,
+        Option<Smoother<f64, 1024, SMOOTHER_STALE_RECORD_THRESHOLD, SMOOTHER_TIME_RANGE_THRESHOLD>>,
     pending_bytes_before_unsafe_destroy_range: Option<f64>,
 
     // On start related markers. Because after restart, the memtable, l0 files
@@ -422,6 +422,12 @@ struct CfFlowChecker {
 
 impl Default for CfFlowChecker {
     fn default() -> Self {
+        CfFlowChecker::new(true)
+    }
+}
+
+impl CfFlowChecker {
+    pub fn new(include_pending_bytes: bool) -> Self {
         Self {
             last_num_memtables: Smoother::default(),
             memtable_debt: 0.0,
@@ -433,7 +439,11 @@ impl Default for CfFlowChecker {
             last_l0_bytes: 0,
             last_l0_bytes_time: Instant::now_coarse(),
             short_term_l0_consumption_flow: Smoother::default(),
-            long_term_pending_bytes: Smoother::default(),
+            long_term_pending_bytes: if include_pending_bytes {
+                Some(Smoother::default())
+            } else {
+                None
+            },
             pending_bytes_before_unsafe_destroy_range: None,
             on_start_memtable: true,
             on_start_l0_files: true,
@@ -442,8 +452,43 @@ impl Default for CfFlowChecker {
     }
 }
 
+pub trait FlowControlFactorStore {
+    fn num_files_at_level(&self, region_id: u64, cf: &str, level: usize) -> u64;
+    fn num_immutable_mem_table(&self, region_id: u64, cf: &str) -> u64;
+    fn pending_compaction_bytes(&self, region_id: u64, cf: &str) -> u64;
+    fn cf_names(&self, region_id: u64) -> Vec<String>;
+}
+
+impl<E: FlowControlFactorsExt + CfNamesExt> FlowControlFactorStore for E {
+    fn cf_names(&self, _region_id: u64) -> Vec<String> {
+        CfNamesExt::cf_names(self)
+            .iter()
+            .map(|v| v.to_string())
+            .collect()
+    }
+
+    fn num_files_at_level(&self, _region_id: u64, cf: &str, level: usize) -> u64 {
+        match self.get_cf_num_files_at_level(cf, level) {
+            Ok(Some(n)) => n,
+            _ => 0,
+        }
+    }
+    fn num_immutable_mem_table(&self, _region_id: u64, cf: &str) -> u64 {
+        match self.get_cf_num_immutable_mem_table(cf) {
+            Ok(Some(n)) => n,
+            _ => 0,
+        }
+    }
+    fn pending_compaction_bytes(&self, _region_id: u64, cf: &str) -> u64 {
+        match self.get_cf_pending_compaction_bytes(cf) {
+            Ok(Some(n)) => n,
+            _ => 0,
+        }
+    }
+}
+
 #[derive(CopyGetters, Setters)]
-pub(super) struct FlowChecker<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> {
+pub(super) struct FlowChecker<E: FlowControlFactorStore + Send + 'static> {
     pub soft_pending_compaction_bytes_limit: u64,
     hard_pending_compaction_bytes_limit: u64,
     memtables_threshold: u64,
@@ -469,34 +514,36 @@ pub(super) struct FlowChecker<E: CfNamesExt + FlowControlFactorsExt + Send + 'st
     last_speed: f64,
     wait_for_destroy_range_finish: bool,
 
-    #[getset(get_copy = "pub", set = "pub")]
-    tablet_suffix: u64,
+    region_id: u64,
+    rc: AtomicU32,
 }
 
-impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
+impl<E: FlowControlFactorStore + Send + 'static> FlowChecker<E> {
     pub fn new(
         config: &FlowControlConfig,
         engine: E,
         discard_ratio: Arc<AtomicU32>,
         limiter: Arc<Limiter>,
     ) -> Self {
-        Self::new_with_tablet_suffix(config, engine, discard_ratio, limiter, 0)
+        Self::new_with_region_id(0, config, engine, discard_ratio, limiter)
     }
 
-    pub fn new_with_tablet_suffix(
+    pub fn new_with_region_id(
+        region_id: u64,
         config: &FlowControlConfig,
         engine: E,
         discard_ratio: Arc<AtomicU32>,
         limiter: Arc<Limiter>,
-        tablet_suffix: u64,
     ) -> Self {
+        let include_pending_bytes = region_id == 0;
         let cf_checkers = engine
-            .cf_names()
+            .cf_names(region_id)
             .into_iter()
-            .map(|cf| (cf.to_owned(), CfFlowChecker::default()))
+            .map(|cf_name| (cf_name, CfFlowChecker::new(include_pending_bytes)))
             .collect();
 
         Self {
+            region_id,
             soft_pending_compaction_bytes_limit: config.soft_pending_compaction_bytes_limit.0,
             hard_pending_compaction_bytes_limit: config.hard_pending_compaction_bytes_limit.0,
             memtables_threshold: config.memtables_threshold,
@@ -510,7 +557,7 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
             last_record_time: Instant::now_coarse(),
             last_speed: 0.0,
             wait_for_destroy_range_finish: false,
-            tablet_suffix,
+            rc: AtomicU32::new(1),
         }
     }
 
@@ -551,22 +598,16 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
                 if !enabled {
                     return;
                 }
-                if self.wait_for_destroy_range_finish {
-                    // Concurrent unsafe destroy range, ignore the second one
-                    info!("concurrent unsafe destroy range, ignore");
-                    return;
-                }
                 self.wait_for_destroy_range_finish = true;
                 let soft = (self.soft_pending_compaction_bytes_limit as f64).log2();
-                for (cf, cf_checker) in &mut self.cf_checkers {
-                    let v = cf_checker.long_term_pending_bytes.get_avg();
-                    if v <= soft {
-                        info!(
-                            "before unsafe destroy range";
-                            "cf" => cf,
-                            "pending_bytes" => v
-                        );
-                        cf_checker.pending_bytes_before_unsafe_destroy_range = Some(v);
+                for cf_checker in self.cf_checkers.values_mut() {
+                    if let Some(long_term_pending_bytes) =
+                        cf_checker.long_term_pending_bytes.as_ref()
+                    {
+                        let v = long_term_pending_bytes.get_avg();
+                        if v <= soft {
+                            cf_checker.pending_bytes_before_unsafe_destroy_range = Some(v);
+                        }
                     }
                 }
             }
@@ -578,11 +619,8 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
                 for (cf, cf_checker) in &mut self.cf_checkers {
                     if let Some(before) = cf_checker.pending_bytes_before_unsafe_destroy_range {
                         let soft = (self.soft_pending_compaction_bytes_limit as f64).log2();
-                        let after = (self
-                            .engine
-                            .get_cf_pending_compaction_bytes(cf)
-                            .unwrap_or(None)
-                            .unwrap_or(0) as f64)
+                        let after = (self.engine.pending_compaction_bytes(self.region_id, cf)
+                            as f64)
                             .log2();
 
                         assert!(before < soft);
@@ -591,13 +629,9 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
                             SCHED_THROTTLE_ACTION_COUNTER
                                 .with_label_values(&[cf, "pending_bytes_jump"])
                                 .inc();
+                        } else {
+                            cf_checker.pending_bytes_before_unsafe_destroy_range = None;
                         }
-                        info!(
-                            "after unsafe destroy range";
-                            "cf" => cf,
-                            "before" => before,
-                            "after" => after
-                        );
                     }
                 }
             }
@@ -613,7 +647,6 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
         Builder::new()
             .name(thd_name!("flow-checker"))
             .spawn_wrapper(move || {
-                tikv_alloc::add_thread_memory_accessor();
                 let mut checker = self;
                 let mut deadline = std::time::Instant::now();
                 let mut enabled = true;
@@ -632,13 +665,16 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
 
                     let msg = flow_info_receiver.recv_deadline(deadline);
                     if let Err(RecvTimeoutError::Timeout) = msg {
-                        checker.update_statistics();
+                        let (rate, cf_throttle_flags) = checker.update_statistics();
+                        for (cf, val) in cf_throttle_flags {
+                            SCHED_THROTTLE_CF_GAUGE.with_label_values(&[cf]).set(val);
+                        }
+                        SCHED_WRITE_FLOW_GAUGE.set(rate as i64);
                         deadline = std::time::Instant::now() + TICK_DURATION;
                     } else {
                         checker.on_flow_info_msg(enabled, msg);
                     }
                 }
-                tikv_alloc::remove_thread_memory_accessor();
             })
             .unwrap()
     }
@@ -663,26 +699,25 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
         self.discard_ratio.store(0, Ordering::Relaxed);
     }
 
-    pub fn update_statistics(&mut self) {
+    pub fn update_statistics(&mut self) -> (f64, HashMap<&str, i64>) {
+        let mut cf_throttle_flags = HashMap::default();
         if let Some(throttle_cf) = self.throttle_cf.as_ref() {
-            SCHED_THROTTLE_CF_GAUGE
-                .with_label_values(&[throttle_cf])
-                .set(1);
+            cf_throttle_flags.insert(throttle_cf.as_str(), 1);
             for cf in self.cf_checkers.keys() {
                 if cf != throttle_cf {
-                    SCHED_THROTTLE_CF_GAUGE.with_label_values(&[cf]).set(0);
+                    cf_throttle_flags.insert(cf.as_str(), 0);
                 }
             }
         } else {
             for cf in self.cf_checkers.keys() {
-                SCHED_THROTTLE_CF_GAUGE.with_label_values(&[cf]).set(0);
+                cf_throttle_flags.insert(cf.as_str(), 0);
             }
         }
 
         // calculate foreground write flow
         let dur = self.last_record_time.saturating_elapsed_secs();
         if dur < f64::EPSILON {
-            return;
+            return (0.0, cf_throttle_flags);
         }
         let rate = self.limiter.total_bytes_consumed() as f64 / dur;
         // don't record those write rate of 0.
@@ -692,103 +727,100 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
         if self.limiter.total_bytes_consumed() != 0 {
             self.write_flow_recorder.observe(rate as u64);
         }
-        SCHED_WRITE_FLOW_GAUGE.set(rate as i64);
+
         self.last_record_time = Instant::now_coarse();
 
         self.limiter.reset_statistics();
+        (rate, cf_throttle_flags)
     }
 
-    fn on_pending_compaction_bytes_change(&mut self, cf: String) {
+    pub fn on_pending_compaction_bytes_change(&mut self, cf: String) -> u64 {
+        let pending_compaction_bytes = self.engine.pending_compaction_bytes(self.region_id, &cf);
+        self.on_pending_compaction_bytes_change_cf(pending_compaction_bytes, cf);
+        pending_compaction_bytes
+    }
+
+    pub fn on_pending_compaction_bytes_change_cf(
+        &mut self,
+        pending_compaction_bytes: u64,
+        cf: String,
+    ) {
         let hard = (self.hard_pending_compaction_bytes_limit as f64).log2();
         let soft = (self.soft_pending_compaction_bytes_limit as f64).log2();
-
         // Because pending compaction bytes changes dramatically, take the
         // logarithm of pending compaction bytes to make the values fall into
         // a relative small range
-        let mut num = (self
-            .engine
-            .get_cf_pending_compaction_bytes(&cf)
-            .unwrap_or(None)
-            .unwrap_or(0) as f64)
-            .log2();
+        let mut num = (pending_compaction_bytes as f64).log2();
         if !num.is_finite() {
             // 0.log2() == -inf, which is not expected and may lead to sum always be NaN
             num = 0.0;
         }
         let checker = self.cf_checkers.get_mut(&cf).unwrap();
-        checker.long_term_pending_bytes.observe(num);
-        SCHED_PENDING_COMPACTION_BYTES_GAUGE
-            .with_label_values(&[&cf])
-            .set((checker.long_term_pending_bytes.get_avg() * RATIO_SCALE_FACTOR as f64) as i64);
 
-        // do special check on start, see the comment of the variable definition for
-        // detail.
-        if checker.on_start_pending_bytes {
-            if num < soft || checker.long_term_pending_bytes.trend() == Trend::Increasing {
-                // the write is accumulating, still need to throttle
-                checker.on_start_pending_bytes = false;
+        // only be called by v1
+        if let Some(long_term_pending_bytes) = checker.long_term_pending_bytes.as_mut() {
+            long_term_pending_bytes.observe(num);
+            SCHED_PENDING_COMPACTION_BYTES_GAUGE
+                .with_label_values(&[&cf])
+                .set((long_term_pending_bytes.get_avg() * RATIO_SCALE_FACTOR as f64) as i64);
+
+            // do special check on start, see the comment of the variable definition for
+            // detail.
+            if checker.on_start_pending_bytes {
+                if num < soft || long_term_pending_bytes.trend() == Trend::Increasing {
+                    // the write is accumulating, still need to throttle
+                    checker.on_start_pending_bytes = false;
+                } else {
+                    // still on start, should not throttle now
+                    return;
+                }
+            }
+
+            let pending_compaction_bytes = long_term_pending_bytes.get_avg();
+            let ignore = if let Some(before) = checker.pending_bytes_before_unsafe_destroy_range {
+                if pending_compaction_bytes <= before && !self.wait_for_destroy_range_finish {
+                    checker.pending_bytes_before_unsafe_destroy_range = None;
+                }
+                true
             } else {
-                // still on start, should not throttle now
-                return;
+                false
+            };
+
+            for checker in self.cf_checkers.values() {
+                if let Some(long_term_pending_bytes) = checker.long_term_pending_bytes.as_ref()
+                    && num < long_term_pending_bytes.get_recent()
+                {
+                    return;
+                }
             }
-        }
 
-        let pending_compaction_bytes = checker.long_term_pending_bytes.get_avg();
-        let ignore = if let Some(before) = checker.pending_bytes_before_unsafe_destroy_range {
-            // It assumes that the long term average will eventually come down below the
-            // soft limit. If the general traffic flow increases during destroy, the long
-            // term average may never come down and the flow control will be turned off for
-            // a long time, which would be a rather rare case, so just ignore it.
-            if pending_compaction_bytes <= before && !self.wait_for_destroy_range_finish {
-                info!(
-                    "pending compaction bytes is back to normal";
-                    "cf" => &cf,
-                    "pending_compaction_bytes" => pending_compaction_bytes,
-                    "before" => before
-                );
-                checker.pending_bytes_before_unsafe_destroy_range = None;
-            }
-            true
-        } else {
-            false
-        };
-
-        for checker in self.cf_checkers.values() {
-            if num < checker.long_term_pending_bytes.get_recent() {
-                return;
-            }
-        }
-
-        let mut ratio = if pending_compaction_bytes < soft || ignore {
-            0
-        } else {
-            let new_ratio = (pending_compaction_bytes - soft) / (hard - soft);
-            let old_ratio = self.discard_ratio.load(Ordering::Relaxed);
-
-            // Because pending compaction bytes changes up and down, so using
-            // EMA(Exponential Moving Average) to smooth it.
-            (if old_ratio != 0 {
-                EMA_FACTOR * (old_ratio as f64 / RATIO_SCALE_FACTOR as f64)
-                    + (1.0 - EMA_FACTOR) * new_ratio
-            } else if new_ratio > 0.01 {
-                0.01
+            let mut ratio = if pending_compaction_bytes < soft || ignore {
+                0
             } else {
-                new_ratio
-            } * RATIO_SCALE_FACTOR as f64) as u32
-        };
-        SCHED_DISCARD_RATIO_GAUGE.set(ratio as i64);
-        if ratio > RATIO_SCALE_FACTOR {
-            ratio = RATIO_SCALE_FACTOR;
+                let new_ratio = (pending_compaction_bytes - soft) / (hard - soft);
+                let old_ratio = self.discard_ratio.load(Ordering::Relaxed);
+
+                // Because pending compaction bytes changes up and down, so using
+                // EMA(Exponential Moving Average) to smooth it.
+                (if old_ratio != 0 {
+                    EMA_FACTOR * (old_ratio as f64 / RATIO_SCALE_FACTOR as f64)
+                        + (1.0 - EMA_FACTOR) * new_ratio
+                } else if new_ratio > 0.01 {
+                    0.01
+                } else {
+                    new_ratio
+                } * RATIO_SCALE_FACTOR as f64) as u32
+            };
+            SCHED_DISCARD_RATIO_GAUGE.set(ratio as i64);
+            if ratio > RATIO_SCALE_FACTOR {
+                ratio = RATIO_SCALE_FACTOR;
+            }
+            self.discard_ratio.store(ratio, Ordering::Relaxed);
         }
-        self.discard_ratio.store(ratio, Ordering::Relaxed);
     }
 
     fn on_memtable_change(&mut self, cf: &str) {
-        let num_memtables = self
-            .engine
-            .get_cf_num_immutable_mem_table(cf)
-            .unwrap_or(None)
-            .unwrap_or(0);
+        let num_memtables = self.engine.num_immutable_mem_table(self.region_id, cf);
         let checker = self.cf_checkers.get_mut(cf).unwrap();
         SCHED_MEMTABLE_GAUGE
             .with_label_values(&[cf])
@@ -867,11 +899,7 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
     }
 
     fn collect_l0_consumption_stats(&mut self, cf: &str, l0_bytes: u64) {
-        let num_l0_files = self
-            .engine
-            .get_cf_num_files_at_level(cf, 0)
-            .unwrap_or(None)
-            .unwrap_or(0);
+        let num_l0_files = self.engine.num_files_at_level(self.region_id, cf, 0);
         let checker = self.cf_checkers.get_mut(cf).unwrap();
         checker.last_l0_bytes += l0_bytes;
         checker.long_term_num_l0_files.observe(num_l0_files);
@@ -884,11 +912,7 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
     }
 
     fn collect_l0_production_stats(&mut self, cf: &str, flush_bytes: u64) {
-        let num_l0_files = self
-            .engine
-            .get_cf_num_files_at_level(cf, 0)
-            .unwrap_or(None)
-            .unwrap_or(0);
+        let num_l0_files = self.engine.num_files_at_level(self.region_id, cf, 0);
 
         let checker = self.cf_checkers.get_mut(cf).unwrap();
         checker.last_flush_bytes += flush_bytes;
@@ -1015,6 +1039,14 @@ impl<E: CfNamesExt + FlowControlFactorsExt + Send + 'static> FlowChecker<E> {
         });
         self.limiter.set_speed_limit(throttle)
     }
+
+    pub fn inc(&self) -> u32 {
+        self.rc.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn dec(&self) -> u32 {
+        self.rc.fetch_sub(1, Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -1078,27 +1110,13 @@ pub(super) mod tests {
         }
     }
 
-    fn send_flow_info(tx: &mpsc::SyncSender<FlowInfo>, region_id: u64, tablet_suffix: u64) {
-        tx.send(FlowInfo::Flush(
-            "default".to_string(),
-            0,
-            region_id,
-            tablet_suffix,
-        ))
-        .unwrap();
-        tx.send(FlowInfo::Compaction(
-            "default".to_string(),
-            region_id,
-            tablet_suffix,
-        ))
-        .unwrap();
-        tx.send(FlowInfo::L0Intra(
-            "default".to_string(),
-            0,
-            region_id,
-            tablet_suffix,
-        ))
-        .unwrap();
+    pub fn send_flow_info(tx: &mpsc::SyncSender<FlowInfo>, region_id: u64) {
+        tx.send(FlowInfo::Flush("default".to_string(), 0, region_id))
+            .unwrap();
+        tx.send(FlowInfo::Compaction("default".to_string(), region_id))
+            .unwrap();
+        tx.send(FlowInfo::L0Intra("default".to_string(), 0, region_id))
+            .unwrap();
     }
 
     pub fn test_flow_controller_basic_impl(flow_controller: &FlowController, region_id: u64) {
@@ -1134,7 +1152,6 @@ pub(super) mod tests {
         stub: &EngineStub,
         tx: &mpsc::SyncSender<FlowInfo>,
         region_id: u64,
-        tablet_suffix: u64,
     ) {
         assert_eq!(flow_controller.consume(0, 2000), Duration::ZERO);
         loop {
@@ -1154,30 +1171,30 @@ pub(super) mod tests {
 
         // exceeds the threshold on start
         stub.0.num_memtables.store(8, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert_eq!(flow_controller.should_drop(region_id), false);
         // on start check forbids flow control
         assert_eq!(flow_controller.is_unlimited(region_id), true);
         // once falls below the threshold, pass the on start check
         stub.0.num_memtables.store(1, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         // not throttle when the average of the sliding window doesn't exceeds the
         // threshold
         stub.0.num_memtables.store(6, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert_eq!(flow_controller.should_drop(region_id), false);
         assert_eq!(flow_controller.is_unlimited(region_id), true);
 
         // the average of sliding window exceeds the threshold
         stub.0.num_memtables.store(6, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert_eq!(flow_controller.should_drop(region_id), false);
         assert_eq!(flow_controller.is_unlimited(region_id), false);
         assert_ne!(flow_controller.consume(region_id, 2000), Duration::ZERO);
 
         // not throttle once the number of memtables falls below the threshold
         stub.0.num_memtables.store(1, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert_eq!(flow_controller.should_drop(region_id), false);
         assert_eq!(flow_controller.is_unlimited(region_id), true);
     }
@@ -1189,7 +1206,7 @@ pub(super) mod tests {
         let flow_controller =
             EngineFlowController::new(&FlowControlConfig::default(), stub.clone(), rx);
         let flow_controller = FlowController::Singleton(flow_controller);
-        test_flow_controller_memtable_impl(&flow_controller, &stub, &tx, 0, 0);
+        test_flow_controller_memtable_impl(&flow_controller, &stub, &tx, 0);
     }
 
     pub fn test_flow_controller_l0_impl(
@@ -1197,7 +1214,6 @@ pub(super) mod tests {
         stub: &EngineStub,
         tx: &mpsc::SyncSender<FlowInfo>,
         region_id: u64,
-        tablet_suffix: u64,
     ) {
         assert_eq!(flow_controller.consume(region_id, 2000), Duration::ZERO);
         loop {
@@ -1209,17 +1225,17 @@ pub(super) mod tests {
 
         // exceeds the threshold
         stub.0.num_l0_files.store(30, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert_eq!(flow_controller.should_drop(region_id), false);
         // on start check forbids flow control
         assert_eq!(flow_controller.is_unlimited(region_id), true);
         // once fall below the threshold, pass the on start check
         stub.0.num_l0_files.store(10, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
 
         // exceeds the threshold, throttle now
         stub.0.num_l0_files.store(30, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert_eq!(flow_controller.should_drop(region_id), false);
         assert_eq!(flow_controller.is_unlimited(region_id), false);
         assert_ne!(flow_controller.consume(region_id, 2000), Duration::ZERO);
@@ -1232,7 +1248,7 @@ pub(super) mod tests {
         let flow_controller =
             EngineFlowController::new(&FlowControlConfig::default(), stub.clone(), rx);
         let flow_controller = FlowController::Singleton(flow_controller);
-        test_flow_controller_l0_impl(&flow_controller, &stub, &tx, 0, 0);
+        test_flow_controller_l0_impl(&flow_controller, &stub, &tx, 0);
     }
 
     pub fn test_flow_controller_pending_compaction_bytes_impl(
@@ -1240,37 +1256,36 @@ pub(super) mod tests {
         stub: &EngineStub,
         tx: &mpsc::SyncSender<FlowInfo>,
         region_id: u64,
-        tablet_suffix: u64,
     ) {
         // exceeds the threshold
         stub.0
             .pending_compaction_bytes
             .store(1000 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         // on start check forbids flow control
         assert!(flow_controller.discard_ratio(region_id) < f64::EPSILON);
         // once fall below the threshold, pass the on start check
         stub.0
             .pending_compaction_bytes
             .store(100 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
 
         stub.0
             .pending_compaction_bytes
             .store(1000 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert!(flow_controller.discard_ratio(region_id) > f64::EPSILON);
 
         stub.0
             .pending_compaction_bytes
             .store(1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert!(flow_controller.discard_ratio(region_id) < f64::EPSILON);
 
         // pending compaction bytes jump after unsafe destroy range
         tx.send(FlowInfo::BeforeUnsafeDestroyRange(region_id))
             .unwrap();
-        tx.send(FlowInfo::L0Intra("default".to_string(), 0, region_id, 0))
+        tx.send(FlowInfo::L0Intra("default".to_string(), 0, region_id))
             .unwrap();
         assert!(flow_controller.discard_ratio(region_id) < f64::EPSILON);
 
@@ -1278,62 +1293,35 @@ pub(super) mod tests {
         stub.0
             .pending_compaction_bytes
             .store(1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert!(flow_controller.discard_ratio(region_id) < f64::EPSILON);
 
         stub.0
             .pending_compaction_bytes
             .store(10000000 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
-        assert!(flow_controller.discard_ratio(region_id) < f64::EPSILON);
-
-        // after unsafe destroy range, pending compaction bytes may jump back to a lower
-        // value
-        stub.0
-            .pending_compaction_bytes
-            .store(100 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        tx.send(FlowInfo::Compaction(
-            "default".to_string(),
-            region_id,
-            tablet_suffix,
-        ))
-        .unwrap();
+        tx.send(FlowInfo::Compaction("default".to_string(), region_id))
+            .unwrap();
         tx.send(FlowInfo::AfterUnsafeDestroyRange(region_id))
             .unwrap();
-        tx.send(FlowInfo::L0Intra(
-            "default".to_string(),
-            0,
-            region_id,
-            tablet_suffix,
-        ))
-        .unwrap();
+        tx.send(FlowInfo::L0Intra("default".to_string(), 0, region_id))
+            .unwrap();
         assert!(
             flow_controller.discard_ratio(region_id) < f64::EPSILON,
             "discard_ratio {}",
             flow_controller.discard_ratio(region_id)
         );
 
-        // the long term average pending compaction bytes is still high, shouldn't
-        // unfreeze the jump control
-        stub.0
-            .pending_compaction_bytes
-            .store(100 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
-        assert!(flow_controller.discard_ratio(region_id) < f64::EPSILON);
-
-        // the long term average pending compaction bytes falls below the threshold,
-        // should unfreeze the jump control
+        // unfreeze the control
         stub.0
             .pending_compaction_bytes
             .store(1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert!(flow_controller.discard_ratio(region_id) < f64::EPSILON);
 
-        // exceeds the threshold, should perform throttle
         stub.0
             .pending_compaction_bytes
             .store(1000000000 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(tx, region_id, tablet_suffix);
+        send_flow_info(tx, region_id);
         assert!(flow_controller.discard_ratio(region_id) > f64::EPSILON);
     }
 
@@ -1344,7 +1332,7 @@ pub(super) mod tests {
         let flow_controller =
             EngineFlowController::new(&FlowControlConfig::default(), stub.clone(), rx);
         let flow_controller = FlowController::Singleton(flow_controller);
-        test_flow_controller_pending_compaction_bytes_impl(&flow_controller, &stub, &tx, 0, 0);
+        test_flow_controller_pending_compaction_bytes_impl(&flow_controller, &stub, &tx, 0);
     }
 
     #[test]
@@ -1358,16 +1346,16 @@ pub(super) mod tests {
 
         // should handle zero pending compaction bytes properly
         stub.0.pending_compaction_bytes.store(0, Ordering::Relaxed);
-        send_flow_info(&tx, region_id, 0);
+        send_flow_info(&tx, region_id);
         assert!(flow_controller.discard_ratio(region_id) < f64::EPSILON);
         stub.0
             .pending_compaction_bytes
             .store(10000000000 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(&tx, region_id, 0);
+        send_flow_info(&tx, region_id);
         stub.0
             .pending_compaction_bytes
             .store(10000000000 * 1024 * 1024 * 1024, Ordering::Relaxed);
-        send_flow_info(&tx, region_id, 0);
+        send_flow_info(&tx, region_id);
         assert!(flow_controller.discard_ratio(region_id) > f64::EPSILON);
     }
 

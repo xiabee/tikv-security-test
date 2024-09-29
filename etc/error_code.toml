@@ -258,9 +258,9 @@ error = '''
 KV:Pd:StoreTombstone
 '''
 
-["KV:Pd:GlobalConfigNotFound"]
+["KV:Pd:DataCompacted"]
 error = '''
-KV:Pd:GlobalConfigNotFound
+KV:Pd:DataCompacted
 '''
 
 ["KV:Pd:Unknown"]
@@ -441,6 +441,11 @@ KV:Raftstore:FlashbackInProgress
 ["KV:Raftstore:FlashbackNotPrepared"]
 error = '''
 KV:Raftstore:FlashbackNotPrepared
+'''
+
+["KV:Raftstore:IsWitness"]
+error = '''
+KV:Raftstore:IsWitness
 '''
 
 ["KV:Raftstore:SnapAbort"]

@@ -18,8 +18,10 @@ use backup_stream::{
     },
     observer::BackupStreamObserver,
     router::{Router, TaskSelector},
-    utils, Endpoint, GetCheckpointResult, RegionCheckpointOperation, RegionSet, Service, Task,
+    utils, BackupStreamResolver, Endpoint, GetCheckpointResult, RegionCheckpointOperation,
+    RegionSet, Service, Task,
 };
+use engine_rocks::RocksEngine;
 use futures::{executor::block_on, AsyncWriteExt, Future, Stream, StreamExt};
 use grpcio::{ChannelBuilder, Server, ServerBuilder};
 use kvproto::{
@@ -30,10 +32,11 @@ use kvproto::{
     tikvpb::*,
 };
 use pd_client::PdClient;
-use raftstore::RegionInfoAccessor;
-use tempdir::TempDir;
+use raftstore::{router::CdcRaftRouter, RegionInfoAccessor};
+use resolved_ts::LeadershipResolver;
+use tempfile::TempDir;
 use test_pd_client::TestPdClient;
-use test_raftstore::{new_server_cluster, Cluster, ServerCluster};
+use test_raftstore::{new_server_cluster, Cluster, Config, ServerCluster};
 use test_util::retry;
 use tikv::config::{BackupStreamConfig, ResolvedTsConfig};
 use tikv_util::{
@@ -122,6 +125,7 @@ pub struct SuiteBuilder {
     nodes: usize,
     metastore_error: Box<dyn Fn(&str) -> Result<()> + Send + Sync>,
     cfg: Box<dyn FnOnce(&mut BackupStreamConfig)>,
+    cluster_cfg: Box<dyn FnOnce(&mut Config)>,
 }
 
 impl SuiteBuilder {
@@ -133,6 +137,7 @@ impl SuiteBuilder {
             cfg: Box::new(|cfg| {
                 cfg.enable = true;
             }),
+            cluster_cfg: Box::new(|_| {}),
         }
     }
 
@@ -141,6 +146,7 @@ impl SuiteBuilder {
         self
     }
 
+    #[allow(dead_code)]
     pub fn inject_meta_store_error<F>(mut self, f: F) -> Self
     where
         F: Fn(&str) -> Result<()> + Send + Sync + 'static,
@@ -149,9 +155,20 @@ impl SuiteBuilder {
         self
     }
 
+    #[allow(dead_code)]
     pub fn cfg(mut self, f: impl FnOnce(&mut BackupStreamConfig) + 'static) -> Self {
         let old_f = self.cfg;
         self.cfg = Box::new(move |cfg| {
+            old_f(cfg);
+            f(cfg);
+        });
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn cluster_cfg(mut self, f: impl FnOnce(&mut Config) + 'static) -> Self {
+        let old_f = self.cluster_cfg;
+        self.cluster_cfg = Box::new(move |cfg| {
             old_f(cfg);
             f(cfg);
         });
@@ -164,10 +181,12 @@ impl SuiteBuilder {
             nodes: n,
             metastore_error,
             cfg: cfg_f,
+            cluster_cfg: ccfg_f,
         } = self;
 
         info!("start test"; "case" => %case, "nodes" => %n);
-        let cluster = new_server_cluster(42, n);
+        let mut cluster = new_server_cluster(42, n);
+        ccfg_f(&mut cluster.cfg);
         let mut suite = Suite {
             endpoints: Default::default(),
             meta_store: ErrorStore {
@@ -182,8 +201,8 @@ impl SuiteBuilder {
             env: Arc::new(grpcio::Environment::new(1)),
             cluster,
 
-            temp_files: TempDir::new("temp").unwrap(),
-            flushed_files: TempDir::new("flush").unwrap(),
+            temp_files: TempDir::new().unwrap(),
+            flushed_files: TempDir::new().unwrap(),
             case_name: case,
         };
         for id in 1..=(n as u64) {
@@ -245,7 +264,7 @@ impl<S: MetaStore> MetaStore for ErrorStore<S> {
 pub struct Suite {
     pub endpoints: HashMap<u64, LazyWorker<Task>>,
     pub meta_store: ErrorStore<SlashEtcStore>,
-    pub cluster: Cluster<ServerCluster>,
+    pub cluster: Cluster<RocksEngine, ServerCluster<RocksEngine>>,
     tikv_cli: HashMap<u64, TikvClient>,
     log_backup_cli: HashMap<u64, LogBackupClient>,
     obs: HashMap<u64, BackupStreamObserver>,
@@ -253,7 +272,7 @@ pub struct Suite {
     // The place to make services live as long as suite.
     servers: Vec<Server>,
 
-    temp_files: TempDir,
+    pub temp_files: TempDir,
     pub flushed_files: TempDir,
     case_name: String,
 }
@@ -356,12 +375,25 @@ impl Suite {
         let worker = self.endpoints.get_mut(&id).unwrap();
         let sim = cluster.sim.wl();
         let raft_router = sim.get_server_router(id);
+        let raft_router = CdcRaftRouter(raft_router);
         let cm = sim.get_concurrency_manager(id);
         let regions = sim.region_info_accessors.get(&id).unwrap().clone();
         let ob = self.obs.get(&id).unwrap().clone();
         cfg.enable = true;
         cfg.temp_path = format!("/{}/{}", self.temp_files.path().display(), id);
-        let endpoint: TestEndpoint = Endpoint::new(
+        let resolver = LeadershipResolver::new(
+            id,
+            cluster.pd_client.clone(),
+            Arc::clone(&self.env),
+            Arc::clone(&sim.security_mgr),
+            cluster.store_metas[&id]
+                .lock()
+                .unwrap()
+                .region_read_progress
+                .clone(),
+            Duration::from_secs(60),
+        );
+        let endpoint = Endpoint::new(
             id,
             self.meta_store.clone(),
             cfg,
@@ -372,18 +404,13 @@ impl Suite {
             raft_router,
             cluster.pd_client.clone(),
             cm,
-            Arc::clone(&self.env),
-            cluster.store_metas[&id]
-                .lock()
-                .unwrap()
-                .region_read_progress
-                .clone(),
-            Arc::clone(&sim.security_mgr),
+            BackupStreamResolver::V1(resolver),
+            sim.encryption.clone(),
         );
         worker.start(endpoint);
     }
 
-    pub fn get_meta_cli(&self) -> MetadataClient<ErrorStore<SlashEtcStore>> {
+    pub fn get_meta_cli(&self) -> MetadataClient<impl MetaStore> {
         MetadataClient::new(self.meta_store.clone(), 0)
     }
 
@@ -452,6 +479,52 @@ impl Suite {
             .await
     }
 
+    #[allow(dead_code)]
+    pub async fn write_records_batched(
+        &mut self,
+        from: usize,
+        n: usize,
+        for_table: i64,
+    ) -> HashSet<Vec<u8>> {
+        let mut inserted = HashSet::default();
+        let mut keys = HashMap::new();
+        let start_ts = self.cluster.pd_client.get_tso().await.unwrap();
+        for sn in (from..(from + n)).map(|x| x * 2) {
+            let sn = sn as u64;
+            let key = make_record_key(for_table, sn);
+            let enc_key = Key::from_raw(&key).into_encoded();
+            let region = self.cluster.get_region_id(&enc_key);
+            let v = keys.entry(region).or_insert_with(|| vec![]);
+            v.push((key, sn));
+        }
+        let commit_ts = self.cluster.pd_client.get_tso().await.unwrap();
+        for (region, keys) in keys {
+            let mut muts = vec![];
+            for (key, sn) in &keys {
+                let raw_key = make_record_key(for_table, *sn);
+                let value = if sn % 4 == 0 {
+                    Self::PROMISED_SHORT_VALUE.to_vec()
+                } else {
+                    Self::PROMISED_LONG_VALUE.to_vec()
+                };
+
+                let k = Key::from_raw(key).append_ts(commit_ts);
+                muts.push(mutation(raw_key, value));
+                inserted.insert(k.into_encoded());
+            }
+            let pk = muts[0].key.clone();
+            self.must_kv_prewrite(region, muts, pk, start_ts);
+            self.must_kv_commit(
+                region,
+                keys.into_iter().map(|(k, _)| k).collect(),
+                start_ts,
+                commit_ts,
+            );
+        }
+
+        inserted
+    }
+
     pub async fn write_records(
         &mut self,
         from: usize,
@@ -459,10 +532,10 @@ impl Suite {
         for_table: i64,
     ) -> HashSet<Vec<u8>> {
         let mut inserted = HashSet::default();
-        for ts in (from..(from + n)).map(|x| x * 2) {
-            let ts = ts as u64;
-            let key = make_record_key(for_table, ts);
-            let value = if ts % 4 == 0 {
+        for sn in (from..(from + n)).map(|x| x * 2) {
+            let sn = sn as u64;
+            let key = make_record_key(for_table, sn);
+            let value = if sn % 4 == 0 {
                 Self::PROMISED_SHORT_VALUE.to_vec()
             } else {
                 Self::PROMISED_LONG_VALUE.to_vec()
@@ -476,7 +549,7 @@ impl Suite {
             self.must_kv_commit(region, vec![key.clone()], start_ts, commit_ts);
             inserted.insert(make_encoded_record_key(
                 for_table,
-                ts,
+                sn,
                 commit_ts.into_inner(),
             ));
         }
@@ -513,6 +586,7 @@ impl Suite {
     }
 
     pub fn force_flush_files(&self, task: &str) {
+        // TODO: use the callback to make the test more stable.
         self.run(|| Task::ForceFlush(task.to_owned()));
         self.sync();
     }
@@ -847,7 +921,7 @@ impl Suite {
     }
 
     pub fn wait_with_router(&self, mut cond: impl FnMut(&Router) -> bool + Send + 'static + Clone) {
-        self.wait_with(move |ep: &mut TestEndpoint| cond(&ep.range_router))
+        self.wait_with(move |ep| cond(&ep.range_router))
     }
 
     pub fn wait_for_flush(&self) {

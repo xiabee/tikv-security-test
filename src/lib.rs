@@ -23,10 +23,16 @@
 #![feature(proc_macro_hygiene)]
 #![feature(min_specialization)]
 #![feature(box_patterns)]
-#![feature(drain_filter)]
+#![feature(extract_if)]
 #![feature(deadline_api)]
 #![feature(let_chains)]
+#![feature(read_buf)]
 #![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
+#![allow(incomplete_features)]
+#![feature(core_io_borrowed_buf)]
+#![feature(assert_matches)]
+#![feature(associated_type_bounds)]
 
 #[macro_use(fail_point)]
 extern crate fail;
@@ -76,8 +82,8 @@ pub fn tikv_version_info(build_time: Option<&str>) -> String {
 }
 
 /// return the build version of tikv-server
-pub fn tikv_build_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+pub fn tikv_build_version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
 }
 
 /// Prints the tikv version information to the standard output.

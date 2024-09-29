@@ -2,6 +2,7 @@
 
 use std::{cmp, convert::TryInto, io::Write, sync::Arc, u8};
 
+use api_version::KvFormat;
 use codec::prelude::*;
 use collections::{HashMap, HashSet};
 use kvproto::coprocessor::KeyRange;
@@ -38,10 +39,12 @@ pub const INDEX_VALUE_VERSION_FLAG: u8 = 125;
 /// Flag that indicate if the index value has restored data.
 pub const INDEX_VALUE_RESTORED_DATA_FLAG: u8 = crate::codec::row::v2::CODEC_VERSION;
 
+/// Deprecated. see <https://github.com/tikv/tikv/issues/17138>
 /// ID for partition column, see <https://github.com/pingcap/parser/pull/1010>
 pub const EXTRA_PARTITION_ID_COL_ID: i64 = -2;
 
 /// ID for physical table id column, see <https://github.com/tikv/tikv/issues/11888>
+/// If it's a global index, it will return partition id, see <https://github.com/tikv/tikv/issues/17138>
 pub const EXTRA_PHYSICAL_TABLE_ID_COL_ID: i64 = -3;
 
 /// `TableEncoder` encodes the table record/index prefix.
@@ -75,10 +78,13 @@ pub fn extract_table_prefix(key: &[u8]) -> Result<&[u8]> {
 }
 
 /// Checks if the range is for table record or index.
-pub fn check_table_ranges(ranges: &[KeyRange]) -> Result<()> {
+pub fn check_table_ranges<F: KvFormat>(ranges: &[KeyRange]) -> Result<()> {
     for range in ranges {
-        extract_table_prefix(range.get_start())?;
-        extract_table_prefix(range.get_end())?;
+        let (_, start) =
+            F::parse_keyspace(range.get_start()).map_err(|e| Error::Other(Box::new(e)))?;
+        let (_, end) = F::parse_keyspace(range.get_end()).map_err(|e| Error::Other(Box::new(e)))?;
+        extract_table_prefix(start)?;
+        extract_table_prefix(end)?;
         if range.get_start() >= range.get_end() {
             return Err(invalid_type!(
                 "invalid range,range.start should be smaller than range.end, but got [{:?},{:?})",
@@ -315,7 +321,7 @@ pub fn decode_row(
     cols: &HashMap<i64, ColumnInfo>,
 ) -> Result<HashMap<i64, Datum>> {
     let mut values = datum::decode(data)?;
-    if values.get(0).map_or(true, |d| *d == Datum::Null) {
+    if values.first().map_or(true, |d| *d == Datum::Null) {
         return Ok(HashMap::default());
     }
     if values.len() & 1 == 1 {
@@ -520,11 +526,11 @@ pub fn generate_index_data_for_test(
     col_val: &Datum,
     unique: bool,
 ) -> (HashMap<i64, Vec<u8>>, Vec<u8>) {
-    let indice = vec![(2, col_val.clone()), (3, Datum::Dec(handle.into()))];
+    let indice = [(2, col_val.clone()), (3, Datum::Dec(handle.into()))];
     let mut expect_row = HashMap::default();
     let mut v: Vec<_> = indice
         .iter()
-        .map(|&(ref cid, ref value)| {
+        .map(|(cid, value)| {
             expect_row.insert(
                 *cid,
                 datum::encode_key(&mut EvalContext::default(), &[value.clone()]).unwrap(),
@@ -544,6 +550,7 @@ pub fn generate_index_data_for_test(
 mod tests {
     use std::{i64, iter::FromIterator};
 
+    use api_version::ApiV1;
     use collections::{HashMap, HashSet};
     use tipb::ColumnInfo;
 
@@ -790,18 +797,18 @@ mod tests {
         let mut range = KeyRange::default();
         range.set_start(small_key.clone());
         range.set_end(large_key.clone());
-        check_table_ranges(&[range]).unwrap();
+        check_table_ranges::<ApiV1>(&[range]).unwrap();
         // test range.start > range.end
         let mut range = KeyRange::default();
         range.set_end(small_key.clone());
         range.set_start(large_key);
-        check_table_ranges(&[range]).unwrap_err();
+        check_table_ranges::<ApiV1>(&[range]).unwrap_err();
 
         // test invalid end
         let mut range = KeyRange::default();
         range.set_start(small_key);
         range.set_end(b"xx".to_vec());
-        check_table_ranges(&[range]).unwrap_err();
+        check_table_ranges::<ApiV1>(&[range]).unwrap_err();
     }
 
     #[test]

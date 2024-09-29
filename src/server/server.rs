@@ -11,9 +11,11 @@ use std::{
 use api_version::KvFormat;
 use futures::{compat::Stream01CompatExt, stream::StreamExt};
 use grpcio::{ChannelBuilder, Environment, ResourceQuota, Server as GrpcServer, ServerBuilder};
-use grpcio_health::{create_health, HealthService, ServingStatus};
+use grpcio_health::{create_health, HealthService};
+use health_controller::HealthController;
 use kvproto::tikvpb::*;
-use raftstore::store::{CheckLeaderTask, SnapManager};
+use raftstore::store::{CheckLeaderTask, SnapManager, TabletSnapManager};
+use resource_control::ResourceGroupManager;
 use security::SecurityManager;
 use tikv_util::{
     config::VersionTrack,
@@ -32,6 +34,7 @@ use super::{
     resolve::StoreAddrResolver,
     service::*,
     snap::{Runner as SnapHandler, Task as SnapTask},
+    tablet_snap::SnapCacheBuilder,
     transport::ServerTransport,
     Config, Error, Result,
 };
@@ -39,7 +42,7 @@ use crate::{
     coprocessor::Endpoint,
     coprocessor_v2,
     read_pool::ReadPool,
-    server::{gc_worker::GcWorker, Proxy},
+    server::{gc_worker::GcWorker, tablet_snap::TabletRunner, Proxy},
     storage::{lock_manager::LockManager, Engine, Storage},
     tikv_util::sys::thread::ThreadBuildWrapper,
 };
@@ -127,7 +130,7 @@ pub struct Server<S: StoreAddrResolver + 'static, E: Engine> {
     trans: ServerTransport<E::RaftExtension, S>,
     raft_router: E::RaftExtension,
     // For sending/receiving snapshots.
-    snap_mgr: SnapManager,
+    snap_mgr: Either<SnapManager, TabletSnapManager>,
     snap_worker: LazyWorker<SnapTask>,
 
     // Currently load statistics is done in the thread.
@@ -135,7 +138,7 @@ pub struct Server<S: StoreAddrResolver + 'static, E: Engine> {
     grpc_thread_load: Arc<ThreadLoadPool>,
     yatp_read_pool: Option<ReadPool>,
     debug_thread_pool: Arc<Runtime>,
-    health_service: HealthService,
+    health_controller: HealthController,
     timer: Handle,
     builder_factory: Box<dyn GrpcBuilderFactory>,
 }
@@ -155,13 +158,14 @@ where
         copr: Endpoint<E>,
         copr_v2: coprocessor_v2::Endpoint,
         resolver: S,
-        snap_mgr: SnapManager,
+        snap_mgr: Either<SnapManager, TabletSnapManager>,
         gc_worker: GcWorker<E>,
         check_leader_scheduler: Scheduler<CheckLeaderTask>,
         env: Arc<Environment>,
         yatp_read_pool: Option<ReadPool>,
         debug_thread_pool: Arc<Runtime>,
-        health_service: HealthService,
+        health_controller: HealthController,
+        resource_manager: Option<Arc<ResourceGroupManager>>,
     ) -> Result<Self> {
         // A helper thread (or pool) for transport layer.
         let stats_pool = if cfg.value().stats_concurrency > 0 {
@@ -169,8 +173,7 @@ where
                 RuntimeBuilder::new_multi_thread()
                     .thread_name(STATS_THREAD_PREFIX)
                     .worker_threads(cfg.value().stats_concurrency)
-                    .after_start_wrapper(|| {})
-                    .before_stop_wrapper(|| {})
+                    .with_sys_hooks()
                     .build()
                     .unwrap(),
             )
@@ -183,10 +186,17 @@ where
 
         let snap_worker = Worker::new("snap-handler");
         let lazy_worker = snap_worker.lazy_build("snap-handler");
-        let raft_ext = storage.get_engine().raft_extension().clone();
+        let raft_ext = storage.get_engine().raft_extension();
+
+        let health_feedback_interval = if cfg.value().health_feedback_interval.0.is_zero() {
+            None
+        } else {
+            Some(cfg.value().health_feedback_interval.0)
+        };
 
         let proxy = Proxy::new(security_mgr.clone(), &env, Arc::new(cfg.value().clone()));
         let kv_service = KvService::new(
+            cfg.value().cluster_id,
             store_id,
             storage,
             gc_worker,
@@ -198,12 +208,15 @@ where
             cfg.value().enable_request_batch,
             proxy,
             cfg.value().reject_messages_on_memory_ratio,
+            resource_manager,
+            health_controller.clone(),
+            health_feedback_interval,
         );
         let builder_factory = Box::new(BuilderFactory::new(
             kv_service,
             cfg.clone(),
             security_mgr.clone(),
-            health_service.clone(),
+            health_controller.get_grpc_health_service(),
         ));
 
         let addr = SocketAddr::from_str(&cfg.value().addr)?;
@@ -223,7 +236,6 @@ where
         let raft_client = RaftClient::new(store_id, conn_builder);
 
         let trans = ServerTransport::new(raft_client);
-        health_service.set_serving_status("", ServingStatus::NotServing);
 
         let svr = Server {
             env: Arc::clone(&env),
@@ -238,7 +250,7 @@ where
             grpc_thread_load,
             yatp_read_pool,
             debug_thread_pool,
-            health_service,
+            health_controller,
             timer: GLOBAL_TIMER_HANDLE.clone(),
             builder_factory,
         };
@@ -299,8 +311,7 @@ where
         let mut grpc_server = self.builder_or_server.take().unwrap().right().unwrap();
         grpc_server.start();
         self.builder_or_server = Some(Either::Right(grpc_server));
-        self.health_service
-            .set_serving_status("", ServingStatus::Serving);
+        self.health_controller.set_is_serving(true);
     }
 
     /// Starts the TiKV server.
@@ -309,15 +320,31 @@ where
         &mut self,
         cfg: Arc<VersionTrack<Config>>,
         security_mgr: Arc<SecurityManager>,
+        snap_cache_builder: impl SnapCacheBuilder + Clone + 'static,
     ) -> Result<()> {
-        let snap_runner = SnapHandler::new(
-            Arc::clone(&self.env),
-            self.snap_mgr.clone(),
-            self.raft_router.clone(),
-            security_mgr,
-            Arc::clone(&cfg),
-        );
-        self.snap_worker.start(snap_runner);
+        match self.snap_mgr.clone() {
+            Either::Left(mgr) => {
+                let snap_runner = SnapHandler::new(
+                    self.env.clone(),
+                    mgr,
+                    self.raft_router.clone(),
+                    security_mgr,
+                    cfg,
+                );
+                self.snap_worker.start(snap_runner);
+            }
+            Either::Right(mgr) => {
+                let snap_runner = TabletRunner::new(
+                    self.env.clone(),
+                    mgr,
+                    snap_cache_builder,
+                    self.raft_router.clone(),
+                    security_mgr,
+                    cfg,
+                );
+                self.snap_worker.start(snap_runner);
+            }
+        }
 
         self.start_grpc();
 
@@ -374,7 +401,7 @@ where
             pool.shutdown_background();
         }
         let _ = self.yatp_read_pool.take();
-        self.health_service.shutdown();
+        self.health_controller.shutdown();
         Ok(())
     }
 
@@ -386,8 +413,7 @@ where
         if let Some(Either::Right(server)) = self.builder_or_server.take() {
             drop(server);
         }
-        self.health_service
-            .set_serving_status("", ServingStatus::NotServing);
+        self.health_controller.set_is_serving(false);
         self.builder_or_server = Some(builder);
         info!("paused the grpc server"; "takes" => ?start.elapsed(),);
         Ok(())
@@ -420,6 +446,7 @@ pub mod test_router {
     use engine_rocks::{RocksEngine, RocksSnapshot};
     use kvproto::raft_serverpb::RaftMessage;
     use raftstore::{router::RaftStoreRouter, store::*, Result as RaftStoreResult};
+    use tikv_util::time::Instant as TiInstant;
 
     use super::*;
 
@@ -479,12 +506,10 @@ pub mod test_router {
 
     impl RaftStoreRouter<RocksEngine> for TestRaftStoreRouter {
         fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()> {
-            let _ = self
-                .tx
-                .send(Either::Left(PeerMsg::RaftMessage(InspectedRaftMessage {
-                    heap_size: 0,
-                    msg,
-                })));
+            let _ = self.tx.send(Either::Left(PeerMsg::RaftMessage(
+                InspectedRaftMessage { heap_size: 0, msg },
+                Some(TiInstant::now()),
+            )));
             Ok(())
         }
 
@@ -516,15 +541,15 @@ mod tests {
 
     use super::{
         super::{
-            resolve::{Callback as ResolveCallback, StoreAddrResolver},
-            Config, Result,
+            resolve::{self, Callback as ResolveCallback, StoreAddrResolver},
+            Config,
         },
         *,
     };
     use crate::{
         config::CoprReadPoolConfig,
         coprocessor::{self, readpool_impl},
-        server::{raftkv::RaftRouterWrap, TestRaftStoreRouter},
+        server::{raftkv::RaftRouterWrap, tablet_snap::NoSnapshotCache, TestRaftStoreRouter},
         storage::{lock_manager::MockLockManager, TestEngineBuilder, TestStorageBuilderApiV1},
     };
 
@@ -535,7 +560,7 @@ mod tests {
     }
 
     impl StoreAddrResolver for MockResolver {
-        fn resolve(&self, _: u64, cb: ResolveCallback) -> Result<()> {
+        fn resolve(&self, _: u64, cb: ResolveCallback) -> resolve::Result<()> {
             if self.quick_fail.load(Ordering::SeqCst) {
                 return Err(box_err!("quick fail"));
             }
@@ -620,19 +645,20 @@ mod tests {
             storage.get_concurrency_manager(),
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
         let copr_v2 = coprocessor_v2::Endpoint::new(&coprocessor_v2::Config::default());
         let debug_thread_pool = Arc::new(
             TokioBuilder::new_multi_thread()
                 .thread_name(thd_name!("debugger"))
                 .worker_threads(1)
-                .after_start_wrapper(|| {})
-                .before_stop_wrapper(|| {})
+                .with_sys_hooks()
                 .build()
                 .unwrap(),
         );
         let addr = Arc::new(Mutex::new(None));
         let (check_leader_scheduler, _) = tikv_util::worker::dummy_scheduler();
+        let path = tempfile::TempDir::new().unwrap();
         let mut server = Server::new(
             mock_store_id,
             &cfg,
@@ -644,18 +670,19 @@ mod tests {
                 quick_fail: Arc::clone(&quick_fail),
                 addr: Arc::clone(&addr),
             },
-            SnapManager::new(""),
+            Either::Left(SnapManager::new(path.path().to_str().unwrap())),
             gc_worker,
             check_leader_scheduler,
             env,
             None,
             debug_thread_pool,
-            HealthService::default(),
+            HealthController::new(),
+            None,
         )
         .unwrap();
 
         server.build_and_bind().unwrap();
-        server.start(cfg, security_mgr).unwrap();
+        server.start(cfg, security_mgr, NoSnapshotCache).unwrap();
 
         let mut trans = server.transport();
         router.report_unreachable(0, 0).unwrap();

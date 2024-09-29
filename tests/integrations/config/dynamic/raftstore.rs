@@ -9,6 +9,7 @@ use std::{
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::RocksEngine;
 use engine_traits::{Engines, ALL_CFS, CF_DEFAULT};
+use health_controller::HealthController;
 use kvproto::raft_serverpb::RaftMessage;
 use raftstore::{
     coprocessor::CoprocessorHost,
@@ -20,6 +21,7 @@ use raftstore::{
     Result,
 };
 use resource_metering::CollectorRegHandle;
+use service::service_manager::GrpcServiceManager;
 use tempfile::TempDir;
 use test_pd_client::TestPdClient;
 use tikv::{
@@ -27,7 +29,7 @@ use tikv::{
     import::SstImporter,
 };
 use tikv_util::{
-    config::{ReadableSize, VersionTrack},
+    config::{ReadableDuration, ReadableSize, VersionTrack},
     worker::{dummy_scheduler, LazyWorker, Worker},
 };
 
@@ -66,7 +68,7 @@ fn start_raftstore(
     ApplyRouter<RocksEngine>,
     RaftBatchSystem<RocksEngine, RocksEngine>,
 ) {
-    let (raft_router, mut system) = create_raft_batch_system(&cfg.raft_store);
+    let (raft_router, mut system) = create_raft_batch_system(&cfg.raft_store, &None);
     let engines = create_tmp_engine(dir);
     let host = CoprocessorHost::default();
     let importer = {
@@ -76,7 +78,7 @@ fn start_raftstore(
             .as_path()
             .display()
             .to_string();
-        Arc::new(SstImporter::new(&cfg.import, p, None, cfg.storage.api_version()).unwrap())
+        Arc::new(SstImporter::new(&cfg.import, p, None, cfg.storage.api_version(), false).unwrap())
     };
     let snap_mgr = {
         let p = dir
@@ -110,8 +112,9 @@ fn start_raftstore(
             Arc::default(),
             ConcurrencyManager::new(1.into()),
             CollectorRegHandle::new_for_test(),
+            HealthController::new(),
             None,
-            None,
+            GrpcServiceManager::dummy(),
             Arc::new(AtomicU64::new(0)),
         )
         .unwrap();
@@ -142,18 +145,18 @@ where
     rx.recv_timeout(Duration::from_secs(3)).unwrap();
 }
 
+fn new_changes(cfgs: Vec<(&str, &str)>) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from_iter(
+        cfgs.into_iter()
+            .map(|kv| (kv.0.to_owned(), kv.1.to_owned())),
+    )
+}
+
 #[test]
 fn test_update_raftstore_config() {
     let (mut config, _dir) = TikvConfig::with_tmp().unwrap();
     config.validate().unwrap();
     let (cfg_controller, router, _, mut system) = start_raftstore(config.clone(), &_dir);
-
-    let new_changes = |cfgs: Vec<(&str, &str)>| {
-        std::collections::HashMap::from_iter(
-            cfgs.into_iter()
-                .map(|kv| (kv.0.to_owned(), kv.1.to_owned())),
-        )
-    };
 
     // dispatch updated config
     let change = new_changes(vec![
@@ -164,6 +167,7 @@ fn test_update_raftstore_config() {
         ("raftstore.store-max-batch-size", "4321"),
         ("raftstore.raft-entry-max-size", "32MiB"),
         ("raftstore.apply-yield-write-size", "10KiB"),
+        ("raftstore.snap-wait-split-duration", "10s"),
     ]);
 
     cfg_controller.update(change).unwrap();
@@ -177,6 +181,7 @@ fn test_update_raftstore_config() {
     raft_store.store_batch_system.max_batch_size = Some(4321);
     raft_store.raft_max_size_per_msg = ReadableSize::mb(128);
     raft_store.raft_entry_max_size = ReadableSize::mb(32);
+    raft_store.snap_wait_split_duration = ReadableDuration::secs(10);
     let validate_store_cfg = |raft_cfg: &Config| {
         let raftstore_cfg = raft_cfg.clone();
         validate_store(&router, move |cfg: &Config| {
@@ -224,4 +229,60 @@ fn test_update_raftstore_config() {
     validate_store_cfg(&raft_store);
 
     system.shutdown();
+}
+
+#[test]
+fn test_update_raftstore_io_config() {
+    // Test update raftstore configurations on io settings.
+    // Start from SYNC mode.
+    {
+        let (mut resize_config, _dir) = TikvConfig::with_tmp().unwrap();
+        resize_config.raft_store.store_io_pool_size = 0; // SYNC mode
+        resize_config.validate().unwrap();
+        let (cfg_controller, _, _, mut system) = start_raftstore(resize_config, &_dir);
+
+        // not allowed to resize from SYNC mode to ASYNC mode
+        let resize_store_writers_cfg = vec![("raftstore.store-io-pool-size", "2")];
+        assert!(
+            cfg_controller
+                .update(new_changes(resize_store_writers_cfg))
+                .is_err()
+        );
+        system.shutdown();
+    }
+    // Start from ASYNC mode.
+    {
+        let (mut resize_config, _dir) = TikvConfig::with_tmp().unwrap();
+        resize_config.raft_store.store_io_pool_size = 2;
+        resize_config.validate().unwrap();
+        let (cfg_controller, _, _, mut system) = start_raftstore(resize_config, &_dir);
+
+        // not allowed to resize from ASYNC mode to SYNC mode
+        let resize_store_writers_cfg = vec![("raftstore.store-io-pool-size", "0")];
+        assert!(
+            cfg_controller
+                .update(new_changes(resize_store_writers_cfg))
+                .is_err()
+        );
+        system.shutdown();
+    }
+    // Modify the size of async-ios.
+    {
+        let (mut resize_config, _dir) = TikvConfig::with_tmp().unwrap();
+        resize_config.raft_store.store_io_pool_size = 2;
+        resize_config.validate().unwrap();
+        let (cfg_controller, _, _, mut system) = start_raftstore(resize_config, &_dir);
+
+        // resize the count of ios to 1 by decreasing.
+        let resize_store_writers_cfg = vec![("raftstore.store-io-pool-size", "1")];
+        cfg_controller
+            .update(new_changes(resize_store_writers_cfg))
+            .unwrap();
+        // resize the count of ios to 4 by increasing.
+        let resize_store_writers_cfg = vec![("raftstore.store-io-pool-size", "4")];
+        cfg_controller
+            .update(new_changes(resize_store_writers_cfg))
+            .unwrap();
+        system.shutdown();
+    }
 }

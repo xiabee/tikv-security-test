@@ -48,16 +48,25 @@ impl Debug for ResumedPessimisticLockItem {
     }
 }
 
+impl tikv_util::memory::HeapSize for ResumedPessimisticLockItem {
+    fn approximate_heap_size(&self) -> usize {
+        // TODO: account heap size for params
+        self.key.approximate_heap_size()
+    }
+}
+
 command! {
     /// Acquire a Pessimistic lock on the keys.
     ///
     /// This can be rolled back with a [`PessimisticRollback`](Command::PessimisticRollback) command.
     AcquirePessimisticLockResumed:
         cmd_ty => StorageResult<PessimisticLockResults>,
-        display => "kv::command::acquirepessimisticlockresumed {:?}",
-        (items),
+        display => { "kv::command::acquirepessimisticlockresumed {:?}", (items), }
         content => {
             items: Vec<ResumedPessimisticLockItem>,
+        }
+        in_heap => {
+            items,
         }
 }
 
@@ -82,6 +91,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLockR
     fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
         fail_point!("acquire_pessimistic_lock_resumed_before_process_write");
         let mut modifies = vec![];
+        let mut new_acquired_locks = vec![];
         let mut txn = None;
         let mut reader: Option<SnapshotReader<S>> = None;
 
@@ -107,10 +117,11 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLockR
                 .as_ref()
                 .map_or(true, |t: &MvccTxn| t.start_ts != params.start_ts)
             {
-                if let Some(prev_txn) = txn.replace(MvccTxn::new(
+                if let Some(mut prev_txn) = txn.replace(MvccTxn::new(
                     params.start_ts,
                     context.concurrency_manager.clone(),
                 )) {
+                    new_acquired_locks.extend(prev_txn.take_new_locks());
                     modifies.extend(prev_txn.into_modifies());
                 }
                 // TODO: Is it possible to reuse the same reader but change the start_ts stored
@@ -169,8 +180,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLockR
             };
         }
 
-        if let Some(txn) = txn {
+        if let Some(mut txn) = txn {
             if !txn.is_empty() {
+                new_acquired_locks.extend(txn.take_new_locks());
                 modifies.extend(txn.into_modifies());
             }
         }
@@ -188,8 +200,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLockR
             pr,
             lock_info: encountered_locks,
             released_locks: ReleasedLocks::new(),
+            new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnProposed,
+            known_txn_status: vec![],
         })
     }
 }
@@ -235,6 +249,7 @@ mod tests {
         txn::{
             commands::pessimistic_rollback::tests::must_success as must_pessimistic_rollback,
             tests::{must_commit, must_pessimistic_locked, must_prewrite_put, must_rollback},
+            txn_status_cache::TxnStatusCache,
         },
         TestEngineBuilder,
     };
@@ -271,6 +286,7 @@ mod tests {
                     statistics: &mut Default::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
+                    txn_status_cache: &TxnStatusCache::new_for_test(),
                 },
             )
             .unwrap();
