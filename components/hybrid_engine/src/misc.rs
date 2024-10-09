@@ -1,6 +1,8 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{CacheRange, KvEngine, MiscExt, RangeCacheEngine, Result, WriteBatchExt};
+use engine_traits::{
+    CacheRange, EvictReason, KvEngine, MiscExt, RangeCacheEngine, Result, WriteBatchExt,
+};
 
 use crate::{engine::HybridEngine, hybrid_metrics::HybridEngineStatisticsReporter};
 
@@ -36,8 +38,10 @@ where
         ranges: &[engine_traits::Range<'_>],
     ) -> Result<bool> {
         for r in ranges {
-            self.region_cache_engine()
-                .evict_range(&CacheRange::new(r.start_key.to_vec(), r.end_key.to_vec()));
+            self.range_cache_engine().evict_range(
+                &CacheRange::new(r.start_key.to_vec(), r.end_key.to_vec()),
+                EvictReason::DeleteRange,
+            );
         }
         self.disk_engine()
             .delete_ranges_cf(wopts, cf, strategy, ranges)
@@ -152,7 +156,7 @@ mod tests {
         CacheRange, DeleteStrategy, MiscExt, Mutable, Range, RangeCacheEngine, WriteBatch,
         WriteBatchExt, WriteOptions, CF_DEFAULT,
     };
-    use region_cache_memory_engine::RangeCacheEngineConfig;
+    use range_cache_memory_engine::RangeCacheEngineConfig;
 
     use crate::util::hybrid_engine_for_tests;
 
@@ -196,15 +200,15 @@ mod tests {
             .unwrap();
 
         hybrid_engine
-            .region_cache_engine()
+            .range_cache_engine()
             .snapshot(range1.clone(), 1000, 1000)
             .unwrap_err();
         hybrid_engine
-            .region_cache_engine()
+            .range_cache_engine()
             .snapshot(range2.clone(), 1000, 1000)
             .unwrap_err();
         hybrid_engine
-            .region_cache_engine()
+            .range_cache_engine()
             .snapshot(range3.clone(), 1000, 1000)
             .unwrap();
     }

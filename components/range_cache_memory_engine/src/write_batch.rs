@@ -7,7 +7,7 @@ use std::{
 use bytes::Bytes;
 use crossbeam::epoch;
 use engine_traits::{
-    CacheRange, MiscExt, Mutable, RangeCacheEngine, Result, WriteBatch, WriteBatchExt,
+    CacheRange, EvictReason, MiscExt, Mutable, RangeCacheEngine, Result, WriteBatch, WriteBatchExt,
     WriteOptions, CF_DEFAULT,
 };
 use tikv_util::{box_err, config::ReadableSize, error, info, time::Instant, warn};
@@ -174,7 +174,7 @@ impl RangeCacheWriteBatch {
     // that all keys have unique sequence numbers.
     fn write_impl(&mut self, mut seq: u64) -> Result<()> {
         fail::fail_point!("on_write_impl");
-        let ranges_to_delete = self.handle_ranges_to_evict();
+        let mut ranges_to_delete = self.handle_ranges_to_evict();
         let (entries_to_write, engine) = self.engine.handle_pending_range_in_loading_buffer(
             &mut seq,
             std::mem::take(&mut self.pending_range_in_loading_buffer),
@@ -202,11 +202,13 @@ impl RangeCacheWriteBatch {
         fail::fail_point!("in_memory_engine_write_batch_consumed");
         fail::fail_point!("before_clear_ranges_in_being_written");
 
-        self.engine
-            .core
-            .write()
-            .mut_range_manager()
-            .clear_ranges_in_being_written(self.id, have_entry_applied);
+        {
+            let mut core = self.engine.core.write();
+            core.mut_range_manager()
+                .clear_ranges_in_being_written(self.id, have_entry_applied);
+            core.mut_range_manager()
+                .mark_delete_ranges_scheduled(&mut ranges_to_delete);
+        }
 
         self.engine
             .lock_modification_bytes
@@ -241,7 +243,8 @@ impl RangeCacheWriteBatch {
         let mut ranges = vec![];
         let range_manager = core.mut_range_manager();
         for r in std::mem::take(&mut self.ranges_to_evict) {
-            let mut ranges_to_delete = range_manager.evict_range(&r);
+            let mut ranges_to_delete =
+                range_manager.evict_range(&r, EvictReason::MemoryLimitReached);
             if !ranges_to_delete.is_empty() {
                 ranges.append(&mut ranges_to_delete);
                 continue;
@@ -611,13 +614,13 @@ impl Mutable for RangeCacheWriteBatch {
     // them directly
     fn delete_range(&mut self, begin_key: &[u8], end_key: &[u8]) -> Result<()> {
         let range = CacheRange::new(begin_key.to_vec(), end_key.to_vec());
-        self.engine.evict_range(&range);
+        self.engine.evict_range(&range, EvictReason::DeleteRange);
         Ok(())
     }
 
     fn delete_range_cf(&mut self, _: &str, begin_key: &[u8], end_key: &[u8]) -> Result<()> {
         let range = CacheRange::new(begin_key.to_vec(), end_key.to_vec());
-        self.engine.evict_range(&range);
+        self.engine.evict_range(&range, EvictReason::DeleteRange);
         Ok(())
     }
 }
@@ -626,13 +629,13 @@ impl Mutable for RangeCacheWriteBatch {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use crossbeam_skiplist::SkipList;
     use engine_rocks::util::new_engine;
     use engine_traits::{
         CacheRange, FailedReason, KvEngine, Peekable, RangeCacheEngine, WriteBatch, CF_WRITE,
         DATA_CFS,
     };
     use online_config::{ConfigChange, ConfigManager, ConfigValue};
-    use skiplist_rs::SkipList;
     use tempfile::Builder;
     use tikv_util::config::VersionTrack;
 
@@ -956,7 +959,7 @@ mod tests {
         assert_eq!(822, memory_controller.mem_usage());
 
         drop(snap1);
-        engine.evict_range(&range1);
+        engine.evict_range(&range1, EvictReason::AutoEvict);
         flush_epoch();
         wait_evict_done(&engine);
         assert_eq!(548, memory_controller.mem_usage());

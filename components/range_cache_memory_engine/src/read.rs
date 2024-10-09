@@ -5,6 +5,7 @@ use std::{fmt::Debug, ops::Deref, result, sync::Arc};
 
 use bytes::Bytes;
 use crossbeam::epoch::{self};
+use crossbeam_skiplist::{base::OwnedIter, SkipList};
 use engine_rocks::{raw::SliceTransform, util::FixedSuffixSliceTransform};
 use engine_traits::{
     CacheRange, CfNamesExt, DbVector, Error, FailedReason, IterMetricsCollector, IterOptions,
@@ -12,7 +13,6 @@ use engine_traits::{
     CF_DEFAULT,
 };
 use prometheus::local::LocalHistogram;
-use skiplist_rs::{base::OwnedIter, SkipList};
 use slog_global::error;
 use tikv_util::{box_err, time::Instant};
 
@@ -89,9 +89,11 @@ impl RangeCacheSnapshot {
 impl Drop for RangeCacheSnapshot {
     fn drop(&mut self) {
         let mut core = self.engine.core.write();
-        let ranges_removable = core
+        let mut ranges_removable = core
             .range_manager
             .remove_range_snapshot(&self.snapshot_meta);
+        core.mut_range_manager()
+            .mark_delete_ranges_scheduled(&mut ranges_removable);
         if !ranges_removable.is_empty() {
             drop(core);
             if let Err(e) = self
@@ -664,15 +666,15 @@ mod tests {
 
     use bytes::{BufMut, Bytes};
     use crossbeam::epoch;
+    use crossbeam_skiplist::SkipList;
     use engine_rocks::{
         raw::DBStatisticsTickerType, util::new_engine_opt, RocksDbOptions, RocksStatistics,
     };
     use engine_traits::{
-        CacheRange, FailedReason, IterMetricsCollector, IterOptions, Iterable, Iterator,
-        MetricsExt, Mutable, Peekable, RangeCacheEngine, ReadOptions, WriteBatch, WriteBatchExt,
-        CF_DEFAULT, CF_LOCK, CF_WRITE,
+        CacheRange, EvictReason, FailedReason, IterMetricsCollector, IterOptions, Iterable,
+        Iterator, MetricsExt, Mutable, Peekable, RangeCacheEngine, ReadOptions, WriteBatch,
+        WriteBatchExt, CF_DEFAULT, CF_LOCK, CF_WRITE,
     };
-    use skiplist_rs::SkipList;
     use tempfile::Builder;
     use tikv_util::config::VersionTrack;
 
@@ -1796,7 +1798,7 @@ mod tests {
             }
         }
 
-        engine.evict_range(&evict_range);
+        engine.evict_range(&evict_range, EvictReason::AutoEvict);
         assert_eq!(
             engine.snapshot(range.clone(), 10, 200).unwrap_err(),
             FailedReason::NotCached
@@ -1861,7 +1863,7 @@ mod tests {
 
         let s1 = engine.snapshot(range.clone(), 10, 10);
         let s2 = engine.snapshot(range, 20, 20);
-        engine.evict_range(&evict_range);
+        engine.evict_range(&evict_range, EvictReason::AutoEvict);
         let range_left = CacheRange::new(construct_user_key(0), construct_user_key(10));
         let s3 = engine.snapshot(range_left, 20, 20).unwrap();
         let range_right = CacheRange::new(construct_user_key(20), construct_user_key(30));
@@ -1869,7 +1871,7 @@ mod tests {
 
         drop(s3);
         let range_left_eviction = CacheRange::new(construct_user_key(0), construct_user_key(5));
-        engine.evict_range(&range_left_eviction);
+        engine.evict_range(&range_left_eviction, EvictReason::AutoEvict);
 
         // todo(SpadeA): memory limiter
         {
@@ -1880,7 +1882,8 @@ mod tests {
                     .read()
                     .range_manager()
                     .ranges_being_deleted
-                    .contains(&evict_range)
+                    .get(&evict_range)
+                    .is_some()
             );
         }
 
@@ -1893,7 +1896,8 @@ mod tests {
                     .read()
                     .range_manager()
                     .ranges_being_deleted
-                    .contains(&evict_range)
+                    .get(&evict_range)
+                    .is_some()
             );
         }
         drop(s2);
