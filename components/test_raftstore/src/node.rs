@@ -11,7 +11,6 @@ use encryption_export::DataKeyManager;
 use engine_rocks::{RocksEngine, RocksSnapshot};
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{Engines, MiscExt, Peekable};
-use health_controller::HealthController;
 use kvproto::{
     kvrpcpb::ApiVersion,
     metapb,
@@ -23,7 +22,7 @@ use raft::{eraftpb::MessageType, SnapshotStatus};
 use raftstore::{
     coprocessor::{config::SplitCheckConfigManager, CoprocessorHost},
     errors::Error as RaftError,
-    router::{LocalReadRouter, RaftStoreRouter, ReadContext, ServerRaftStoreRouter},
+    router::{LocalReadRouter, RaftStoreRouter, ServerRaftStoreRouter},
     store::{
         config::RaftstoreConfigManager,
         fsm::{store::StoreMeta, RaftBatchSystem, RaftRouter},
@@ -39,7 +38,7 @@ use test_pd_client::TestPdClient;
 use tikv::{
     config::{ConfigController, Module},
     import::SstImporter,
-    server::{raftkv::ReplicaReadLockChecker, MultiRaftServer, Result as ServerResult},
+    server::{raftkv::ReplicaReadLockChecker, Node, Result as ServerResult},
 };
 use tikv_util::{
     config::VersionTrack,
@@ -155,12 +154,11 @@ type SimulateChannelTransport = SimulateTransport<ChannelTransport>;
 pub struct NodeCluster {
     trans: ChannelTransport,
     pd_client: Arc<TestPdClient>,
-    nodes: HashMap<u64, MultiRaftServer<TestPdClient, RocksEngine, RaftTestEngine>>,
+    nodes: HashMap<u64, Node<TestPdClient, RocksEngine, RaftTestEngine>>,
     snap_mgrs: HashMap<u64, SnapManager>,
     cfg_controller: HashMap<u64, ConfigController>,
     simulate_trans: HashMap<u64, SimulateChannelTransport>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
-    importers: HashMap<u64, Arc<SstImporter<RocksEngine>>>,
     #[allow(clippy::type_complexity)]
     post_create_coprocessor_host: Option<Box<dyn Fn(u64, &mut CoprocessorHost<RocksEngine>)>>,
 }
@@ -175,7 +173,6 @@ impl NodeCluster {
             cfg_controller: HashMap::default(),
             simulate_trans: HashMap::default(),
             concurrency_managers: HashMap::default(),
-            importers: HashMap::default(),
             post_create_coprocessor_host: None,
         }
     }
@@ -211,7 +208,7 @@ impl NodeCluster {
     pub fn get_node(
         &mut self,
         node_id: u64,
-    ) -> Option<&mut MultiRaftServer<TestPdClient, RocksEngine, RaftTestEngine>> {
+    ) -> Option<&mut Node<TestPdClient, RocksEngine, RaftTestEngine>> {
         self.nodes.get_mut(&node_id)
     }
 
@@ -221,10 +218,6 @@ impl NodeCluster {
 
     pub fn get_cfg_controller(&self, node_id: u64) -> Option<&ConfigController> {
         self.cfg_controller.get(&node_id)
-    }
-
-    pub fn get_importer(&self, node_id: u64) -> Option<Arc<SstImporter<RocksEngine>>> {
-        self.importers.get(&node_id).cloned()
     }
 }
 
@@ -255,16 +248,15 @@ impl Simulator for NodeCluster {
             )
             .unwrap();
         let bg_worker = WorkerBuilder::new("background").thread_count(2).create();
-        let store_config = Arc::new(VersionTrack::new(raft_store));
-        let mut node = MultiRaftServer::new(
+        let mut node = Node::new(
             system,
             &cfg.server,
-            store_config.clone(),
+            Arc::new(VersionTrack::new(raft_store)),
             cfg.storage.api_version(),
             Arc::clone(&self.pd_client),
             Arc::default(),
             bg_worker.clone(),
-            HealthController::new(),
+            None,
             None,
         );
 
@@ -281,17 +273,15 @@ impl Simulator for NodeCluster {
             let snap_mgr = SnapManagerBuilder::default()
                 .max_write_bytes_per_sec(cfg.server.snap_io_max_bytes_per_sec.0 as i64)
                 .max_total_size(cfg.server.snap_max_total_size.0)
-                .concurrent_recv_snap_limit(cfg.server.concurrent_recv_snap_limit)
                 .encryption_key_manager(key_manager)
                 .max_per_file_size(cfg.raft_store.max_snapshot_file_raw_size.0)
                 .enable_multi_snapshot_files(true)
                 .enable_receive_tablet_snapshot(cfg.raft_store.enable_v2_compatible_learner)
-                .min_ingest_snapshot_limit(cfg.server.snap_min_ingest_size)
                 .build(tmp.path().to_str().unwrap());
             (snap_mgr, Some(tmp))
         } else {
             let trans = self.trans.core.lock().unwrap();
-            let (snap_mgr, _) = &trans.snap_paths[&node_id];
+            let &(ref snap_mgr, _) = &trans.snap_paths[&node_id];
             (snap_mgr.clone(), None)
         };
 
@@ -314,13 +304,11 @@ impl Simulator for NodeCluster {
                 SstImporter::new(&cfg.import, dir, None, cfg.storage.api_version(), false).unwrap(),
             )
         };
-        self.importers.insert(node_id, importer.clone());
 
         let local_reader = LocalReader::new(
             engines.kv.clone(),
             StoreMetaDelegate::new(store_meta.clone(), engines.kv.clone()),
             router.clone(),
-            coprocessor_host.clone(),
         );
         let cfg_controller = ConfigController::new(cfg.tikv.clone());
 
@@ -367,11 +355,25 @@ impl Simulator for NodeCluster {
                 .map(|p| p.path().to_str().unwrap().to_owned())
         );
 
+        let region_split_size = cfg.coprocessor.region_split_size();
+        let enable_region_bucket = cfg.coprocessor.enable_region_bucket();
+        let region_bucket_size = cfg.coprocessor.region_bucket_size;
+        let mut raftstore_cfg = cfg.tikv.raft_store;
+        raftstore_cfg.optimize_for(false);
+        raftstore_cfg
+            .validate(
+                region_split_size,
+                enable_region_bucket,
+                region_bucket_size,
+                false,
+            )
+            .unwrap();
+        let raft_store = Arc::new(VersionTrack::new(raftstore_cfg));
         cfg_controller.register(
             Module::Raftstore,
             Box::new(RaftstoreConfigManager::new(
                 node.refresh_config_scheduler(),
-                store_config,
+                raft_store,
             )),
         );
 
@@ -481,8 +483,7 @@ impl Simulator for NodeCluster {
         }
         let mut guard = self.trans.core.lock().unwrap();
         let router = guard.routers.get_mut(&node_id).unwrap();
-        let read_ctx = ReadContext::new(batch_id, None);
-        router.read(read_ctx, request, cb).unwrap();
+        router.read(batch_id, request, cb).unwrap();
     }
 
     fn send_raft_msg(&mut self, msg: raft_serverpb::RaftMessage) -> Result<()> {

@@ -21,8 +21,6 @@
 //!
 //! Please refer to `Endpoint` for more details.
 
-#![allow(clippy::diverging_sub_expression)]
-
 mod cache;
 mod checksum;
 mod config_manager;

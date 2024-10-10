@@ -15,4 +15,3 @@ pub mod raft_engine_switch;
 pub mod server;
 pub mod server2;
 pub mod signal_handler;
-mod utils;

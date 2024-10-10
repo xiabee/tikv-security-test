@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use concurrency_manager::ConcurrencyManager;
 use kvproto::kvrpcpb::Context;
-use pd_client::PdClient;
 use resource_metering::ResourceTagFactory;
 use tidb_query_datatype::codec::{row::v2::CODEC_VERSION, Datum};
 use tikv::{
@@ -46,10 +45,6 @@ impl ProductTable {
             .build();
         ProductTable(table)
     }
-
-    pub fn table_id(&self) -> i64 {
-        self.0.id
-    }
 }
 
 impl Default for ProductTable {
@@ -76,7 +71,7 @@ pub fn init_data_with_engine_and_commit<E: Engine>(
     init_data_with_details(ctx, engine, tbl, vals, commit, &Config::default())
 }
 
-fn init_data_with_engine_and_commit_v2_checksum<E: Engine>(
+pub fn init_data_with_engine_and_commit_v2_checksum<E: Engine>(
     ctx: Context,
     engine: E,
     tbl: &ProductTable,
@@ -105,24 +100,10 @@ pub fn init_data_with_details<E: Engine>(
     commit: bool,
     cfg: &Config,
 ) -> (Store<E>, Endpoint<E>, Arc<QuotaLimiter>) {
-    init_data_with_details_impl(ctx, engine, tbl, vals, commit, cfg, 0, false, None, None)
+    init_data_with_details_impl(ctx, engine, tbl, vals, commit, cfg, 0, false, None)
 }
 
-pub fn init_data_with_details_pd_client<E: Engine>(
-    ctx: Context,
-    engine: E,
-    tbl: &ProductTable,
-    vals: &[(i64, Option<&str>, i64)],
-    commit: bool,
-    cfg: &Config,
-    pd_client: Option<Arc<dyn PdClient>>,
-) -> (Store<E>, Endpoint<E>, Arc<QuotaLimiter>) {
-    init_data_with_details_impl(
-        ctx, engine, tbl, vals, commit, cfg, 0, false, None, pd_client,
-    )
-}
-
-fn init_data_with_details_v2_checksum<E: Engine>(
+pub fn init_data_with_details_v2_checksum<E: Engine>(
     ctx: Context,
     engine: E,
     tbl: &ProductTable,
@@ -142,7 +123,6 @@ fn init_data_with_details_v2_checksum<E: Engine>(
         CODEC_VERSION,
         with_checksum,
         extra_checksum,
-        None,
     )
 }
 
@@ -156,12 +136,11 @@ fn init_data_with_details_impl<E: Engine>(
     codec_ver: u8,
     with_checksum: bool,
     extra_checksum: Option<u32>,
-    pd_client: Option<Arc<dyn PdClient>>,
 ) -> (Store<E>, Endpoint<E>, Arc<QuotaLimiter>) {
     let storage = TestStorageBuilderApiV1::from_engine_and_lock_mgr(engine, MockLockManager::new())
         .build()
         .unwrap();
-    let mut store = Store::from_storage_pd_client(storage, pd_client);
+    let mut store = Store::from_storage(storage);
 
     store.begin();
     for &(id, name, count) in vals {

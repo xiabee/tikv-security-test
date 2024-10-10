@@ -27,7 +27,7 @@ use raftstore::{
     },
 };
 use security::SecurityManager;
-use tikv::{config::ResolvedTsConfig, storage::txn::txn_status_cache::TxnStatusCache};
+use tikv::config::ResolvedTsConfig;
 use tikv_util::{
     memory::{HeapSize, MemoryQuota},
     warn,
@@ -45,7 +45,7 @@ use crate::{
     Error, Result, TsSource, TxnLocks, ON_DROP_WARN_HEAP_SIZE,
 };
 
-/// grace period for identifying slow resolved-ts and safe-ts.
+/// grace period for identifying identifying slow resolved-ts and safe-ts.
 const SLOW_LOG_GRACE_PERIOD_MS: u64 = 1000;
 const MEMORY_QUOTA_EXCEEDED_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -65,8 +65,7 @@ impl Drop for ResolverStatus {
             locks,
             memory_quota,
             ..
-        } = self
-        else {
+        } = self else {
             return;
         };
         if locks.is_empty() {
@@ -97,8 +96,7 @@ impl ResolverStatus {
             locks,
             memory_quota,
             ..
-        } = self
-        else {
+        } = self else {
             panic!("region {:?} resolver has ready", region_id)
         };
         // Check if adding a new lock or unlock will exceed the memory
@@ -114,7 +112,10 @@ impl ResolverStatus {
     }
 
     fn update_tracked_index(&mut self, index: u64, region_id: u64) {
-        let ResolverStatus::Pending { tracked_index, .. } = self else {
+        let ResolverStatus::Pending {
+            tracked_index,
+            ..
+        } = self else {
             panic!("region {:?} resolver has ready", region_id)
         };
         assert!(
@@ -136,8 +137,7 @@ impl ResolverStatus {
             memory_quota,
             tracked_index,
             ..
-        } = self
-        else {
+        } = self else {
             panic!("region {:?} resolver has ready", region_id)
         };
         // Must take locks, otherwise it may double free memory quota on drop.
@@ -157,7 +157,6 @@ enum PendingLock {
     Track {
         key: Key,
         start_ts: TimeStamp,
-        generation: u64,
     },
     Untrack {
         key: Key,
@@ -194,15 +193,9 @@ impl ObserveRegion {
         rrp: Arc<RegionReadProgress>,
         memory_quota: Arc<MemoryQuota>,
         cancelled: Sender<()>,
-        txn_status_cache: Arc<TxnStatusCache>,
     ) -> Self {
         ObserveRegion {
-            resolver: Resolver::with_read_progress(
-                meta.id,
-                Some(rrp),
-                memory_quota.clone(),
-                txn_status_cache,
-            ),
+            resolver: Resolver::with_read_progress(meta.id, Some(rrp), memory_quota.clone()),
             meta,
             handle: ObserveHandle::new(),
             resolver_status: ResolverStatus::Pending {
@@ -242,15 +235,9 @@ impl ObserveRegion {
                     ChangeLog::Rows { rows, index } => {
                         for row in rows {
                             let lock = match row {
-                                ChangeRow::Prewrite {
-                                    key,
-                                    start_ts,
-                                    generation,
-                                    ..
-                                } => PendingLock::Track {
+                                ChangeRow::Prewrite { key, start_ts, .. } => PendingLock::Track {
                                     key: key.clone(),
                                     start_ts: *start_ts,
-                                    generation: *generation,
                                 },
                                 ChangeRow::Commit {
                                     key,
@@ -309,23 +296,17 @@ impl ObserveRegion {
                     ChangeLog::Rows { rows, index } => {
                         for row in rows {
                             match row {
-                                ChangeRow::Prewrite {
-                                    key,
-                                    start_ts,
-                                    generation,
-                                    ..
-                                } => {
+                                ChangeRow::Prewrite { key, start_ts, .. } => {
                                     self.resolver.track_lock(
                                         *start_ts,
                                         key.to_raw().unwrap(),
                                         Some(*index),
-                                        *generation,
                                     )?;
                                 }
                                 ChangeRow::Commit { key, .. } => self
                                     .resolver
                                     .untrack_lock(&key.to_raw().unwrap(), Some(*index)),
-                                // One pc command do not contain any lock, so just skip it
+                                // One pc command do not contains any lock, so just skip it
                                 ChangeRow::OnePc { .. } => {
                                     self.resolver.update_tracked_index(*index);
                                 }
@@ -349,12 +330,8 @@ impl ObserveRegion {
                     panic!("region {:?} resolver has ready", self.meta.id)
                 }
                 for (key, lock) in locks {
-                    self.resolver.track_lock(
-                        lock.ts,
-                        key.to_raw().unwrap(),
-                        Some(apply_index),
-                        lock.generation,
-                    )?;
+                    self.resolver
+                        .track_lock(lock.ts, key.to_raw().unwrap(), Some(apply_index))?;
                 }
             }
             ScanEntries::None => {
@@ -366,16 +343,11 @@ impl ObserveRegion {
                     resolver_status.drain_pending_locks(self.meta.id);
                 for lock in pending_locks {
                     match lock {
-                        PendingLock::Track {
-                            key,
-                            start_ts,
-                            generation,
-                        } => {
+                        PendingLock::Track { key, start_ts } => {
                             self.resolver.track_lock(
                                 start_ts,
                                 key.to_raw().unwrap(),
                                 Some(pending_tracked_index),
-                                generation,
                             )?;
                         }
                         PendingLock::Untrack { key, .. } => self
@@ -408,7 +380,6 @@ pub struct Endpoint<T, E: KvEngine, S> {
     scan_concurrency_semaphore: Arc<Semaphore>,
     scheduler: Scheduler<Task>,
     advance_worker: AdvanceTsWorker,
-    txn_status_cache: Arc<TxnStatusCache>,
     _phantom: PhantomData<(T, E)>,
 }
 
@@ -426,7 +397,6 @@ where
 
         let store_id = self.get_or_init_store_id();
         let mut stats = Stats::default();
-        let now = self.approximate_now_tso();
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
                 let (leader_info, leader_store_id) = read_progress.dump_leader_info();
@@ -449,9 +419,6 @@ where
                     }
                 } else {
                     // follower safe-ts
-                    RTS_MIN_FOLLOWER_SAFE_TS_GAP_HISTOGRAM
-                        .observe(now.saturating_sub(TimeStamp::from(safe_ts).physical()) as f64);
-
                     if safe_ts > 0 && safe_ts < stats.min_follower_safe_ts.safe_ts {
                         stats.min_follower_safe_ts.set(*region_id, &core);
                     }
@@ -688,7 +655,6 @@ where
         concurrency_manager: ConcurrencyManager,
         env: Arc<Environment>,
         security_mgr: Arc<SecurityManager>,
-        txn_status_cache: Arc<TxnStatusCache>,
     ) -> Self {
         let (region_read_progress, store_id) = {
             let meta = store_meta.lock().unwrap();
@@ -719,8 +685,7 @@ where
             scanner_pool,
             scan_concurrency_semaphore,
             regions: HashMap::default(),
-            txn_status_cache,
-            _phantom: PhantomData,
+            _phantom: PhantomData::default(),
         };
         ep.handle_advance_resolved_ts(leader_resolver);
         ep
@@ -740,7 +705,6 @@ where
             read_progress,
             self.memory_quota.clone(),
             cancelled_tx,
-            self.txn_status_cache.clone(),
         );
         let observe_handle = observe_region.handle.clone();
         observe_region
@@ -904,7 +868,7 @@ where
 
     // Tracking or untracking locks with incoming commands that corresponding
     // observe id is valid.
-    #[allow(dropping_references)]
+    #[allow(clippy::drop_ref)]
     fn handle_change_log(&mut self, cmd_batch: Vec<CmdBatch>) {
         let size = cmd_batch.iter().map(|b| b.size()).sum::<usize>();
         RTS_CHANNEL_PENDING_CMD_BYTES.sub(size as i64);
@@ -964,7 +928,7 @@ where
     }
 
     fn handle_advance_resolved_ts(&self, leader_resolver: LeadershipResolver) {
-        let regions = self.regions.keys().copied().collect();
+        let regions = self.regions.keys().into_iter().copied().collect();
         self.advance_worker.advance_ts_for_regions(
             regions,
             leader_resolver,
@@ -1261,7 +1225,7 @@ impl LeaderStats {
             last_resolve_attempt: resolver.as_mut().and_then(|r| r.take_last_attempt()),
             min_lock: resolver
                 .as_ref()
-                .and_then(|r| r.oldest_transaction().map(|(t, tk)| (t, tk.clone()))),
+                .and_then(|r| r.oldest_transaction().map(|(t, tk)| (*t, tk.clone()))),
             applied_index: region_read_progress.applied_index(),
             lock_num: resolver.as_ref().map(|r| r.num_locks()),
             txn_num: resolver.as_ref().map(|r| r.num_transactions()),

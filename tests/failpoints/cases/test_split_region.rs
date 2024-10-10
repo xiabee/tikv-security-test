@@ -17,7 +17,7 @@ use kvproto::{
         Mutation, Op, PessimisticLockRequest, PrewriteRequest, PrewriteRequestPessimisticAction::*,
     },
     metapb::Region,
-    pdpb::{self, CheckPolicy},
+    pdpb::CheckPolicy,
     raft_serverpb::{PeerState, RaftMessage},
     tikvpb::TikvClient,
 };
@@ -552,115 +552,6 @@ fn test_split_not_to_split_existing_tombstone_region() {
     must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
 }
 
-#[test]
-fn test_stale_peer_handle_snap() {
-    test_stale_peer_handle_raft_msg("on_snap_msg_1000_2");
-}
-
-#[test]
-fn test_stale_peer_handle_vote() {
-    test_stale_peer_handle_raft_msg("on_vote_msg_1000_2");
-}
-
-#[test]
-fn test_stale_peer_handle_append() {
-    test_stale_peer_handle_raft_msg("on_append_msg_1000_2");
-}
-
-#[test]
-fn test_stale_peer_handle_heartbeat() {
-    test_stale_peer_handle_raft_msg("on_heartbeat_msg_1000_2");
-}
-
-fn test_stale_peer_handle_raft_msg(on_handle_raft_msg_1000_2_fp: &str) {
-    // The following diagram represents the final state of the test:
-    //
-    //                    ┌───────────┐  ┌───────────┐  ┌───────────┐
-    //                    │           │  │           │  │           │
-    //      Region 1      │ Peer 1    │  │ Peer 2    │  │ Peer 3    │
-    //      [k2, +∞)      │           │  │           │  │           │
-    // ───────────────────┼───────────┼──┼───────────┼──┼───────────┼──
-    //                    │           │  │           │  │           │
-    //      Region 1000   │ Peer 1001 │  │ Peer 1003 │  │ Peer 1002 │
-    //      (-∞, k2)      │           │  │           │  │           │
-    //                    └───────────┘  └───────────┘  └───────────┘
-    //                       Store 1        Store 2        Store 3
-    //
-    // In this test, there is a split operation and Peer 1003 will be created
-    // twice (by raft message and by split). The new Peer 1003 will replace the
-    // old Peer 1003 and but it will be immediately removed. This test verifies
-    // that TiKV would not panic if the old Peer 1003 continues to process a
-    // remaining raft message (which may be a snapshot/vote/heartbeat/append
-    // message).
-
-    let mut cluster = new_node_cluster(0, 3);
-    configure_for_merge(&mut cluster.cfg);
-    cluster.cfg.raft_store.right_derive_when_split = true;
-    cluster.cfg.raft_store.store_batch_system.max_batch_size = Some(1);
-    cluster.cfg.raft_store.store_batch_system.pool_size = 2;
-    cluster.cfg.raft_store.apply_batch_system.max_batch_size = Some(1);
-    cluster.cfg.raft_store.apply_batch_system.pool_size = 2;
-    let pd_client = Arc::clone(&cluster.pd_client);
-    pd_client.disable_default_operator();
-
-    fail::cfg("on_raft_gc_log_tick", "return()").unwrap();
-    let r1 = cluster.run_conf_change();
-    // Add Peer 3
-    pd_client.must_add_peer(r1, new_peer(3, 3));
-    assert_eq!(r1, 1);
-
-    // Pause the snapshot apply of Peer 2.
-    let before_check_snapshot_1_2_fp = "before_check_snapshot_1_2";
-    fail::cfg(before_check_snapshot_1_2_fp, "pause").unwrap();
-
-    // Add Peer 2. The peer will be created but stuck at applying snapshot due
-    // to the failpoint above.
-    pd_client.must_add_peer(r1, new_peer(2, 2));
-    cluster.must_put(b"k1", b"v1");
-
-    // Before the split, pause Peer 1003 when processing a certain raft message.
-    // The message type depends on the failpoint name input.
-    fail::cfg(on_handle_raft_msg_1000_2_fp, "pause").unwrap();
-
-    // Split the region into Region 1 and Region 1000. Peer 1003 will be created
-    // for the first time when it receives a raft message from Peer 1001, but it
-    // will remain uninitialized because it's paused due to the failpoint above.
-    let region = pd_client.get_region(b"k1").unwrap();
-
-    cluster.must_split(&region, b"k2");
-    cluster.must_put(b"k22", b"v22");
-
-    // Check that Store 2 doesn't have any data yet.
-    must_get_none(&cluster.get_engine(2), b"k1");
-    must_get_none(&cluster.get_engine(2), b"k22");
-
-    // Unblock Peer 2. It will proceed to apply the split operation, which
-    // creates Peer 1003 for the second time and replaces the old Peer 1003.
-    fail::remove(before_check_snapshot_1_2_fp);
-
-    // Verify that data can be accessed from Peer 2 and the new Peer 1003.
-    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
-    must_get_equal(&cluster.get_engine(2), b"k22", b"v22");
-
-    // Immediately remove the new Peer 1003. This removes the region metadata.
-    let left = pd_client.get_region(b"k1").unwrap();
-    let left_peer_2 = find_peer(&left, 2).cloned().unwrap();
-    pd_client.must_remove_peer(left.get_id(), left_peer_2);
-    must_get_none(&cluster.get_engine(2), b"k1");
-    must_get_equal(&cluster.get_engine(2), b"k22", b"v22");
-
-    // Unblock the old Peer 1003 so that it can continue to process its raft
-    // message. It would lead to a panic when it processes a snapshot message if
-    // #17469 is not fixed.
-    fail::remove(on_handle_raft_msg_1000_2_fp);
-
-    // Waiting for the stale peer to handle its raft message.
-    sleep_ms(300);
-
-    must_get_none(&cluster.get_engine(2), b"k1");
-    must_get_equal(&cluster.get_engine(2), b"k22", b"v22");
-}
-
 // TiKV uses memory lock to control the order between spliting and creating
 // new peer. This case test if tikv continues split if the peer is destroyed
 // after memory lock check.
@@ -1161,8 +1052,6 @@ fn test_split_with_concurrent_pessimistic_locking() {
 
 #[test]
 fn test_split_pessimistic_locks_with_concurrent_prewrite() {
-    let peer_size_limit = 512 << 10;
-    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 2);
     cluster.cfg.pessimistic_txn.pipelined = true;
     cluster.cfg.pessimistic_txn.in_memory = true;
@@ -1218,11 +1107,10 @@ fn test_split_pessimistic_locks_with_concurrent_prewrite() {
     {
         let mut locks = txn_ext.pessimistic_locks.write();
         locks
-            .insert(
-                vec![(Key::from_raw(b"a"), lock_a), (Key::from_raw(b"c"), lock_c)],
-                peer_size_limit,
-                instance_size_limit,
-            )
+            .insert(vec![
+                (Key::from_raw(b"a"), lock_a),
+                (Key::from_raw(b"c"), lock_c),
+            ])
             .unwrap();
     }
 
@@ -1538,7 +1426,8 @@ impl Filter for TeeFilter {
 // 2. the splitted region set has_dirty_data be true in `apply_snapshot`
 // 3. the splitted region schedule tablet trim task in `on_applied_snapshot`
 //    with tablet index 5
-// 4. the splitted region received a snapshot sent from its leader
+// 4. the splitted region received a snapshot sent from its
+//    leader
 // 5. after finishing applying this snapshot, the tablet index in storage
 //    changed to 6
 // 6. tablet trim complete and callbacked to raftstore
@@ -1721,66 +1610,4 @@ fn test_split_by_split_check_on_keys() {
     put_till_count(&mut cluster, region_max_keys / 2 + 3, &mut range);
     // waiting the split,
     cluster.wait_region_split(&region);
-}
-
-fn change(name: &str, value: &str) -> std::collections::HashMap<String, String> {
-    let mut m = std::collections::HashMap::new();
-    m.insert(name.to_owned(), value.to_owned());
-    m
-}
-
-#[test]
-fn test_turn_off_manual_compaction_caused_by_no_valid_split_key() {
-    let mut cluster = new_node_cluster(0, 1);
-    cluster.run();
-    let r = cluster.get_region(b"");
-    cluster.must_split(&r, b"k1");
-    let r = cluster.get_region(b"k1");
-    cluster.must_split(&r, b"k2");
-    cluster.must_put(b"k1", b"val");
-
-    let (tx, rx) = sync_channel(5);
-    fail::cfg_callback("on_compact_range_cf", move || {
-        tx.send(true).unwrap();
-    })
-    .unwrap();
-
-    let safe_point_inject = "safe_point_inject";
-    fail::cfg(safe_point_inject, "return(100)").unwrap();
-
-    {
-        let sim = cluster.sim.rl();
-        let cfg_controller = sim.get_cfg_controller(1).unwrap();
-        cfg_controller
-            .update(change(
-                "raftstore.skip-manual-compaction-in-clean_up-worker",
-                "true",
-            ))
-            .unwrap();
-    }
-
-    let r = cluster.get_region(b"k1");
-    cluster
-        .pd_client
-        .split_region(r.clone(), pdpb::CheckPolicy::Usekey, vec![b"k1".to_vec()]);
-    rx.recv_timeout(Duration::from_secs(1)).unwrap_err();
-
-    {
-        let sim = cluster.sim.rl();
-        let cfg_controller = sim.get_cfg_controller(1).unwrap();
-        cfg_controller
-            .update(change(
-                "raftstore.skip-manual-compaction-in-clean_up-worker",
-                "false",
-            ))
-            .unwrap();
-    }
-
-    cluster
-        .pd_client
-        .split_region(r, pdpb::CheckPolicy::Usekey, vec![b"k1".to_vec()]);
-    fail::cfg(safe_point_inject, "return(200)").unwrap();
-    rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    rx.try_recv().unwrap_err();
 }

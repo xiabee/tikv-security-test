@@ -12,7 +12,7 @@ use std::{
 };
 
 use crossbeam::{atomic::AtomicCell, channel::TrySendError};
-use engine_traits::{KvEngine, Peekable, RaftEngine, SnapshotMiscExt};
+use engine_traits::{KvEngine, Peekable, RaftEngine};
 use fail::fail_point;
 use kvproto::{
     errorpb,
@@ -34,9 +34,7 @@ use txn_types::{TimeStamp, WriteBatchFlags};
 
 use super::metrics::*;
 use crate::{
-    coprocessor::CoprocessorHost,
     errors::RAFTSTORE_IS_BUSY,
-    router::ReadContext,
     store::{
         cmd_resp,
         fsm::store::StoreMeta,
@@ -108,12 +106,10 @@ pub trait ReadExecutor {
 
     fn execute(
         &mut self,
-        ctx: &ReadContext,
         msg: &RaftCmdRequest,
         region: &Arc<metapb::Region>,
         read_index: Option<u64>,
         local_read_ctx: Option<LocalReadContext<'_, Self::Tablet>>,
-        host: &CoprocessorHost<Self::Tablet>,
     ) -> ReadResponse<<Self::Tablet as KvEngine>::Snapshot> {
         let requests = msg.get_requests();
         let mut response = ReadResponse {
@@ -137,21 +133,10 @@ pub trait ReadExecutor {
                     }
                 },
                 CmdType::Snap => {
-                    let mut snapshot = RegionSnapshot::from_snapshot(
+                    let snapshot = RegionSnapshot::from_snapshot(
                         self.get_snapshot(&local_read_ctx),
                         region.clone(),
                     );
-                    if let Some(read_ts) = ctx.read_ts {
-                        // We only observe snapshot when it has snapshot context.
-                        //
-                        // Currently, the snapshot context is set when caller
-                        // wants an in-memory engine snapshot which requires
-                        // the snapshot and some metadata in the context.
-                        let seqno = snapshot.get_snapshot().sequence_number();
-                        if let Some(observed_snap) = host.on_snapshot(region, read_ts, seqno) {
-                            snapshot.set_observed_snapshot(observed_snap);
-                        }
-                    }
                     response.snapshot = Some(snapshot);
                     Response::default()
                 }
@@ -458,6 +443,7 @@ impl ReadDelegate {
             bucket_meta: peer
                 .region_buckets_info()
                 .bucket_stat()
+                .as_ref()
                 .map(|b| b.meta.clone()),
             track_ver: TrackVer::new(),
         }
@@ -924,7 +910,6 @@ where
     snap_cache: SnapCache<E>,
     // A channel to raftstore.
     router: C,
-    host: CoprocessorHost<E>,
 }
 
 impl<E, C> LocalReader<E, C>
@@ -932,18 +917,12 @@ where
     E: KvEngine,
     C: ProposalRouter<E::Snapshot> + CasualRouter<E>,
 {
-    pub fn new(
-        kv_engine: E,
-        store_meta: StoreMetaDelegate<E>,
-        router: C,
-        host: CoprocessorHost<E>,
-    ) -> Self {
+    pub fn new(kv_engine: E, store_meta: StoreMetaDelegate<E>, router: C) -> Self {
         Self {
             local_reader: LocalReaderCore::new(store_meta),
             kv_engine,
             snap_cache: SnapCache::new(),
             router,
-            host,
         }
     }
 
@@ -1003,13 +982,13 @@ where
     /// the read response is returned, otherwise None is returned.
     fn try_local_leader_read(
         &mut self,
-        ctx: &ReadContext,
         req: &RaftCmdRequest,
         delegate: &mut CachedReadDelegate<E>,
+        read_id: Option<ThreadReadId>,
         snap_updated: &mut bool,
         last_valid_ts: Timespec,
     ) -> Option<ReadResponse<E::Snapshot>> {
-        let mut local_read_ctx = LocalReadContext::new(&mut self.snap_cache, ctx.read_id.clone());
+        let mut local_read_ctx = LocalReadContext::new(&mut self.snap_cache, read_id);
 
         (*snap_updated) =
             local_read_ctx.maybe_update_snapshot(delegate.get_tablet(), last_valid_ts);
@@ -1020,8 +999,7 @@ where
         }
 
         let region = Arc::clone(&delegate.region);
-        let mut response =
-            delegate.execute(ctx, req, &region, None, Some(local_read_ctx), &self.host);
+        let mut response = delegate.execute(req, &region, None, Some(local_read_ctx));
         if let Some(snap) = response.snapshot.as_mut() {
             snap.bucket_meta = delegate.bucket_meta.clone();
         }
@@ -1035,7 +1013,6 @@ where
     /// `DataIsNotReady` error is returned.
     fn try_local_stale_read(
         &mut self,
-        ctx: &ReadContext,
         req: &RaftCmdRequest,
         delegate: &mut CachedReadDelegate<E>,
         snap_updated: &mut bool,
@@ -1051,8 +1028,7 @@ where
 
         let region = Arc::clone(&delegate.region);
         // Getting the snapshot
-        let mut response =
-            delegate.execute(ctx, req, &region, None, Some(local_read_ctx), &self.host);
+        let mut response = delegate.execute(req, &region, None, Some(local_read_ctx));
         if let Some(snap) = response.snapshot.as_mut() {
             snap.bucket_meta = delegate.bucket_meta.clone();
         }
@@ -1066,7 +1042,7 @@ where
 
     pub fn propose_raft_command(
         &mut self,
-        ctx: &ReadContext,
+        read_id: Option<ThreadReadId>,
         mut req: RaftCmdRequest,
         cb: Callback<E::Snapshot>,
     ) {
@@ -1078,9 +1054,9 @@ where
                     // Leader can read local if and only if it is in lease.
                     RequestPolicy::ReadLocal => {
                         if let Some(read_resp) = self.try_local_leader_read(
-                            ctx,
                             &req,
                             &mut delegate,
+                            read_id,
                             &mut snap_updated,
                             last_valid_ts,
                         ) {
@@ -1095,7 +1071,6 @@ where
                     // Replica can serve stale read if and only if its `safe_ts` >= `read_ts`
                     RequestPolicy::StaleRead => {
                         match self.try_local_stale_read(
-                            ctx,
                             &req,
                             &mut delegate,
                             &mut snap_updated,
@@ -1125,9 +1100,9 @@ where
                                     return;
                                 }
                                 if let Some(read_resp) = self.try_local_leader_read(
-                                    ctx,
                                     &req,
                                     &mut delegate,
+                                    None,
                                     &mut snap_updated,
                                     last_valid_ts,
                                 ) {
@@ -1203,8 +1178,13 @@ where
     /// which left a snapshot cached in LocalReader. ThreadReadId is composed by
     /// thread_id and a thread_local incremental sequence.
     #[inline]
-    pub fn read(&mut self, ctx: ReadContext, req: RaftCmdRequest, cb: Callback<E::Snapshot>) {
-        self.propose_raft_command(&ctx, req, cb);
+    pub fn read(
+        &mut self,
+        read_id: Option<ThreadReadId>,
+        req: RaftCmdRequest,
+        cb: Callback<E::Snapshot>,
+    ) {
+        self.propose_raft_command(read_id, req, cb);
         maybe_tls_local_read_metrics_flush();
     }
 
@@ -1224,7 +1204,6 @@ where
             kv_engine: self.kv_engine.clone(),
             snap_cache: self.snap_cache.clone(),
             router: self.router.clone(),
-            host: self.host.clone(),
         }
     }
 }
@@ -1349,9 +1328,7 @@ mod tests {
         let path = Builder::new().prefix(path).tempdir().unwrap();
         let db = engine_test::kv::new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap();
         let (ch, rx, _) = MockRouter::new();
-        let host = CoprocessorHost::default();
-        let mut reader =
-            LocalReader::new(db.clone(), StoreMetaDelegate::new(store_meta, db), ch, host);
+        let mut reader = LocalReader::new(db.clone(), StoreMetaDelegate::new(store_meta, db), ch);
         reader.local_reader.store_id = Cell::new(Some(store_id));
         (path, reader, rx)
     }
@@ -1373,9 +1350,8 @@ mod tests {
         rx: &Receiver<RaftCommand<KvTestSnapshot>>,
         cmd: RaftCmdRequest,
     ) {
-        let read_ctx = &ReadContext::new(None, None);
         reader.propose_raft_command(
-            read_ctx,
+            None,
             cmd.clone(),
             Callback::read(Box::new(|resp| {
                 panic!("unexpected invoke, {:?}", resp);
@@ -1403,8 +1379,7 @@ mod tests {
         task: RaftCommand<KvTestSnapshot>,
         read_id: Option<ThreadReadId>,
     ) {
-        let ctx = ReadContext::new(read_id, None);
-        reader.propose_raft_command(&ctx, task.request, task.callback);
+        reader.propose_raft_command(read_id, task.request, task.callback);
         assert_eq!(rx.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 
@@ -1413,7 +1388,6 @@ mod tests {
         let store_id = 2;
         let store_meta = Arc::new(Mutex::new(StoreMeta::new(0)));
         let (_tmp, mut reader, rx) = new_reader("test-local-reader", store_id, store_meta.clone());
-        let read_ctx = &ReadContext::new(None, None);
 
         // region: 1,
         // peers: 2, 3, 4,
@@ -1538,7 +1512,7 @@ mod tests {
             .mut_peer()
             .set_store_id(store_id + 1);
         reader.propose_raft_command(
-            read_ctx,
+            None,
             cmd_store_id,
             Callback::read(Box::new(move |resp: ReadResponse<KvTestSnapshot>| {
                 let err = resp.response.get_header().get_error();
@@ -1562,7 +1536,7 @@ mod tests {
             .mut_peer()
             .set_id(leader2.get_id() + 1);
         reader.propose_raft_command(
-            read_ctx,
+            None,
             cmd_peer_id,
             Callback::read(Box::new(move |resp: ReadResponse<KvTestSnapshot>| {
                 assert!(
@@ -1587,7 +1561,7 @@ mod tests {
         let mut cmd_term = cmd.clone();
         cmd_term.mut_header().set_term(term6 - 2);
         reader.propose_raft_command(
-            read_ctx,
+            None,
             cmd_term,
             Callback::read(Box::new(move |resp: ReadResponse<KvTestSnapshot>| {
                 let err = resp.response.get_header().get_error();
@@ -1623,9 +1597,9 @@ mod tests {
         );
 
         // Channel full.
-        reader.propose_raft_command(read_ctx, cmd.clone(), Callback::None);
+        reader.propose_raft_command(None, cmd.clone(), Callback::None);
         reader.propose_raft_command(
-            read_ctx,
+            None,
             cmd.clone(),
             Callback::read(Box::new(move |resp: ReadResponse<KvTestSnapshot>| {
                 let err = resp.response.get_header().get_error();
@@ -1657,7 +1631,7 @@ mod tests {
                 .update(Progress::applied_term(term6 + 3));
         }
         reader.propose_raft_command(
-            read_ctx,
+            None,
             cmd9.clone(),
             Callback::read(Box::new(|resp| {
                 panic!("unexpected invoke, {:?}", resp);

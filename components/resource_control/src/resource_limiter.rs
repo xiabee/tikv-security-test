@@ -8,11 +8,10 @@ use std::{
 
 use file_system::IoBytes;
 use futures::compat::Future01CompatExt;
-use prometheus::Histogram;
 use strum::EnumCount;
-use tikv_util::{resource_control::TaskPriority, time::Limiter, timer::GLOBAL_TIMER_HANDLE};
+use tikv_util::{time::Limiter, timer::GLOBAL_TIMER_HANDLE};
 
-use crate::metrics::PRIORITY_WAIT_DURATION_VEC;
+use crate::metrics::BACKGROUND_TASKS_WAIT_DURATION;
 
 #[derive(Clone, Copy, Eq, PartialEq, EnumCount)]
 #[repr(usize)]
@@ -37,13 +36,11 @@ impl fmt::Debug for ResourceType {
 }
 
 pub struct ResourceLimiter {
-    _name: String,
+    name: String,
     version: u64,
     limiters: [QuotaLimiter; ResourceType::COUNT],
     // whether the resource limiter is a background limiter or priority limiter.
     is_background: bool,
-    // the wait duration histogram for prioitry limiter.
-    wait_histogram: Option<Histogram>,
 }
 
 impl std::fmt::Debug for ResourceLimiter {
@@ -62,23 +59,11 @@ impl ResourceLimiter {
     ) -> Self {
         let cpu_limiter = QuotaLimiter::new(cpu_limit);
         let io_limiter = QuotaLimiter::new(io_limit);
-        // high priority tasks does not triggers wait, so no need to generate an empty
-        // metrics.
-        let wait_histogram = if !is_background && name != TaskPriority::High.as_str() {
-            Some(
-                PRIORITY_WAIT_DURATION_VEC
-                    .get_metric_with_label_values(&[&name])
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
         Self {
-            _name: name,
+            name,
             version,
             limiters: [cpu_limiter, io_limiter],
             is_background,
-            wait_histogram,
         }
     }
 
@@ -91,11 +76,12 @@ impl ResourceLimiter {
             self.limiters[ResourceType::Cpu as usize].consume(cpu_time.as_micros() as u64, wait);
         let io_dur = self.limiters[ResourceType::Io as usize].consume_io(io_bytes, wait);
         let wait_dur = cpu_dur.max(io_dur);
-        if !wait_dur.is_zero()
-            && let Some(h) = &self.wait_histogram
-        {
-            h.observe(wait_dur.as_secs_f64());
+        if wait_dur > Duration::ZERO {
+            BACKGROUND_TASKS_WAIT_DURATION
+                .with_label_values(&[&self.name])
+                .inc_by(wait_dur.as_micros() as u64);
         }
+
         wait_dur
     }
 
@@ -141,14 +127,7 @@ pub(crate) struct QuotaLimiter {
 impl QuotaLimiter {
     fn new(limit: f64) -> Self {
         Self {
-            // we use 1s refill and 1ms min_wait duration to avoid trigger
-            // wait too frequently or waiting too long.
-            // NOTE: the parameter `refill` mainly impact the capacity
-            // of token bucket but not refill interval.
-            limiter: Limiter::builder(limit)
-                .refill(Duration::from_millis(1000))
-                .min_wait(Duration::from_millis(1))
-                .build(),
+            limiter: Limiter::new(limit),
             total_wait_dur_us: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),

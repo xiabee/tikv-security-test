@@ -18,7 +18,6 @@ use engine_traits::{KvEngine, RaftEngine, TabletRegistry};
 use futures::{executor::block_on, future::BoxFuture, Future};
 use grpcio::{ChannelBuilder, EnvBuilder, Environment, Error as GrpcError, Service};
 use grpcio_health::HealthService;
-use health_controller::HealthController;
 use kvproto::{
     deadlock_grpc::create_deadlock,
     debugpb_grpc::{create_debug, DebugClient},
@@ -68,10 +67,7 @@ use tikv::{
     storage::{
         self,
         kv::{FakeExtension, LocalTablets, RaftExtension, SnapContext},
-        txn::{
-            flow_controller::{EngineFlowController, FlowController},
-            txn_status_cache::TxnStatusCache,
-        },
+        txn::flow_controller::{EngineFlowController, FlowController},
         Engine, Storage,
     },
 };
@@ -148,12 +144,6 @@ impl<EK: KvEngine> Engine for TestRaftKv2<EK> {
     type SnapshotRes = <SimulateEngine<EK> as Engine>::SnapshotRes;
     fn async_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::SnapshotRes {
         self.raftkv.async_snapshot(ctx)
-    }
-
-    type IMSnap = Self::Snap;
-    type IMSnapshotRes = Self::SnapshotRes;
-    fn async_in_memory_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::IMSnapshotRes {
-        self.async_snapshot(ctx)
     }
 
     type WriteRes = <SimulateEngine<EK> as Engine>::WriteRes;
@@ -428,14 +418,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
         let mut coprocessor_host =
             CoprocessorHost::new(raft_router.store_router().clone(), cfg.coprocessor.clone());
 
-        let region_info_accessor = RegionInfoAccessor::new(
-            &mut coprocessor_host,
-            Arc::new(|| false), // Not applicable to v2
-            Box::new(|| {
-                // v2 does not support ime
-                unreachable!()
-            }),
-        );
+        let region_info_accessor = RegionInfoAccessor::new(&mut coprocessor_host);
 
         let sim_router = SimulateTransport::new(raft_router.clone());
         let mut raft_kv_v2 = TestRaftKv2::new(
@@ -473,7 +456,6 @@ impl<EK: KvEngine> ServerCluster<EK> {
         );
         gc_worker.start(node_id).unwrap();
 
-        let txn_status_cache = Arc::new(TxnStatusCache::new_for_test());
         let rts_worker = if cfg.resolved_ts.enable {
             // Resolved ts worker
             let mut rts_worker = LazyWorker::new("resolved-ts");
@@ -491,7 +473,6 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 concurrency_manager.clone(),
                 self.env.clone(),
                 self.security_mgr.clone(),
-                txn_status_cache.clone(),
             );
             // Start the worker
             rts_worker.start(rts_endpoint);
@@ -553,7 +534,6 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 .as_ref()
                 .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
             resource_manager.clone(),
-            txn_status_cache,
         )?;
         self.storages.insert(node_id, raft_kv_v2.clone());
 
@@ -625,7 +605,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
             cfg.slow_log_file.clone(),
         );
 
-        let health_controller = HealthController::new();
+        let health_service = HealthService::default();
 
         for _ in 0..100 {
             let mut svr = Server::new(
@@ -642,7 +622,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 self.env.clone(),
                 None,
                 debug_thread_pool.clone(),
-                health_controller.clone(),
+                health_service.clone(),
                 resource_manager.clone(),
             )
             .unwrap();
@@ -711,8 +691,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
         self.region_info_accessors
             .insert(node_id, region_info_accessor);
         // todo: importer
-        self.health_services
-            .insert(node_id, health_controller.get_grpc_health_service());
+        self.health_services.insert(node_id, health_service);
 
         lock_mgr
             .start(
@@ -1033,18 +1012,7 @@ pub fn must_new_cluster_and_kv_client_mul(
     TikvClient,
     Context,
 ) {
-    must_new_cluster_with_cfg_and_kv_client_mul(count, |_| {})
-}
-
-pub fn must_new_cluster_with_cfg_and_kv_client_mul(
-    count: usize,
-    configure: impl FnMut(&mut Cluster<ServerCluster<RocksEngine>, RocksEngine>),
-) -> (
-    Cluster<ServerCluster<RocksEngine>, RocksEngine>,
-    TikvClient,
-    Context,
-) {
-    let (cluster, leader, ctx) = must_new_and_configure_cluster_mul(count, configure);
+    let (cluster, leader, ctx) = must_new_cluster_mul(count);
 
     let env = Arc::new(Environment::new(1));
     let channel =
@@ -1053,7 +1021,6 @@ pub fn must_new_cluster_with_cfg_and_kv_client_mul(
 
     (cluster, client, ctx)
 }
-
 pub fn must_new_cluster_mul(
     count: usize,
 ) -> (

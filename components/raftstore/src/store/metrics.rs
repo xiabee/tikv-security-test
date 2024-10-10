@@ -214,10 +214,7 @@ make_static_metric! {
 
     pub label_enum RaftEventDurationType {
         compact_check,
-        periodic_full_compact,
-        load_metrics_window,
         pd_store_heartbeat,
-        pd_report_min_resolved_ts,
         snap_gc,
         compact_lock_cf,
         consistency_check,
@@ -323,20 +320,6 @@ make_static_metric! {
 
     pub struct LoadBaseSplitEventCounterVec: IntCounter {
         "type" => LoadBaseSplitEventType,
-    }
-
-    pub struct StoreBusyOnApplyRegionsGaugeVec: IntGauge {
-        "type" => {
-            busy_apply_peers,
-            completed_apply_peers,
-        },
-    }
-
-    pub struct StoreBusyStateGaugeVec: IntGauge {
-        "type" => {
-            raftstore_busy,
-            applystore_busy,
-        },
     }
 }
 
@@ -503,7 +486,6 @@ lazy_static! {
             exponential_buckets(0.00001, 2.0, 32).unwrap() // 10us ~ 42949s.
         ).unwrap();
 
-
     pub static ref STORE_APPLY_LOG_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_apply_log_duration_seconds",
@@ -568,19 +550,6 @@ lazy_static! {
             "tikv_raftstore_propose_log_size",
             "Bucketed histogram of peer proposing log size.",
             exponential_buckets(8.0, 2.0, 22).unwrap()
-        ).unwrap();
-
-    pub static ref STORE_APPLY_KEY_SIZE_HISTOGRAM: Histogram =
-        register_histogram!(
-            "tikv_raftstore_apply_key_size",
-            "Bucketed histogram of apply key size.",
-            exponential_buckets(8.0, 2.0, 17).unwrap()
-        ).unwrap();
-    pub static ref STORE_APPLY_VALUE_SIZE_HISTOGRAM: Histogram =
-        register_histogram!(
-            "tikv_raftstore_apply_value_size",
-            "Bucketed histogram of apply value size.",
-            exponential_buckets(8.0, 2.0, 23).unwrap()
         ).unwrap();
 
     pub static ref REGION_HASH_COUNTER_VEC: IntCounterVec =
@@ -719,6 +688,13 @@ lazy_static! {
         "Total number of checking stale peers."
     ).unwrap();
 
+    pub static ref INGEST_SST_DURATION_SECONDS: Histogram =
+        register_histogram!(
+            "tikv_snapshot_ingest_sst_duration_seconds",
+            "Bucketed histogram of rocksdb ingestion durations.",
+            exponential_buckets(0.005, 2.0, 20).unwrap()
+        ).unwrap();
+
     pub static ref RAFT_INVALID_PROPOSAL_COUNTER_VEC: IntCounterVec =
         register_int_counter_vec!(
             "tikv_raftstore_raft_invalid_proposal_total",
@@ -786,17 +762,6 @@ lazy_static! {
         "Histogram of query",
         &["type"],
         exponential_buckets(8.0, 2.0, 24).unwrap()
-    ).unwrap();
-
-    pub static ref RAFT_APPLY_AHEAD_PERSIST_HISTOGRAM: Histogram = register_histogram!(
-        "tikv_raft_apply_ahead_of_persist",
-        "Histogram of the raft log lag between persisted index and applied index",
-        exponential_buckets(1.0, 2.0, 20).unwrap()
-    ).unwrap();
-
-    pub static ref RAFT_ENABLE_UNPERSISTED_APPLY_GAUGE: IntGauge = register_int_gauge!(
-        "tikv_raft_enable_unpersisted_apply_regions",
-        "The number of regions that disable apply unpersisted raft log."
     ).unwrap();
 
     pub static ref RAFT_ENTRIES_CACHES_GAUGE: IntGauge = register_int_gauge!(
@@ -978,20 +943,4 @@ lazy_static! {
         "The events of the lease to denying new admin commands being proposed by snapshot br.",
         &["event"]
     ).unwrap();
-
-    pub static ref STORE_BUSY_ON_APPLY_REGIONS_GAUGE_VEC: StoreBusyOnApplyRegionsGaugeVec =
-        register_static_int_gauge_vec!(
-            StoreBusyOnApplyRegionsGaugeVec,
-            "tikv_raftstore_busy_on_apply_region_total",
-            "Total number of regions busy on apply or complete apply.",
-            &["type"]
-        ).unwrap();
-
-    pub static ref STORE_PROCESS_BUSY_GAUGE_VEC: StoreBusyStateGaugeVec =
-        register_static_int_gauge_vec!(
-            StoreBusyStateGaugeVec,
-            "tikv_raftstore_process_busy",
-            "Is raft process busy or not",
-            &["type"]
-        ).unwrap();
 }

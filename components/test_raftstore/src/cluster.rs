@@ -4,7 +4,10 @@ use std::{
     collections::hash_map::Entry as MapEntry,
     error::Error as StdError,
     result,
-    sync::{mpsc, Arc, Mutex, RwLock},
+    sync::{
+        mpsc::{self},
+        Arc, Mutex, RwLock,
+    },
     thread,
     time::Duration,
 };
@@ -15,8 +18,8 @@ use encryption_export::DataKeyManager;
 use engine_rocks::{RocksEngine, RocksSnapshot, RocksStatistics};
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{
-    CompactExt, Engines, Iterable, ManualCompactionOptions, MiscExt, Mutable, Peekable,
-    RaftEngineReadOnly, SyncMutable, WriteBatch, WriteBatchExt, CF_DEFAULT, CF_RAFT,
+    CompactExt, Engines, Iterable, MiscExt, Mutable, Peekable, RaftEngineReadOnly, SyncMutable,
+    WriteBatch, WriteBatchExt, CF_DEFAULT, CF_RAFT,
 };
 use file_system::IoRateLimiter;
 use futures::{self, channel::oneshot, executor::block_on, future::BoxFuture, StreamExt};
@@ -58,9 +61,9 @@ use tikv_util::{
 };
 use txn_types::WriteBatchFlags;
 
-use self::region_cache_engine::RangCacheEngineExt;
 use super::*;
 use crate::Config;
+
 // We simulate 3 or 5 nodes, each has a store.
 // Sometimes, we use fixed id to test, which means the id
 // isn't allocated by pd, and node id, store id are same.
@@ -177,11 +180,6 @@ pub struct Cluster<T: Simulator> {
     pub sim: Arc<RwLock<T>>,
     pub pd_client: Arc<TestPdClient>,
     resource_manager: Option<Arc<ResourceGroupManager>>,
-
-    // When this is set, the `HybridEngineImpl` will be used as the underlying KvEngine. In
-    // addition, it atomaticaly load the whole range when start. When we want to do something
-    // specific, for example, only load ranges of some regions, we may not set this.
-    region_cache_engine_enabled_with_whole_range: bool,
 }
 
 impl<T: Simulator> Cluster<T> {
@@ -215,7 +213,6 @@ impl<T: Simulator> Cluster<T> {
             resource_manager: Some(Arc::new(ResourceGroupManager::default())),
             kv_statistics: vec![],
             raft_statistics: vec![],
-            region_cache_engine_enabled_with_whole_range: false,
         }
     }
 
@@ -322,13 +319,8 @@ impl<T: Simulator> Cluster<T> {
     pub fn compact_data(&self) {
         for engine in self.engines.values() {
             let db = &engine.kv;
-            db.compact_range_cf(
-                CF_DEFAULT,
-                None,
-                None,
-                ManualCompactionOptions::new(false, 1, false),
-            )
-            .unwrap();
+            db.compact_range_cf(CF_DEFAULT, None, None, false, 1)
+                .unwrap();
         }
     }
 
@@ -345,17 +337,6 @@ impl<T: Simulator> Cluster<T> {
         self.create_engines();
         self.bootstrap_region().unwrap();
         self.start().unwrap();
-        if self.region_cache_engine_enabled_with_whole_range {
-            let pd_regions = self.pd_client.scan_regions(&[], &[], i32::MAX).unwrap();
-            let regions: Vec<_> = pd_regions
-                .into_iter()
-                .map(|mut r| r.take_region())
-                .collect();
-
-            self.engines
-                .iter()
-                .for_each(|(_, engines)| engines.kv.cache_regions(&regions));
-        }
     }
 
     // Bootstrap the store with fixed ID (like 1, 2, .. 5) and
@@ -1311,9 +1292,7 @@ impl<T: Simulator> Cluster<T> {
                     engine_traits::CF_RAFT,
                     &keys::region_state_key(region_id),
                 )
-                .unwrap()
-                && state.get_state() == peer_state
-            {
+                .unwrap() && state.get_state() == peer_state {
                 return;
             }
             sleep_ms(10);
@@ -1729,7 +1708,7 @@ impl<T: Simulator> Cluster<T> {
         }
     }
 
-    pub fn new_prepare_merge(&self, source: u64, target: u64) -> RaftCmdRequest {
+    fn new_prepare_merge(&self, source: u64, target: u64) -> RaftCmdRequest {
         let region = block_on(self.pd_client.get_region_by_id(target))
             .unwrap()
             .unwrap();
@@ -2015,10 +1994,6 @@ impl<T: Simulator> Cluster<T> {
 
         Ok(())
     }
-
-    pub fn region_cache_engine_enabled_with_whole_range(&mut self, v: bool) {
-        self.region_cache_engine_enabled_with_whole_range = v;
-    }
 }
 
 impl<T: Simulator> Drop for Cluster<T> {
@@ -2031,10 +2006,6 @@ impl<T: Simulator> Drop for Cluster<T> {
 pub trait RawEngine<EK: engine_traits::KvEngine>:
     Peekable<DbVector = EK::DbVector> + SyncMutable
 {
-    fn region_cache_engine(&self) -> bool {
-        false
-    }
-
     fn region_local_state(&self, region_id: u64)
     -> engine_traits::Result<Option<RegionLocalState>>;
 
@@ -2057,29 +2028,5 @@ impl RawEngine<RocksEngine> for RocksEngine {
 
     fn raft_local_state(&self, region_id: u64) -> engine_traits::Result<Option<RaftLocalState>> {
         self.get_msg_cf(CF_RAFT, &keys::raft_state_key(region_id))
-    }
-}
-
-impl RawEngine<RocksEngine> for HybridEngineImpl {
-    fn region_cache_engine(&self) -> bool {
-        true
-    }
-
-    fn region_local_state(
-        &self,
-        region_id: u64,
-    ) -> engine_traits::Result<Option<RegionLocalState>> {
-        self.disk_engine()
-            .get_msg_cf(CF_RAFT, &keys::region_state_key(region_id))
-    }
-
-    fn raft_apply_state(&self, region_id: u64) -> engine_traits::Result<Option<RaftApplyState>> {
-        self.disk_engine()
-            .get_msg_cf(CF_RAFT, &keys::apply_state_key(region_id))
-    }
-
-    fn raft_local_state(&self, region_id: u64) -> engine_traits::Result<Option<RaftLocalState>> {
-        self.disk_engine()
-            .get_msg_cf(CF_RAFT, &keys::raft_state_key(region_id))
     }
 }

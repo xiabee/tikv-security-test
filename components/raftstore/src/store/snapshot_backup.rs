@@ -10,10 +10,7 @@ use std::{
 
 use engine_traits::{KvEngine, RaftEngine};
 use futures::channel::mpsc::UnboundedSender;
-use kvproto::{
-    brpb::CheckAdminResponse, metapb::RegionEpoch, raft_cmdpb::AdminCmdType,
-    raft_serverpb::ExtraMessage,
-};
+use kvproto::{brpb::CheckAdminResponse, metapb::RegionEpoch, raft_cmdpb::AdminCmdType};
 use tikv_util::{info, warn};
 use tokio::sync::oneshot;
 
@@ -78,7 +75,7 @@ impl<EK: KvEngine, ER: RaftEngine> SnapshotBrHandle for Arc<Mutex<RaftRouter<EK,
     fn broadcast_wait_apply(&self, req: SnapshotBrWaitApplyRequest) -> crate::Result<()> {
         let msg_gen = || {
             metrics::SNAP_BR_WAIT_APPLY_EVENT.sent.inc();
-            PeerMsg::SignificantMsg(Box::new(SignificantMsg::SnapshotBrWaitApply(req.clone())))
+            PeerMsg::SignificantMsg(SignificantMsg::SnapshotBrWaitApply(req.clone()))
         };
         self.lock().unwrap().broadcast_normal(msg_gen);
         Ok(())
@@ -89,7 +86,7 @@ impl<EK: KvEngine, ER: RaftEngine> SnapshotBrHandle for Arc<Mutex<RaftRouter<EK,
         tx: UnboundedSender<CheckAdminResponse>,
     ) -> crate::Result<()> {
         self.lock().unwrap().broadcast_normal(|| {
-            PeerMsg::SignificantMsg(Box::new(SignificantMsg::CheckPendingAdmin(tx.clone())))
+            PeerMsg::SignificantMsg(SignificantMsg::CheckPendingAdmin(tx.clone()))
         });
         Ok(())
     }
@@ -266,9 +263,9 @@ impl AdminObserver for Arc<PrepareDiskSnapObserver> {
         &self,
         _ctx: &mut crate::coprocessor::ObserverContext<'_>,
         _tr: &kvproto::raft_cmdpb::TransferLeaderRequest,
-    ) -> crate::coprocessor::Result<Option<ExtraMessage>> {
+    ) -> crate::coprocessor::Result<()> {
         if self.allowed() {
-            return Ok(None);
+            return Ok(());
         }
         metrics::SNAP_BR_SUSPEND_COMMAND_TYPE
             .with_label_values(&["TransferLeader"])

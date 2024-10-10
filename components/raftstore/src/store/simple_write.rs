@@ -231,7 +231,7 @@ pub struct SimpleWriteReqDecoder<'a> {
 impl<'a> SimpleWriteReqDecoder<'a> {
     pub fn new(
         fallback: impl FnOnce(&'a [u8], u64, u64) -> RaftCmdRequest,
-        logger: Option<&Logger>,
+        logger: &Logger,
         buf: &'a [u8],
         index: u64,
         term: u64,
@@ -241,22 +241,13 @@ impl<'a> SimpleWriteReqDecoder<'a> {
                 let mut is = CodedInputStream::from_bytes(&buf[1..]);
                 let header = match is.read_message() {
                     Ok(h) => h,
-                    Err(e) => {
-                        if let Some(logger) = logger {
-                            slog_panic!(
-                                logger,
-                                "data corrupted";
-                                "term" => term,
-                                "index" => index,
-                                "error" => ?e
-                            )
-                        } else {
-                            panic!(
-                                "data corrupted term: {}, index: {}, error {:?}",
-                                term, index, e
-                            )
-                        }
-                    }
+                    Err(e) => slog_panic!(
+                        logger,
+                        "data corrupted";
+                        "term" => term,
+                        "index" => index,
+                        "error" => ?e
+                    ),
                 };
                 let read = is.pos();
                 Ok(SimpleWriteReqDecoder {
@@ -569,40 +560,31 @@ mod tests {
         let (bytes, _) = req_encoder.encode();
         let logger = slog_global::borrow_global().new(o!());
         let mut decoder =
-            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap();
+            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
         assert_eq!(*decoder.header(), *header);
         let write = decoder.next().unwrap();
-        let SimpleWrite::Put(put) = write else {
-            panic!("should be put")
-        };
+        let SimpleWrite::Put(put) = write else { panic!("should be put") };
         assert_eq!(put.cf, CF_DEFAULT);
         assert_eq!(put.key, b"key");
         assert_eq!(put.value, b"");
 
         let write = decoder.next().unwrap();
-        let SimpleWrite::Delete(delete) = write else {
-            panic!("should be delete")
-        };
+        let SimpleWrite::Delete(delete) = write else { panic!("should be delete") };
         assert_eq!(delete.cf, CF_WRITE);
         assert_eq!(delete.key, &delete_key);
         assert_matches!(decoder.next(), None);
 
         let (bytes, _) = req_encoder2.encode();
-        decoder =
-            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap();
+        decoder = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
         let write = decoder.next().unwrap();
-        let SimpleWrite::DeleteRange(dr) = write else {
-            panic!("should be delete range")
-        };
+        let SimpleWrite::DeleteRange(dr) = write else { panic!("should be delete range") };
         assert_eq!(dr.cf, CF_LOCK);
         assert_eq!(dr.start_key, b"key");
         assert_eq!(dr.end_key, b"key");
         assert!(dr.notify_only);
 
         let write = decoder.next().unwrap();
-        let SimpleWrite::DeleteRange(dr) = write else {
-            panic!("should be delete range")
-        };
+        let SimpleWrite::DeleteRange(dr) = write else { panic!("should be delete range") };
         assert_eq!(dr.cf, "cf");
         assert_eq!(dr.start_key, b"key");
         assert_eq!(dr.end_key, b"key");
@@ -625,11 +607,9 @@ mod tests {
             SimpleWriteReqEncoder::<Callback<engine_rocks::RocksSnapshot>>::new(header, bin, 0);
         let (bytes, _) = req_encoder.encode();
         let mut decoder =
-            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap();
+            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
         let write = decoder.next().unwrap();
-        let SimpleWrite::Ingest(ssts) = write else {
-            panic!("should be ingest")
-        };
+        let SimpleWrite::Ingest(ssts) = write else { panic!("should be ingest") };
         assert_eq!(exp, ssts);
         assert_matches!(decoder.next(), None);
     }
@@ -671,7 +651,7 @@ mod tests {
         let bytes = raft_cmd.write_to_bytes().unwrap();
         let logger = slog_global::borrow_global().new(o!());
         let decoded =
-            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap_err();
+            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap_err();
         // SimpleWriteReqDecoder should be able to decode naive RaftCmdRequest.
         assert_eq!(decoded, raft_cmd);
 
@@ -713,12 +693,10 @@ mod tests {
 
         let (bytes, _) = req_encoder.encode();
         let mut decoder =
-            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap();
+            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
         assert_eq!(*decoder.header(), *header);
         let req = decoder.next().unwrap();
-        let SimpleWrite::Put(put) = req else {
-            panic!("should be put")
-        };
+        let SimpleWrite::Put(put) = req else { panic!("should be put") };
         assert_eq!(put.cf, CF_DEFAULT);
         assert_eq!(put.key, b"key");
         assert_eq!(put.value, b"");
@@ -742,7 +720,7 @@ mod tests {
         let (bin, _) = req_encoder.encode();
         assert_eq!(
             header.as_ref(),
-            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
+            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
                 .unwrap()
                 .to_raft_cmd_request()
                 .get_header(),
@@ -757,7 +735,7 @@ mod tests {
             512,
         );
         let (bin, _) = req_encoder.encode();
-        let req = SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
+        let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
             .unwrap()
             .to_raft_cmd_request();
         assert_eq!(req.get_requests().len(), 1);
@@ -774,7 +752,7 @@ mod tests {
             512,
         );
         let (bin, _) = req_encoder.encode();
-        let req = SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
+        let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
             .unwrap()
             .to_raft_cmd_request();
         assert_eq!(req.get_requests().len(), 1);
@@ -790,7 +768,7 @@ mod tests {
             512,
         );
         let (bin, _) = req_encoder.encode();
-        let req = SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
+        let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
             .unwrap()
             .to_raft_cmd_request();
         assert_eq!(req.get_requests().len(), 1);
@@ -817,7 +795,7 @@ mod tests {
             512,
         );
         let (bin, _) = req_encoder.encode();
-        let req = SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
+        let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
             .unwrap()
             .to_raft_cmd_request();
         assert_eq!(req.get_requests().len(), 5);

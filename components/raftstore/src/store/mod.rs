@@ -71,7 +71,7 @@ pub use self::{
     replication_mode::{GlobalReplicationState, StoreGroup},
     snap::{
         check_abort, copy_snapshot,
-        snap_io::{apply_sst_cf_files_by_ingest, build_sst_cf_file_list},
+        snap_io::{apply_sst_cf_file, build_sst_cf_file_list},
         ApplyOptions, CfFile, Error as SnapError, SnapEntry, SnapKey, SnapManager,
         SnapManagerBuilder, Snapshot, SnapshotStatistics, TabletSnapKey, TabletSnapManager,
     },
@@ -88,9 +88,9 @@ pub use self::{
     worker::{
         metrics as worker_metrics, need_compact, AutoSplitController, BatchComponent, Bucket,
         BucketRange, BucketStatsInfo, CachedReadDelegate, CheckLeaderRunner, CheckLeaderTask,
-        CompactThreshold, FlowStatistics, FlowStatsReporter, FullCompactController, KeyEntry,
-        LocalReadContext, LocalReader, LocalReaderCore, PdStatsMonitor, PdTask, ReadDelegate,
-        ReadExecutor, ReadExecutorProvider, ReadProgress, ReadStats, RefreshConfigTask, RegionTask,
+        CompactThreshold, FlowStatistics, FlowStatsReporter, KeyEntry, LocalReadContext,
+        LocalReader, LocalReaderCore, PdStatsMonitor, PdTask, ReadDelegate, ReadExecutor,
+        ReadExecutorProvider, ReadProgress, ReadStats, RefreshConfigTask, RegionTask,
         SplitCheckRunner, SplitCheckTask, SplitConfig, SplitConfigManager, SplitInfo,
         StoreMetaDelegate, StoreStatsReporter, TrackVer, WriteStats, WriterContoller,
         BIG_REGION_CPU_OVERLOAD_THRESHOLD_RATIO, DEFAULT_BIG_REGION_BYTE_THRESHOLD,

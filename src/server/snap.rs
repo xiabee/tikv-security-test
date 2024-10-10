@@ -110,7 +110,6 @@ struct SnapChunk {
     first: Option<SnapshotChunk>,
     snap: Box<Snapshot>,
     remain_bytes: usize,
-    io_type: IoType,
 }
 
 pub const SNAP_CHUNK_LEN: usize = 1024 * 1024;
@@ -129,7 +128,6 @@ impl Stream for SnapChunk {
             n if n > SNAP_CHUNK_LEN => vec![0; SNAP_CHUNK_LEN],
             n => vec![0; n],
         };
-        let _with_io_type = WithIoType::new(self.io_type);
         let result = self.snap.read_exact(buf.as_mut_slice());
         match result {
             Ok(_) => {
@@ -166,7 +164,7 @@ pub fn send_snap(
 
     let send_timer = SEND_SNAP_HISTOGRAM.start_coarse_timer();
 
-    let (key, snap_start, generate_duration_sec, io_type) = {
+    let (key, snap_start, generate_duration_sec) = {
         let snap = msg.get_message().get_snapshot();
         let mut snap_data = RaftSnapshotData::default();
         if let Err(e) = snap_data.merge_from_bytes(snap.get_data()) {
@@ -175,12 +173,7 @@ pub fn send_snap(
         let key = SnapKey::from_region_snap(msg.get_region_id(), snap);
         let snap_start = snap_data.get_meta().get_start();
         let generate_duration_sec = snap_data.get_meta().get_generate_duration_sec();
-        let io_type = if snap_data.get_meta().get_for_balance() {
-            IoType::LoadBalance
-        } else {
-            IoType::Replication
-        };
-        (key, snap_start, generate_duration_sec, io_type)
+        (key, snap_start, generate_duration_sec)
     };
 
     mgr.register(key.clone(), SnapEntry::Sending);
@@ -205,7 +198,6 @@ pub fn send_snap(
             first: Some(first_chunk),
             snap: s,
             remain_bytes: total_size as usize,
-            io_type,
         }
     };
 
@@ -227,9 +219,6 @@ pub fn send_snap(
 
             #[cfg(feature = "failpoints")]
             {
-                fail::fail_point!("snap_send_error", |_| {
-                    Err(Error::Other(box_err!("snap_send_error")))
-                });
                 let should_delay = (|| {
                     fail::fail_point!("snap_send_timer_delay", |_| { true });
                     false
@@ -258,11 +247,10 @@ pub fn send_snap(
         send_timer.observe_duration();
         drop(deregister);
         drop(client);
-
-        fail_point!("snapshot_delete_after_send");
-        mgr.delete_snapshot(&key, &chunks.snap, true);
         match recv_result {
             Ok(_) => {
+                fail_point!("snapshot_delete_after_send");
+                mgr.delete_snapshot(&key, &chunks.snap, true);
                 let cost = UnixSecs::now().into_inner().saturating_sub(snap_start);
                 let send_duration_sec = timer.saturating_elapsed().as_secs();
                 // it should ignore if the duration of snapshot is less than 1s to decrease the
@@ -385,7 +373,6 @@ fn recv_snap<R: RaftExtension + 'static>(
         snap_mgr.register(context.key.clone(), SnapEntry::Receiving);
         defer!(snap_mgr.deregister(&context_key, &SnapEntry::Receiving));
         while let Some(item) = stream.next().await {
-            fail_point!("receiving_snapshot_callback");
             fail_point!("receiving_snapshot_net_error", |_| {
                 Err(box_err!("{} failed to receive snapshot", context_key))
             });
@@ -403,9 +390,6 @@ fn recv_snap<R: RaftExtension + 'static>(
                 return Err(e);
             }
         }
-        // Notify the snapshot manager that a snapshot has been received,
-        // freeing up the associated resource in the concurrency limiter.
-        snap_mgr.recv_snap_complete(context.raft_msg.region_id);
         context.finish(raft_router)
     };
     async move {
@@ -477,17 +461,9 @@ impl<R: RaftExtension + 'static> Runner<R> {
             };
             self.snap_mgr.set_speed_limit(limit);
             self.snap_mgr.set_max_total_snap_size(max_total_size);
-            self.snap_mgr
-                .set_min_ingest_cf_limit(incoming.snap_min_ingest_size);
-            info!(
-                "refresh snapshot manager config";
-                "speed_limit" => limit,
-                "max_total_snap_size" => max_total_size,
-                "min_ingest_cf_size" => ?incoming.snap_min_ingest_size);
-            if incoming.concurrent_recv_snap_limit > 0 {
-                self.snap_mgr
-                    .set_concurrent_recv_snap_limit(incoming.concurrent_recv_snap_limit);
-            }
+            info!("refresh snapshot manager config";
+            "speed_limit"=> limit,
+            "max_total_snap_size"=> max_total_size);
             self.cfg = incoming.clone();
         }
     }

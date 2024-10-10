@@ -80,9 +80,7 @@ impl<EK: KvEngine, ER: RaftEngine> UnsafeRecoveryHandle for Mutex<RaftRouter<EK,
 
     fn broadcast_exit_force_leader(&self) {
         let router = self.lock().unwrap();
-        router.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(Box::new(SignificantMsg::ExitForceLeaderState))
-        });
+        router.broadcast_normal(|| PeerMsg::SignificantMsg(SignificantMsg::ExitForceLeaderState));
     }
 
     fn send_create_peer(
@@ -132,18 +130,14 @@ impl<EK: KvEngine, ER: RaftEngine> UnsafeRecoveryHandle for Mutex<RaftRouter<EK,
     fn broadcast_wait_apply(&self, syncer: UnsafeRecoveryWaitApplySyncer) {
         let router = self.lock().unwrap();
         router.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(Box::new(SignificantMsg::UnsafeRecoveryWaitApply(
-                syncer.clone(),
-            )))
+            PeerMsg::SignificantMsg(SignificantMsg::UnsafeRecoveryWaitApply(syncer.clone()))
         });
     }
 
     fn broadcast_fill_out_report(&self, syncer: UnsafeRecoveryFillOutReportSyncer) {
         let router = self.lock().unwrap();
         router.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(Box::new(SignificantMsg::UnsafeRecoveryFillOutReport(
-                syncer.clone(),
-            )))
+            PeerMsg::SignificantMsg(SignificantMsg::UnsafeRecoveryFillOutReport(syncer.clone()))
         });
     }
 
@@ -170,10 +164,6 @@ pub enum ForceLeaderState {
         syncer: UnsafeRecoveryForceLeaderSyncer,
         failed_stores: HashSet<u64>,
         ticks: usize,
-    },
-    WaitForceCompact {
-        syncer: UnsafeRecoveryForceLeaderSyncer,
-        failed_stores: HashSet<u64>,
     },
     PreForceLeader {
         syncer: UnsafeRecoveryForceLeaderSyncer,

@@ -38,7 +38,7 @@ impl SoftLimit {
         Ok(())
     }
 
-    fn grant_tokens(&self, n: usize) {
+    async fn grant_tokens(&self, n: usize) {
         self.0.semaphore.add_permits(n);
     }
 
@@ -53,9 +53,9 @@ impl SoftLimit {
 
     /// Grows the tasks can be executed concurrently by n
     #[cfg(test)]
-    pub fn grow(&self, n: usize) {
+    pub async fn grow(&self, n: usize) {
         self.0.cap.fetch_add(n, Ordering::SeqCst);
-        self.grant_tokens(n);
+        self.grant_tokens(n).await;
     }
 
     /// resize the tasks available concurrently.
@@ -66,7 +66,7 @@ impl SoftLimit {
                 self.take_tokens(current - target).await?;
             }
             CmpOrder::Less => {
-                self.grant_tokens(target - current);
+                self.grant_tokens(target - current).await;
             }
             _ => {}
         }
@@ -304,7 +304,7 @@ mod softlimit_test {
         )
         .await;
 
-        limit_cloned.grow(1);
+        limit_cloned.grow(1).await;
         let working_cloned = working.clone();
         should_satisfy_in(
             Duration::from_secs(10),
@@ -314,7 +314,7 @@ mod softlimit_test {
         .await;
 
         let working_cloned = working.clone();
-        limit_cloned.grow(2);
+        limit_cloned.grow(2).await;
         should_satisfy_in(
             Duration::from_secs(10),
             "waiting for worker grow to 4",

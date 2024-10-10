@@ -35,9 +35,6 @@ pub fn validate_kv_api(kv_api: ChangeDataRequestKvApi, api_version: ApiVersion) 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ConnId(usize);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct RequestId(pub u64);
-
 impl ConnId {
     pub fn new() -> ConnId {
         ConnId(CONNECTION_ID_ALLOC.fetch_add(1, Ordering::SeqCst))
@@ -92,7 +89,7 @@ pub struct Conn {
 
 #[derive(PartialEq, Eq, Hash)]
 struct DownstreamKey {
-    request_id: RequestId,
+    request_id: u64,
     region_id: u64,
 }
 
@@ -103,9 +100,9 @@ struct DownstreamValue {
 }
 
 impl Conn {
-    pub fn new(conn_id: ConnId, sink: Sink, peer: String) -> Conn {
+    pub fn new(sink: Sink, peer: String) -> Conn {
         Conn {
-            id: conn_id,
+            id: ConnId::new(),
             sink,
             downstreams: HashMap::default(),
             peer,
@@ -146,7 +143,7 @@ impl Conn {
         &self.sink
     }
 
-    pub fn get_downstream(&self, request_id: RequestId, region_id: u64) -> Option<DownstreamId> {
+    pub fn get_downstream(&self, request_id: u64, region_id: u64) -> Option<DownstreamId> {
         let key = DownstreamKey {
             request_id,
             region_id,
@@ -156,7 +153,7 @@ impl Conn {
 
     pub fn subscribe(
         &mut self,
-        request_id: RequestId,
+        request_id: u64,
         region_id: u64,
         downstream_id: DownstreamId,
         downstream_state: Arc<AtomicCell<DownstreamState>>,
@@ -177,7 +174,7 @@ impl Conn {
         }
     }
 
-    pub fn unsubscribe(&mut self, request_id: RequestId, region_id: u64) -> Option<DownstreamId> {
+    pub fn unsubscribe(&mut self, request_id: u64, region_id: u64) -> Option<DownstreamId> {
         let key = DownstreamKey {
             request_id,
             region_id,
@@ -185,7 +182,7 @@ impl Conn {
         self.downstreams.remove(&key).map(|value| value.id)
     }
 
-    pub fn unsubscribe_request(&mut self, request_id: RequestId) -> Vec<(u64, DownstreamId)> {
+    pub fn unsubscribe_request(&mut self, request_id: u64) -> Vec<(u64, DownstreamId)> {
         let mut downstreams = Vec::new();
         self.downstreams.retain(|key, value| -> bool {
             if key.request_id == request_id {
@@ -199,7 +196,7 @@ impl Conn {
 
     pub fn iter_downstreams<F>(&self, mut f: F)
     where
-        F: FnMut(RequestId, u64, DownstreamId, &Arc<AtomicCell<DownstreamState>>),
+        F: FnMut(u64, u64, DownstreamId, &Arc<AtomicCell<DownstreamState>>),
     {
         for (key, value) in &self.downstreams {
             f(key.request_id, key.region_id, value.id, &value.state);
@@ -220,8 +217,8 @@ struct EventFeedHeaders {
 }
 
 impl EventFeedHeaders {
-    const FEATURES_KEY: &'static str = "features";
-    const STREAM_MULTIPLEXING: &'static str = "stream-multiplexing";
+    const FEATURES_KEY: &str = "features";
+    const STREAM_MULTIPLEXING: &str = "stream-multiplexing";
     const FEATURES: &'static [&'static str] = &[Self::STREAM_MULTIPLEXING];
 
     fn parse_features(value: &[u8]) -> Result<Vec<&'static str>, String> {
@@ -279,15 +276,18 @@ impl Service {
         peer: &str,
     ) -> semver::Version {
         let version_field = request.get_header().get_ticdc_version();
-        semver::Version::parse(version_field).unwrap_or_else(|e| {
-            warn!(
-                "empty or invalid TiCDC version, please upgrading TiCDC";
-                "version" => version_field,
-                "downstream" => ?peer, "region_id" => request.region_id,
-                "error" => ?e,
-            );
-            semver::Version::new(0, 0, 0)
-        })
+        match semver::Version::parse(version_field) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "empty or invalid TiCDC version, please upgrading TiCDC";
+                    "version" => version_field,
+                    "downstream" => ?peer, "region_id" => request.region_id,
+                    "error" => ?e,
+                );
+                semver::Version::new(0, 0, 0)
+            }
+        }
     }
 
     fn set_conn_version(
@@ -334,23 +334,22 @@ impl Service {
         request: ChangeDataRequest,
         conn_id: ConnId,
     ) -> Result<(), String> {
-        let observed_range = ObservedRange::new(request.start_key.clone(), request.end_key.clone())
-            .unwrap_or_else(|e| {
-                warn!(
-                    "cdc invalid observed start key or end key version";
-                    "downstream" => ?peer,
-                    "region_id" => request.region_id,
-                    "request_id" => request.region_id,
-                    "error" => ?e,
-                    "start_key" => log_wrappers::Value::key(&request.start_key),
-                    "end_key" => log_wrappers::Value::key(&request.end_key),
-                );
-                ObservedRange::default()
-            });
+        let observed_range =
+            match ObservedRange::new(request.start_key.clone(), request.end_key.clone()) {
+                Ok(observed_range) => observed_range,
+                Err(e) => {
+                    warn!(
+                        "cdc invalid observed start key or end key version";
+                        "downstream" => ?peer, "region_id" => request.region_id,
+                        "error" => ?e,
+                    );
+                    ObservedRange::default()
+                }
+            };
         let downstream = Downstream::new(
             peer.to_owned(),
             request.get_region_epoch().clone(),
-            RequestId(request.request_id),
+            request.request_id,
             conn_id,
             request.kv_api,
             request.filter_loop,
@@ -359,6 +358,7 @@ impl Service {
         let task = Task::Register {
             request,
             downstream,
+            conn_id,
         };
         scheduler.schedule(task).map_err(|e| format!("{:?}", e))
     }
@@ -371,13 +371,13 @@ impl Service {
         let task = if request.region_id != 0 {
             Task::Deregister(Deregister::Region {
                 conn_id,
-                request_id: RequestId(request.request_id),
+                request_id: request.request_id,
                 region_id: request.region_id,
             })
         } else {
             Task::Deregister(Deregister::Request {
                 conn_id,
-                request_id: RequestId(request.request_id),
+                request_id: request.request_id,
             })
         };
         scheduler.schedule(task).map_err(|e| format!("{:?}", e))
@@ -405,10 +405,10 @@ impl Service {
         event_feed_v2: bool,
     ) {
         sink.enhance_batch(true);
-        let conn_id = ConnId::new();
         let (event_sink, mut event_drain) =
-            channel(conn_id, CDC_CHANNLE_CAPACITY, self.memory_quota.clone());
-        let conn = Conn::new(conn_id, event_sink, ctx.peer());
+            channel(CDC_CHANNLE_CAPACITY, self.memory_quota.clone());
+        let conn = Conn::new(event_sink, ctx.peer());
+        let conn_id = conn.get_id();
         let mut explicit_features = vec![];
 
         if event_feed_v2 {

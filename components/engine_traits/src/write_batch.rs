@@ -1,6 +1,6 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::{errors::Result, options::WriteOptions, CacheRegion};
+use crate::{errors::Result, options::WriteOptions};
 
 /// Engines that can create write batches
 pub trait WriteBatchExt: Sized {
@@ -39,16 +39,10 @@ pub trait Mutable: Send {
     /// Delete a range of key/values in a given column family
     fn delete_range_cf(&mut self, cf: &str, begin_key: &[u8], end_key: &[u8]) -> Result<()>;
 
-    fn put_msg<M: protobuf::Message>(&mut self, key: &[u8], m: &M) -> Result<()>
-    where
-        Self: Sized,
-    {
+    fn put_msg<M: protobuf::Message>(&mut self, key: &[u8], m: &M) -> Result<()> {
         self.put(key, &m.write_to_bytes()?)
     }
-    fn put_msg_cf<M: protobuf::Message>(&mut self, cf: &str, key: &[u8], m: &M) -> Result<()>
-    where
-        Self: Sized,
-    {
+    fn put_msg_cf<M: protobuf::Message>(&mut self, cf: &str, key: &[u8], m: &M) -> Result<()> {
         self.put_cf(cf, key, &m.write_to_bytes()?)
     }
 }
@@ -79,15 +73,10 @@ pub trait WriteBatch: Mutable {
     /// Commit the WriteBatch to disk with the given options
     fn write_opt(&mut self, opts: &WriteOptions) -> Result<u64>;
 
-    /// Commit the WriteBatch to disk with the given options and call the
-    /// callback. The callback is called multiple times with the sequence number
-    /// of the write.
-    fn write_callback_opt(&mut self, opts: &WriteOptions, mut cb: impl FnMut(u64)) -> Result<u64>
-    where
-        Self: Sized,
-    {
+    // TODO: it should be `FnOnce`.
+    fn write_callback_opt(&mut self, opts: &WriteOptions, mut cb: impl FnMut()) -> Result<u64> {
         let seq = self.write_opt(opts)?;
-        cb(seq);
+        cb();
         Ok(seq)
     }
 
@@ -133,11 +122,5 @@ pub trait WriteBatch: Mutable {
     fn rollback_to_save_point(&mut self) -> Result<()>;
 
     /// Merge another WriteBatch to itself
-    fn merge(&mut self, src: Self) -> Result<()>
-    where
-        Self: Sized;
-
-    /// It declares that the following consecutive write will be within this
-    /// region.
-    fn prepare_for_region(&mut self, _: CacheRegion) {}
+    fn merge(&mut self, src: Self) -> Result<()>;
 }

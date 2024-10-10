@@ -56,7 +56,6 @@ impl BackupStreamObserver {
             .scheduler
             .schedule(Task::ModifyObserve(ObserveOp::Start {
                 region: region.clone(),
-                handle: ObserveHandle::new(),
             }))
         {
             use crate::errors::Error;
@@ -129,7 +128,6 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
                 self.scheduler,
                 Task::ModifyObserve(ObserveOp::Start {
                     region: region.clone(),
-                    handle: ObserveHandle::new(),
                 })
             );
         }
@@ -189,9 +187,8 @@ impl RegionChangeObserver for BackupStreamObserver {
 #[cfg(test)]
 
 mod tests {
-    use std::{assert_matches::assert_matches, sync::Arc, time::Duration};
+    use std::{assert_matches::assert_matches, time::Duration};
 
-    use dashmap::DashMap;
     use engine_panic::PanicEngine;
     use kvproto::metapb::Region;
     use raft::StateRole;
@@ -199,7 +196,6 @@ mod tests {
         Cmd, CmdBatch, CmdObserveInfo, CmdObserver, ObserveHandle, ObserveLevel, ObserverContext,
         RegionChangeEvent, RegionChangeObserver, RegionChangeReason, RoleChange, RoleObserver,
     };
-    use tikv::storage::txn::txn_status_cache::TxnStatusCache;
     use tikv_util::{worker::dummy_scheduler, HandyRwLock};
 
     use super::BackupStreamObserver;
@@ -222,10 +218,7 @@ mod tests {
 
         // Prepare: assuming a task wants the range of [0001, 0010].
         let o = BackupStreamObserver::new(sched);
-        let subs = SubscriptionTracer(
-            Arc::new(DashMap::new()),
-            Arc::new(TxnStatusCache::new_for_test()),
-        );
+        let subs = SubscriptionTracer::default();
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
         // Test regions can be registered.
@@ -250,10 +243,7 @@ mod tests {
 
         // Prepare: assuming a task wants the range of [0001, 0010].
         let o = BackupStreamObserver::new(sched);
-        let subs = SubscriptionTracer(
-            Arc::new(DashMap::new()),
-            Arc::new(TxnStatusCache::new_for_test()),
-        );
+        let subs = SubscriptionTracer::default();
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
         // Test regions can be registered.

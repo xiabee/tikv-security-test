@@ -16,9 +16,8 @@ max-backups = 2
 max-days = 3
 
 [memory]
-enable-heap-profiling = false
-profiling-sample-per-bytes = "1MB"
-enable-thread-exclusive-arena = false
+enable-heap-profiling = false 
+profiling-sample-per-bytes = "1MB" 
 
 [readpool.unified]
 min-thread-count = 5
@@ -85,7 +84,6 @@ background-thread-count = 999
 end-point-slow-log-threshold = "1s"
 forward-max-connections-per-address = 5
 reject-messages-on-memory-ratio = 0.8
-health-feedback-interval = "2s"
 
 [server.labels]
 a = "b"
@@ -104,7 +102,6 @@ reserve-raft-space = "2GB"
 enable-ttl = true
 ttl-check-poll-interval = "0s"
 txn-status-cache-capacity = 1000
-memory-quota = "123KB"
 
 [storage.block-cache]
 capacity = "40GB"
@@ -174,7 +171,6 @@ region-compact-min-redundant-rows = 999
 region-compact-redundant-rows-percent = 33
 pd-heartbeat-tick-interval = "12m"
 pd-store-heartbeat-tick-interval = "12s"
-pd-report-min-resolved-ts-interval = "233ms"
 snap-mgr-gc-tick-interval = "12m"
 snap-gc-timeout = "12h"
 snap-wait-split-duration = "12h"
@@ -220,8 +216,6 @@ evict-cache-on-memory-ratio = 0.8
 cmd-batch = false
 cmd-batch-concurrent-ready-max-count = 123
 raft-write-size-limit = "34MB"
-raft-write-batch-size-hint = "1MB"
-raft-write-wait-duration = "444us"
 waterfall-metrics = true
 io-reschedule-concurrent-max-count = 1234
 io-reschedule-hotpot-duration = "4321s"
@@ -233,6 +227,7 @@ reactive-memory-lock-tick-interval = "566ms"
 reactive-memory-lock-timeout-tick = 8
 check-long-uncommitted-interval = "1s"
 long-uncommitted-base-threshold = "1s"
+report-min-resolved-ts-interval = "233ms"
 report-region-buckets-tick-interval = "1234s"
 max-snapshot-file-raw-size = "10GB"
 unreachable-backoff = "111s"
@@ -266,6 +261,9 @@ create-if-missing = false
 max-open-files = 12345
 stats-dump-period = "12m"
 compaction-readahead-size = "1KB"
+info-log-max-size = "1KB"
+info-log-roll-time = "12s"
+info-log-keep-log-file-num = 1000
 info-log-dir = "/var"
 rate-bytes-per-sec = "1KB"
 rate-limiter-refill-period = "10ms"
@@ -341,9 +339,7 @@ periodic-compaction-seconds = "10d"
 
 [rocksdb.defaultcf.titan]
 min-blob-size = "2018B"
-blob-file-compression = "lz4"
-zstd-dict-size = "16KB"
-shared-blob-cache = false
+blob-file-compression = "zstd"
 blob-cache-size = "12GB"
 min-gc-batch-size = "12KB"
 max-gc-batch-size = "12MB"
@@ -506,6 +502,9 @@ create-if-missing = false
 max-open-files = 12345
 stats-dump-period = "12m"
 compaction-readahead-size = "1KB"
+info-log-max-size = "1KB"
+info-log-roll-time = "1s"
+info-log-keep-log-file-num = 1000
 info-log-dir = "/var"
 max-sub-compactions = 12
 writable-file-max-buffer-size = "12MB"
@@ -568,9 +567,7 @@ max-compactions = 3
 
 [raftdb.defaultcf.titan]
 min-blob-size = "2018B"
-blob-file-compression = "lz4"
-zstd-dict-size = "16KB"
-shared-blob-cache = false
+blob-file-compression = "zstd"
 blob-cache-size = "12GB"
 min-gc-batch-size = "12KB"
 max-gc-batch-size = "12MB"
@@ -659,7 +656,6 @@ old-value-cache-size = 0
 hibernate-regions-compatible = false
 incremental-scan-threads = 3
 incremental-scan-concurrency = 4
-incremental-scan-concurrency-limit = 5
 incremental-scan-speed-limit = 7
 incremental-fetch-speed-limit = 8
 incremental-scan-ts-filter-ratio = 0.7
@@ -685,4 +681,3 @@ split.split-contained-score = 0.5
 
 [resource-control]
 enabled = false
-priority-ctl-strategy = "aggressive"

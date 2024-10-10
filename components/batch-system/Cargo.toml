@@ -2,14 +2,14 @@
 name = "batch-system"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
 
 [features]
 default = ["test-runner"]
 test-runner = ["derive_more"]
 
 [dependencies]
-crossbeam = { workspace = true }
+collections = { workspace = true }
+crossbeam = "0.8"
 dashmap = "5.2"
 derive_more = { version = "0.99", optional = true }
 fail = "0.5"
@@ -20,6 +20,7 @@ online_config = { workspace = true }
 prometheus = { version = "0.13", default-features = false, features = ["nightly"] }
 resource_control = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
+serde_derive = "1.0"
 slog = { workspace = true }
 slog-global = { workspace = true }
 tikv_alloc = { workspace = true }

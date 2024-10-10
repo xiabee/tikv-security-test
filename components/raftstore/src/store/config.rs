@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::with_prefix;
 use tikv_util::{
     box_err,
-    config::{ReadableDuration, ReadableSchedule, ReadableSize, VersionTrack},
+    config::{ReadableDuration, ReadableSize, VersionTrack},
     error, info,
     sys::SysQuota,
     warn,
@@ -87,9 +87,6 @@ pub struct Config {
     // When the approximate size of raft log entries exceed this value,
     // gc will be forced trigger.
     pub raft_log_gc_size_limit: Option<ReadableSize>,
-    /// The maximum raft log numbers that applied_index can be ahead of
-    /// persisted_index.
-    pub max_apply_unpersisted_log_limit: u64,
     // follower will reject this follower request to avoid falling behind leader too far,
     // when the read index is ahead of the sum between the applied index and
     // follower_read_max_log_gap,
@@ -145,7 +142,6 @@ pub struct Config {
     pub region_compact_redundant_rows_percent: Option<u64>,
     pub pd_heartbeat_tick_interval: ReadableDuration,
     pub pd_store_heartbeat_tick_interval: ReadableDuration,
-    pub pd_report_min_resolved_ts_interval: ReadableDuration,
     pub snap_mgr_gc_tick_interval: ReadableDuration,
     pub snap_gc_timeout: ReadableDuration,
     /// The duration of snapshot waits for region split. It prevents leader from
@@ -154,15 +150,6 @@ pub struct Config {
     pub snap_wait_split_duration: ReadableDuration,
     pub lock_cf_compact_interval: ReadableDuration,
     pub lock_cf_compact_bytes_threshold: ReadableSize,
-
-    /// Hours of the day during which we may execute a periodic full compaction.
-    /// If not set or empty, periodic full compaction will not run. In toml this
-    /// should be a list of timesin "HH:MM" format with an optional timezone
-    /// offset. If no timezone is specified, local timezone is used. E.g.,
-    /// `["23:00 +0000", "03:00 +0700"]` or `["23:00", "03:00"]`.
-    pub periodic_full_compact_start_times: ReadableSchedule,
-    /// Do not start a full compaction if cpu utilization exceeds this number.
-    pub periodic_full_compact_start_max_cpu: f64,
 
     #[online_config(skip)]
     pub notify_capacity: usize,
@@ -303,7 +290,7 @@ pub struct Config {
     #[doc(hidden)]
     #[online_config(skip)]
     /// Disable this feature by set to 0, logic will be removed in other pr.
-    /// When TiKV memory usage is near `memory_usage_high_water` it will try to
+    /// When TiKV memory usage reaches `memory_usage_high_water` it will try to
     /// limit memory increasing. For raftstore layer entries will be evicted
     /// from entry cache, if they utilize memory more than
     /// `evict_cache_on_memory_ratio` * total.
@@ -326,19 +313,6 @@ pub struct Config {
     /// When the size of raft db writebatch exceeds this value, write will be
     /// triggered.
     pub raft_write_size_limit: ReadableSize,
-
-    /// When the size of raft db writebatch is smaller than this value, write
-    /// will wait for a while to make the writebatch larger, which will reduce
-    /// the write amplification.
-    #[doc(hidden)]
-    pub raft_write_batch_size_hint: ReadableSize,
-
-    /// When the size of raft db writebatch is smaller than this value, write
-    /// will wait for a while. This is used to reduce the write amplification.
-    /// It should be smaller than 1ms. Invalid to use too long duration because
-    /// it will make the write request wait too long.
-    #[doc(hidden)]
-    pub raft_write_wait_duration: ReadableDuration,
 
     pub waterfall_metrics: bool,
 
@@ -377,8 +351,9 @@ pub struct Config {
     pub slow_trend_unsensitive_cause: f64,
     // The unsensitive(increase it to reduce sensitiveness) of the result-trend detection
     pub slow_trend_unsensitive_result: f64,
-    // The sensitiveness of slowness on network-io.
-    pub slow_trend_network_io_factor: f64,
+
+    // Interval to report min resolved ts, if it is zero, it means disabled.
+    pub report_min_resolved_ts_interval: ReadableDuration,
 
     /// Interval to check whether to reactivate in-memory pessimistic lock after
     /// being disabled before transferring leader.
@@ -423,18 +398,6 @@ pub struct Config {
     #[online_config(hidden)]
     #[serde(alias = "enable-partitioned-raft-kv-compatible-learner")]
     pub enable_v2_compatible_learner: bool,
-
-    /// The minimal count of region pending on applying raft logs.
-    /// Only when the count of regions which not pending on applying logs is
-    /// less than the threshold, can the raftstore supply service.
-    #[doc(hidden)]
-    #[online_config(hidden)]
-    pub min_pending_apply_region_count: u64,
-
-    /// Whether to skip manual compaction in the clean up worker for `write` and
-    /// `default` column family
-    #[doc(hidden)]
-    pub skip_manual_compaction_in_clean_up_worker: bool,
 }
 
 impl Default for Config {
@@ -458,7 +421,6 @@ impl Default for Config {
             raft_log_gc_threshold: 50,
             raft_log_gc_count_limit: None,
             raft_log_gc_size_limit: None,
-            max_apply_unpersisted_log_limit: 1024,
             follower_read_max_log_gap: 100,
             raft_log_reserve_max_ticks: 6,
             raft_engine_purge_interval: ReadableDuration::secs(10),
@@ -475,12 +437,6 @@ impl Default for Config {
             region_compact_redundant_rows_percent: Some(20),
             pd_heartbeat_tick_interval: ReadableDuration::minutes(1),
             pd_store_heartbeat_tick_interval: ReadableDuration::secs(10),
-            pd_report_min_resolved_ts_interval: ReadableDuration::secs(1),
-            // Disable periodic full compaction by default.
-            periodic_full_compact_start_times: ReadableSchedule::default(),
-            // If periodic full compaction is enabled, do not start a full compaction
-            // if the CPU utilization is over 10%.
-            periodic_full_compact_start_max_cpu: 0.1,
             notify_capacity: 40960,
             snap_mgr_gc_tick_interval: ReadableDuration::minutes(1),
             snap_gc_timeout: ReadableDuration::hours(4),
@@ -517,7 +473,7 @@ impl Default for Config {
             local_read_batch_size: 1024,
             apply_batch_system: BatchSystemConfig::default(),
             store_batch_system: BatchSystemConfig::default(),
-            store_io_pool_size: 1,
+            store_io_pool_size: 0,
             store_io_notify_capacity: 40960,
             future_poll_size: 1,
             hibernate_regions: true,
@@ -529,8 +485,6 @@ impl Default for Config {
             cmd_batch: true,
             cmd_batch_concurrent_ready_max_count: 1,
             raft_write_size_limit: ReadableSize::mb(1),
-            raft_write_batch_size_hint: ReadableSize::kb(8),
-            raft_write_wait_duration: ReadableDuration::micros(20),
             waterfall_metrics: true,
             io_reschedule_concurrent_max_count: 4,
             io_reschedule_hotpot_duration: ReadableDuration::secs(5),
@@ -538,12 +492,12 @@ impl Default for Config {
             reactive_memory_lock_tick_interval: ReadableDuration::secs(2),
             reactive_memory_lock_timeout_tick: 5,
             check_long_uncommitted_interval: ReadableDuration::secs(10),
-            // In some cases, such as rolling upgrade, some regions' commit log
-            // duration can be 12 seconds. Before #13078 is merged,
-            // the commit log duration can be 2.8 minutes. So maybe
-            // 20s is a relatively reasonable base threshold. Generally,
-            // the log commit duration is less than 1s. Feel free to adjust
-            // this config :)
+            /// In some cases, such as rolling upgrade, some regions' commit log
+            /// duration can be 12 seconds. Before #13078 is merged,
+            /// the commit log duration can be 2.8 minutes. So maybe
+            /// 20s is a relatively reasonable base threshold. Generally,
+            /// the log commit duration is less than 1s. Feel free to adjust
+            /// this config :)
             long_uncommitted_base_threshold: ReadableDuration::secs(20),
             max_entry_cache_warmup_duration: ReadableDuration::secs(1),
 
@@ -561,7 +515,7 @@ impl Default for Config {
             // make it `10.0` to reduce a bit sensitiveness because SpikeFilter is disabled
             slow_trend_unsensitive_cause: 10.0,
             slow_trend_unsensitive_result: 0.5,
-            slow_trend_network_io_factor: 0.0,
+            report_min_resolved_ts_interval: ReadableDuration::secs(1),
             check_leader_lease_interval: ReadableDuration::secs(0),
             renew_leader_lease_advance_duration: ReadableDuration::secs(0),
             allow_unsafe_vote_after_start: false,
@@ -575,8 +529,6 @@ impl Default for Config {
             check_request_snapshot_interval: ReadableDuration::minutes(1),
             enable_v2_compatible_learner: false,
             unsafe_disable_check_quorum: false,
-            min_pending_apply_region_count: 10,
-            skip_manual_compaction_in_clean_up_worker: false,
         }
     }
 }
@@ -842,13 +794,6 @@ impl Config {
             return Err(box_err!("local-read-batch-size must be greater than 0"));
         }
 
-        if self.raft_write_wait_duration.as_micros() > 1000 {
-            return Err(box_err!(
-                "raft-write-wait-duration should be less than 1ms, current value is {}ms",
-                self.raft_write_wait_duration.as_millis()
-            ));
-        }
-
         // Since the following configuration supports online update, in order to
         // prevent mistakenly inputting too large values, the max limit is made
         // according to the cpu quota * 10. Notice 10 is only an estimate, not an
@@ -982,18 +927,6 @@ impl Config {
             ));
         }
 
-        if self.slow_trend_network_io_factor < 0.0 {
-            return Err(box_err!(
-                "slow_trend_network_io_factor must be greater than 0"
-            ));
-        }
-
-        if self.min_pending_apply_region_count == 0 {
-            return Err(box_err!(
-                "min_pending_apply_region_count must be greater than 0"
-            ));
-        }
-
         Ok(())
     }
 
@@ -1094,9 +1027,6 @@ impl Config {
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["pd_store_heartbeat_tick_interval"])
             .set(self.pd_store_heartbeat_tick_interval.as_secs_f64());
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["pd_report_min_resolved_ts_interval"])
-            .set(self.pd_report_min_resolved_ts_interval.as_secs_f64());
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["snap_mgr_gc_tick_interval"])
             .set(self.snap_mgr_gc_tick_interval.as_secs_f64());
@@ -1208,12 +1138,6 @@ impl Config {
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["raft_write_size_limit"])
             .set(self.raft_write_size_limit.0 as f64);
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["raft_write_batch_size_hint"])
-            .set(self.raft_write_batch_size_hint.0 as f64);
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["raft_write_wait_duration"])
-            .set(self.raft_write_wait_duration.as_micros() as f64);
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["waterfall_metrics"])
             .set((self.waterfall_metrics as i32).into());
@@ -1623,11 +1547,5 @@ mod tests {
             cfg.raft_log_gc_count_limit(),
             split_size * 3 / 4 / ReadableSize::kb(1)
         );
-
-        cfg = Config::new();
-        cfg.optimize_for(false);
-        cfg.raft_write_wait_duration = ReadableDuration::micros(1001);
-        cfg.validate(split_size, true, split_size / 20, false)
-            .unwrap_err();
     }
 }

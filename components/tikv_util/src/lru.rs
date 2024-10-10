@@ -317,7 +317,7 @@ where
                 if replace {
                     self.size_policy.on_remove(e.key(), &e.get().value);
                     self.size_policy.on_insert(e.key(), &value);
-                    let entry = e.get_mut();
+                    let mut entry = e.get_mut();
                     self.trace.promote(entry.record);
                     entry.value = value;
                 } else {
@@ -403,11 +403,6 @@ where
     #[inline]
     pub fn get_no_promote(&self, key: &K) -> Option<&V> {
         self.map.get(key).map(|v| &v.value)
-    }
-
-    #[inline]
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.get_no_promote(key).is_some()
     }
 
     #[inline]

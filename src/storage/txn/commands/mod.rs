@@ -14,12 +14,10 @@ pub(crate) mod commit;
 pub(crate) mod compare_and_swap;
 pub(crate) mod flashback_to_version;
 pub(crate) mod flashback_to_version_read_phase;
-pub(crate) mod flush;
 pub(crate) mod mvcc_by_key;
 pub(crate) mod mvcc_by_start_ts;
 pub(crate) mod pause;
 pub(crate) mod pessimistic_rollback;
-mod pessimistic_rollback_read_phase;
 pub(crate) mod prewrite;
 pub(crate) mod resolve_lock;
 pub(crate) mod resolve_lock_lite;
@@ -49,19 +47,17 @@ pub use flashback_to_version_read_phase::{
     new_flashback_rollback_lock_cmd, new_flashback_write_cmd, FlashbackToVersionReadPhase,
     FlashbackToVersionState,
 };
-pub use flush::Flush;
 use kvproto::kvrpcpb::*;
 pub use mvcc_by_key::MvccByKey;
 pub use mvcc_by_start_ts::MvccByStartTs;
 pub use pause::Pause;
 pub use pessimistic_rollback::PessimisticRollback;
-pub use pessimistic_rollback_read_phase::PessimisticRollbackReadPhase;
 pub use prewrite::{one_pc_commit, Prewrite, PrewritePessimistic};
 pub use resolve_lock::{ResolveLock, RESOLVE_LOCK_BATCH_SIZE};
 pub use resolve_lock_lite::ResolveLockLite;
 pub use resolve_lock_readphase::ResolveLockReadPhase;
 pub use rollback::Rollback;
-use tikv_util::{deadline::Deadline, memory::HeapSize};
+use tikv_util::deadline::Deadline;
 use tracker::RequestType;
 pub use txn_heart_beat::TxnHeartBeat;
 use txn_types::{Key, TimeStamp, Value, Write};
@@ -99,7 +95,6 @@ pub enum Command {
     Cleanup(Cleanup),
     Rollback(Rollback),
     PessimisticRollback(PessimisticRollback),
-    PessimisticRollbackReadPhase(PessimisticRollbackReadPhase),
     TxnHeartBeat(TxnHeartBeat),
     CheckTxnStatus(CheckTxnStatus),
     CheckSecondaryLocks(CheckSecondaryLocks),
@@ -113,7 +108,6 @@ pub enum Command {
     RawAtomicStore(RawAtomicStore),
     FlashbackToVersionReadPhase(FlashbackToVersionReadPhase),
     FlashbackToVersion(FlashbackToVersion),
-    Flush(Flush),
 }
 
 /// A `Command` with its return type, reified as the generic parameter `T`.
@@ -127,8 +121,7 @@ pub enum Command {
 /// 2. The `From<CommitRequest>` impl for `TypedCommand` gets chosen, and its
 /// generic parameter indicates that the result type for this instance of
 /// `TypedCommand` is going to be `TxnStatus` - one of the variants of the
-/// `StorageCallback` enum.
-/// 3. In the above `from` method, the details of the
+/// `StorageCallback` enum. 3. In the above `from` method, the details of the
 /// commit request are captured by creating an instance of the struct
 /// `storage::txn::commands::commit::Command` via its `new` method.
 /// 4. This struct is wrapped in a variant of the enum
@@ -281,26 +274,14 @@ impl From<BatchRollbackRequest> for TypedCommand<()> {
 
 impl From<PessimisticRollbackRequest> for TypedCommand<Vec<StorageResult<()>>> {
     fn from(mut req: PessimisticRollbackRequest) -> Self {
-        // If the keys are empty, try to scan locks with specified `start_ts` and
-        // `for_update_ts`, and then pass them to a new pessimitic rollback
-        // command to clean up, just like resolve lock with read phase.
-        if req.get_keys().is_empty() {
-            PessimisticRollbackReadPhase::new(
-                req.get_start_version().into(),
-                req.get_for_update_ts().into(),
-                None,
-                req.take_context(),
-            )
-        } else {
-            let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
-            PessimisticRollback::new(
-                keys,
-                req.get_start_version().into(),
-                req.get_for_update_ts().into(),
-                None,
-                req.take_context(),
-            )
-        }
+        let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
+
+        PessimisticRollback::new(
+            keys,
+            req.get_start_version().into(),
+            req.get_for_update_ts().into(),
+            req.take_context(),
+        )
     }
 }
 
@@ -310,7 +291,6 @@ impl From<TxnHeartBeatRequest> for TypedCommand<TxnStatus> {
             Key::from_raw(req.get_primary_lock()),
             req.get_start_version().into(),
             req.get_advise_lock_ttl(),
-            req.get_min_commit_ts(),
             req.take_context(),
         )
     }
@@ -413,20 +393,6 @@ impl From<FlashbackToVersionRequest> for TypedCommand<()> {
     }
 }
 
-impl From<FlushRequest> for TypedCommand<Vec<StorageResult<()>>> {
-    fn from(mut req: FlushRequest) -> Self {
-        Flush::new(
-            req.get_start_ts().into(),
-            req.take_primary_key(),
-            req.take_mutations().into_iter().map(Into::into).collect(),
-            req.get_generation(),
-            req.get_lock_ttl(),
-            req.get_assertion_level(),
-            req.take_context(),
-        )
-    }
-}
-
 /// Represents for a scheduler command, when should the response sent to the
 /// client. For most cases, the response should be sent after the result being
 /// successfully applied to the storage (if needed). But in some special cases,
@@ -464,35 +430,6 @@ pub struct WriteResult {
     pub known_txn_status: Vec<(TimeStamp, TimeStamp)>,
 }
 
-impl WriteResult {
-    pub fn new(
-        ctx: Context,
-        to_be_write: WriteData,
-        rows: usize,
-        pr: ProcessResult,
-        lock_info: Vec<WriteResultLockInfo>,
-        released_locks: ReleasedLocks,
-        new_acquired_locks: Vec<LockInfo>,
-        lock_guards: Vec<KeyHandleGuard>,
-        response_policy: ResponsePolicy,
-        known_txn_status: Vec<(TimeStamp, TimeStamp)>,
-    ) -> Self {
-        Self {
-            ctx,
-            to_be_write,
-            rows,
-            pr,
-            lock_info,
-            released_locks,
-            new_acquired_locks,
-            lock_guards,
-            response_policy,
-            known_txn_status,
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct WriteResultLockInfo {
     pub lock_digest: lock_manager::LockDigest,
     pub key: Key,
@@ -534,7 +471,7 @@ impl WriteResultLockInfo {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct ReleasedLocks(Vec<ReleasedLock>);
 
 impl ReleasedLocks {
@@ -641,9 +578,8 @@ pub struct WriteContext<'a, L: LockManager> {
     pub extra_op: ExtraOp,
     pub statistics: &'a mut Statistics,
     pub async_apply_prewrite: bool,
-    pub raw_ext: Option<RawExt>,
-    // use for apiv2
-    pub txn_status_cache: Arc<TxnStatusCache>,
+    pub raw_ext: Option<RawExt>, // use for apiv2
+    pub txn_status_cache: &'a TxnStatusCache,
 }
 
 pub struct ReaderWithStats<'a, S: Snapshot> {
@@ -690,7 +626,6 @@ impl Command {
             Command::Cleanup(t) => t,
             Command::Rollback(t) => t,
             Command::PessimisticRollback(t) => t,
-            Command::PessimisticRollbackReadPhase(t) => t,
             Command::TxnHeartBeat(t) => t,
             Command::CheckTxnStatus(t) => t,
             Command::CheckSecondaryLocks(t) => t,
@@ -704,7 +639,6 @@ impl Command {
             Command::RawAtomicStore(t) => t,
             Command::FlashbackToVersionReadPhase(t) => t,
             Command::FlashbackToVersion(t) => t,
-            Command::Flush(t) => t,
         }
     }
 
@@ -718,7 +652,6 @@ impl Command {
             Command::Cleanup(t) => t,
             Command::Rollback(t) => t,
             Command::PessimisticRollback(t) => t,
-            Command::PessimisticRollbackReadPhase(t) => t,
             Command::TxnHeartBeat(t) => t,
             Command::CheckTxnStatus(t) => t,
             Command::CheckSecondaryLocks(t) => t,
@@ -732,7 +665,6 @@ impl Command {
             Command::RawAtomicStore(t) => t,
             Command::FlashbackToVersionReadPhase(t) => t,
             Command::FlashbackToVersion(t) => t,
-            Command::Flush(t) => t,
         }
     }
 
@@ -743,7 +675,6 @@ impl Command {
     ) -> Result<ProcessResult> {
         match self {
             Command::ResolveLockReadPhase(t) => t.process_read(snapshot, statistics),
-            Command::PessimisticRollbackReadPhase(t) => t.process_read(snapshot, statistics),
             Command::MvccByKey(t) => t.process_read(snapshot, statistics),
             Command::MvccByStartTs(t) => t.process_read(snapshot, statistics),
             Command::FlashbackToVersionReadPhase(t) => t.process_read(snapshot, statistics),
@@ -774,7 +705,6 @@ impl Command {
             Command::RawCompareAndSwap(t) => t.process_write(snapshot, context),
             Command::RawAtomicStore(t) => t.process_write(snapshot, context),
             Command::FlashbackToVersion(t) => t.process_write(snapshot, context),
-            Command::Flush(t) => t.process_write(snapshot, context),
             _ => panic!("unsupported write command"),
         }
     }
@@ -857,37 +787,6 @@ impl Debug for Command {
     }
 }
 
-impl HeapSize for Command {
-    fn approximate_heap_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + match self {
-                Command::Prewrite(t) => t.approximate_heap_size(),
-                Command::PrewritePessimistic(t) => t.approximate_heap_size(),
-                Command::AcquirePessimisticLock(t) => t.approximate_heap_size(),
-                Command::AcquirePessimisticLockResumed(t) => t.approximate_heap_size(),
-                Command::Commit(t) => t.approximate_heap_size(),
-                Command::Cleanup(t) => t.approximate_heap_size(),
-                Command::Rollback(t) => t.approximate_heap_size(),
-                Command::PessimisticRollback(t) => t.approximate_heap_size(),
-                Command::PessimisticRollbackReadPhase(t) => t.approximate_heap_size(),
-                Command::TxnHeartBeat(t) => t.approximate_heap_size(),
-                Command::CheckTxnStatus(t) => t.approximate_heap_size(),
-                Command::CheckSecondaryLocks(t) => t.approximate_heap_size(),
-                Command::ResolveLockReadPhase(t) => t.approximate_heap_size(),
-                Command::ResolveLock(t) => t.approximate_heap_size(),
-                Command::ResolveLockLite(t) => t.approximate_heap_size(),
-                Command::Pause(t) => t.approximate_heap_size(),
-                Command::MvccByKey(t) => t.approximate_heap_size(),
-                Command::MvccByStartTs(t) => t.approximate_heap_size(),
-                Command::RawCompareAndSwap(t) => t.approximate_heap_size(),
-                Command::RawAtomicStore(t) => t.approximate_heap_size(),
-                Command::FlashbackToVersionReadPhase(t) => t.approximate_heap_size(),
-                Command::FlashbackToVersion(t) => t.approximate_heap_size(),
-                Command::Flush(t) => t.approximate_heap_size(),
-            }
-    }
-}
-
 /// Commands that do not need to modify the database during execution will
 /// implement this trait.
 pub trait ReadCommand<S: Snapshot>: CommandExt {
@@ -931,7 +830,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
-            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
         let ret = cmd.cmd.process_write(snap, context)?;
         let res = match ret.pr {
@@ -1092,7 +991,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
-            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
 
         let ret = cmd.cmd.process_write(snap, context)?;
@@ -1118,7 +1017,7 @@ pub mod test_util {
             statistics,
             async_apply_prewrite: false,
             raw_ext: None,
-            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            txn_status_cache: &TxnStatusCache::new_for_test(),
         };
 
         let ret = cmd.cmd.process_write(snap, context)?;

@@ -8,7 +8,6 @@
 #![feature(bound_map)]
 #![feature(min_specialization)]
 #![feature(type_alias_impl_trait)]
-#![feature(impl_trait_in_assoc_type)]
 #![feature(associated_type_defaults)]
 
 #[macro_use(fail_point)]
@@ -37,7 +36,7 @@ use std::{
 
 use collections::HashMap;
 use engine_traits::{
-    CfName, IterOptions, KvEngine as LocalEngine, MetricsExt, Mutable, MvccProperties, ReadOptions,
+    CfName, IterOptions, KvEngine as LocalEngine, Mutable, MvccProperties, ReadOptions,
     TabletRegistry, WriteBatch, CF_DEFAULT, CF_LOCK,
 };
 use error_code::{self, ErrorCode, ErrorCodeExt};
@@ -52,9 +51,7 @@ use kvproto::{
 use pd_client::BucketMeta;
 use raftstore::store::{PessimisticLockPair, TxnExt};
 use thiserror::Error;
-use tikv_util::{
-    deadline::Deadline, escape, future::block_on_timeout, memory::HeapSize, time::ThreadReadId,
-};
+use tikv_util::{deadline::Deadline, escape, future::block_on_timeout, time::ThreadReadId};
 use tracker::with_tls_tracker;
 use txn_types::{Key, PessimisticLock, TimeStamp, TxnExtra, Value};
 
@@ -65,8 +62,8 @@ pub use self::{
     raft_extension::{FakeExtension, RaftExtension},
     rocksdb_engine::{RocksEngine, RocksSnapshot},
     stats::{
-        CfStatistics, FlowStatistics, FlowStatsReporter, LoadDataHint, StageLatencyStats,
-        Statistics, StatisticsSummary, RAW_VALUE_TOMBSTONE,
+        CfStatistics, FlowStatistics, FlowStatsReporter, StageLatencyStats, Statistics,
+        StatisticsSummary, RAW_VALUE_TOMBSTONE,
     },
 };
 
@@ -86,20 +83,6 @@ pub enum Modify {
     // cf_name, start_key, end_key, notify_only
     DeleteRange(CfName, Key, Key, bool),
     Ingest(Box<SstMeta>),
-}
-
-impl HeapSize for Modify {
-    fn approximate_heap_size(&self) -> usize {
-        match self {
-            Modify::Delete(_, k) => k.approximate_heap_size(),
-            Modify::Put(_, k, v) => k.approximate_heap_size() + v.approximate_heap_size(),
-            Modify::PessimisticLock(k, _) => k.approximate_heap_size(),
-            Modify::DeleteRange(_, k1, k2, _) => {
-                k1.approximate_heap_size() + k2.approximate_heap_size()
-            }
-            Modify::Ingest(_) => 0,
-        }
-    }
 }
 
 impl Modify {
@@ -367,14 +350,6 @@ pub trait Engine: Send + Clone + 'static {
     /// future is polled or not.
     fn async_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::SnapshotRes;
 
-    type IMSnap: Snapshot;
-    type IMSnapshotRes: Future<Output = Result<Self::IMSnap>> + Send + 'static;
-    /// Get a snapshot asynchronously.
-    ///
-    /// Note the snapshot is queried immediately no matter whether the returned
-    /// future is polled or not.
-    fn async_in_memory_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::IMSnapshotRes;
-
     /// Precheck request which has write with it's context.
     fn precheck_write_with_ctx(&self, _ctx: &Context) -> Result<()> {
         Ok(())
@@ -540,20 +515,13 @@ pub trait SnapshotExt {
     fn get_buckets(&self) -> Option<Arc<BucketMeta>> {
         None
     }
-
-    /// Whether the snapshot acquired hit the cached range in the range cache
-    /// engine. It always returns false if the range cahce engine is not
-    /// enabled.
-    fn region_cache_engine_hit(&self) -> bool {
-        false
-    }
 }
 
 pub struct DummySnapshotExt;
 
 impl SnapshotExt for DummySnapshotExt {}
 
-pub trait Iterator: Send + MetricsExt {
+pub trait Iterator: Send {
     fn next(&mut self) -> Result<bool>;
     fn prev(&mut self) -> Result<bool>;
     fn seek(&mut self, key: &Key) -> Result<bool>;
@@ -585,7 +553,7 @@ pub enum ErrorInner {
     Request(ErrorHeader),
     #[error("timeout after {0:?}")]
     Timeout(Duration),
-    #[error("an empty request")]
+    #[error("an empty requets")]
     EmptyRequest,
     #[error("key is locked (backoff or cleanup) {0:?}")]
     KeyIsLocked(kvproto::kvrpcpb::LockInfo),
@@ -660,7 +628,7 @@ impl ErrorCodeExt for Error {
 
 thread_local! {
     // A pointer to thread local engine. Use raw pointer and `UnsafeCell` to reduce runtime check.
-    static TLS_ENGINE_ANY: UnsafeCell<*mut ()> = const { UnsafeCell::new(ptr::null_mut())};
+    static TLS_ENGINE_ANY: UnsafeCell<*mut ()> = UnsafeCell::new(ptr::null_mut());
 }
 
 /// Execute the closure on the thread local engine.
@@ -720,24 +688,6 @@ pub fn snapshot<E: Engine>(
 ) -> impl std::future::Future<Output = Result<E::Snap>> {
     let begin = Instant::now();
     let val = engine.async_snapshot(ctx);
-    // make engine not cross yield point
-    async move {
-        let result = val.await;
-        with_tls_tracker(|tracker| {
-            tracker.metrics.get_snapshot_nanos += begin.elapsed().as_nanos() as u64;
-        });
-        fail_point!("after-snapshot");
-        result
-    }
-}
-
-/// Get an in memory snapshot of `engine`.
-pub fn in_memory_snapshot<E: Engine>(
-    engine: &mut E,
-    ctx: SnapContext<'_>,
-) -> impl std::future::Future<Output = Result<E::IMSnap>> {
-    let begin = Instant::now();
-    let val = engine.async_in_memory_snapshot(ctx);
     // make engine not cross yield point
     async move {
         let result = val.await;

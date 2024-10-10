@@ -824,8 +824,8 @@ fn test_node_split_update_region_right_derive() {
     let new_leader = right
         .get_peers()
         .iter()
-        .find(|&p| p.get_id() != origin_leader.get_id())
         .cloned()
+        .find(|p| p.get_id() != origin_leader.get_id())
         .unwrap();
 
     // Make sure split is done in the new_leader.
@@ -896,8 +896,6 @@ fn test_split_with_epoch_not_match() {
 #[test_case(test_raftstore::new_server_cluster)]
 #[test_case(test_raftstore_v2::new_server_cluster)]
 fn test_split_with_in_memory_pessimistic_locks() {
-    let peer_size_limit = 512 << 10;
-    let instance_size_limit = 100 << 20;
     let mut cluster = new_cluster(0, 3);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -934,14 +932,10 @@ fn test_split_with_in_memory_pessimistic_locks() {
     {
         let mut locks = txn_ext.pessimistic_locks.write();
         locks
-            .insert(
-                vec![
-                    (Key::from_raw(b"a"), lock_a.clone()),
-                    (Key::from_raw(b"c"), lock_c.clone()),
-                ],
-                peer_size_limit,
-                instance_size_limit,
-            )
+            .insert(vec![
+                (Key::from_raw(b"a"), lock_a.clone()),
+                (Key::from_raw(b"c"), lock_c.clone()),
+            ])
             .unwrap();
     }
 
@@ -1174,9 +1168,6 @@ fn test_gen_split_check_bucket_ranges() {
     cluster.cfg.coprocessor.enable_region_bucket = Some(true);
     // disable report buckets; as it will reset the user traffic stats to randomize
     // the test result
-    cluster.cfg.raft_store.check_leader_lease_interval = ReadableDuration::secs(5);
-    // Make merge check resume quickly.
-    cluster.cfg.raft_store.merge_check_tick_interval = ReadableDuration::millis(100);
     cluster.run();
     let pd_client = Arc::clone(&cluster.pd_client);
 
@@ -1196,7 +1187,6 @@ fn test_gen_split_check_bucket_ranges() {
         .insert(0, region.get_start_key().to_vec());
     expected_buckets.keys.push(region.get_end_key().to_vec());
     let buckets = vec![bucket];
-
     // initialize fsm.peer.bucket_regions
     cluster.refresh_region_bucket_keys(
         &region,

@@ -5,7 +5,6 @@ use std::{cmp, sync::Arc};
 use collections::{HashMap, HashSet};
 use engine_traits::{KvEngine, RaftEngine};
 use fail::fail_point;
-use health_controller::types::LatencyInspector;
 use kvproto::pdpb;
 use pd_client::{
     metrics::{
@@ -16,14 +15,13 @@ use pd_client::{
 };
 use prometheus::local::LocalHistogram;
 use raftstore::store::{
-    metrics::STORE_SNAPSHOT_TRAFFIC_GAUGE_VEC, UnsafeRecoveryExecutePlanSyncer,
-    UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryHandle,
+    metrics::STORE_SNAPSHOT_TRAFFIC_GAUGE_VEC, util::LatencyInspector,
+    UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryHandle,
 };
 use slog::{error, info, warn};
 use tikv_util::{
     metrics::RecordPairVec,
     store::QueryStats,
-    sys::disk::get_disk_space_stats,
     time::{Duration, Instant as TiInstant, UnixSecs},
     topn::TopN,
 };
@@ -443,8 +441,7 @@ where
 
     /// Returns (capacity, used, available).
     fn collect_engine_size(&self) -> Option<(u64, u64, u64)> {
-        let (disk_cap, disk_avail) = match get_disk_space_stats(self.tablet_registry.tablet_root())
-        {
+        let disk_stats = match fs2::statvfs(self.tablet_registry.tablet_root()) {
             Err(e) => {
                 error!(
                     self.logger,
@@ -454,8 +451,9 @@ where
                 );
                 return None;
             }
-            Ok((total_size, available_size)) => (total_size, available_size),
+            Ok(stats) => stats,
         };
+        let disk_cap = disk_stats.total_space();
         let capacity = if self.cfg.value().capacity.0 == 0 {
             disk_cap
         } else {
@@ -482,7 +480,7 @@ where
         let mut available = capacity.checked_sub(used_size).unwrap_or_default();
         // We only care about rocksdb SST file size, so we should check disk available
         // here.
-        available = cmp::min(available, disk_avail);
+        available = cmp::min(available, disk_stats.available_space());
         Some((capacity, used_size, available))
     }
 }

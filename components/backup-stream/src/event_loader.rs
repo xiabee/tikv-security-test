@@ -22,8 +22,6 @@ use tikv_util::{
     worker::Scheduler,
 };
 use tokio::sync::Semaphore;
-use tracing::instrument;
-use tracing_active_tree::frame;
 use txn_types::{Key, Lock, TimeStamp};
 
 use crate::{
@@ -36,10 +34,6 @@ use crate::{
 };
 
 const MAX_GET_SNAPSHOT_RETRY: usize = 5;
-/// The threshold of slowing down initial scanning.
-/// While the memory usage reaches this ratio, we will consume the result of
-/// initial scanning more frequently.
-const SLOW_DOWN_INITIAL_SCAN_RATIO: f64 = 0.7;
 
 struct ScanResult {
     more: bool,
@@ -51,7 +45,6 @@ struct ScanResult {
 pub struct EventLoader<S: Snapshot> {
     scanner: DeltaScanner<S>,
     // pooling the memory.
-    region: Region,
     entry_batch: Vec<TxnEntry>,
 }
 
@@ -81,7 +74,6 @@ impl<S: Snapshot> EventLoader<S> {
 
         Ok(Self {
             scanner,
-            region: region.clone(),
             entry_batch: Vec::with_capacity(ENTRY_BATCH_SIZE),
         })
     }
@@ -116,9 +108,7 @@ impl<S: Snapshot> EventLoader<S> {
                 Some(entry) => {
                     let size = entry.size();
                     batch.push(entry);
-                    if memory_quota.alloc(size).is_err()
-                        || memory_quota.source().used_ratio() > SLOW_DOWN_INITIAL_SCAN_RATIO
-                    {
+                    if memory_quota.alloc(size).is_err() {
                         return Ok(self.out_of_memory());
                     }
                 }
@@ -159,11 +149,7 @@ impl<S: Snapshot> EventLoader<S> {
                     })?;
                     debug!("meet lock during initial scanning."; "key" => %utils::redact(&lock_at), "ts" => %lock.ts);
                     if utils::should_track_lock(&lock) {
-                        resolver
-                            .track_phase_one_lock(lock.ts, lock_at, lock.generation)
-                            .map_err(|_| Error::OutOfQuota {
-                                region_id: self.region.id,
-                            })?;
+                        resolver.track_phase_one_lock(lock.ts, lock_at);
                     }
                 }
                 TxnEntry::Commit { default, write, .. } => {
@@ -238,7 +224,6 @@ where
         }
     }
 
-    #[instrument(skip_all)]
     pub async fn capture_change(
         &self,
         region: &Region,
@@ -291,7 +276,6 @@ where
         Ok(snap)
     }
 
-    #[instrument(skip_all)]
     pub async fn observe_over_with_retry(
         &self,
         region: &Region,
@@ -389,7 +373,6 @@ where
         f(v.value_mut().resolver())
     }
 
-    #[instrument(skip_all)]
     async fn scan_and_async_send(
         &self,
         region: &Region,
@@ -447,7 +430,6 @@ where
         }
     }
 
-    #[instrument(skip_all)]
     pub async fn do_initial_scan(
         &self,
         region: &Region,
@@ -456,12 +438,16 @@ where
         start_ts: TimeStamp,
         snap: impl Snapshot,
     ) -> Result<Statistics> {
+        let tr = self.tracing.clone();
+        let region_id = region.get_id();
+
         let mut join_handles = Vec::with_capacity(8);
 
-        let permit = frame!(self.concurrency_limit.acquire())
+        let permit = self
+            .concurrency_limit
+            .acquire()
             .await
             .expect("BUG: semaphore closed");
-
         // It is ok to sink more data than needed. So scan to +inf TS for convenance.
         let event_loader = EventLoader::load_from(snap, start_ts, TimeStamp::max(), region)?;
         let stats = self
@@ -469,9 +455,18 @@ where
             .await?;
         drop(permit);
 
-        frame!(futures::future::try_join_all(join_handles))
+        futures::future::try_join_all(join_handles)
             .await
             .map_err(|err| annotate!(err, "tokio runtime failed to join consuming threads"))?;
+
+        Self::with_resolver_by(&tr, region, &handle, |r| {
+            r.phase_one_done();
+            Ok(())
+        })
+        .context(format_args!(
+            "failed to finish phase 1 for region {:?}",
+            region_id
+        ))?;
 
         Ok(stats)
     }
@@ -483,10 +478,7 @@ mod tests {
 
     use futures::executor::block_on;
     use kvproto::metapb::*;
-    use tikv::storage::{
-        txn::{tests::*, txn_status_cache::TxnStatusCache},
-        TestEngineBuilder,
-    };
+    use tikv::storage::{txn::tests::*, TestEngineBuilder};
     use tikv_kv::SnapContext;
     use tikv_util::memory::{MemoryQuota, OwnedAllocated};
     use txn_types::TimeStamp;
@@ -527,7 +519,7 @@ mod tests {
         });
         r.unwrap();
         let mut events = ApplyEvents::with_capacity(1024, 42);
-        let mut res = TwoPhaseResolver::new(42, None, Arc::new(TxnStatusCache::new_for_test()));
+        let mut res = TwoPhaseResolver::new(42, None);
         loader.emit_entries_to(&mut events, &mut res).unwrap();
         assert_ne!(events.len(), 0);
         assert_ne!(data_load, 0);

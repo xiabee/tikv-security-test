@@ -4,14 +4,12 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Write},
-    str::FromStr,
     sync::{Arc, Mutex},
 };
 
 use online_config::{ConfigChange, OnlineConfig};
 use raftstore::store::Config as RaftstoreConfig;
 use tikv::config::*;
-use tikv_util::config::{ReadableOffsetTime, ReadableSchedule, ReadableSize};
 
 fn change(name: &str, value: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
@@ -26,63 +24,11 @@ fn test_update_config() {
     let cfg_controller = ConfigController::new(cfg);
     let mut cfg = cfg_controller.get_current();
 
-    cfg_controller
-        .update(change(
-            "raftstore.periodic-full-compact-start-times",
-            "[\"12:00 +0800\",\"14:00 +0800\"]",
-        ))
-        .unwrap();
-    cfg.raft_store.periodic_full_compact_start_times = ReadableSchedule(vec![
-        ReadableOffsetTime::from_str("12:00 +0800").unwrap(),
-        ReadableOffsetTime::from_str("14:00 +0800").unwrap(),
-    ]);
-    assert_eq!(cfg_controller.get_current(), cfg);
-
-    cfg_controller
-        .update(change(
-            "raftstore.periodic-full-compact-start-times",
-            "[\"12:00\",\"14:00\"]",
-        ))
-        .unwrap();
-    cfg.raft_store.periodic_full_compact_start_times = ReadableSchedule(vec![
-        ReadableOffsetTime::from_str("12:00").unwrap(),
-        ReadableOffsetTime::from_str("14:00").unwrap(),
-    ]);
-
     // normal update
     cfg_controller
         .update(change("raftstore.raft-log-gc-threshold", "2000"))
         .unwrap();
     cfg.raft_store.raft_log_gc_threshold = 2000;
-    assert_eq!(cfg_controller.get_current(), cfg);
-
-    let mut in_memory_engine_config_change = HashMap::new();
-    in_memory_engine_config_change.insert("in_memory_engine.enabled".to_owned(), "true".to_owned());
-    in_memory_engine_config_change.insert(
-        "in_memory_engine.stop-load-limit-threshold".to_owned(),
-        "8GB".to_owned(),
-    );
-    in_memory_engine_config_change.insert(
-        "in_memory_engine.soft-limit-threshold".to_owned(),
-        "10GB".to_owned(),
-    );
-    in_memory_engine_config_change.insert(
-        "in_memory_engine.hard-limit-threshold".to_owned(),
-        "15GB".to_owned(),
-    );
-    cfg_controller
-        .update(in_memory_engine_config_change)
-        .unwrap();
-    cfg.in_memory_engine.enabled = true;
-    cfg.in_memory_engine.stop_load_limit_threshold = Some(ReadableSize::gb(8));
-    cfg.in_memory_engine.soft_limit_threshold = Some(ReadableSize::gb(10));
-    cfg.in_memory_engine.hard_limit_threshold = Some(ReadableSize::gb(15));
-    assert_eq!(cfg_controller.get_current(), cfg);
-
-    cfg_controller
-        .update(change("in_memory_engine.soft-limit-threshold", "11GB"))
-        .unwrap();
-    cfg.in_memory_engine.soft_limit_threshold = Some(ReadableSize::gb(11));
     assert_eq!(cfg_controller.get_current(), cfg);
 
     // update not support config

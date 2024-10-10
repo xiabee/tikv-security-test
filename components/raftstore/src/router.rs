@@ -92,10 +92,7 @@ where
     /// Report a `StoreResolved` event to all Raft groups.
     fn report_resolved(&self, store_id: u64, group_id: u64) {
         self.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(Box::new(SignificantMsg::StoreResolved {
-                store_id,
-                group_id,
-            }))
+            PeerMsg::SignificantMsg(SignificantMsg::StoreResolved { store_id, group_id })
         })
     }
 }
@@ -118,24 +115,13 @@ where
         .map_err(|e| handle_send_error(region_id, e))
 }
 
-pub struct ReadContext {
-    pub(crate) read_id: Option<ThreadReadId>,
-    pub(crate) read_ts: Option<u64>,
-}
-
-impl ReadContext {
-    pub fn new(read_id: Option<ThreadReadId>, read_ts: Option<u64>) -> Self {
-        ReadContext { read_id, read_ts }
-    }
-}
-
 pub trait LocalReadRouter<EK>: Send + Clone
 where
     EK: KvEngine,
 {
     fn read(
         &mut self,
-        ctx: ReadContext,
+        read_id: Option<ThreadReadId>,
         req: RaftCmdRequest,
         cb: Callback<EK::Snapshot>,
     ) -> RaftStoreResult<()>;
@@ -265,11 +251,11 @@ impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for ServerRaftStoreRouter
 impl<EK: KvEngine, ER: RaftEngine> LocalReadRouter<EK> for ServerRaftStoreRouter<EK, ER> {
     fn read(
         &mut self,
-        ctx: ReadContext,
+        read_id: Option<ThreadReadId>,
         req: RaftCmdRequest,
         cb: Callback<EK::Snapshot>,
     ) -> RaftStoreResult<()> {
-        self.local_reader.read(ctx, req, cb);
+        self.local_reader.read(read_id, req, cb);
         Ok(())
     }
 

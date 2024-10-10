@@ -42,28 +42,6 @@ pub fn prewrite<S: Snapshot>(
     pessimistic_action: PrewriteRequestPessimisticAction,
     expected_for_update_ts: Option<TimeStamp>,
 ) -> Result<(TimeStamp, OldValue)> {
-    prewrite_with_generation(
-        txn,
-        reader,
-        txn_props,
-        mutation,
-        secondary_keys,
-        pessimistic_action,
-        expected_for_update_ts,
-        0,
-    )
-}
-
-pub fn prewrite_with_generation<S: Snapshot>(
-    txn: &mut MvccTxn,
-    reader: &mut SnapshotReader<S>,
-    txn_props: &TransactionProperties<'_>,
-    mutation: Mutation,
-    secondary_keys: &Option<Vec<Vec<u8>>>,
-    pessimistic_action: PrewriteRequestPessimisticAction,
-    expected_for_update_ts: Option<TimeStamp>,
-    generation: u64,
-) -> Result<(TimeStamp, OldValue)> {
     let mut mutation =
         PrewriteMutation::from_mutation(mutation, secondary_keys, pessimistic_action, txn_props)?;
 
@@ -90,13 +68,8 @@ pub fn prewrite_with_generation<S: Snapshot>(
     let mut lock_amended = false;
 
     let lock_status = match reader.load_lock(&mutation.key)? {
-        Some(lock) => {
-            mutation.check_lock(lock, pessimistic_action, expected_for_update_ts, generation)?
-        }
+        Some(lock) => mutation.check_lock(lock, pessimistic_action, expected_for_update_ts)?,
         None if matches!(pessimistic_action, DoPessimisticCheck) => {
-            // pipelined DML can't go into this. Otherwise, assertions may need to be
-            // skipped for non-first flushes.
-            assert_eq!(generation, 0);
             amend_pessimistic_lock(&mut mutation, reader)?;
             lock_amended = true;
             LockStatus::None
@@ -104,12 +77,8 @@ pub fn prewrite_with_generation<S: Snapshot>(
         None => LockStatus::None,
     };
 
-    // a key can be flushed multiple times. We cannot skip the prewrite if it is
-    // already locked.
-    if generation == 0 {
-        if let LockStatus::Locked(ts) = lock_status {
-            return Ok((ts, OldValue::Unspecified));
-        }
+    if let LockStatus::Locked(ts) = lock_status {
+        return Ok((ts, OldValue::Unspecified));
     }
 
     // Note that the `prev_write` may have invalid GC fence.
@@ -128,14 +97,7 @@ pub fn prewrite_with_generation<S: Snapshot>(
     //   assertion here introduces too much overhead. However, we'll do it anyway if
     //   `assertion_level` is set to `Strict` level.
     // Assertion level will be checked within the `check_assertion` function.
-    //
-    // By design, each key can be asserted only once in a transaction. For
-    // pipelined-DML, a key may be flushed multiple times. Once a mutation with an
-    // assertion is flushed and dropped from client buffer, the following execution
-    // can set a different assertion for the same key. We only check the first
-    // assertion here, ignoring the rest.
-    let is_subsequent_flush = generation > 0 && matches!(lock_status, LockStatus::Locked(_));
-    if !lock_amended && !is_subsequent_flush {
+    if !lock_amended {
         let (reloaded_prev_write, reloaded) =
             mutation.check_assertion(reader, &prev_write, prev_write_loaded)?;
         if reloaded {
@@ -198,7 +160,7 @@ pub fn prewrite_with_generation<S: Snapshot>(
 
     let is_new_lock = !matches!(pessimistic_action, DoPessimisticCheck) || lock_amended;
 
-    let final_min_commit_ts = mutation.write_lock(lock_status, txn, is_new_lock, generation)?;
+    let final_min_commit_ts = mutation.write_lock(lock_status, txn, is_new_lock)?;
 
     fail_point!("after_prewrite_one_key");
 
@@ -354,7 +316,6 @@ impl<'a> PrewriteMutation<'a> {
         lock: Lock,
         pessimistic_action: PrewriteRequestPessimisticAction,
         expected_for_update_ts: Option<TimeStamp>,
-        generation_to_write: u64,
     ) -> Result<LockStatus> {
         if lock.ts != self.txn_props.start_ts {
             // Abort on lock belonging to other transaction if
@@ -390,9 +351,7 @@ impl<'a> PrewriteMutation<'a> {
                 .into());
             }
 
-            if let Some(ts) = expected_for_update_ts
-                && lock.for_update_ts != ts
-            {
+            if let Some(ts) = expected_for_update_ts && lock.for_update_ts != ts {
                 // The constraint on for_update_ts of the pessimistic lock is violated.
                 // Consider the following case:
                 //
@@ -403,8 +362,8 @@ impl<'a> PrewriteMutation<'a> {
                 //    pessimistic lock.
                 // 3. Another transaction `T2` writes the key and committed.
                 // 4. The key then receives a stale pessimistic lock request of `T1` that has
-                //    been received in step 1 (maybe because of retrying due to network issue in
-                //    step 1). Since it allows locking with conflict, though there's a newer
+                //    been received in step 1 (maybe because of retrying due to network issue
+                //    in step 1). Since it allows locking with conflict, though there's a newer
                 //    version that's later than the request's `for_update_ts`, the request can
                 //    still acquire the lock. However no one will check the response, which
                 //    tells the latest commit_ts it met.
@@ -445,26 +404,6 @@ impl<'a> PrewriteMutation<'a> {
             self.min_commit_ts = std::cmp::max(self.min_commit_ts, lock.min_commit_ts);
 
             return Ok(LockStatus::Pessimistic(lock.for_update_ts));
-        }
-
-        if generation_to_write > 0 && lock.generation >= generation_to_write {
-            return Err(ErrorInner::GenerationOutOfOrder(
-                generation_to_write,
-                self.key.clone(),
-                lock,
-            )
-            .into());
-        }
-
-        // A key can be flushed multiple times for a Pipelined-DML transaction.
-        // A latter flush with `should_not_exist` should return error if a previous
-        // flush of the key writes a value
-        if lock.generation > 0 && self.should_not_exist && matches!(lock.lock_type, LockType::Put) {
-            return Err(ErrorInner::AlreadyExist {
-                key: self.key.to_raw()?,
-                existing_start_ts: lock.ts,
-            }
-            .into());
         }
 
         // Duplicated command. No need to overwrite the lock and data.
@@ -569,7 +508,6 @@ impl<'a> PrewriteMutation<'a> {
         lock_status: LockStatus,
         txn: &mut MvccTxn,
         is_new_lock: bool,
-        generation: u64,
     ) -> Result<TimeStamp> {
         let mut try_one_pc = self.try_one_pc();
 
@@ -591,8 +529,7 @@ impl<'a> PrewriteMutation<'a> {
             self.min_commit_ts,
             false,
         )
-        .set_txn_source(self.txn_props.txn_source)
-        .with_generation(generation);
+        .set_txn_source(self.txn_props.txn_source);
         // Only Lock needs to record `last_change_ts` in its write record, Put or Delete
         // records themselves are effective changes.
         if tls_can_enable(LAST_CHANGE_TS) && self.lock_type == Some(LockType::Lock) {
@@ -829,6 +766,7 @@ fn async_commit_timestamps(
         #[cfg(not(feature = "failpoints"))]
         let injected_fallback = false;
 
+        let max_commit_ts = max_commit_ts;
         if (!max_commit_ts.is_zero() && min_commit_ts > max_commit_ts) || injected_fallback {
             warn!("commit_ts is too large, fallback to normal 2PC";
                 "key" => log_wrappers::Value::key(key.as_encoded()),
@@ -1937,6 +1875,7 @@ pub mod tests {
             // At most 12 ops per-case.
             let ops_count = rg.gen::<u8>() % 12;
             let ops = (0..ops_count)
+                .into_iter()
                 .enumerate()
                 .map(|(i, _)| {
                     if i == 0 {

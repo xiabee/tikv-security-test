@@ -173,10 +173,6 @@ pub struct Config {
     #[serde(alias = "snap-max-write-bytes-per-sec")]
     pub snap_io_max_bytes_per_sec: ReadableSize,
     pub snap_max_total_size: ReadableSize,
-    /// Minimal size of snapshot for applying with ingestion.
-    /// If the size of snapshot is smaller than this value, it will be applied
-    /// without ingestion, just bulk write kvs to kvdb.
-    pub snap_min_ingest_size: ReadableSize,
     #[online_config(skip)]
     pub stats_concurrency: usize,
     #[online_config(skip)]
@@ -211,12 +207,6 @@ pub struct Config {
     // whether to compact metrics or not.
     #[doc(hidden)]
     pub simplify_metrics: bool,
-
-    #[doc(hidden)]
-    #[online_config(skip)]
-    /// Minimum interval to send health feedback information in each
-    /// `BatchCommands` gRPC stream. 0 to disable sending health feedback.
-    pub health_feedback_interval: ReadableDuration,
 
     // Server labels to specify some attributes about this server.
     #[online_config(skip)]
@@ -288,7 +278,6 @@ impl Default for Config {
             end_point_memory_quota: *DEFAULT_ENDPOINT_MEMORY_QUOTA,
             snap_io_max_bytes_per_sec: ReadableSize(DEFAULT_SNAP_MAX_BYTES_PER_SEC),
             snap_max_total_size: ReadableSize(0),
-            snap_min_ingest_size: ReadableSize::mb(2),
             stats_concurrency: 1,
             // 75 means a gRPC thread is under heavy load if its total CPU usage
             // is greater than 75%.
@@ -301,7 +290,6 @@ impl Default for Config {
             // Go tikv client uses 4 as well.
             forward_max_connections_per_address: 4,
             simplify_metrics: false,
-            health_feedback_interval: ReadableDuration::secs(1),
         }
     }
 }

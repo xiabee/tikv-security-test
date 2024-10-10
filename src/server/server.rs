@@ -11,8 +11,7 @@ use std::{
 use api_version::KvFormat;
 use futures::{compat::Stream01CompatExt, stream::StreamExt};
 use grpcio::{ChannelBuilder, Environment, ResourceQuota, Server as GrpcServer, ServerBuilder};
-use grpcio_health::{create_health, HealthService};
-use health_controller::HealthController;
+use grpcio_health::{create_health, HealthService, ServingStatus};
 use kvproto::tikvpb::*;
 use raftstore::store::{CheckLeaderTask, SnapManager, TabletSnapManager};
 use resource_control::ResourceGroupManager;
@@ -138,7 +137,7 @@ pub struct Server<S: StoreAddrResolver + 'static, E: Engine> {
     grpc_thread_load: Arc<ThreadLoadPool>,
     yatp_read_pool: Option<ReadPool>,
     debug_thread_pool: Arc<Runtime>,
-    health_controller: HealthController,
+    health_service: HealthService,
     timer: Handle,
     builder_factory: Box<dyn GrpcBuilderFactory>,
 }
@@ -164,7 +163,7 @@ where
         env: Arc<Environment>,
         yatp_read_pool: Option<ReadPool>,
         debug_thread_pool: Arc<Runtime>,
-        health_controller: HealthController,
+        health_service: HealthService,
         resource_manager: Option<Arc<ResourceGroupManager>>,
     ) -> Result<Self> {
         // A helper thread (or pool) for transport layer.
@@ -188,15 +187,8 @@ where
         let lazy_worker = snap_worker.lazy_build("snap-handler");
         let raft_ext = storage.get_engine().raft_extension();
 
-        let health_feedback_interval = if cfg.value().health_feedback_interval.0.is_zero() {
-            None
-        } else {
-            Some(cfg.value().health_feedback_interval.0)
-        };
-
         let proxy = Proxy::new(security_mgr.clone(), &env, Arc::new(cfg.value().clone()));
         let kv_service = KvService::new(
-            cfg.value().cluster_id,
             store_id,
             storage,
             gc_worker,
@@ -209,14 +201,12 @@ where
             proxy,
             cfg.value().reject_messages_on_memory_ratio,
             resource_manager,
-            health_controller.clone(),
-            health_feedback_interval,
         );
         let builder_factory = Box::new(BuilderFactory::new(
             kv_service,
             cfg.clone(),
             security_mgr.clone(),
-            health_controller.get_grpc_health_service(),
+            health_service.clone(),
         ));
 
         let addr = SocketAddr::from_str(&cfg.value().addr)?;
@@ -236,6 +226,7 @@ where
         let raft_client = RaftClient::new(store_id, conn_builder);
 
         let trans = ServerTransport::new(raft_client);
+        health_service.set_serving_status("", ServingStatus::NotServing);
 
         let svr = Server {
             env: Arc::clone(&env),
@@ -250,7 +241,7 @@ where
             grpc_thread_load,
             yatp_read_pool,
             debug_thread_pool,
-            health_controller,
+            health_service,
             timer: GLOBAL_TIMER_HANDLE.clone(),
             builder_factory,
         };
@@ -311,7 +302,8 @@ where
         let mut grpc_server = self.builder_or_server.take().unwrap().right().unwrap();
         grpc_server.start();
         self.builder_or_server = Some(Either::Right(grpc_server));
-        self.health_controller.set_is_serving(true);
+        self.health_service
+            .set_serving_status("", ServingStatus::Serving);
     }
 
     /// Starts the TiKV server.
@@ -401,7 +393,7 @@ where
             pool.shutdown_background();
         }
         let _ = self.yatp_read_pool.take();
-        self.health_controller.shutdown();
+        self.health_service.shutdown();
         Ok(())
     }
 
@@ -413,7 +405,8 @@ where
         if let Some(Either::Right(server)) = self.builder_or_server.take() {
             drop(server);
         }
-        self.health_controller.set_is_serving(false);
+        self.health_service
+            .set_serving_status("", ServingStatus::NotServing);
         self.builder_or_server = Some(builder);
         info!("paused the grpc server"; "takes" => ?start.elapsed(),);
         Ok(())
@@ -481,18 +474,14 @@ pub mod test_router {
             cmd: RaftCommand<RocksSnapshot>,
         ) -> std::result::Result<(), crossbeam::channel::TrySendError<RaftCommand<RocksSnapshot>>>
         {
-            let _ = self
-                .tx
-                .send(Either::Left(PeerMsg::RaftCommand(Box::new(cmd))));
+            let _ = self.tx.send(Either::Left(PeerMsg::RaftCommand(cmd)));
             Ok(())
         }
     }
 
     impl CasualRouter<RocksEngine> for TestRaftStoreRouter {
         fn send(&self, _: u64, msg: CasualMessage<RocksEngine>) -> RaftStoreResult<()> {
-            let _ = self
-                .tx
-                .send(Either::Left(PeerMsg::CasualMessage(Box::new(msg))));
+            let _ = self.tx.send(Either::Left(PeerMsg::CasualMessage(msg)));
             Ok(())
         }
     }
@@ -511,7 +500,7 @@ pub mod test_router {
     impl RaftStoreRouter<RocksEngine> for TestRaftStoreRouter {
         fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()> {
             let _ = self.tx.send(Either::Left(PeerMsg::RaftMessage(
-                Box::new(InspectedRaftMessage { heap_size: 0, msg }),
+                InspectedRaftMessage { heap_size: 0, msg },
                 Some(TiInstant::now()),
             )));
             Ok(())
@@ -680,7 +669,7 @@ mod tests {
             env,
             None,
             debug_thread_pool,
-            HealthController::new(),
+            HealthService::default(),
             None,
         )
         .unwrap();

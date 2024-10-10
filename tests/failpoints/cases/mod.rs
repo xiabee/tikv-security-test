@@ -28,7 +28,6 @@ mod test_pd_client_legacy;
 mod test_pending_peers;
 mod test_rawkv;
 mod test_read_execution_tracker;
-mod test_region_cache_engine;
 mod test_replica_read;
 mod test_replica_stale_read;
 mod test_server;

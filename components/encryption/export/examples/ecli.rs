@@ -4,10 +4,10 @@ use std::io::{Read, Write};
 
 use azure::STORAGE_VENDOR_NAME_AZURE;
 pub use cloud::kms::Config as CloudConfig;
-use encryption::{GcpConfig, KmsBackend};
-use encryption_export::{create_cloud_backend, AzureConfig, Backend, Error, KmsConfig, Result};
+#[cfg(feature = "cloud-aws")]
+use encryption_export::{create_cloud_backend, KmsConfig};
+use encryption_export::{AzureConfig, Backend, Error, Result};
 use file_system::{File, OpenOptions};
-use gcp::STORAGE_VENDOR_NAME_GCP;
 use ini::ini::Ini;
 use kvproto::encryptionpb::EncryptedContent;
 use protobuf::Message;
@@ -48,7 +48,6 @@ pub struct Opt {
 enum Command {
     Aws(SubCommandAws),
     Azure(SubCommandAzure),
-    Gcp(SubCommandGcp),
 }
 
 #[derive(StructOpt)]
@@ -87,19 +86,10 @@ struct SubCommandAzure {
     secret: Option<String>,
 }
 
-#[derive(StructOpt)]
-#[structopt(rename_all = "kebab-case")]
-/// KMS backend.
-struct SubCommandGcp {
-    /// KMS key id of backend.
-    #[structopt(long)]
-    key_id: String,
-}
-
 fn create_aws_backend(
     cmd: &SubCommandAws,
     credential_file: Option<&String>,
-) -> Result<Box<KmsBackend>> {
+) -> Result<Box<dyn Backend>> {
     let mut config = KmsConfig::default();
 
     if let Some(credential_file) = credential_file {
@@ -122,7 +112,7 @@ fn create_aws_backend(
 fn create_azure_backend(
     cmd: &SubCommandAzure,
     credential_file: Option<&String>,
-) -> Result<Box<KmsBackend>> {
+) -> Result<Box<dyn Backend>> {
     let mut config = KmsConfig::default();
 
     config.vendor = STORAGE_VENDOR_NAME_AZURE.to_owned();
@@ -143,20 +133,6 @@ fn create_azure_backend(
     create_cloud_backend(&config)
 }
 
-fn create_gcp_backend(
-    cmd: &SubCommandGcp,
-    credential_file: Option<&String>,
-) -> Result<Box<KmsBackend>> {
-    let mut config = KmsConfig::default();
-    config.gcp = Some(GcpConfig {
-        credential_file_path: credential_file
-            .and_then(|f| if f.is_empty() { None } else { Some(f.clone()) }),
-    });
-    config.key_id = cmd.key_id.to_owned();
-    config.vendor = STORAGE_VENDOR_NAME_GCP.to_owned();
-    create_cloud_backend(&config)
-}
-
 #[allow(irrefutable_let_patterns)]
 fn process() -> Result<()> {
     let opt: Opt = Opt::from_args();
@@ -166,10 +142,9 @@ fn process() -> Result<()> {
     file.read_to_end(&mut content)?;
 
     let credential_file = opt.credential_file.as_ref();
-    let backend = match &opt.command {
-        Command::Aws(cmd) => create_aws_backend(cmd, credential_file)?,
-        Command::Azure(cmd) => create_azure_backend(cmd, credential_file)?,
-        Command::Gcp(cmd) => create_gcp_backend(cmd, credential_file)?,
+    let backend = match opt.command {
+        Command::Aws(ref cmd) => create_aws_backend(cmd, credential_file)?,
+        Command::Azure(ref cmd) => create_azure_backend(cmd, credential_file)?,
     };
 
     let output = match opt.operation {

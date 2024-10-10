@@ -1,6 +1,5 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use core::panic;
 use std::{
     pin::Pin,
     sync::{atomic::AtomicU64, Arc, RwLock},
@@ -437,7 +436,7 @@ impl Client {
     }
 }
 
-/// The context of sending request.
+/// The context of sending requets.
 pub struct Request<Req, F> {
     remain_request_count: usize,
     request_sent: usize,
@@ -732,11 +731,10 @@ impl PdConnector {
 
     // There are 3 kinds of situations we will return the new client:
     // 1. the force is true which represents the client is newly created or the
-    // original connection has some problem.
-    // 2. the previous forwarded host is not empty and it can connect the leader
-    // now which represents the network partition problem to leader may be
-    // recovered.
-    // 3. the member information of PD has been changed.
+    // original connection has some problem 2. the previous forwarded host is
+    // not empty and it can connect the leader now which represents the network
+    // partition problem to leader may be recovered 3. the member information of
+    // PD has been changed
     pub async fn reconnect_pd(
         &self,
         members_resp: GetMembersResponse,
@@ -947,14 +945,14 @@ pub fn check_resp_header(header: &ResponseHeader) -> Result<()> {
         ErrorType::IncompatibleVersion => Err(Error::Incompatible),
         ErrorType::StoreTombstone => Err(Error::StoreTombstone(err.get_message().to_owned())),
         ErrorType::RegionNotFound => Err(Error::RegionNotFound(vec![])),
+        ErrorType::GlobalConfigNotFound => {
+            Err(Error::GlobalConfigNotFound(err.get_message().to_owned()))
+        }
         ErrorType::DataCompacted => Err(Error::DataCompacted(err.get_message().to_owned())),
         ErrorType::Ok => Ok(()),
         ErrorType::DuplicatedEntry | ErrorType::EntryNotFound => Err(box_err!(err.get_message())),
         ErrorType::Unknown => Err(box_err!(err.get_message())),
         ErrorType::InvalidValue => Err(box_err!(err.get_message())),
-        ErrorType::GlobalConfigNotFound => panic!("unexpected error {:?}", err),
-        // It will not happen, because we don't call `batch_scan_regions` in TiKV.
-        ErrorType::RegionsNotContainAllKeyRange => Err(box_err!(err.get_message())),
     }
 }
 

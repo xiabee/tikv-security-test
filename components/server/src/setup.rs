@@ -11,7 +11,7 @@ use chrono::Local;
 use clap::ArgMatches;
 use collections::HashMap;
 use fail;
-use tikv::config::{MetricConfig, TikvConfig};
+use tikv::config::{check_critical_config, persist_config, MetricConfig, TikvConfig};
 use tikv_util::{self, config, logger};
 
 // A workaround for checking if log is initialized.
@@ -74,6 +74,7 @@ fn make_engine_log_path(path: &str, sub_path: &str, filename: &str) -> String {
     })
 }
 
+#[allow(dead_code)]
 pub fn initial_logger(config: &TikvConfig) {
     fail::fail_point!("mock_force_uninitial_logger", |_| {
         LOG_INITIALIZED.store(false, Ordering::SeqCst);
@@ -218,7 +219,8 @@ pub fn initial_logger(config: &TikvConfig) {
     }
 
     // Set redact_info_log.
-    log_wrappers::set_redact_info_log(config.security.redact_info_log.clone());
+    let redact_info_log = config.security.redact_info_log.unwrap_or(false);
+    log_wrappers::set_redact_info_log(redact_info_log);
 
     LOG_INITIALIZED.store(true, Ordering::SeqCst);
 }
@@ -302,9 +304,21 @@ pub fn overwrite_config_with_cmd_args(config: &mut TikvConfig, matches: &ArgMatc
     }
 }
 
+#[allow(dead_code)]
 pub fn validate_and_persist_config(config: &mut TikvConfig, persist: bool) {
-    if let Err(e) = tikv::config::validate_and_persist_config(config, persist) {
-        fatal!("failed to validate config: {}", e);
+    config.compatible_adjust();
+    if let Err(e) = config.validate() {
+        fatal!("invalid configuration: {}", e);
+    }
+
+    if let Err(e) = check_critical_config(config) {
+        fatal!("critical config check failed: {}", e);
+    }
+
+    if persist {
+        if let Err(e) = persist_config(config) {
+            fatal!("persist critical config failed: {}", e);
+        }
     }
 }
 

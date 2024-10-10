@@ -61,7 +61,7 @@ fn test_dr_auto_sync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -83,7 +83,7 @@ fn test_dr_auto_sync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -174,7 +174,7 @@ fn test_sync_recover_after_apply_snapshot() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -321,7 +321,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -357,7 +357,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -385,7 +385,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -416,7 +416,7 @@ fn test_replication_mode_allowlist() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -504,7 +504,7 @@ fn test_migrate_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -550,7 +550,7 @@ fn test_migrate_majority_to_drautosync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb_rocks(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
