@@ -93,7 +93,7 @@ txn_types = { workspace = true }
 
 [build-dependencies]
 cc = "1.0"
-time = "0.1"
+time = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
