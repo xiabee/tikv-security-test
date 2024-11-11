@@ -280,7 +280,8 @@ pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, CfName),
 /// `try_send!(s: Scheduler<T>, task: T)` tries to send a task to the scheduler,
 /// once meet an error, would report it, with the current file and line (so it
 /// is made as a macro). returns whether it success.
-#[macro_export(crate)]
+// Note: perhaps we'd better using std::panic::Location.
+#[macro_export]
 macro_rules! try_send {
     ($s:expr, $task:expr) => {
         match $s.schedule($task) {
@@ -304,7 +305,7 @@ macro_rules! try_send {
 /// `backup_stream_debug`. because once we enable debug log for all crates, it
 /// would soon get too verbose to read. using this macro now we can enable debug
 /// log level for the crate only (even compile time...).
-#[macro_export(crate)]
+#[macro_export]
 macro_rules! debug {
     ($($t: tt)+) => {
         if cfg!(feature = "backup-stream-debug") {
@@ -778,7 +779,7 @@ impl<'a> slog::KV for SlogRegion<'a> {
 }
 
 /// A shortcut for making an opaque future type for return type or argument
-/// type, which is sendable and not borrowing any variables.  
+/// type, which is sendable and not borrowing any variables.
 ///
 /// `future![T]` == `impl Future<Output = T> + Send + 'static`
 #[macro_export]
@@ -820,13 +821,14 @@ mod test {
     use engine_traits::WriteOptions;
     use futures::executor::block_on;
     use kvproto::metapb::{Region, RegionEpoch};
+    use log_wrappers::RedactOption;
     use tokio::io::{AsyncWriteExt, BufReader};
 
     use crate::utils::{is_in_range, FutureWaitGroup, SegmentMap};
 
     #[test]
     fn test_redact() {
-        log_wrappers::set_redact_info_log(true);
+        log_wrappers::set_redact_info_log(RedactOption::Flag(true));
         let mut region = Region::default();
         region.set_id(42);
         region.set_start_key(b"TiDB".to_vec());
@@ -992,9 +994,9 @@ mod test {
     #[test]
     fn test_recorder() {
         use engine_traits::{Iterable, KvEngine, Mutable, WriteBatch, WriteBatchExt, CF_DEFAULT};
-        use tempdir::TempDir;
+        use tempfile::TempDir;
 
-        let p = TempDir::new("test_db").unwrap();
+        let p = TempDir::new().unwrap();
         let engine =
             engine_rocks::util::new_engine(p.path().to_str().unwrap(), &[CF_DEFAULT]).unwrap();
         let mut wb = engine.write_batch();
@@ -1010,7 +1012,7 @@ mod test {
 
         let (items, size) = super::with_record_read_throughput(|| {
             let mut items = vec![];
-            let snap = engine.snapshot();
+            let snap = engine.snapshot(None);
             snap.scan(CF_DEFAULT, b"", b"", false, |k, v| {
                 items.push((k.to_owned(), v.to_owned()));
                 Ok(true)
@@ -1039,12 +1041,12 @@ mod test {
 
     #[tokio::test]
     async fn test_files_reader() {
-        use tempdir::TempDir;
+        use tempfile::TempDir;
         use tokio::{fs::File, io::AsyncReadExt};
 
         use super::FilesReader;
 
-        let dir = TempDir::new("test_files").unwrap();
+        let dir = TempDir::new().unwrap();
         let files_num = 5;
         let mut files_path = Vec::new();
         let mut expect_content = String::new();
@@ -1077,12 +1079,12 @@ mod test {
     #[tokio::test]
     async fn test_compression_writer() {
         use kvproto::brpb::CompressionType;
-        use tempdir::TempDir;
+        use tempfile::TempDir;
         use tokio::{fs::File, io::AsyncReadExt};
 
         use super::compression_writer_dispatcher;
 
-        let dir = TempDir::new("test_files").unwrap();
+        let dir = TempDir::new().unwrap();
         let content = "test for compression writer. try to write to local path, and read it back.";
 
         // uncompressed writer

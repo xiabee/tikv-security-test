@@ -3,6 +3,7 @@ name = "engine_rocks"
 version = "0.0.1"
 edition = "2021"
 publish = false
+license = "Apache-2.0"
 
 [features]
 trace-lifetime = []
@@ -26,7 +27,6 @@ nortcheck = []
 
 [dependencies]
 api_version = { workspace = true }
-case_macros = { workspace = true }
 collections = { workspace = true }
 derive_more = "0.99.3"
 encryption = { workspace = true }
@@ -52,7 +52,7 @@ slog_derive = "0.2"
 tempfile = "3.0"
 tikv_alloc = { workspace = true }
 tikv_util = { workspace = true }
-time = "0.1"
+time = { workspace = true }
 tracker = { workspace = true }
 txn_types = { workspace = true }
 
@@ -64,3 +64,4 @@ features = ["encryption"]
 [dev-dependencies]
 rand = "0.8"
 toml = "0.5"
+proptest = "1.0.0"

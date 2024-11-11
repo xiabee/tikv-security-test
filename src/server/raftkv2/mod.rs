@@ -202,9 +202,21 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
         let mut cmd = RaftCmdRequest::default();
         cmd.set_header(header);
         cmd.set_requests(vec![req].into());
-        let f = self.router.snapshot(cmd);
+        let res: tikv_kv::Result<()> = (|| {
+            fail_point!("raftkv_async_snapshot_err", |_| {
+                Err(box_err!("injected error for async_snapshot"))
+            });
+            Ok(())
+        })();
+        let f = if res.is_err() {
+            None
+        } else {
+            Some(self.router.snapshot(cmd))
+        };
+
         async move {
-            let res = f.await;
+            res?;
+            let res = f.unwrap().await;
             match res {
                 Ok(snap) => {
                     let elapse = begin_instant.saturating_elapsed_secs();
@@ -232,10 +244,6 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
                                 .observe(elapse);
                         }
                     });
-                    // The observed snapshot duration is larger than the actual
-                    // snapshot duration, because it includes the waiting time
-                    // of this future.
-                    // TODO: Fix the inaccuracy, see #17581.
                     ASYNC_REQUESTS_DURATIONS_VEC.snapshot.observe(elapse);
                     ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
                     Ok(snap)
@@ -243,7 +251,7 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
                 Err(mut resp) => {
                     if resp
                         .get_responses()
-                        .get(0)
+                        .first()
                         .map_or(false, |r| r.get_read_index().has_locked())
                     {
                         let locked = resp.mut_responses()[0].mut_read_index().take_locked();
@@ -309,20 +317,16 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
         if WriteEvent::subscribed_committed(subscribed) {
             builder.subscribe_committed();
         }
-        builder.before_set(move |resp| {
-            let mut res = if !resp.get_header().has_error() {
-                ASYNC_REQUESTS_COUNTER_VEC.write.success.inc();
-                ASYNC_REQUESTS_DURATIONS_VEC
-                    .write
-                    .observe(begin_instant.saturating_elapsed_secs());
-                Ok(())
-            } else {
-                Err(tikv_kv::Error::from(resp.get_header().get_error().clone()))
-            };
-            if let Some(cb) = on_applied {
+        if let Some(cb) = on_applied {
+            builder.before_set(move |resp| {
+                let mut res = if !resp.get_header().has_error() {
+                    Ok(())
+                } else {
+                    Err(tikv_kv::Error::from(resp.get_header().get_error().clone()))
+                };
                 cb(&mut res);
-            }
-        });
+            });
+        }
         let (ch, sub) = builder.build();
         let res = if inject_region_not_found {
             ch.report_error(cmd_resp::new_error(Error::RegionNotFound(region_id)));
@@ -348,9 +352,20 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
             early_err: res.err(),
         })
         .inspect(move |ev| {
-            if let WriteEvent::Finished(Err(e)) = ev {
-                let status_kind = get_status_kind_from_engine_error(e);
-                ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
+            let WriteEvent::Finished(res) = ev else {
+                return;
+            };
+            match res {
+                Ok(()) => {
+                    ASYNC_REQUESTS_COUNTER_VEC.write.success.inc();
+                    ASYNC_REQUESTS_DURATIONS_VEC
+                        .write
+                        .observe(begin_instant.saturating_elapsed_secs());
+                }
+                Err(e) => {
+                    let status_kind = get_status_kind_from_engine_error(e);
+                    ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
+                }
             }
         })
     }

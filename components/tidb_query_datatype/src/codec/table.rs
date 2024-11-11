@@ -39,10 +39,12 @@ pub const INDEX_VALUE_VERSION_FLAG: u8 = 125;
 /// Flag that indicate if the index value has restored data.
 pub const INDEX_VALUE_RESTORED_DATA_FLAG: u8 = crate::codec::row::v2::CODEC_VERSION;
 
+/// Deprecated. see <https://github.com/tikv/tikv/issues/17138>
 /// ID for partition column, see <https://github.com/pingcap/parser/pull/1010>
 pub const EXTRA_PARTITION_ID_COL_ID: i64 = -2;
 
 /// ID for physical table id column, see <https://github.com/tikv/tikv/issues/11888>
+/// If it's a global index, it will return partition id, see <https://github.com/tikv/tikv/issues/17138>
 pub const EXTRA_PHYSICAL_TABLE_ID_COL_ID: i64 = -3;
 
 /// `TableEncoder` encodes the table record/index prefix.
@@ -319,7 +321,7 @@ pub fn decode_row(
     cols: &HashMap<i64, ColumnInfo>,
 ) -> Result<HashMap<i64, Datum>> {
     let mut values = datum::decode(data)?;
-    if values.get(0).map_or(true, |d| *d == Datum::Null) {
+    if values.first().map_or(true, |d| *d == Datum::Null) {
         return Ok(HashMap::default());
     }
     if values.len() & 1 == 1 {
@@ -524,11 +526,11 @@ pub fn generate_index_data_for_test(
     col_val: &Datum,
     unique: bool,
 ) -> (HashMap<i64, Vec<u8>>, Vec<u8>) {
-    let indice = vec![(2, col_val.clone()), (3, Datum::Dec(handle.into()))];
+    let indice = [(2, col_val.clone()), (3, Datum::Dec(handle.into()))];
     let mut expect_row = HashMap::default();
     let mut v: Vec<_> = indice
         .iter()
-        .map(|&(ref cid, ref value)| {
+        .map(|(cid, value)| {
             expect_row.insert(
                 *cid,
                 datum::encode_key(&mut EvalContext::default(), &[value.clone()]).unwrap(),

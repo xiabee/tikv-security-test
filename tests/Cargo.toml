@@ -3,6 +3,7 @@ name = "tests"
 version = "0.0.1"
 edition = "2021"
 publish = false
+license = "Apache-2.0"
 
 [[test]]
 name = "failpoints"
@@ -45,11 +46,8 @@ harness = false
 path = "benches/memory/mod.rs"
 
 [features]
-default = ["failpoints", "testexport", "test-engine-kv-rocksdb", "test-engine-raft-raft-engine", "cloud-aws", "cloud-gcp", "cloud-azure"]
+default = ["failpoints", "testexport", "test-engine-kv-rocksdb", "test-engine-raft-raft-engine"]
 failpoints = ["fail/failpoints", "tikv/failpoints", "pd_client/failpoints"]
-cloud-aws = ["external_storage_export/cloud-aws"]
-cloud-gcp = ["external_storage_export/cloud-gcp"]
-cloud-azure = ["external_storage_export/cloud-azure"]
 testexport = ["raftstore/testexport", "tikv/testexport", "pd_client/testexport"]
 profiling = ["profiler/profiling"]
 
@@ -79,7 +77,7 @@ batch-system = { workspace = true }
 cdc = { workspace = true }
 collections = { workspace = true }
 crc64fast = "0.1"
-crossbeam = "0.8"
+crossbeam = { workspace = true }
 encryption = { workspace = true }
 engine_rocks_helper = { workspace = true }
 error_code = { workspace = true }
@@ -88,6 +86,7 @@ file_system = { workspace = true }
 futures = "0.3"
 grpcio = { workspace = true }
 grpcio-health = { workspace = true }
+health_controller = { workspace = true }
 kvproto = { workspace = true }
 libc = "0.2"
 log_wrappers = { workspace = true }
@@ -114,7 +113,7 @@ tidb_query_executors = { workspace = true }
 tidb_query_expr = { workspace = true }
 tikv = { workspace = true }
 tikv_util = { workspace = true }
-time = "0.1"
+time = { workspace = true }
 tipb = { workspace = true }
 toml = "0.5"
 tracker = { workspace = true }
@@ -135,7 +134,7 @@ criterion-cpu-time = "0.1"
 engine_rocks = { workspace = true }
 engine_test = { workspace = true }
 engine_traits = { workspace = true }
-external_storage_export = { workspace = true }
+external_storage ={ workspace = true }
 file_system = { workspace = true }
 hyper = { version = "0.14", default-features = false, features = ["runtime"] }
 keys = { workspace = true }

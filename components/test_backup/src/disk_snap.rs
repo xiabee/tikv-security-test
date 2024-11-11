@@ -7,6 +7,7 @@ use std::{
 };
 
 use backup::disk_snap::Env as BEnv;
+use engine_rocks::RocksEngine as KTE;
 use futures_executor::block_on;
 use futures_util::{
     sink::SinkExt,
@@ -39,7 +40,7 @@ pub struct Node {
 }
 
 pub struct Suite {
-    pub cluster: Cluster<ServerCluster>,
+    pub cluster: Cluster<KTE, ServerCluster<KTE>>,
     pub nodes: HashMap<u64, Node>,
     grpc_env: Arc<Environment>,
 }
@@ -185,25 +186,30 @@ impl PrepareBackup {
     }
 
     pub fn send_finalize(mut self) -> bool {
-        block_on(self.tx.send({
-            let mut req = PrepareSnapshotBackupRequest::new();
-            req.set_ty(PrepareSnapshotBackupRequestType::Finish);
-            (req, WriteFlags::default())
-        }))
-        .unwrap();
-        block_on_timeout(
-            async {
-                while let Some(item) = self.rx.next().await {
-                    let item = item.unwrap();
-                    if item.ty == PrepareSnapshotBackupEventType::UpdateLeaseResult {
-                        return item.last_lease_is_valid;
+        if matches!(
+            block_on(self.tx.send({
+                let mut req = PrepareSnapshotBackupRequest::new();
+                req.set_ty(PrepareSnapshotBackupRequestType::Finish);
+                (req, WriteFlags::default())
+            })),
+            Ok(_) | Err(grpcio::Error::RpcFinished(_))
+        ) {
+            block_on_timeout(
+                async {
+                    while let Some(item) = self.rx.next().await {
+                        let item = item.unwrap();
+                        if item.ty == PrepareSnapshotBackupEventType::UpdateLeaseResult {
+                            return item.last_lease_is_valid;
+                        }
                     }
-                }
-                false
-            },
-            Duration::from_secs(2),
-        )
-        .expect("take too long to finalize the stream")
+                    false
+                },
+                Duration::from_secs(2),
+            )
+            .expect("take too long to finalize the stream")
+        } else {
+            false
+        }
     }
 
     pub fn next(&mut self) -> PrepareSnapshotBackupResponse {

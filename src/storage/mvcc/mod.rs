@@ -40,7 +40,7 @@ pub enum ErrorInner {
     Codec(#[from] tikv_util::codec::Error),
 
     #[error("key is locked (backoff or cleanup) {0:?}")]
-    KeyIsLocked(kvproto::kvrpcpb::LockInfo),
+    KeyIsLocked(kvrpcpb::LockInfo),
 
     #[error("{0}")]
     BadFormat(#[source] txn_types::Error),
@@ -110,8 +110,13 @@ pub enum ErrorInner {
         wait_chain: Vec<kvproto::deadlock::WaitForEntry>,
     },
 
-    #[error("key {} already exists", log_wrappers::Value::key(.key))]
-    AlreadyExist { key: Vec<u8> },
+    #[error(
+        "key {} already exists with existing_start_ts={}", log_wrappers::Value::key(.key),
+        .existing_start_ts)]
+    AlreadyExist {
+        key: Vec<u8>,
+        existing_start_ts: TimeStamp,
+    },
 
     #[error(
         "default not found: key:{}, maybe read truncated/dropped table data?",
@@ -172,7 +177,10 @@ pub enum ErrorInner {
     LockIfExistsFailed { start_ts: TimeStamp, key: Vec<u8> },
 
     #[error("check_txn_status sent to secondary lock, current lock: {0:?}")]
-    PrimaryMismatch(kvproto::kvrpcpb::LockInfo),
+    PrimaryMismatch(kvrpcpb::LockInfo),
+
+    #[error("generation out of order: current = {0}, key={1:?}, lock = {1:?}")]
+    GenerationOutOfOrder(u64, Key, Lock),
 
     #[error("{0:?}")]
     Other(#[from] Box<dyn error::Error + Sync + Send>),
@@ -235,7 +243,13 @@ impl ErrorInner {
                 deadlock_key_hash: *deadlock_key_hash,
                 wait_chain: wait_chain.clone(),
             }),
-            ErrorInner::AlreadyExist { key } => Some(ErrorInner::AlreadyExist { key: key.clone() }),
+            ErrorInner::AlreadyExist {
+                key,
+                existing_start_ts,
+            } => Some(ErrorInner::AlreadyExist {
+                key: key.clone(),
+                existing_start_ts: *existing_start_ts,
+            }),
             ErrorInner::DefaultNotFound { key } => Some(ErrorInner::DefaultNotFound {
                 key: key.to_owned(),
             }),
@@ -304,6 +318,9 @@ impl ErrorInner {
                 })
             }
             ErrorInner::PrimaryMismatch(l) => Some(ErrorInner::PrimaryMismatch(l.clone())),
+            ErrorInner::GenerationOutOfOrder(gen, key, lock_info) => Some(
+                ErrorInner::GenerationOutOfOrder(*gen, key.clone(), lock_info.clone()),
+            ),
             ErrorInner::Io(_) | ErrorInner::Other(_) => None,
         }
     }
@@ -407,6 +424,7 @@ impl ErrorCodeExt for Error {
             ErrorInner::AssertionFailed { .. } => error_code::storage::ASSERTION_FAILED,
             ErrorInner::LockIfExistsFailed { .. } => error_code::storage::LOCK_IF_EXISTS_FAILED,
             ErrorInner::PrimaryMismatch(_) => error_code::storage::PRIMARY_MISMATCH,
+            ErrorInner::GenerationOutOfOrder(..) => error_code::storage::GENERATION_OUT_OF_ORDER,
             ErrorInner::Other(_) => error_code::storage::UNKNOWN,
         }
     }

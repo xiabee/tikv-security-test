@@ -11,8 +11,11 @@ use std::{
 
 use collections::{HashMap, HashSet};
 use crossbeam::channel::TrySendError;
-use engine_rocks::{RocksEngine, RocksSnapshot};
-use kvproto::{raft_cmdpb::RaftCmdRequest, raft_serverpb::RaftMessage};
+use engine_traits::{KvEngine, SnapshotContext};
+use kvproto::{
+    raft_cmdpb::RaftCmdRequest,
+    raft_serverpb::{ExtraMessageType, RaftMessage},
+};
 use raft::eraftpb::MessageType;
 use raftstore::{
     router::{LocalReadRouter, RaftStoreRouter},
@@ -140,16 +143,19 @@ impl Filter for DelayFilter {
 }
 
 #[derive(Clone)]
-pub struct SimulateTransport<C> {
+pub struct SimulateTransport<C, EK: KvEngine> {
     filters: Arc<RwLock<Vec<Box<dyn Filter>>>>,
     ch: C,
+
+    _p: PhantomData<EK>,
 }
 
-impl<C> SimulateTransport<C> {
-    pub fn new(ch: C) -> SimulateTransport<C> {
+impl<C, EK: KvEngine> SimulateTransport<C, EK> {
+    pub fn new(ch: C) -> SimulateTransport<C, EK> {
         SimulateTransport {
             filters: Arc::new(RwLock::new(vec![])),
             ch,
+            _p: PhantomData,
         }
     }
 
@@ -195,7 +201,7 @@ where
     res
 }
 
-impl<C: Transport> Transport for SimulateTransport<C> {
+impl<EK: KvEngine, C: Transport> Transport for SimulateTransport<C, EK> {
     fn send(&mut self, m: RaftMessage) -> Result<()> {
         let ch = &mut self.ch;
         filter_send(&self.filters, m, |m| ch.send(m))
@@ -214,49 +220,52 @@ impl<C: Transport> Transport for SimulateTransport<C> {
     }
 }
 
-impl<C: RaftStoreRouter<RocksEngine>> StoreRouter<RocksEngine> for SimulateTransport<C> {
-    fn send(&self, msg: StoreMsg<RocksEngine>) -> Result<()> {
+impl<EK: KvEngine, C: RaftStoreRouter<EK>> StoreRouter<EK> for SimulateTransport<C, EK> {
+    fn send(&self, msg: StoreMsg<EK>) -> Result<()> {
         StoreRouter::send(&self.ch, msg)
     }
 }
 
-impl<C: RaftStoreRouter<RocksEngine>> ProposalRouter<RocksSnapshot> for SimulateTransport<C> {
+impl<EK: KvEngine, C: RaftStoreRouter<EK>> ProposalRouter<<EK as KvEngine>::Snapshot>
+    for SimulateTransport<C, EK>
+{
     fn send(
         &self,
-        cmd: RaftCommand<RocksSnapshot>,
-    ) -> std::result::Result<(), TrySendError<RaftCommand<RocksSnapshot>>> {
-        ProposalRouter::<RocksSnapshot>::send(&self.ch, cmd)
+        cmd: RaftCommand<<EK as KvEngine>::Snapshot>,
+    ) -> std::result::Result<(), TrySendError<RaftCommand<<EK as KvEngine>::Snapshot>>> {
+        ProposalRouter::<<EK as KvEngine>::Snapshot>::send(&self.ch, cmd)
     }
 }
 
-impl<C: RaftStoreRouter<RocksEngine>> CasualRouter<RocksEngine> for SimulateTransport<C> {
-    fn send(&self, region_id: u64, msg: CasualMessage<RocksEngine>) -> Result<()> {
-        CasualRouter::<RocksEngine>::send(&self.ch, region_id, msg)
+impl<EK: KvEngine, C: RaftStoreRouter<EK>> CasualRouter<EK> for SimulateTransport<C, EK> {
+    fn send(&self, region_id: u64, msg: CasualMessage<EK>) -> Result<()> {
+        CasualRouter::<EK>::send(&self.ch, region_id, msg)
     }
 }
 
-impl<C: RaftStoreRouter<RocksEngine>> SignificantRouter<RocksEngine> for SimulateTransport<C> {
-    fn significant_send(&self, region_id: u64, msg: SignificantMsg<RocksSnapshot>) -> Result<()> {
+impl<EK: KvEngine, C: RaftStoreRouter<EK>> SignificantRouter<EK> for SimulateTransport<C, EK> {
+    fn significant_send(&self, region_id: u64, msg: SignificantMsg<EK::Snapshot>) -> Result<()> {
         self.ch.significant_send(region_id, msg)
     }
 }
 
-impl<C: RaftStoreRouter<RocksEngine>> RaftStoreRouter<RocksEngine> for SimulateTransport<C> {
+impl<EK: KvEngine, C: RaftStoreRouter<EK>> RaftStoreRouter<EK> for SimulateTransport<C, EK> {
     fn send_raft_msg(&self, msg: RaftMessage) -> Result<()> {
         filter_send(&self.filters, msg, |m| self.ch.send_raft_msg(m))
     }
 
-    fn broadcast_normal(&self, _: impl FnMut() -> PeerMsg<RocksEngine>) {}
+    fn broadcast_normal(&self, _: impl FnMut() -> PeerMsg<EK>) {}
 }
 
-impl<C: LocalReadRouter<RocksEngine>> LocalReadRouter<RocksEngine> for SimulateTransport<C> {
+impl<EK: KvEngine, C: LocalReadRouter<EK>> LocalReadRouter<EK> for SimulateTransport<C, EK> {
     fn read(
         &mut self,
+        snap_ctx: Option<SnapshotContext>,
         read_id: Option<ThreadReadId>,
         req: RaftCmdRequest,
-        cb: Callback<RocksSnapshot>,
+        cb: Callback<EK::Snapshot>,
     ) -> RaftStoreResult<()> {
-        self.ch.read(read_id, req, cb)
+        self.ch.read(snap_ctx, read_id, req, cb)
     }
 
     fn release_snapshot_cache(&mut self) {
@@ -380,6 +389,7 @@ pub struct RegionPacketFilter {
     direction: Direction,
     block: Either<Arc<AtomicUsize>, Arc<AtomicBool>>,
     drop_type: Vec<MessageType>,
+    drop_extra_type: Vec<ExtraMessageType>,
     skip_type: Vec<MessageType>,
     dropped_messages: Option<Arc<Mutex<Vec<RaftMessage>>>>,
     msg_callback: Option<Arc<dyn Fn(&RaftMessage) + Send + Sync>>,
@@ -387,6 +397,13 @@ pub struct RegionPacketFilter {
 
 impl Filter for RegionPacketFilter {
     fn before(&self, msgs: &mut Vec<RaftMessage>) -> Result<()> {
+        let need_drop_msg_type = |m: &RaftMessage| {
+            let msg_type = m.get_message().get_msg_type();
+            let extra_msg_type = m.get_extra_msg().get_type();
+            self.drop_type.is_empty()
+                || self.drop_type.contains(&msg_type)
+                || self.drop_extra_type.contains(&extra_msg_type)
+        };
         let retain = |m: &RaftMessage| {
             let region_id = m.get_region_id();
             let from_store_id = m.get_from_peer().get_store_id();
@@ -396,7 +413,7 @@ impl Filter for RegionPacketFilter {
             if self.region_id == region_id
                 && (self.direction.is_send() && self.store_id == from_store_id
                     || self.direction.is_recv() && self.store_id == to_store_id)
-                && (self.drop_type.is_empty() || self.drop_type.contains(&msg_type))
+                && need_drop_msg_type(m)
                 && !self.skip_type.contains(&msg_type)
             {
                 let res = match self.block {
@@ -438,6 +455,7 @@ impl RegionPacketFilter {
             store_id,
             direction: Direction::Both,
             drop_type: vec![],
+            drop_extra_type: vec![],
             skip_type: vec![],
             block: Either::Right(Arc::new(AtomicBool::new(true))),
             dropped_messages: None,
@@ -455,6 +473,12 @@ impl RegionPacketFilter {
     #[must_use]
     pub fn msg_type(mut self, m_type: MessageType) -> RegionPacketFilter {
         self.drop_type.push(m_type);
+        self
+    }
+
+    #[must_use]
+    pub fn drop_extra_message(mut self, m_type: ExtraMessageType) -> RegionPacketFilter {
+        self.drop_extra_type.push(m_type);
         self
     }
 

@@ -180,7 +180,7 @@ impl Samples {
     // evaluate the samples according to the given key range, it will update the
     // sample's left, right and contained counter.
     fn evaluate(&mut self, key_range: &KeyRange) {
-        for mut sample in self.0.iter_mut() {
+        for sample in self.0.iter_mut() {
             let order_start = if key_range.start_key.is_empty() {
                 Ordering::Greater
             } else {
@@ -454,7 +454,9 @@ impl ReadStats {
         region_info.flow.add(data);
         // the bucket of the follower only have the version info and not needs to be
         // recorded the hot bucket.
-        if let Some(buckets) = buckets && !buckets.sizes.is_empty() {
+        if let Some(buckets) = buckets
+            && !buckets.sizes.is_empty()
+        {
             let bucket_stat = self
                 .region_buckets
                 .entry(region_id)
@@ -498,10 +500,7 @@ pub struct WriteStats {
 
 impl WriteStats {
     pub fn add_query_num(&mut self, region_id: u64, kind: QueryKind) {
-        let query_stats = self
-            .region_infos
-            .entry(region_id)
-            .or_insert_with(QueryStats::default);
+        let query_stats = self.region_infos.entry(region_id).or_default();
         query_stats.add_query_num(kind, 1);
     }
 
@@ -849,18 +848,21 @@ impl AutoSplitController {
             if recorder.is_ready() {
                 let key = recorder.collect(&self.cfg);
                 if !key.is_empty() {
+                    info!("load base split region";
+                        "region_id" => region_id,
+                        "qps" => qps,
+                        "byte" => byte,
+                        "cpu_usage" => cpu_usage,
+                        "split_key" => log_wrappers::Value::key(&key),
+                        "start_key" => log_wrappers::Value::key(&recorder.hottest_key_range.as_ref().unwrap_or_default().start_key),
+                        "end_key" => log_wrappers::Value::key(&recorder.hottest_key_range.as_ref().unwrap_or_default().end_key),
+                    );
                     split_infos.push(SplitInfo::with_split_key(
                         region_id,
                         recorder.peer.clone(),
                         key,
                     ));
                     LOAD_BASE_SPLIT_EVENT.ready_to_split.inc();
-                    info!("load base split region";
-                        "region_id" => region_id,
-                        "qps" => qps,
-                        "byte" => byte,
-                        "cpu_usage" => cpu_usage,
-                    );
                     self.recorders.remove(&region_id);
                 } else if is_unified_read_pool_busy && is_region_busy {
                     LOAD_BASE_SPLIT_EVENT.cpu_load_fit.inc();
@@ -1084,8 +1086,8 @@ mod tests {
 
     #[test]
     fn test_prefix_sum() {
-        let v = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let expect = vec![1, 3, 6, 10, 15, 21, 28, 36, 45];
+        let v = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expect = [1, 3, 6, 10, 15, 21, 28, 36, 45];
         let pre = prefix_sum(v.iter(), |x| *x);
         for i in 0..v.len() {
             assert_eq!(expect[i], pre[i]);

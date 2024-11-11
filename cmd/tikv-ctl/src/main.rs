@@ -1,6 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-#![feature(once_cell)]
+#![feature(lazy_cell)]
 #![feature(let_chains)]
 
 #[macro_use]
@@ -20,12 +20,12 @@ use std::{
 };
 
 use collections::HashMap;
+use crypto::fips;
 use encryption_export::{
-    create_backend, data_key_manager_from_config, from_engine_encryption_method, DataKeyManager,
-    DecrypterReader, Iv,
+    create_backend, data_key_manager_from_config, DataKeyManager, DecrypterReader, Iv,
 };
 use engine_rocks::get_env;
-use engine_traits::{EncryptionKeyManager, Peekable};
+use engine_traits::Peekable;
 use file_system::calc_crc32;
 use futures::{executor::block_on, future::try_join_all};
 use gag::BufferRedirect;
@@ -61,10 +61,16 @@ mod fork_readonly_tikv;
 mod util;
 
 fn main() {
+    // OpenSSL FIPS mode should be enabled at the very start.
+    fips::maybe_enable();
+
     let opt = Opt::from_args();
 
     // Initialize logger.
     init_ctl_logger(&opt.log_level);
+
+    // Print OpenSSL FIPS mode status.
+    fips::log_status();
 
     // Initialize configuration and security manager.
     let cfg_path = opt.config.as_ref();
@@ -115,13 +121,13 @@ fn main() {
             }
         }
         Cmd::RaftEngineCtl { args } => {
+            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
+                return;
+            }
             let key_manager =
                 data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
                     .expect("data_key_manager_from_config should success");
-            let file_system = Arc::new(ManagedFileSystem::new(
-                key_manager.map(|m| Arc::new(m)),
-                None,
-            ));
+            let file_system = Arc::new(ManagedFileSystem::new(key_manager.map(Arc::new), None));
             raft_engine_ctl::run_command(args, file_system);
         }
         Cmd::BadSsts { manifest, pd } => {
@@ -136,6 +142,9 @@ fn main() {
             dump_snap_meta_file(path);
         }
         Cmd::DecryptFile { file, out_file } => {
+            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
+                return;
+            }
             let message =
                 "This action will expose sensitive data as plaintext on persistent storage";
             if !warning_prompt(message) {
@@ -160,7 +169,7 @@ fn main() {
             let infile1 = Path::new(infile).canonicalize().unwrap();
             let file_info = key_manager.get_file(infile1.to_str().unwrap()).unwrap();
 
-            let mthd = from_engine_encryption_method(file_info.method);
+            let mthd = file_info.method;
             if mthd == EncryptionMethod::Plaintext {
                 println!(
                     "{} is not encrypted, skip to decrypt it into {}",
@@ -184,28 +193,36 @@ fn main() {
             io::copy(&mut reader, &mut outf).unwrap();
             println!("crc32: {}", calc_crc32(outfile).unwrap());
         }
-        Cmd::EncryptionMeta { cmd: subcmd } => match subcmd {
-            EncryptionMetaCmd::DumpKey { ids } => {
-                let message = "This action will expose encryption key(s) as plaintext. Do not output the \
+        Cmd::EncryptionMeta { cmd: subcmd } => {
+            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
+                return;
+            }
+            match subcmd {
+                EncryptionMetaCmd::DumpKey { ids } => {
+                    let message = "This action will expose encryption key(s) as plaintext. Do not output the \
                     result in file on disk.";
-                if !warning_prompt(message) {
-                    return;
+                    if !warning_prompt(message) {
+                        return;
+                    }
+                    DataKeyManager::dump_key_dict(
+                        create_backend(&cfg.security.encryption.master_key)
+                            .expect("encryption-meta master key creation"),
+                        &cfg.storage.data_dir,
+                        ids,
+                    )
+                    .unwrap();
                 }
-                DataKeyManager::dump_key_dict(
-                    create_backend(&cfg.security.encryption.master_key)
-                        .expect("encryption-meta master key creation"),
-                    &cfg.storage.data_dir,
-                    ids,
-                )
-                .unwrap();
+                EncryptionMetaCmd::DumpFile { path } => {
+                    let path = path
+                        .map(|path| fs::canonicalize(path).unwrap().to_str().unwrap().to_owned());
+                    DataKeyManager::dump_file_dict(&cfg.storage.data_dir, path.as_deref()).unwrap();
+                }
             }
-            EncryptionMetaCmd::DumpFile { path } => {
-                let path =
-                    path.map(|path| fs::canonicalize(path).unwrap().to_str().unwrap().to_owned());
-                DataKeyManager::dump_file_dict(&cfg.storage.data_dir, path.as_deref()).unwrap();
-            }
-        },
+        }
         Cmd::CleanupEncryptionMeta {} => {
+            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
+                return;
+            }
             let key_manager =
                 match data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
                     .expect("data_key_manager_from_config should success")
@@ -1329,4 +1346,18 @@ fn read_cluster_id(config: &TikvConfig) -> Result<u64, String> {
         .unwrap()
         .unwrap();
     Ok(ident.cluster_id)
+}
+
+fn validate_storage_data_dir(config: &mut TikvConfig, data_dir: Option<String>) -> bool {
+    if let Some(data_dir) = data_dir {
+        if !Path::new(&data_dir).exists() {
+            eprintln!("--data-dir {:?} not exists", data_dir);
+            return false;
+        }
+        config.storage.data_dir = data_dir;
+    } else if config.storage.data_dir.is_empty() {
+        eprintln!("--data-dir or data-dir in the config file should not be empty");
+        return false;
+    }
+    true
 }

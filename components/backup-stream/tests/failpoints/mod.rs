@@ -24,12 +24,17 @@ mod all {
         },
         GetCheckpointResult, RegionCheckpointOperation, RegionSet, Task,
     };
+    use encryption::{FileConfig, MasterKeyConfig};
     use futures::executor::block_on;
+    use kvproto::encryptionpb::EncryptionMethod;
+    use raftstore::coprocessor::ObserveHandle;
+    use tempfile::TempDir;
     use tikv_util::{
         config::{ReadableDuration, ReadableSize},
         defer,
     };
     use txn_types::Key;
+    use walkdir::WalkDir;
 
     use super::{
         make_record_key, make_split_key_at_record, mutation, run_async_test, SuiteBuilder,
@@ -111,9 +116,11 @@ mod all {
         suite.run(|| {
             Task::ModifyObserve(backup_stream::ObserveOp::Start {
                 region: suite.cluster.get_region(&make_record_key(1, 886)),
+                handle: ObserveHandle::new(),
             })
         });
         fail::cfg("scan_after_get_snapshot", "off").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
         suite.force_flush_files("frequent_initial_scan");
         suite.wait_for_flush();
         std::thread::sleep(Duration::from_secs(1));
@@ -181,6 +188,8 @@ mod all {
 
         suite.must_split(b"SOLE");
         let keys2 = run_async_test(suite.write_records(256, 128, 1));
+        // Let's make sure the retry has been triggered...
+        std::thread::sleep(Duration::from_secs(2));
         suite.force_flush_files("fail_to_refresh_region");
         suite.wait_for_flush();
         suite.check_for_write_records(
@@ -245,7 +254,7 @@ mod all {
         .unwrap();
 
         suite.sync();
-        suite.wait_with_router(move |r| block_on(r.get_task_info("retry_abort")).is_ok());
+        suite.wait_with_router(move |r| r.get_task_info("retry_abort").is_ok());
         let items = run_async_test(suite.write_records(0, 128, 1));
         suite.force_flush_files("retry_abort");
         suite.wait_for_flush();
@@ -269,6 +278,8 @@ mod all {
         fail::cfg("try_start_observe", "2*return").unwrap();
         fail::cfg("try_start_observe0", "off").unwrap();
 
+        // Let's wait enough time for observing the split operation.
+        std::thread::sleep(Duration::from_secs(2));
         let round2 = run_async_test(suite.write_records(256, 128, 1));
         suite.force_flush_files("failure_and_split");
         suite.wait_for_flush();
@@ -288,7 +299,6 @@ mod all {
             .build();
         let keys = run_async_test(suite.write_records(0, 128, 1));
         let failed = Arc::new(AtomicBool::new(false));
-        fail::cfg("router_on_event_delay_ms", "6*return(1000)").unwrap();
         fail::cfg_callback("scan_and_async_send::about_to_consume", {
             let failed = failed.clone();
             move || {
@@ -309,20 +319,6 @@ mod all {
             keys.iter().map(|v| v.as_slice()),
         );
         assert!(!failed.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn failed_to_get_task_when_pausing() {
-        let suite = SuiteBuilder::new_named("resume_error").nodes(1).build();
-        suite.must_register_task(1, "resume_error");
-        let mcli = suite.get_meta_cli();
-        run_async_test(mcli.pause("resume_error")).unwrap();
-        suite.sync();
-        fail::cfg("failed_to_get_task", "1*return").unwrap();
-        run_async_test(mcli.resume("resume_error")).unwrap();
-        suite.sync();
-        // Make sure our suite doesn't panic.
-        suite.sync();
     }
 
     #[test]
@@ -406,5 +402,87 @@ mod all {
             suite.flushed_files.path(),
             std::iter::once(enc_key.as_encoded().as_slice()),
         )
+    }
+
+    #[test]
+    fn encryption() {
+        let key_folder = TempDir::new().unwrap();
+        let key_file = key_folder.path().join("key.txt");
+        fail::cfg("log_backup_always_swap_out", "return()").unwrap();
+        std::fs::write(&key_file, "42".repeat(32) + "\n").unwrap();
+
+        let mut suite = SuiteBuilder::new_named("encryption")
+            .nodes(1)
+            .cluster_cfg(move |cfg| {
+                cfg.tikv.security.encryption.data_encryption_method = EncryptionMethod::Aes256Ctr;
+                cfg.tikv.security.encryption.master_key = MasterKeyConfig::File {
+                    config: FileConfig {
+                        path: key_file
+                            .to_str()
+                            .expect("cannot convert OsStr to Rust string")
+                            .to_owned(),
+                    },
+                };
+            })
+            .cfg(|cfg| cfg.temp_file_memory_quota = ReadableSize(16))
+            .build();
+
+        suite.must_register_task(1, "encryption");
+        let items = run_async_test(suite.write_records_batched(0, 128, 1));
+        // So the old files can be "flushed" to disk.
+        let items2 = run_async_test(suite.write_records_batched(256, 128, 1));
+        suite.sync();
+
+        let files = WalkDir::new(suite.temp_files.path())
+            .into_iter()
+            .filter_map(|file| file.ok().filter(|f| f.file_type().is_file()))
+            .collect::<Vec<_>>();
+        assert!(!files.is_empty());
+        for dir in files {
+            let data = std::fs::read(dir.path()).unwrap();
+            // assert it contains data...
+            assert_ne!(data.len(), 0);
+            // ... and is not plain zstd compression. (As it was encrypted.)
+            assert_ne!(
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+                0xFD2FB528,
+                "not encrypted: found plain zstd header"
+            );
+            // ... and doesn't contains the raw value.
+            assert!(
+                !data
+                    .windows(Suite::PROMISED_SHORT_VALUE.len())
+                    .any(|w| w == Suite::PROMISED_SHORT_VALUE)
+            );
+            assert!(
+                !data
+                    .windows(Suite::PROMISED_LONG_VALUE.len())
+                    .any(|w| w == Suite::PROMISED_LONG_VALUE)
+            );
+        }
+
+        fail::remove("log_backup_always_swap_out");
+
+        suite.force_flush_files("encryption");
+        suite.sync();
+        suite.wait_for_flush();
+        suite.check_for_write_records(
+            suite.flushed_files.path(),
+            items.union(&items2).map(Vec::as_slice),
+        );
+    }
+
+    #[test]
+    fn failed_to_get_task_when_pausing() {
+        let suite = SuiteBuilder::new_named("resume_error").nodes(1).build();
+        suite.must_register_task(1, "resume_error");
+        let mcli = suite.get_meta_cli();
+        run_async_test(mcli.pause("resume_error")).unwrap();
+        suite.sync();
+        fail::cfg("failed_to_get_task", "1*return").unwrap();
+        run_async_test(mcli.resume("resume_error")).unwrap();
+        suite.sync();
+        // Make sure our suite doesn't panic.
+        suite.sync();
     }
 }

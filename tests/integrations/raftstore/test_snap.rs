@@ -12,12 +12,13 @@ use std::{
 };
 
 use collections::HashMap;
+use engine_rocks::RocksEngine;
 use engine_traits::{Checkpointer, KvEngine, RaftEngineDebug};
 use file_system::{IoOp, IoType};
 use futures::executor::block_on;
 use grpcio::{self, ChannelBuilder, Environment};
 use kvproto::{
-    raft_serverpb::{RaftMessage, RaftSnapshotData},
+    raft_serverpb::{ExtraMessageType, RaftMessage, RaftSnapshotData},
     tikvpb::TikvClient,
 };
 use protobuf::Message as M1;
@@ -39,8 +40,11 @@ use tikv_util::{
     HandyRwLock,
 };
 
-fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>, max_snapshot_file_size: u64) {
-    cluster.cfg.rocksdb.titan.enabled = true;
+fn test_huge_snapshot<T: Simulator<RocksEngine>>(
+    cluster: &mut Cluster<RocksEngine, T>,
+    max_snapshot_file_size: u64,
+) {
+    cluster.cfg.rocksdb.titan.enabled = Some(true);
     cluster.cfg.raft_store.raft_log_gc_count_limit = Some(1000);
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(10);
     cluster.cfg.raft_store.snap_apply_batch_size = ReadableSize(500);
@@ -232,7 +236,7 @@ fn test_concurrent_snap() {
     // Test that the handling of snapshot is correct when there are multiple
     // snapshots which have overlapped region ranges arrive at the same
     // raftstore.
-    cluster.cfg.rocksdb.titan.enabled = true;
+    cluster.cfg.rocksdb.titan.enabled = Some(true);
     // Disable raft log gc in this test case.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::secs(60);
     // For raftstore v2, after split, follower delays first messages (see
@@ -285,7 +289,7 @@ fn test_concurrent_snap_v2() {
     // Test that the handling of snapshot is correct when there are multiple
     // snapshots which have overlapped region ranges arrive at the same
     // raftstore.
-    // cluster.cfg.rocksdb.titan.enabled = true;
+    // cluster.cfg.rocksdb.titan.enabled = Some(true);
     // Disable raft log gc in this test case.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::secs(60);
     // For raftstore v2, after split, follower delays first messages (see
@@ -619,7 +623,7 @@ fn test_gen_during_heavy_recv() {
     let snap = do_snapshot(
         snap_mgr.clone(),
         &engine,
-        engine.snapshot(),
+        engine.snapshot(None),
         r2,
         snap_term,
         snap_apply_state,
@@ -1036,4 +1040,154 @@ fn test_v2_leaner_snapshot_commit_index() {
     cluster.must_transfer_leader(1, new_peer(2, 2));
 
     cluster.must_put(b"k3", b"v3");
+}
+
+/// Snapshot should not be blocked when a peer is removed before receiving
+/// MsgSnapGenPrecheckRequest.
+#[test_case(test_raftstore::new_node_cluster)]
+fn test_remove_peer_after_requesting_snapshot() {
+    let mut cluster = new_cluster(0, 3);
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    // Use run conf change to make new node be initialized with term 0.
+    let r = cluster.run_conf_change();
+
+    // Add peer(3, 3) to store 3
+    cluster.must_put(b"k0", b"v0");
+    pd_client.must_add_peer(r, new_peer(3, 3));
+    must_get_equal(&cluster.get_engine(3), b"k0", b"v0");
+
+    // Add peer(2, 2) to store 2
+    //
+    // Drop MsgSnapGenPrecheckRequest to region 1 on store 2 before adding peer.
+    let (send_tx, send_rx) = mpsc::channel();
+    cluster.add_send_filter(CloneFilterFactory(DropMessageFilter::new(Arc::new(
+        move |m| {
+            let is_precheck_2 = m.get_to_peer().get_id() == 2
+                && m.get_extra_msg().get_type() == ExtraMessageType::MsgSnapGenPrecheckRequest;
+            if is_precheck_2 {
+                let _ = send_tx.send(());
+            }
+            !is_precheck_2
+        },
+    ))));
+    // Make sure add peer conf change is applied on leader side.
+    pd_client.must_add_peer(r, new_peer(2, 2));
+
+    // Make sure peer 2 has requested snapshot.
+    send_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Remove peer(2, 2) from store 2
+    pd_client.must_remove_peer(r, new_peer(2, 2));
+
+    // Clear filters and add peer(2, 4) to store 2.
+    cluster.clear_send_filters();
+    pd_client.must_add_peer(r, new_peer(2, 4));
+
+    // Make sure store 2 has applied a snapshot.
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+}
+
+/// Snapshot should not be blocked when a peer is stopped before receiving
+/// MsgSnapGenPrecheckRequest.
+#[test_case(test_raftstore::new_server_cluster)]
+fn test_network_partition_after_requesting_snapshot() {
+    let mut cluster = new_cluster(0, 5);
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    // Use run conf change to make new node be initialized with term 0.
+    let r = cluster.run_conf_change();
+
+    // Add peers.
+    cluster.must_put(b"k0", b"v0");
+    for id in 2..=3 {
+        pd_client.must_add_peer(r, new_peer(id, id));
+        must_get_equal(&cluster.get_engine(id), b"k0", b"v0");
+    }
+
+    // Add peer(4, 4) to store 4
+    //
+    // Drop MsgSnapGenPrecheckRequest to region 1 on store 4 before adding peer.
+    let (send_tx, send_rx) = mpsc::channel();
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(r, 4)
+            .msg_type(MessageType::MsgSnapshot)
+            .drop_extra_message(ExtraMessageType::MsgSnapGenPrecheckRequest)
+            .direction(Direction::Recv)
+            .set_msg_callback(Arc::new(move |m: &RaftMessage| {
+                if m.get_extra_msg().get_type() == ExtraMessageType::MsgSnapGenPrecheckRequest {
+                    let _ = send_tx.send(());
+                }
+            })),
+    ));
+    // Make sure add peer conf change is applied on leader side.
+    pd_client.must_add_peer(r, new_peer(4, 4));
+
+    // Make sure peer 4 has requested snapshot.
+    send_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Stop node 4.
+    cluster.stop_node(4);
+
+    // Add peer to store 5.
+    pd_client.must_add_peer(r, new_peer(5, 5));
+
+    // Make sure store 5 has applied a snapshot.
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(5), b"k1", b"v1");
+}
+
+/// Snapshot precheck should be cancelled when a leader steps down.
+#[test_case(test_raftstore::new_node_cluster)]
+fn test_leader_step_down_after_requesting_snapshot() {
+    let mut cluster = new_cluster(0, 3);
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    // Use run conf change to make new node be initialized with term 0.
+    let r = cluster.run_conf_change();
+
+    // Add peer(3, 3) to store 3
+    cluster.must_put(b"k0", b"v0");
+    pd_client.must_add_peer(r, new_peer(3, 3));
+    must_get_equal(&cluster.get_engine(3), b"k0", b"v0");
+
+    // Add peer(2, 2) to store 2
+    //
+    // Drop MsgSnapGenPrecheckRequest to region 1 on store 2 before adding peer.
+    let (send_tx, send_rx) = mpsc::channel();
+    cluster.add_send_filter(CloneFilterFactory(DropMessageFilter::new(Arc::new(
+        move |m| {
+            let is_precheck_2 = m.get_to_peer().get_id() == 2
+                && m.get_from_peer().get_id() == 1
+                && m.get_extra_msg().get_type() == ExtraMessageType::MsgSnapGenPrecheckRequest;
+            if is_precheck_2 {
+                let _ = send_tx.send(());
+            }
+            !is_precheck_2
+        },
+    ))));
+    // Make sure add peer conf change is applied on leader side.
+    pd_client.must_add_peer(r, new_peer(2, 2));
+
+    // Make sure peer 2 has requested snapshot.
+    send_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Transfer leader to peer 3.
+    cluster.must_transfer_leader(r, new_peer(3, 3));
+
+    // Make sure store 2 has applied a snapshot.
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+
+    // Peer 1 should not send precheck after became follower.
+    while send_rx.try_recv().is_ok() {}
+    let base_tick_interval = cluster.cfg.raft_store.raft_base_tick_interval.0;
+    let election_ticks = cluster.cfg.raft_store.raft_election_timeout_ticks as u32;
+    let election_timeout = base_tick_interval * election_ticks;
+    std::thread::sleep(election_timeout);
+    send_rx.try_recv().unwrap_err();
 }

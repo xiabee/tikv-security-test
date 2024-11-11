@@ -1,6 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 #![feature(let_chains)]
+#![feature(noop_waker)]
 
 mod config;
 mod crypter;
@@ -16,10 +17,7 @@ use std::{io::ErrorKind, path::Path};
 
 pub use self::{
     config::*,
-    crypter::{
-        from_engine_encryption_method, to_engine_encryption_method, verify_encryption_config,
-        AesGcmCrypter, Iv,
-    },
+    crypter::{verify_encryption_config, AesGcmCrypter, FileEncryptionInfo, Iv},
     encrypted_file::EncryptedFile,
     errors::{cloud_convert_error, Error, Result, RetryCodedError},
     file_dict_file::FileDictionaryFile,

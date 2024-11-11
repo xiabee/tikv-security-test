@@ -18,7 +18,9 @@ use crate::{
 make_auto_flush_static_metric! {
     pub label_enum ReqTag {
         select,
+        select_by_range_cache,
         index,
+        index_by_range_cache,
         // For AnalyzeType::{TypeColumn,TypeMixed}.
         analyze_table,
         // For AnalyzeType::{TypeIndex,TypeCommonHandle}.
@@ -286,7 +288,7 @@ pub fn tls_collect_scan_details(cmd: ReqTag, stats: &Statistics) {
         m.borrow_mut()
             .local_scan_details
             .entry(cmd)
-            .or_insert_with(Default::default)
+            .or_default()
             .add(stats);
     });
 }
