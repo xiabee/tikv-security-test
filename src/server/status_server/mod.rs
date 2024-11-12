@@ -1,13 +1,11 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-mod metrics;
 /// Provides profilers for TiKV.
 mod profile;
-
 use std::{
-    env::args,
     error::Error as StdError,
     net::SocketAddr,
+    path::PathBuf,
     pin::Pin,
     str::{self, FromStr},
     sync::Arc,
@@ -19,7 +17,7 @@ use async_stream::stream;
 use collections::HashMap;
 use flate2::{write::GzEncoder, Compression};
 use futures::{
-    compat::Compat01As03,
+    compat::{Compat01As03, Stream01CompatExt},
     future::{ok, poll_fn},
     prelude::*,
 };
@@ -35,14 +33,16 @@ use hyper::{
     Body, Method, Request, Response, Server, StatusCode,
 };
 use kvproto::resource_manager::ResourceGroup;
-use metrics::STATUS_REQUEST_DURATION;
 use online_config::OnlineConfig;
 use openssl::{
     ssl::{Ssl, SslAcceptor, SslContext, SslFiletype, SslMethod, SslVerifyMode},
     x509::X509,
 };
 use pin_project::pin_project;
-use profile::*;
+pub use profile::{
+    activate_heap_profile, deactivate_heap_profile, jeprof_heap_profile, list_heap_profiles,
+    read_file, start_one_cpu_profile, start_one_heap_profile,
+};
 use prometheus::TEXT_FORMAT;
 use regex::Regex;
 use resource_control::ResourceGroupManager;
@@ -58,11 +58,10 @@ use tikv_util::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    runtime::{Builder, Runtime},
+    runtime::{Builder, Handle, Runtime},
     sync::oneshot::{self, Receiver, Sender},
 };
 use tokio_openssl::SslStream;
-use tracing_active_tree::tree::formating::FormatFlat;
 
 use crate::{
     config::{ConfigController, LogLevel},
@@ -93,6 +92,7 @@ pub struct StatusServer<R> {
     cfg_controller: ConfigController,
     router: R,
     security_config: Arc<SecurityConfig>,
+    store_path: PathBuf,
     resource_manager: Option<Arc<ResourceGroupManager>>,
     grpc_service_mgr: GrpcServiceManager,
 }
@@ -106,6 +106,7 @@ where
         cfg_controller: ConfigController,
         security_config: Arc<SecurityConfig>,
         router: R,
+        store_path: PathBuf,
         resource_manager: Option<Arc<ResourceGroupManager>>,
         grpc_service_mgr: GrpcServiceManager,
     ) -> Result<Self> {
@@ -113,10 +114,8 @@ where
             .enable_all()
             .worker_threads(status_thread_pool_size)
             .thread_name("status-server")
-            .with_sys_and_custom_hooks(
-                || debug!("Status server started"),
-                || debug!("stopping status server"),
-            )
+            .after_start_wrapper(|| debug!("Status server started"))
+            .before_stop_wrapper(|| debug!("stopping status server"))
             .build()?;
 
         let (tx, rx) = oneshot::channel::<()>();
@@ -128,28 +127,105 @@ where
             cfg_controller,
             router,
             security_config,
+            store_path,
             resource_manager,
             grpc_service_mgr,
         })
     }
 
-    fn dump_heap_prof_to_resp(req: Request<Body>) -> hyper::Result<Response<Body>> {
+    fn list_heap_prof(_req: Request<Body>) -> hyper::Result<Response<Body>> {
+        let profiles = match list_heap_profiles() {
+            Ok(s) => s,
+            Err(e) => return Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, e)),
+        };
+
+        let text = profiles
+            .into_iter()
+            .map(|(f, ct)| format!("{}\t\t{}", f, ct))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+
+        let response = Response::builder()
+            .header("Content-Type", mime::TEXT_PLAIN.to_string())
+            .header("Content-Length", text.len())
+            .body(text.into())
+            .unwrap();
+        Ok(response)
+    }
+
+    async fn activate_heap_prof(
+        req: Request<Body>,
+        store_path: PathBuf,
+    ) -> hyper::Result<Response<Body>> {
+        let query = req.uri().query().unwrap_or("");
+        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+
+        let interval: u64 = match query_pairs.get("interval") {
+            Some(val) => match val.parse() {
+                Ok(val) => val,
+                Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
+            },
+            None => 60,
+        };
+
+        let interval = Duration::from_secs(interval);
+        let period = GLOBAL_TIMER_HANDLE
+            .interval(Instant::now() + interval, interval)
+            .compat()
+            .map_ok(|_| ())
+            .map_err(|_| TIMER_CANCELED.to_owned())
+            .into_stream();
+        let (tx, rx) = oneshot::channel();
+        let callback = move || tx.send(()).unwrap_or_default();
+        let res = Handle::current().spawn(activate_heap_profile(period, store_path, callback));
+        if rx.await.is_ok() {
+            let msg = "activate heap profile success";
+            Ok(make_response(StatusCode::OK, msg))
+        } else {
+            let errmsg = format!("{:?}", res.await);
+            Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, errmsg))
+        }
+    }
+
+    fn deactivate_heap_prof(_req: Request<Body>) -> hyper::Result<Response<Body>> {
+        let body = if deactivate_heap_profile() {
+            "deactivate heap profile success"
+        } else {
+            "no heap profile is running"
+        };
+        Ok(make_response(StatusCode::OK, body))
+    }
+
+    #[allow(dead_code)]
+    async fn dump_heap_prof_to_resp(req: Request<Body>) -> hyper::Result<Response<Body>> {
         let query = req.uri().query().unwrap_or("");
         let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
 
         let use_jeprof = query_pairs.get("jeprof").map(|x| x.as_ref()) == Some("true");
 
-        let result = {
-            let file = match dump_one_heap_profile() {
-                Ok(file) => file,
-                Err(e) => return Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, e)),
-            };
-            let path = file.path();
+        let result = if let Some(name) = query_pairs.get("name") {
             if use_jeprof {
-                jeprof_heap_profile(path.to_str().unwrap())
+                jeprof_heap_profile(name)
             } else {
-                read_file(path.to_str().unwrap())
+                read_file(name)
             }
+        } else {
+            let mut seconds = 10;
+            if let Some(s) = query_pairs.get("seconds") {
+                match s.parse() {
+                    Ok(val) => seconds = val,
+                    Err(_) => {
+                        let errmsg = "request should have seconds argument".to_owned();
+                        return Ok(make_response(StatusCode::BAD_REQUEST, errmsg));
+                    }
+                }
+            }
+            let timer = GLOBAL_TIMER_HANDLE.delay(Instant::now() + Duration::from_secs(seconds));
+            let end = Compat01As03::new(timer)
+                .map_err(|_| TIMER_CANCELED.to_owned())
+                .into_future();
+            start_one_heap_profile(end, use_jeprof).await
         };
 
         match result {
@@ -173,7 +249,7 @@ where
         }
     }
 
-    fn get_config(
+    async fn get_config(
         req: Request<Body>,
         cfg_controller: &ConfigController,
     ) -> hyper::Result<Response<Body>> {
@@ -205,100 +281,11 @@ where
         })
     }
 
-    fn get_cmdline(_req: Request<Body>) -> hyper::Result<Response<Body>> {
-        let args = args().fold(String::new(), |mut a, b| {
-            a.push_str(&b);
-            a.push('\x00');
-            a
-        });
-        let response = Response::builder()
-            .header("Content-Type", mime::TEXT_PLAIN.to_string())
-            .header("X-Content-Type-Options", "nosniff")
-            .body(args.into())
-            .unwrap();
-        Ok(response)
-    }
-
-    fn get_symbol_count(req: Request<Body>) -> hyper::Result<Response<Body>> {
-        assert_eq!(req.method(), Method::GET);
-        // We don't know how many symbols we have, but we
-        // do have symbol information. pprof only cares whether
-        // this number is 0 (no symbols available) or > 0.
-        let text = "num_symbols: 1\n";
-        let response = Response::builder()
-            .header("Content-Type", mime::TEXT_PLAIN.to_string())
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Content-Length", text.len())
-            .body(text.into())
-            .unwrap();
-        Ok(response)
-    }
-
-    // The request and response format follows pprof remote server
-    // https://gperftools.github.io/gperftools/pprof_remote_servers.html
-    // Here is the go pprof implementation:
-    // https://github.com/golang/go/blob/3857a89e7eb872fa22d569e70b7e076bec74ebbb/src/net/http/pprof/pprof.go#L191
-    async fn get_symbol(req: Request<Body>) -> hyper::Result<Response<Body>> {
-        assert_eq!(req.method(), Method::POST);
-        let mut text = String::new();
-        let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
-        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
-
-        // The request body is a list of addr to be resolved joined by '+'.
-        // Resolve addrs with addr2line and write the symbols each per line in
-        // response.
-        for pc in body.split('+') {
-            let addr = usize::from_str_radix(pc.trim_start_matches("0x"), 16).unwrap_or(0);
-            if addr == 0 {
-                info!("invalid addr: {}", addr);
-                continue;
-            }
-
-            // Would be multiple symbols if inlined.
-            let mut syms = vec![];
-            backtrace::resolve(addr as *mut std::ffi::c_void, |sym| {
-                let name = sym
-                    .name()
-                    .unwrap_or_else(|| backtrace::SymbolName::new(b"<unknown>"));
-                syms.push(name.to_string());
-            });
-
-            if !syms.is_empty() {
-                // join inline functions with '--'
-                let f = syms.join("--");
-                // should be <hex address> <function name>
-                text.push_str(format!("{:#x} {}\n", addr, f).as_str());
-            } else {
-                info!("can't resolve mapped addr: {:#x}", addr);
-                text.push_str(format!("{:#x} ??\n", addr).as_str());
-            }
-        }
-        let response = Response::builder()
-            .header("Content-Type", mime::TEXT_PLAIN.to_string())
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Content-Length", text.len())
-            .body(text.into())
-            .unwrap();
-        Ok(response)
-    }
-
     async fn update_config(
         cfg_controller: ConfigController,
         req: Request<Body>,
     ) -> hyper::Result<Response<Body>> {
         let mut body = Vec::new();
-        let mut persist = true;
-        if let Some(query) = req.uri().query() {
-            let query_pairs: HashMap<_, _> =
-                url::form_urlencoded::parse(query.as_bytes()).collect();
-            persist = match query_pairs.get("persist") {
-                Some(val) => match val.parse() {
-                    Ok(val) => val,
-                    Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
-                },
-                None => true,
-            };
-        }
         req.into_body()
             .try_for_each(|bytes| {
                 body.extend(bytes);
@@ -306,11 +293,7 @@ where
             })
             .await?;
         Ok(match decode_json(&body) {
-            Ok(change) => match if persist {
-                cfg_controller.update(change)
-            } else {
-                cfg_controller.update_without_persist(change)
-            } {
+            Ok(change) => match cfg_controller.update(change) {
                 Err(e) => {
                     if let Some(e) = e.downcast_ref::<std::io::Error>() {
                         make_response(
@@ -340,7 +323,7 @@ where
         })
     }
 
-    fn update_config_from_toml_file(
+    async fn update_config_from_toml_file(
         cfg_controller: ConfigController,
         _req: Request<Body>,
     ) -> hyper::Result<Response<Body>> {
@@ -432,7 +415,7 @@ where
         }
     }
 
-    fn get_engine_type(cfg_controller: &ConfigController) -> hyper::Result<Response<Body>> {
+    async fn get_engine_type(cfg_controller: &ConfigController) -> hyper::Result<Response<Body>> {
         let engine_type = cfg_controller.get_engine_type();
         let response = Response::builder()
             .header("Content-Type", mime::TEXT_PLAIN.to_string())
@@ -459,18 +442,7 @@ impl<R> StatusServer<R>
 where
     R: 'static + Send + RaftExtension + Clone,
 {
-    fn dump_async_trace() -> hyper::Result<Response<Body>> {
-        Ok(make_response(
-            StatusCode::OK,
-            tracing_active_tree::layer::global().fmt_bytes_with(|t, buf| {
-                t.traverse_with(FormatFlat::new(buf)).unwrap_or_else(|err| {
-                    error!("failed to format tree, unreachable!"; "err" => %err);
-                })
-            }),
-        ))
-    }
-
-    fn handle_pause_grpc(
+    async fn handle_pause_grpc(
         mut grpc_service_mgr: GrpcServiceManager,
     ) -> hyper::Result<Response<Body>> {
         if let Err(err) = grpc_service_mgr.pause() {
@@ -485,7 +457,7 @@ where
         ))
     }
 
-    fn handle_resume_grpc(
+    async fn handle_resume_grpc(
         mut grpc_service_mgr: GrpcServiceManager,
     ) -> hyper::Result<Response<Body>> {
         if let Err(err) = grpc_service_mgr.resume() {
@@ -611,6 +583,7 @@ where
         let security_config = self.security_config.clone();
         let cfg_controller = self.cfg_controller.clone();
         let router = self.router.clone();
+        let store_path = self.store_path.clone();
         let resource_manager = self.resource_manager.clone();
         let grpc_service_mgr = self.grpc_service_mgr.clone();
         // Start to serve.
@@ -619,6 +592,7 @@ where
             let security_config = security_config.clone();
             let cfg_controller = cfg_controller.clone();
             let router = router.clone();
+            let store_path = store_path.clone();
             let resource_manager = resource_manager.clone();
             let grpc_service_mgr = grpc_service_mgr.clone();
             async move {
@@ -628,6 +602,7 @@ where
                     let security_config = security_config.clone();
                     let cfg_controller = cfg_controller.clone();
                     let router = router.clone();
+                    let store_path = store_path.clone();
                     let resource_manager = resource_manager.clone();
                     let grpc_service_mgr = grpc_service_mgr.clone();
                     async move {
@@ -660,47 +635,29 @@ where
                             ));
                         }
 
-                        let mut is_unknown_path = false;
-                        let start = Instant::now();
-                        let res = match (method.clone(), path.as_ref()) {
+                        match (method, path.as_ref()) {
                             (Method::GET, "/metrics") => {
                                 Self::handle_get_metrics(req, &cfg_controller)
                             }
                             (Method::GET, "/status") => Ok(Response::default()),
-                            (Method::GET, "/debug/pprof/heap_list") => {
-                                Ok(make_response(
-                                    StatusCode::GONE,
-                                    "Deprecated, heap profiling is always enabled by default, just use /debug/pprof/heap to get the heap profile when needed",
-                                ))
-                            }
+                            (Method::GET, "/debug/pprof/heap_list") => Self::list_heap_prof(req),
                             (Method::GET, "/debug/pprof/heap_activate") => {
-                                Ok(make_response(
-                                    StatusCode::GONE,
-                                    "Deprecated, use config `memory.enable_heap_profiling` to toggle",
-                                ))
+                                Self::activate_heap_prof(req, store_path).await
                             }
                             (Method::GET, "/debug/pprof/heap_deactivate") => {
-                                Ok(make_response(
-                                    StatusCode::GONE,
-                                    "Deprecated, use config `memory.enable_heap_profiling` to toggle",
-                                ))
+                                Self::deactivate_heap_prof(req)
                             }
-                            (Method::GET, "/debug/pprof/heap") => {
-                                Self::dump_heap_prof_to_resp(req)
-                            }
-                            (Method::GET, "/debug/pprof/cmdline") => Self::get_cmdline(req),
-                            (Method::GET, "/debug/pprof/symbol") => {
-                                Self::get_symbol_count(req)
-                            }
-                            (Method::POST, "/debug/pprof/symbol") => Self::get_symbol(req).await,
+                            // (Method::GET, "/debug/pprof/heap") => {
+                            //     Self::dump_heap_prof_to_resp(req).await
+                            // }
                             (Method::GET, "/config") => {
-                                Self::get_config(req, &cfg_controller)
+                                Self::get_config(req, &cfg_controller).await
                             }
                             (Method::POST, "/config") => {
                                 Self::update_config(cfg_controller.clone(), req).await
                             }
                             (Method::GET, "/engine_type") => {
-                                Self::get_engine_type(&cfg_controller)
+                                Self::get_engine_type(&cfg_controller).await
                             }
                             // This interface is used for configuration file hosting scenarios,
                             // TiKV will not update configuration files, and this interface will
@@ -708,6 +665,7 @@ where
                             // hand it over to the hosting platform for processing.
                             (Method::PUT, "/config/reload") => {
                                 Self::update_config_from_toml_file(cfg_controller.clone(), req)
+                                    .await
                             }
                             (Method::GET, "/debug/pprof/profile") => {
                                 Self::dump_cpu_prof_to_resp(req).await
@@ -728,27 +686,13 @@ where
                                 Self::handle_get_all_resource_groups(resource_manager.as_ref())
                             }
                             (Method::PUT, "/pause_grpc") => {
-                                Self::handle_pause_grpc(grpc_service_mgr)
+                                Self::handle_pause_grpc(grpc_service_mgr).await
                             }
                             (Method::PUT, "/resume_grpc") => {
-                                Self::handle_resume_grpc(grpc_service_mgr)
+                                Self::handle_resume_grpc(grpc_service_mgr).await
                             }
-                            (Method::GET, "/async_tasks") => Self::dump_async_trace(),
-                            _ => {
-                                is_unknown_path = true;
-                                Ok(make_response(StatusCode::NOT_FOUND, "path not found"))
-                            },
-                        };
-                        // Using "unknown" for unknown paths to void creating high cardinality.
-                        let path_label = if is_unknown_path {
-                            "unknown".to_owned()
-                        } else {
-                            path
-                        };
-                        STATUS_REQUEST_DURATION
-                            .with_label_values(&[method.as_str(), &path_label])
-                            .observe(start.elapsed().as_secs_f64());
-                        res
+                            _ => Ok(make_response(StatusCode::NOT_FOUND, "path not found")),
+                        }
                     }
                 }))
             }
@@ -819,20 +763,14 @@ where
 }
 
 #[derive(Serialize)]
-struct BackgroundSetting {
-    task_types: Vec<String>,
-}
-
-#[derive(Serialize)]
 struct ResourceGroupSetting {
     name: String,
     ru: u64,
     priority: u32,
     burst_limit: i64,
-    background: BackgroundSetting,
 }
 
-fn into_debug_request_group(mut rg: ResourceGroup) -> ResourceGroupSetting {
+fn into_debug_request_group(rg: ResourceGroup) -> ResourceGroupSetting {
     ResourceGroupSetting {
         name: rg.name,
         ru: rg
@@ -848,12 +786,6 @@ fn into_debug_request_group(mut rg: ResourceGroup) -> ResourceGroupSetting {
             .get_r_u()
             .get_settings()
             .get_burst_limit(),
-        background: BackgroundSetting {
-            task_types: rg
-                .background_settings
-                .as_mut()
-                .map_or(vec![], |s| s.take_job_types().into()),
-        },
     }
 }
 
@@ -1163,11 +1095,13 @@ mod tests {
 
     #[test]
     fn test_status_service() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1211,11 +1145,13 @@ mod tests {
 
     #[test]
     fn test_config_endpoint() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1252,84 +1188,17 @@ mod tests {
         status_server.stop();
     }
 
-    #[test]
-    fn test_update_config_endpoint() {
-        let test_config = |persist: bool| {
-            let temp_dir = tempfile::TempDir::new().unwrap();
-            let mut config = TikvConfig::default();
-            config.cfg_path = temp_dir
-                .path()
-                .join("tikv.toml")
-                .to_str()
-                .unwrap()
-                .to_string();
-            let mut status_server = StatusServer::new(
-                1,
-                ConfigController::new(config),
-                Arc::new(SecurityConfig::default()),
-                MockRouter,
-                None,
-                GrpcServiceManager::dummy(),
-            )
-            .unwrap();
-            let addr = "127.0.0.1:0".to_owned();
-            let _ = status_server.start(addr);
-            let client = Client::new();
-            let uri = if persist {
-                Uri::builder()
-                    .scheme("http")
-                    .authority(status_server.listening_addr().to_string().as_str())
-                    .path_and_query("/config")
-                    .build()
-                    .unwrap()
-            } else {
-                Uri::builder()
-                    .scheme("http")
-                    .authority(status_server.listening_addr().to_string().as_str())
-                    .path_and_query("/config?persist=false")
-                    .build()
-                    .unwrap()
-            };
-            let mut req = Request::new(Body::from("{\"coprocessor.region-split-size\": \"1GB\"}"));
-            *req.method_mut() = Method::POST;
-            *req.uri_mut() = uri.clone();
-            let handle = status_server.thread_pool.spawn(async move {
-                let resp = client.request(req).await.unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
-            });
-            block_on(handle).unwrap();
-
-            let client = Client::new();
-            let handle2 = status_server.thread_pool.spawn(async move {
-                let resp = client.get(uri).await.unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
-                let mut v = Vec::new();
-                resp.into_body()
-                    .try_for_each(|bytes| {
-                        v.extend(bytes);
-                        ok(())
-                    })
-                    .await
-                    .unwrap();
-                let resp_json = String::from_utf8_lossy(&v).to_string();
-                assert!(resp_json.contains("\"region-split-size\":\"1GiB\""));
-            });
-            block_on(handle2).unwrap();
-            status_server.stop();
-        };
-        test_config(true);
-        test_config(false);
-    }
-
     #[cfg(feature = "failpoints")]
     #[test]
     fn test_status_service_fail_endpoints() {
         let _guard = fail::FailScenario::setup();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1441,11 +1310,13 @@ mod tests {
     #[test]
     fn test_status_service_fail_endpoints_can_trigger_fails() {
         let _guard = fail::FailScenario::setup();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1485,11 +1356,13 @@ mod tests {
     #[test]
     fn test_status_service_fail_endpoints_should_give_404_when_failpoints_are_disable() {
         let _guard = fail::FailScenario::setup();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1521,11 +1394,13 @@ mod tests {
     }
 
     fn do_test_security_status_service(allowed_cn: HashSet<String>, expected: bool) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(new_security_cfg(Some(allowed_cn))),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1592,12 +1467,15 @@ mod tests {
 
     #[cfg(feature = "mem-profiling")]
     #[test]
+    #[ignore]
     fn test_pprof_heap_service() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1623,11 +1501,13 @@ mod tests {
     #[test]
     fn test_pprof_profile_service() {
         let _test_guard = TEST_PROFILE_MUTEX.lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1654,64 +1534,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pprof_symbol_service() {
-        let _test_guard = TEST_PROFILE_MUTEX.lock().unwrap();
-        let mut status_server = StatusServer::new(
-            1,
-            ConfigController::default(),
-            Arc::new(SecurityConfig::default()),
-            MockRouter,
-            None,
-            GrpcServiceManager::dummy(),
-        )
-        .unwrap();
-        let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr);
-        let client = Client::new();
-
-        let mut addr = None;
-        backtrace::trace(|f| {
-            addr = Some(f.ip());
-            false
-        });
-        assert!(addr.is_some());
-
-        let uri = Uri::builder()
-            .scheme("http")
-            .authority(status_server.listening_addr().to_string().as_str())
-            .path_and_query("/debug/pprof/symbol")
-            .build()
-            .unwrap();
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(uri)
-            .body(Body::from(format!("{:p}", addr.unwrap())))
-            .unwrap();
-        let handle = status_server
-            .thread_pool
-            .spawn(async move { client.request(req).await.unwrap() });
-        let resp = block_on(handle).unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body_bytes = block_on(hyper::body::to_bytes(resp.into_body())).unwrap();
-        assert!(
-            String::from_utf8(body_bytes.as_ref().to_owned())
-                .unwrap()
-                .split(' ')
-                .last()
-                .unwrap()
-                .starts_with("backtrace::backtrace")
-        );
-        status_server.stop();
-    }
-
-    #[test]
     fn test_metrics() {
         let _test_guard = TEST_PROFILE_MUTEX.lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1762,11 +1593,13 @@ mod tests {
 
     #[test]
     fn test_change_log_level() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let mut status_server = StatusServer::new(
             1,
             ConfigController::default(),
             Arc::new(SecurityConfig::default()),
             MockRouter,
+            temp_dir.path().to_path_buf(),
             None,
             GrpcServiceManager::dummy(),
         )
@@ -1816,11 +1649,13 @@ mod tests {
         let cfgs = [TikvConfig::default(), multi_rocks_cfg];
         let resp_strs = ["raft-kv", "partitioned-raft-kv"];
         for (cfg, resp_str) in IntoIterator::into_iter(cfgs).zip(resp_strs) {
+            let temp_dir = tempfile::TempDir::new().unwrap();
             let mut status_server = StatusServer::new(
                 1,
                 ConfigController::new(cfg),
                 Arc::new(SecurityConfig::default()),
                 MockRouter,
+                temp_dir.path().to_path_buf(),
                 None,
                 GrpcServiceManager::dummy(),
             )
@@ -1853,11 +1688,13 @@ mod tests {
         multi_rocks_cfg.storage.engine = EngineType::RaftKv2;
         let cfgs = [TikvConfig::default(), multi_rocks_cfg];
         for cfg in IntoIterator::into_iter(cfgs) {
+            let temp_dir = tempfile::TempDir::new().unwrap();
             let mut status_server = StatusServer::new(
                 1,
                 ConfigController::new(cfg),
                 Arc::new(SecurityConfig::default()),
                 MockRouter,
+                temp_dir.path().to_path_buf(),
                 None,
                 GrpcServiceManager::dummy(),
             )

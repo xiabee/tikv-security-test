@@ -33,8 +33,6 @@ where
         let causal_ts_provider = self.causal_ts_provider.clone();
         let logger = self.logger.clone();
         let shutdown = self.shutdown.clone();
-        let log_interval = Duration::from_secs(5);
-        let mut last_log_ts = Instant::now().checked_sub(log_interval).unwrap();
 
         let f = async move {
             let mut success = false;
@@ -75,15 +73,10 @@ where
                         break;
                     }
                     Err(e) => {
-                        if last_log_ts.elapsed() > log_interval {
-                            warn!(
-                                logger,
-                                "failed to update max timestamp for region";
-                                "region_id" => region_id,
-                                "error" => ?e
-                            );
-                            last_log_ts = Instant::now();
-                        }
+                        warn!(
+                            logger,
+                            "failed to update max timestamp for region {}: {:?}", region_id, e
+                        );
                     }
                 }
             }

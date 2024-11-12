@@ -6,12 +6,10 @@ pub mod commands;
 pub mod flow_controller;
 pub mod sched_pool;
 pub mod scheduler;
-pub mod txn_status_cache;
 
 mod actions;
 mod latch;
 mod store;
-mod task;
 
 use std::{error::Error as StdError, io::Error as IoError};
 
@@ -144,9 +142,6 @@ pub enum ErrorInner {
     )]
     MaxTimestampNotSynced { region_id: u64, start_ts: TimeStamp },
 
-    #[error("RawKV write fails due to potentially stale max timestamp, region_id: {region_id}")]
-    RawKvMaxTimestampNotSynced { region_id: u64 },
-
     #[error("region {0} not prepared the flashback")]
     FlashbackNotPrepared(u64),
 }
@@ -182,9 +177,6 @@ impl ErrorInner {
                 region_id,
                 start_ts,
             }),
-            ErrorInner::RawKvMaxTimestampNotSynced { region_id } => {
-                Some(ErrorInner::RawKvMaxTimestampNotSynced { region_id })
-            }
             ErrorInner::FlashbackNotPrepared(region_id) => {
                 Some(ErrorInner::FlashbackNotPrepared(region_id))
             }
@@ -236,9 +228,6 @@ impl ErrorCodeExt for Error {
             ErrorInner::InvalidTxnTso { .. } => error_code::storage::INVALID_TXN_TSO,
             ErrorInner::InvalidReqRange { .. } => error_code::storage::INVALID_REQ_RANGE,
             ErrorInner::MaxTimestampNotSynced { .. } => {
-                error_code::storage::MAX_TIMESTAMP_NOT_SYNCED
-            }
-            ErrorInner::RawKvMaxTimestampNotSynced { .. } => {
                 error_code::storage::MAX_TIMESTAMP_NOT_SYNCED
             }
             ErrorInner::FlashbackNotPrepared(_) => error_code::storage::FLASHBACK_NOT_PREPARED,

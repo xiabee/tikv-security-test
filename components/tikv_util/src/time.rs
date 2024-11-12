@@ -6,10 +6,7 @@ use std::{
     cell::RefCell,
     cmp::Ordering,
     ops::{Add, AddAssign, Sub, SubAssign},
-    sync::{
-        mpsc::{self, Sender},
-        Once,
-    },
+    sync::mpsc::{self, Sender},
     thread::{self, Builder, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -153,7 +150,7 @@ impl Monitor {
             .name(thd_name!("time-monitor"))
             .spawn_wrapper(move || {
                 crate::thread_group::set_properties(props);
-
+                tikv_alloc::add_thread_memory_accessor();
                 while rx.try_recv().is_err() {
                     let before = now();
                     thread::sleep(Duration::from_millis(DEFAULT_WAIT_MS));
@@ -169,6 +166,7 @@ impl Monitor {
                         on_jumped()
                     }
                 }
+                tikv_alloc::remove_thread_memory_accessor();
             })
             .unwrap();
 
@@ -203,9 +201,10 @@ impl Drop for Monitor {
     }
 }
 
+use self::inner::monotonic_coarse_now;
+pub use self::inner::monotonic_now;
 /// Returns the monotonic raw time since some unspecified starting point.
 pub use self::inner::monotonic_raw_now;
-pub use self::inner::{monotonic_coarse_now, monotonic_now};
 use crate::sys::thread::StdThreadBuildWrapper;
 
 const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
@@ -513,7 +512,7 @@ pub struct ThreadReadId {
     pub create_time: Timespec,
 }
 
-thread_local!(static READ_SEQUENCE: RefCell<u64> = const { RefCell::new(0) });
+thread_local!(static READ_SEQUENCE: RefCell<u64> = RefCell::new(0));
 
 impl ThreadReadId {
     pub fn new() -> ThreadReadId {
@@ -535,55 +534,6 @@ impl Default for ThreadReadId {
     }
 }
 
-/// Default duration cost for spinning one round.
-///
-/// Heuristically, spin duration for one round is about 3～4ns.
-static mut DEFAULT_DURATION_SPIN_ONE_ROUND: u64 = 1;
-
-/// Setup the default ratio for spin duration.
-pub fn setup_for_spin_interval() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let inspect_duration = Duration::from_millis(10);
-        let start = Instant::now();
-        let mut count = 0;
-        // Spin for a while to get the duration for one round.
-        for _ in 0..2_097_152 {
-            count += 1;
-            if count % 1024 == 0 && start.saturating_elapsed() >= inspect_duration {
-                break;
-            }
-        }
-        let elapsed_one_round = start.saturating_elapsed().as_nanos() as u64 / count;
-        if elapsed_one_round > 0 {
-            unsafe {
-                DEFAULT_DURATION_SPIN_ONE_ROUND = elapsed_one_round;
-            }
-        }
-        debug!("setup duration for spinning one round: {}ns", unsafe {
-            DEFAULT_DURATION_SPIN_ONE_ROUND
-        });
-    });
-}
-
-/// Wait for at least `elaspsed` duration synchronously by looping.
-///
-/// Attention, this function is only suitable for short-time spinning, so
-/// the `elaspsed` should be small, like 1ms. And the caller should not
-/// rely on it to guarantee the exact time to sleep.
-pub fn spin_at_least(elaspsed: Duration) {
-    // Initialize default spin loop interval.
-    setup_for_spin_interval();
-
-    let rounds = unsafe { elaspsed.as_nanos() as u64 / DEFAULT_DURATION_SPIN_ONE_ROUND };
-    let now = Instant::now();
-    for i in 1..=rounds {
-        if i % 100 == 0 && now.saturating_elapsed() >= elaspsed {
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -595,8 +545,6 @@ mod tests {
         thread,
         time::{Duration, SystemTime},
     };
-
-    use test::Bencher;
 
     use super::*;
 
@@ -737,28 +685,5 @@ mod tests {
             assert!(now.saturating_elapsed() >= zero);
             assert!(now_coarse.saturating_elapsed() >= zero);
         }
-    }
-
-    #[test]
-    fn test_wait_at_least() {
-        setup_for_spin_interval();
-
-        let start = Instant::now();
-        spin_at_least(Duration::from_micros(500));
-        assert!(start.saturating_elapsed() >= Duration::from_micros(100));
-    }
-
-    #[bench]
-    fn bench_instant_now(b: &mut Bencher) {
-        b.iter(|| {
-            let _now = Instant::now();
-        });
-    }
-
-    #[bench]
-    fn bench_instant_now_coarse(b: &mut Bencher) {
-        b.iter(|| {
-            let _now = Instant::now_coarse();
-        });
     }
 }

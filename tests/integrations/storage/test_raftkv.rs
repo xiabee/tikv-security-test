@@ -4,7 +4,6 @@ use std::{
     thread, time,
 };
 
-use engine_rocks::RocksEngine as RocksDb;
 use engine_traits::{CfName, IterOptions, CF_DEFAULT};
 use futures::executor::block_on;
 use kvproto::kvrpcpb::{Context, KeyRange};
@@ -234,7 +233,6 @@ fn test_read_on_replica_check_memory_locks() {
         10.into(),
         1,
         20.into(),
-        false,
     );
     let guard = block_on(leader_cm.lock_key(&encoded_key));
     guard.with_lock(|l| *l = Some(lock.clone()));
@@ -324,7 +322,7 @@ fn test_invalid_read_index_when_no_leader() {
         true,
     );
     request.mut_header().set_peer(follower.clone());
-    let (cb, mut rx) = make_cb::<RocksDb>(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()

@@ -137,31 +137,28 @@ impl BatchExecutorsRunner<()> {
                         .map_err(|e| other_err!("BatchProjectionExecutor: {}", e))?;
                 }
                 ExecType::TypeJoin => {
-                    return Err(other_err!("Join executor not implemented"));
+                    other_err!("Join executor not implemented");
                 }
                 ExecType::TypeKill => {
-                    return Err(other_err!("Kill executor not implemented"));
+                    other_err!("Kill executor not implemented");
                 }
                 ExecType::TypeExchangeSender => {
-                    return Err(other_err!("ExchangeSender executor not implemented"));
+                    other_err!("ExchangeSender executor not implemented");
                 }
                 ExecType::TypeExchangeReceiver => {
-                    return Err(other_err!("ExchangeReceiver executor not implemented"));
+                    other_err!("ExchangeReceiver executor not implemented");
                 }
                 ExecType::TypePartitionTableScan => {
-                    return Err(other_err!("PartitionTableScan executor not implemented"));
+                    other_err!("PartitionTableScan executor not implemented");
                 }
                 ExecType::TypeSort => {
-                    return Err(other_err!("Sort executor not implemented"));
+                    other_err!("Sort executor not implemented");
                 }
                 ExecType::TypeWindow => {
-                    return Err(other_err!("Window executor not implemented"));
+                    other_err!("Window executor not implemented");
                 }
                 ExecType::TypeExpand => {
-                    return Err(other_err!("Expand executor not implemented"));
-                }
-                ExecType::TypeExpand2 => {
-                    return Err(other_err!("Expand2 executor not implemented"));
+                    other_err!("Expand executor not implemented");
                 }
             }
         }
@@ -171,8 +168,10 @@ impl BatchExecutorsRunner<()> {
 }
 
 #[inline]
-fn is_arrow_encodable<'a>(mut schema: impl Iterator<Item = &'a FieldType>) -> bool {
-    schema.all(|schema| EvalType::try_from(schema.as_accessor().tp()).is_ok())
+fn is_arrow_encodable(schema: &[FieldType]) -> bool {
+    schema
+        .iter()
+        .all(|schema| EvalType::try_from(schema.as_accessor().tp()).is_ok())
 }
 
 #[allow(clippy::explicit_counter_loop)]
@@ -446,6 +445,12 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
                                                     * end where last scan is finished */
         )?;
 
+        let encode_type = if !is_arrow_encodable(out_most_executor.schema()) {
+            EncodeType::TypeDefault
+        } else {
+            req.get_encode_type()
+        };
+
         // Check output offsets
         let output_offsets = req.take_output_offsets();
         let schema_len = out_most_executor.schema().len();
@@ -458,16 +463,6 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
                 ));
             }
         }
-
-        // Only check output schema field types
-        let new_schema = output_offsets
-            .iter()
-            .map(|&i| &out_most_executor.schema()[i as usize]);
-        let encode_type = if !is_arrow_encodable(new_schema) {
-            EncodeType::TypeDefault
-        } else {
-            req.get_encode_type()
-        };
 
         let exec_stats = ExecuteStats::new(executors_len);
 

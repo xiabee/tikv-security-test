@@ -147,7 +147,7 @@ where
         safe_point: Arc<AtomicU64>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
-        gc_scheduler: Scheduler<GcTask<<EK as MiscExt>::DiskEngine>>,
+        gc_scheduler: Scheduler<GcTask<EK>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
     );
 }
@@ -162,7 +162,7 @@ where
         _safe_point: Arc<AtomicU64>,
         _cfg_tracker: GcWorkerConfigManager,
         _feature_gate: FeatureGate,
-        _gc_scheduler: Scheduler<GcTask<<EK as MiscExt>::DiskEngine>>,
+        _gc_scheduler: Scheduler<GcTask<EK>>,
         _region_info_provider: Arc<dyn RegionInfoProvider>,
     ) {
         info!("Compaction filter is not supported for this engine.");
@@ -888,7 +888,7 @@ pub mod test_utils {
                     cfg.ratio_threshold = ratio_threshold;
                 }
                 cfg.enable_compaction_filter = true;
-                GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)), None)
+                GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)))
             };
             let feature_gate = {
                 let feature_gate = FeatureGate::default();
@@ -1098,7 +1098,6 @@ pub mod tests {
         // Clean the engine, prepare for later tests.
         raw_engine
             .delete_ranges_cf(
-                &WriteOptions::default(),
                 CF_WRITE,
                 DeleteStrategy::DeleteFiles,
                 &[Range::new(b"z", b"zz")],

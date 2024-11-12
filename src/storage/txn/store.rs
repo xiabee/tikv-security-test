@@ -1,7 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use kvproto::kvrpcpb::IsolationLevel;
-use txn_types::{Key, KvPair, LastChange, Lock, OldValue, TimeStamp, TsSet, Value, WriteRef};
+use txn_types::{Key, KvPair, Lock, OldValue, TimeStamp, TsSet, Value, WriteRef};
 
 use super::{Error, ErrorInner, Result};
 use crate::storage::{
@@ -167,13 +167,14 @@ impl TxnEntry {
                 lock: (_, value), ..
             } => {
                 let l = Lock::parse(value).unwrap();
-                *value = l.set_last_change(LastChange::Unknown).to_bytes();
+                *value = l.set_last_change(TimeStamp::zero(), 0).to_bytes();
             }
             TxnEntry::Commit {
                 write: (_, value), ..
             } => {
                 let mut w = WriteRef::parse(value).unwrap();
-                w.last_change = LastChange::Unknown;
+                w.last_change_ts = TimeStamp::zero();
+                w.versions_to_last_change = 0;
                 *value = w.to_bytes();
             }
         }
@@ -655,7 +656,7 @@ mod tests {
     use std::sync::Arc;
 
     use concurrency_manager::ConcurrencyManager;
-    use engine_traits::{CfName, IterMetricsCollector, IterOptions, MetricsExt, ReadOptions};
+    use engine_traits::{CfName, IterOptions, ReadOptions};
     use kvproto::kvrpcpb::{AssertionLevel, Context, PrewriteRequestPessimisticAction::*};
     use tikv_kv::DummySnapshotExt;
 
@@ -815,26 +816,6 @@ mod tests {
         }
         fn value(&self) -> &[u8] {
             b""
-        }
-    }
-
-    pub struct MockRangeSnapIterMetricsCollector;
-
-    impl IterMetricsCollector for MockRangeSnapIterMetricsCollector {
-        fn internal_delete_skipped_count(&self) -> u64 {
-            0
-        }
-
-        fn internal_key_skipped_count(&self) -> u64 {
-            0
-        }
-    }
-
-    impl MetricsExt for MockRangeSnapshotIter {
-        type Collector = MockRangeSnapIterMetricsCollector;
-
-        fn metrics_collector(&self) -> Self::Collector {
-            MockRangeSnapIterMetricsCollector {}
         }
     }
 

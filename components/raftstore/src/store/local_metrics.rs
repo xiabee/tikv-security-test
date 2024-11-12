@@ -68,84 +68,6 @@ impl RaftSendMessageMetrics {
     }
 }
 
-/// Buffered statistics for recording local raftstore message duration.
-///
-/// As it's only used for recording local raftstore message duration,
-/// and it will be manually reset preiodically, so it's not necessary
-/// to use `LocalHistogram`.
-#[derive(Default)]
-struct LocalHealthStatistics {
-    duration_sum: Duration,
-    count: u64,
-}
-
-impl LocalHealthStatistics {
-    #[inline]
-    fn observe(&mut self, dur: Duration) {
-        self.count += 1;
-        self.duration_sum += dur;
-    }
-
-    #[inline]
-    fn avg(&self) -> Duration {
-        if self.count > 0 {
-            Duration::from_micros(self.duration_sum.as_micros() as u64 / self.count)
-        } else {
-            Duration::default()
-        }
-    }
-
-    #[inline]
-    fn reset(&mut self) {
-        self.count = 0;
-        self.duration_sum = Duration::default();
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoType {
-    Disk = 0,
-    Network = 1,
-}
-
-/// Buffered statistics for recording the health of raftstore.
-#[derive(Default)]
-pub struct HealthStatistics {
-    // represents periodic latency on the disk io.
-    disk_io_dur: LocalHealthStatistics,
-    // represents the latency of the network io.
-    network_io_dur: LocalHealthStatistics,
-}
-
-impl HealthStatistics {
-    #[inline]
-    pub fn observe(&mut self, dur: Duration, io_type: IoType) {
-        match io_type {
-            IoType::Disk => self.disk_io_dur.observe(dur),
-            IoType::Network => self.network_io_dur.observe(dur),
-        }
-    }
-
-    #[inline]
-    pub fn avg(&self, io_type: IoType) -> Duration {
-        match io_type {
-            IoType::Disk => self.disk_io_dur.avg(),
-            IoType::Network => self.network_io_dur.avg(),
-        }
-    }
-
-    #[inline]
-    /// Reset HealthStatistics.
-    ///
-    /// Should be manually reset when the metrics are
-    /// accepted by slowness inspector.
-    pub fn reset(&mut self) {
-        self.disk_io_dur.reset();
-        self.network_io_dur.reset();
-    }
-}
-
 /// The buffered metrics counters for raft.
 pub struct RaftMetrics {
     // local counter
@@ -158,10 +80,7 @@ pub struct RaftMetrics {
 
     // local histogram
     pub store_time: LocalHistogram,
-    // the wait time for processing a raft command
     pub propose_wait_time: LocalHistogram,
-    // the wait time for processing a raft message
-    pub process_wait_time: LocalHistogram,
     pub process_ready: LocalHistogram,
     pub event_time: RaftEventDurationVec,
     pub peer_msg_len: LocalHistogram,
@@ -177,9 +96,6 @@ pub struct RaftMetrics {
     pub wf_persist_log: LocalHistogram,
     pub wf_commit_log: LocalHistogram,
     pub wf_commit_not_persist_log: LocalHistogram,
-
-    // local statistics for slowness
-    pub health_stats: HealthStatistics,
 
     pub check_stale_peer: LocalIntCounter,
     pub leader_missing: Arc<Mutex<HashSet<u64>>>,
@@ -202,7 +118,6 @@ impl RaftMetrics {
             raft_log_gc_skipped: RaftLogGcSkippedCounterVec::from(&RAFT_LOG_GC_SKIPPED_VEC),
             store_time: STORE_TIME_HISTOGRAM.local(),
             propose_wait_time: REQUEST_WAIT_TIME_HISTOGRAM.local(),
-            process_wait_time: RAFT_MESSAGE_WAIT_TIME_HISTOGRAM.local(),
             process_ready: PEER_RAFT_PROCESS_DURATION
                 .with_label_values(&["ready"])
                 .local(),
@@ -218,7 +133,6 @@ impl RaftMetrics {
             wf_persist_log: STORE_WF_PERSIST_LOG_DURATION_HISTOGRAM.local(),
             wf_commit_log: STORE_WF_COMMIT_LOG_DURATION_HISTOGRAM.local(),
             wf_commit_not_persist_log: STORE_WF_COMMIT_NOT_PERSIST_LOG_DURATION_HISTOGRAM.local(),
-            health_stats: HealthStatistics::default(),
             check_stale_peer: CHECK_STALE_PEER_COUNTER.local(),
             leader_missing: Arc::default(),
             last_flush_time: Instant::now_coarse(),
@@ -242,7 +156,6 @@ impl RaftMetrics {
 
         self.store_time.flush();
         self.propose_wait_time.flush();
-        self.process_wait_time.flush();
         self.process_ready.flush();
         self.event_time.flush();
         self.peer_msg_len.flush();

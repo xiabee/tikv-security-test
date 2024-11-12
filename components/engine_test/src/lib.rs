@@ -64,13 +64,7 @@ pub mod raft {
     #[cfg(feature = "test-engine-raft-rocksdb")]
     pub use engine_rocks::RocksEngine as RaftTestEngine;
     use engine_traits::Result;
-    #[cfg(any(
-        feature = "test-engine-raft-raft-engine",
-        not(any(
-            feature = "test-engine-raft-panic",
-            feature = "test-engine-raft-rocksdb"
-        ))
-    ))]
+    #[cfg(feature = "test-engine-raft-raft-engine")]
     pub use raft_log_engine::RaftLogEngine as RaftTestEngine;
 
     use crate::ctor::{RaftDbOptions, RaftEngineConstructorExt};
@@ -89,10 +83,7 @@ pub mod kv {
         PanicEngine as KvTestEngine, PanicEngineIterator as KvTestEngineIterator,
         PanicSnapshot as KvTestSnapshot, PanicWriteBatch as KvTestWriteBatch,
     };
-    #[cfg(any(
-        feature = "test-engine-kv-rocksdb",
-        not(feature = "test-engine-kv-panic")
-    ))]
+    #[cfg(feature = "test-engine-kv-rocksdb")]
     pub use engine_rocks::{
         RocksEngine as KvTestEngine, RocksEngineIterator as KvTestEngineIterator,
         RocksSnapshot as KvTestSnapshot, RocksWriteBatchVec as KvTestWriteBatch,
@@ -112,6 +103,8 @@ pub mod kv {
     ) -> Result<KvTestEngine> {
         KvTestEngine::new_kv_engine_opt(path, db_opt, cfs_opts)
     }
+
+    const TOMBSTONE_SUFFIX: &str = ".tombstone";
 
     #[derive(Clone)]
     pub struct TestTabletFactory {
@@ -136,7 +129,13 @@ pub mod kv {
         }
 
         fn destroy_tablet(&self, _ctx: TabletContext, path: &Path) -> Result<()> {
-            encryption::trash_dir_all(path, self.db_opt.get_key_manager().as_deref())?;
+            let tombstone_path = path.with_extension(TOMBSTONE_SUFFIX);
+            let _ = std::fs::remove_dir_all(&tombstone_path);
+            std::fs::rename(path, &tombstone_path)?;
+            if let Some(m) = &self.db_opt.get_key_manager() {
+                m.remove_dir(path, Some(&tombstone_path))?;
+            }
+            std::fs::remove_dir_all(tombstone_path)?;
             Ok(())
         }
 
@@ -424,10 +423,13 @@ pub mod ctor {
                 rocks_db_opts.enable_multi_batch_write(false);
                 rocks_db_opts.allow_concurrent_memtable_write(false);
                 if let Some(storage) = db_opt.state_storage
-                    && let Some(flush_state) = ctx.flush_state
-                {
-                    let listener =
-                        PersistenceListener::new(ctx.id, ctx.suffix.unwrap(), flush_state, storage);
+                    && let Some(flush_state) = ctx.flush_state {
+                    let listener = PersistenceListener::new(
+                        ctx.id,
+                        ctx.suffix.unwrap(),
+                        flush_state,
+                        storage,
+                    );
                     rocks_db_opts.add_event_listener(RocksPersistenceListener::new(listener));
                 }
                 let factory =

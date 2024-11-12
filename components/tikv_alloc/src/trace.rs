@@ -237,7 +237,6 @@ macro_rules! mem_trace {
     }
 }
 
-#[derive(Default)]
 pub struct MemoryTraceGuard<T: Default> {
     item: T,
     size: usize,

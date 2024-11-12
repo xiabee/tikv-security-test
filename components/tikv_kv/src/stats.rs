@@ -2,7 +2,8 @@
 
 use std::cell::RefCell;
 
-use engine_traits::{IterMetricsCollector, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_rocks::PerfContext;
+use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::kvrpcpb::{ScanDetail, ScanDetailV2, ScanInfo};
 pub use raftstore::store::{FlowStatistics, FlowStatsReporter};
 
@@ -23,7 +24,7 @@ const STAT_SEEK_FOR_PREV_TOMBSTONE: &str = "seek_for_prev_tombstone";
 const STAT_RAW_VALUE_TOMBSTONE: &str = "raw_value_tombstone";
 
 thread_local! {
-    pub static RAW_VALUE_TOMBSTONE : RefCell<usize> = const{ RefCell::new(0)};
+    pub static RAW_VALUE_TOMBSTONE : RefCell<usize> = RefCell::new(0);
 }
 
 pub enum StatsKind {
@@ -33,9 +34,7 @@ pub enum StatsKind {
     SeekForPrev,
 }
 
-pub struct StatsCollector<'a, T: IterMetricsCollector> {
-    collector: T,
-
+pub struct StatsCollector<'a> {
     stats: &'a mut CfStatistics,
     kind: StatsKind,
 
@@ -43,25 +42,23 @@ pub struct StatsCollector<'a, T: IterMetricsCollector> {
     raw_value_tombstone: usize,
 }
 
-impl<'a, T: IterMetricsCollector> StatsCollector<'a, T> {
-    pub fn new(collector: T, kind: StatsKind, stats: &'a mut CfStatistics) -> Self {
-        let internal_tombstone = collector.internal_delete_skipped_count() as usize;
+impl<'a> StatsCollector<'a> {
+    pub fn new(kind: StatsKind, stats: &'a mut CfStatistics) -> Self {
         StatsCollector {
-            collector,
             stats,
             kind,
-            internal_tombstone,
+            internal_tombstone: PerfContext::get().internal_delete_skipped_count() as usize,
             raw_value_tombstone: RAW_VALUE_TOMBSTONE.with(|m| *m.borrow()),
         }
     }
 }
 
-impl<T: IterMetricsCollector> Drop for StatsCollector<'_, T> {
+impl Drop for StatsCollector<'_> {
     fn drop(&mut self) {
         self.stats.raw_value_tombstone +=
             RAW_VALUE_TOMBSTONE.with(|m| *m.borrow()) - self.raw_value_tombstone;
         let internal_tombstone =
-            self.collector.internal_delete_skipped_count() as usize - self.internal_tombstone;
+            PerfContext::get().internal_delete_skipped_count() as usize - self.internal_tombstone;
         match self.kind {
             StatsKind::Next => {
                 self.stats.next += 1;
@@ -179,7 +176,7 @@ impl CfStatistics {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct Statistics {
     pub lock: CfStatistics,
     pub write: CfStatistics,
@@ -193,43 +190,9 @@ pub struct Statistics {
     // Note that a value comes from either write cf (due to it's a short value) or default cf, we
     // can't embed this `processed_size` field into `CfStatistics`.
     pub processed_size: usize,
-
-    // When getting data from default cf, we can check write cf statistics to decide which method
-    // should be used to get the data.
-    load_data_hint: LoadDataHintStatistics,
-}
-
-#[derive(Default, Debug)]
-struct LoadDataHintStatistics {
-    // The value of `over_seek_bound` when the last time calling `load_data_hint()`.
-    last_write_over_seek_bound: usize,
-}
-
-#[derive(Default, PartialEq, Debug, Clone)]
-pub enum LoadDataHint {
-    #[default]
-    NearSeek,
-    Seek,
 }
 
 impl Statistics {
-    // Use write cf stats to decide load action for default cf
-    pub fn load_data_hint(&mut self) -> LoadDataHint {
-        let stats = &mut self.load_data_hint;
-
-        let hint = if self.write.over_seek_bound != stats.last_write_over_seek_bound {
-            // Over seek bound indicates the next valid key may be far away from current
-            // position, so use seek directly
-            LoadDataHint::Seek
-        } else {
-            // The next valid key may be around current position, so use near seek which
-            // calls next() multiple times before calling seek()
-            LoadDataHint::NearSeek
-        };
-        stats.last_write_over_seek_bound = self.write.over_seek_bound;
-        hint
-    }
-
     pub fn details(&self) -> [(&'static str, [(&'static str, usize); STATS_COUNT]); 3] {
         [
             (CF_DEFAULT, self.data.details()),

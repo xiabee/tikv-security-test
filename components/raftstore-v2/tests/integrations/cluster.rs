@@ -15,7 +15,6 @@ use causal_ts::CausalTsProviderImpl;
 use collections::HashSet;
 use concurrency_manager::ConcurrencyManager;
 use crossbeam::channel::{self, Receiver, Sender, TrySendError};
-use encryption_export::{data_key_manager_from_config, DataKeyImporter};
 use engine_test::{
     ctor::{CfOptions, DbOptions},
     kv::{KvTestEngine, KvTestSnapshot, TestTabletFactory},
@@ -44,9 +43,7 @@ use raftstore_v2::{
     router::{DebugInfoChannel, FlushChannel, PeerMsg, QueryResult, RaftRouter, StoreMsg},
     Bootstrap, SimpleWriteEncoder, StateStorage, StoreSystem,
 };
-use resource_control::{ResourceController, ResourceGroupManager};
 use resource_metering::CollectorRegHandle;
-use service::service_manager::GrpcServiceManager;
 use slog::{debug, o, Logger};
 use sst_importer::SstImporter;
 use tempfile::TempDir;
@@ -137,9 +134,7 @@ impl TestRouter {
             match res {
                 Ok(_) => return block_on(sub.result()).is_some(),
                 Err(TrySendError::Disconnected(m)) => {
-                    let PeerMsg::WaitFlush(ch) = m else {
-                        unreachable!()
-                    };
+                    let PeerMsg::WaitFlush(ch) = m else { unreachable!() };
                     match self
                         .store_router()
                         .send_control(StoreMsg::WaitFlush { region_id, ch })
@@ -266,14 +261,15 @@ impl RunningState {
         concurrency_manager: ConcurrencyManager,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
         logger: &Logger,
-        resource_ctl: Arc<ResourceController>,
     ) -> (TestRouter, Self) {
-        let encryption_cfg = test_util::new_file_security_config(path);
-        let key_manager = Some(Arc::new(
-            data_key_manager_from_config(&encryption_cfg, path.to_str().unwrap())
-                .unwrap()
-                .unwrap(),
-        ));
+        // TODO(tabokie): Enable encryption by default. (after snapshot encryption)
+        // let encryption_cfg = test_util::new_file_security_config(path);
+        // let key_manager = Some(Arc::new(
+        //     data_key_manager_from_config(&encryption_cfg, path.to_str().unwrap())
+        //         .unwrap()
+        //         .unwrap(),
+        // ));
+        let key_manager = None;
 
         let mut opts = engine_test::ctor::RaftDbOptions::default();
         opts.set_key_manager(key_manager.clone());
@@ -290,7 +286,6 @@ impl RunningState {
             &cfg.value(),
             store_id,
             logger.clone(),
-            Some(resource_ctl.clone()),
         );
         let cf_opts = DATA_CFS
             .iter()
@@ -332,7 +327,6 @@ impl RunningState {
                 path.join("importer"),
                 key_manager.clone(),
                 ApiVersion::V1,
-                true,
             )
             .unwrap(),
         );
@@ -359,8 +353,6 @@ impl RunningState {
                 pd_worker,
                 importer,
                 key_manager,
-                GrpcServiceManager::dummy(),
-                Some(resource_ctl),
             )
             .unwrap();
 
@@ -391,7 +383,6 @@ pub struct TestNode {
     path: TempDir,
     running_state: Option<RunningState>,
     logger: Logger,
-    resource_manager: Arc<ResourceGroupManager>,
 }
 
 impl TestNode {
@@ -403,7 +394,6 @@ impl TestNode {
             path,
             running_state: None,
             logger,
-            resource_manager: Arc::new(ResourceGroupManager::default()),
         }
     }
 
@@ -413,9 +403,6 @@ impl TestNode {
         cop_cfg: Arc<VersionTrack<CopConfig>>,
         trans: TestTransport,
     ) -> TestRouter {
-        let resource_ctl = self
-            .resource_manager
-            .derive_controller("test-raft".into(), false);
         let (router, state) = RunningState::new(
             &self.pd_client,
             self.path.path(),
@@ -425,7 +412,6 @@ impl TestNode {
             ConcurrencyManager::new(1.into()),
             None,
             &self.logger,
-            resource_ctl,
         );
         self.running_state = Some(state);
         router
@@ -517,7 +503,6 @@ pub fn disable_all_auto_ticks(cfg: &mut Config) {
     cfg.region_compact_check_interval = ReadableDuration::ZERO;
     cfg.pd_heartbeat_tick_interval = ReadableDuration::ZERO;
     cfg.pd_store_heartbeat_tick_interval = ReadableDuration::ZERO;
-    cfg.pd_report_min_resolved_ts_interval = ReadableDuration::ZERO;
     cfg.snap_mgr_gc_tick_interval = ReadableDuration::ZERO;
     cfg.lock_cf_compact_interval = ReadableDuration::ZERO;
     cfg.peer_stale_state_check_interval = ReadableDuration::ZERO;
@@ -527,6 +512,7 @@ pub fn disable_all_auto_ticks(cfg: &mut Config) {
     cfg.merge_check_tick_interval = ReadableDuration::ZERO;
     cfg.cleanup_import_sst_interval = ReadableDuration::ZERO;
     cfg.inspect_interval = ReadableDuration::ZERO;
+    cfg.report_min_resolved_ts_interval = ReadableDuration::ZERO;
     cfg.reactive_memory_lock_tick_interval = ReadableDuration::ZERO;
     cfg.report_region_buckets_tick_interval = ReadableDuration::ZERO;
     cfg.check_long_uncommitted_interval = ReadableDuration::ZERO;
@@ -551,27 +537,15 @@ impl Cluster {
         Cluster::with_node_count(1, Some(config))
     }
 
-    pub fn with_config_and_extra_setting(
-        config: Config,
-        extra_setting: impl FnMut(&mut Config),
-    ) -> Cluster {
-        Cluster::with_configs(1, Some(config), None, extra_setting)
-    }
-
     pub fn with_node_count(count: usize, config: Option<Config>) -> Self {
-        Cluster::with_configs(count, config, None, |_| {})
+        Cluster::with_configs(count, config, None)
     }
 
     pub fn with_cop_cfg(config: Option<Config>, coprocessor_cfg: CopConfig) -> Cluster {
-        Cluster::with_configs(1, config, Some(coprocessor_cfg), |_| {})
+        Cluster::with_configs(1, config, Some(coprocessor_cfg))
     }
 
-    pub fn with_configs(
-        count: usize,
-        config: Option<Config>,
-        cop_cfg: Option<CopConfig>,
-        mut extra_setting: impl FnMut(&mut Config),
-    ) -> Self {
+    pub fn with_configs(count: usize, config: Option<Config>, cop_cfg: Option<CopConfig>) -> Self {
         let pd_server = test_pd::Server::new(1);
         let logger = slog_global::borrow_global().new(o!());
         let mut cluster = Cluster {
@@ -587,7 +561,6 @@ impl Cluster {
             v2_default_config()
         };
         disable_all_auto_ticks(&mut cfg);
-        extra_setting(&mut cfg);
         let cop_cfg = cop_cfg.unwrap_or_default();
         for _ in 1..=count {
             let mut node = TestNode::with_pd(&cluster.pd_server, cluster.logger.clone());
@@ -660,24 +633,7 @@ impl Cluster {
                     let gen_path = from_snap_mgr.tablet_gen_path(&key);
                     let recv_path = to_snap_mgr.final_recv_path(&key);
                     assert!(gen_path.exists());
-                    if let Some(m) = from_snap_mgr.key_manager() {
-                        let mut importer =
-                            DataKeyImporter::new(to_snap_mgr.key_manager().as_deref().unwrap());
-                        for e in walkdir::WalkDir::new(&gen_path).into_iter() {
-                            let e = e.unwrap();
-                            let new_path = recv_path.join(e.path().file_name().unwrap());
-                            if let Some((iv, key)) =
-                                m.get_file_internal(e.path().to_str().unwrap()).unwrap()
-                            {
-                                importer.add(new_path.to_str().unwrap(), iv, key).unwrap();
-                            }
-                        }
-                        importer.commit().unwrap();
-                    }
-                    std::fs::rename(&gen_path, &recv_path).unwrap();
-                    if let Some(m) = from_snap_mgr.key_manager() {
-                        m.remove_dir(&gen_path, Some(&recv_path)).unwrap();
-                    }
+                    std::fs::rename(gen_path, recv_path.clone()).unwrap();
                     assert!(recv_path.exists());
                 }
                 regions.insert(msg.get_region_id());
@@ -744,7 +700,7 @@ pub mod split_helper {
         req
     }
 
-    pub fn must_split(region_id: u64, req: RaftCmdRequest, router: &TestRouter) {
+    pub fn must_split(region_id: u64, req: RaftCmdRequest, router: &mut TestRouter) {
         let (msg, sub) = PeerMsg::admin_command(req);
         router.send(region_id, msg).unwrap();
         block_on(sub.result()).unwrap();
@@ -754,7 +710,7 @@ pub mod split_helper {
         thread::sleep(Duration::from_secs(1));
     }
 
-    pub fn put(router: &TestRouter, region_id: u64, key: &[u8]) -> RaftCmdResponse {
+    pub fn put(router: &mut TestRouter, region_id: u64, key: &[u8]) -> RaftCmdResponse {
         let header = Box::new(router.new_request_for(region_id).take_header());
         let mut put = SimpleWriteEncoder::with_capacity(64);
         put.put(CF_DEFAULT, key, b"v1");
@@ -764,7 +720,7 @@ pub mod split_helper {
     // Split the region according to the parameters
     // return the updated original region
     pub fn split_region<'a>(
-        router: &'a TestRouter,
+        router: &'a mut TestRouter,
         region: metapb::Region,
         peer: metapb::Peer,
         split_region_id: u64,
@@ -832,7 +788,7 @@ pub mod split_helper {
     // This is to simulate the case when the splitted peer's storage is not
     // initialized yet when refresh bucket happens
     pub fn split_region_and_refresh_bucket(
-        router: &TestRouter,
+        router: &mut TestRouter,
         region: metapb::Region,
         peer: metapb::Peer,
         split_region_id: u64,
@@ -948,7 +904,7 @@ pub mod merge_helper {
 pub mod life_helper {
     use std::assert_matches::assert_matches;
 
-    use engine_traits::RaftEngineDebug;
+    use engine_traits::RaftEngine;
     use kvproto::raft_serverpb::{ExtraMessageType, PeerState};
 
     use super::*;
@@ -979,11 +935,7 @@ pub mod life_helper {
 
     // TODO: make raft engine support more suitable way to verify range is empty.
     /// Verify all states in raft engine are cleared.
-    pub fn assert_tombstone(
-        raft_engine: &impl RaftEngineDebug,
-        region_id: u64,
-        peer: &metapb::Peer,
-    ) {
+    pub fn assert_tombstone(raft_engine: &impl RaftEngine, region_id: u64, peer: &metapb::Peer) {
         let mut buf = vec![];
         raft_engine.get_all_entries_to(region_id, &mut buf).unwrap();
         assert!(buf.is_empty(), "{:?}", buf);

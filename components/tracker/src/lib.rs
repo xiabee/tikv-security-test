@@ -29,10 +29,6 @@ impl Tracker {
         }
     }
 
-    pub fn write_time_detail(&self, detail_v2: &mut pb::TimeDetailV2) {
-        detail_v2.set_kv_grpc_process_time_ns(self.metrics.grpc_process_nanos);
-    }
-
     pub fn write_scan_detail(&self, detail_v2: &mut pb::ScanDetailV2) {
         detail_v2.set_rocksdb_block_read_byte(self.metrics.block_read_byte);
         detail_v2.set_rocksdb_block_read_count(self.metrics.block_read_count);
@@ -85,17 +81,13 @@ impl Tracker {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct RequestInfo {
     pub region_id: u64,
     pub start_ts: u64,
     pub task_id: u64,
     pub resource_group_tag: Vec<u8>,
-
-    // Information recorded after the task is scheduled.
     pub request_type: RequestType,
-    pub cid: u64,
-    pub is_external_req: bool,
 }
 
 impl RequestInfo {
@@ -106,8 +98,6 @@ impl RequestInfo {
             task_id: ctx.get_task_id(),
             resource_group_tag: ctx.get_resource_group_tag().to_vec(),
             request_type,
-            cid: 0,
-            is_external_req: ctx.get_request_source().starts_with("external"),
         }
     }
 }
@@ -135,18 +125,14 @@ pub enum RequestType {
     CoprocessorDag,
     CoprocessorAnalyze,
     CoprocessorChecksum,
-    KvFlush,
-    KvBufferBatchGet,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct RequestMetrics {
-    pub grpc_process_nanos: u64,
     pub get_snapshot_nanos: u64,
     pub read_index_propose_wait_nanos: u64,
     pub read_index_confirm_wait_nanos: u64,
     pub read_pool_schedule_wait_nanos: u64,
-    pub local_read: bool,
     pub block_cache_hit_count: u64,
     pub block_read_count: u64,
     pub block_read_byte: u64,

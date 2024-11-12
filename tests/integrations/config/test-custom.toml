@@ -1,9 +1,13 @@
+log-level = "info"
+log-file = ""
+log-format = "text"
 slow-log-file = "slow_foo"
 slow-log-threshold = "1s"
+log-rotation-timespan = "1d"
 panic-when-unexpected-key-or-data = true
 abort-on-panic = true
 memory-usage-limit = "10GB"
-memory-usage-high-water = 0.65
+memory-usage-high-water= 0.65
 
 [log]
 level = "fatal"
@@ -14,11 +18,6 @@ filename = "foo"
 max-size = 1
 max-backups = 2
 max-days = 3
-
-[memory]
-enable-heap-profiling = false
-profiling-sample-per-bytes = "1MB"
-enable-thread-exclusive-arena = false
 
 [readpool.unified]
 min-thread-count = 5
@@ -85,7 +84,6 @@ background-thread-count = 999
 end-point-slow-log-threshold = "1s"
 forward-max-connections-per-address = 5
 reject-messages-on-memory-ratio = 0.8
-health-feedback-interval = "2s"
 
 [server.labels]
 a = "b"
@@ -103,8 +101,6 @@ reserve-space = "10GB"
 reserve-raft-space = "2GB"
 enable-ttl = true
 ttl-check-poll-interval = "0s"
-txn-status-cache-capacity = 1000
-memory-quota = "123KB"
 
 [storage.block-cache]
 capacity = "40GB"
@@ -137,7 +133,9 @@ export-priority = "high"
 other-priority = "low"
 
 [pd]
-endpoints = ["example.com:443"]
+endpoints = [
+    "example.com:443",
+]
 
 [metric]
 job = "tikv_1"
@@ -161,7 +159,6 @@ raft-log-gc-count-limit = 12
 raft-log-gc-size-limit = "1KB"
 raft-log-reserve-max-ticks = 100
 raft-engine-purge-interval = "20m"
-max-manual-flush-rate = 5.0
 raft-entry-cache-life-time = "12s"
 split-region-check-tick-interval = "12s"
 region-split-check-diff = "20MB"
@@ -174,10 +171,8 @@ region-compact-min-redundant-rows = 999
 region-compact-redundant-rows-percent = 33
 pd-heartbeat-tick-interval = "12m"
 pd-store-heartbeat-tick-interval = "12s"
-pd-report-min-resolved-ts-interval = "233ms"
 snap-mgr-gc-tick-interval = "12m"
 snap-gc-timeout = "12h"
-snap-wait-split-duration = "12h"
 lock-cf-compact-interval = "12m"
 lock-cf-compact-bytes-threshold = "123MB"
 notify-capacity = 12345
@@ -186,10 +181,8 @@ max-peer-down-duration = "12m"
 max-leader-missing-duration = "12h"
 abnormal-leader-missing-duration = "6h"
 peer-stale-state-check-interval = "2h"
-gc-peer-check-interval = "1d"
 leader-transfer-max-log-lag = 123
 snap-apply-batch-size = "12MB"
-snap-apply-copy-symlink = true
 consistency-check-interval = "12s"
 report-region-flow-interval = "12m"
 raft-store-max-leader-lease = "12s"
@@ -220,19 +213,17 @@ evict-cache-on-memory-ratio = 0.8
 cmd-batch = false
 cmd-batch-concurrent-ready-max-count = 123
 raft-write-size-limit = "34MB"
-raft-write-batch-size-hint = "1MB"
-raft-write-wait-duration = "444us"
 waterfall-metrics = true
 io-reschedule-concurrent-max-count = 1234
 io-reschedule-hotpot-duration = "4321s"
 inspect-interval = "444ms"
-inspect-cpu-util-thd = 0.666
 check-leader-lease-interval = "123ms"
 renew-leader-lease-advance-duration = "456ms"
 reactive-memory-lock-tick-interval = "566ms"
 reactive-memory-lock-timeout-tick = 8
 check-long-uncommitted-interval = "1s"
 long-uncommitted-base-threshold = "1s"
+report-min-resolved-ts-interval = "233ms"
 report-region-buckets-tick-interval = "1234s"
 max-snapshot-file-raw-size = "10GB"
 unreachable-backoff = "111s"
@@ -266,6 +257,9 @@ create-if-missing = false
 max-open-files = 12345
 stats-dump-period = "12m"
 compaction-readahead-size = "1KB"
+info-log-max-size = "1KB"
+info-log-roll-time = "12s"
+info-log-keep-log-file-num = 1000
 info-log-dir = "/var"
 rate-bytes-per-sec = "1KB"
 rate-limiter-refill-period = "10ms"
@@ -297,13 +291,19 @@ cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 optimize-filters-for-hits = false
-optimize-filters-for-memory = true
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
-ribbon-filter-above-level = 1
 read-amp-bytes-per-bit = 0
-compression-per-level = ["no", "no", "zstd", "zstd", "no", "zstd", "lz4"]
+compression-per-level = [
+    "no",
+    "no",
+    "zstd",
+    "zstd",
+    "no",
+    "zstd",
+    "lz4",
+]
 bottommost-level-compression = "disable"
 bottommost-zstd-compression-dict-size = 1024
 bottommost-zstd-compression-sample-size = 1024
@@ -333,7 +333,7 @@ enable-compaction-guard = false
 compaction-guard-min-output-file-size = "12MB"
 compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
-format-version = 0
+format-version = 5
 checksum = "xxh3"
 max-compactions = 3
 ttl = "10d"
@@ -341,9 +341,7 @@ periodic-compaction-seconds = "10d"
 
 [rocksdb.defaultcf.titan]
 min-blob-size = "2018B"
-blob-file-compression = "lz4"
-zstd-dict-size = "16KB"
-shared-blob-cache = false
+blob-file-compression = "zstd"
 blob-cache-size = "12GB"
 min-gc-batch-size = "12KB"
 max-gc-batch-size = "12MB"
@@ -362,13 +360,19 @@ cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 optimize-filters-for-hits = true
-optimize-filters-for-memory = true
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
-ribbon-filter-above-level = 1
 read-amp-bytes-per-bit = 0
-compression-per-level = ["no", "no", "zstd", "zstd", "no", "zstd", "lz4"]
+compression-per-level = [
+    "no",
+    "no",
+    "zstd",
+    "zstd",
+    "no",
+    "zstd",
+    "lz4",
+]
 write-buffer-size = "1MB"
 max-write-buffer-number = 12
 min-write-buffer-number-to-merge = 12
@@ -394,7 +398,7 @@ enable-compaction-guard = false
 compaction-guard-min-output-file-size = "12MB"
 compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
-format-version = 0
+format-version = 5
 checksum = "xxh3"
 max-compactions = 3
 ttl = "10d"
@@ -408,15 +412,20 @@ cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 optimize-filters-for-hits = true
-optimize-filters-for-memory = true
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
-ribbon-filter-above-level = 1
 read-amp-bytes-per-bit = 0
-compression-per-level = ["no", "no", "zstd", "zstd", "no", "zstd", "lz4"]
+compression-per-level = [
+    "no",
+    "no",
+    "zstd",
+    "zstd",
+    "no",
+    "zstd",
+    "lz4",
+]
 write-buffer-size = "1MB"
-write-buffer-limit = "16MB"
 max-write-buffer-number = 12
 min-write-buffer-number-to-merge = 12
 max-bytes-for-level-base = "12KB"
@@ -441,7 +450,7 @@ enable-compaction-guard = true
 compaction-guard-min-output-file-size = "12MB"
 compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
-format-version = 0
+format-version = 5
 checksum = "xxh3"
 max-compactions = 3
 ttl = "10d"
@@ -455,13 +464,19 @@ cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 optimize-filters-for-hits = false
-optimize-filters-for-memory = true
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
-ribbon-filter-above-level = 1
 read-amp-bytes-per-bit = 0
-compression-per-level = ["no", "no", "zstd", "zstd", "no", "zstd", "lz4"]
+compression-per-level = [
+    "no",
+    "no",
+    "zstd",
+    "zstd",
+    "no",
+    "zstd",
+    "lz4",
+]
 write-buffer-size = "1MB"
 max-write-buffer-number = 12
 min-write-buffer-number-to-merge = 12
@@ -487,7 +502,7 @@ enable-compaction-guard = true
 compaction-guard-min-output-file-size = "12MB"
 compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
-format-version = 0
+format-version = 5
 checksum = "xxh3"
 max-compactions = 3
 ttl = "10d"
@@ -506,6 +521,9 @@ create-if-missing = false
 max-open-files = 12345
 stats-dump-period = "12m"
 compaction-readahead-size = "1KB"
+info-log-max-size = "1KB"
+info-log-roll-time = "1s"
+info-log-keep-log-file-num = 1000
 info-log-dir = "/var"
 max-sub-compactions = 12
 writable-file-max-buffer-size = "12MB"
@@ -530,13 +548,19 @@ cache-index-and-filter-blocks = false
 pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 optimize-filters-for-hits = false
-optimize-filters-for-memory = true
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
-ribbon-filter-above-level = 1
 read-amp-bytes-per-bit = 0
-compression-per-level = ["no", "no", "zstd", "zstd", "no", "zstd", "lz4"]
+compression-per-level = [
+    "no",
+    "no",
+    "zstd",
+    "zstd",
+    "no",
+    "zstd",
+    "lz4",
+]
 write-buffer-size = "1MB"
 max-write-buffer-number = 12
 min-write-buffer-number-to-merge = 12
@@ -562,15 +586,13 @@ enable-compaction-guard = true
 compaction-guard-min-output-file-size = "12MB"
 compaction-guard-max-output-file-size = "34MB"
 prepopulate-block-cache = "flush-only"
-format-version = 0
+format-version = 5
 checksum = "xxh3"
 max-compactions = 3
 
 [raftdb.defaultcf.titan]
 min-blob-size = "2018B"
-blob-file-compression = "lz4"
-zstd-dict-size = "16KB"
-shared-blob-cache = false
+blob-file-compression = "zstd"
 blob-cache-size = "12GB"
 min-gc-batch-size = "12KB"
 max-gc-batch-size = "12MB"
@@ -591,14 +613,16 @@ recovery-mode = "tolerate-tail-corruption"
 recovery-read-block-size = "1KB"
 recovery-threads = 2
 memory-limit = "1GB"
-enable-log-recycle = false
+enable-log-recycle = true # enable by default
 
 [security]
 ca-path = "invalid path"
 cert-path = "invalid path"
 key-path = "invalid path"
 redact-info-log = true
-cert-allowed-cn = ["example.tikv.com"]
+cert-allowed-cn = [
+    "example.tikv.com",
+]
 
 [security.encryption]
 data-encryption-method = "aes128-ctr"
@@ -647,9 +671,9 @@ compaction-filter-skip-version-check = true
 num-threads = 2
 
 [pessimistic-txn]
-enabled = false                # test backward compatibility
+enabled = false # test backward compatibility
 wait-for-lock-timeout = "10ms"
-wake-up-delay-duration = 100   # test backward compatibility
+wake-up-delay-duration = 100 # test backward compatibility
 pipelined = false
 in-memory = false
 
@@ -659,7 +683,6 @@ old-value-cache-size = 0
 hibernate-regions-compatible = false
 incremental-scan-threads = 3
 incremental-scan-concurrency = 4
-incremental-scan-concurrency-limit = 5
 incremental-scan-speed-limit = 7
 incremental-fetch-speed-limit = 8
 incremental-scan-ts-filter-ratio = 0.7

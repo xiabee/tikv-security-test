@@ -2,11 +2,8 @@
 
 use std::result;
 
-use kvproto::{
-    meta_storagepb as mpb,
-    pdpb::*,
-    resource_manager::{TokenBucketsRequest, TokenBucketsResponse},
-};
+use futures::executor::block_on;
+use kvproto::{meta_storagepb as mpb, pdpb::*};
 
 mod bootstrap;
 pub mod etcd;
@@ -17,6 +14,7 @@ mod retry;
 mod service;
 mod split;
 
+use self::etcd::{EtcdClient, KeyValue, Keys, MetaKey};
 pub use self::{
     bootstrap::AlreadyBootstrapped,
     incompatible::Incompatible,
@@ -40,10 +38,6 @@ pub trait PdMocker {
         None
     }
 
-    fn meta_store_delete(&self, _req: mpb::DeleteRequest) -> Option<Result<mpb::DeleteResponse>> {
-        None
-    }
-
     fn meta_store_watch(
         &self,
         _req: mpb::WatchRequest,
@@ -51,6 +45,68 @@ pub trait PdMocker {
         _ctx: &grpcio::RpcContext<'_>,
     ) -> bool {
         false
+    }
+
+    fn load_global_config(
+        &self,
+        _req: &LoadGlobalConfigRequest,
+        etcd_client: EtcdClient,
+    ) -> Option<Result<LoadGlobalConfigResponse>> {
+        let mut res = LoadGlobalConfigResponse::default();
+        let mut items = Vec::new();
+        let (resp, revision) = block_on(async move {
+            etcd_client.lock().await.get_key(Keys::Range(
+                MetaKey(b"".to_vec()),
+                MetaKey(b"\xff".to_vec()),
+            ))
+        });
+
+        let values: Vec<GlobalConfigItem> = resp
+            .iter()
+            .map(|kv| {
+                let mut item = GlobalConfigItem::default();
+                item.set_name(String::from_utf8(kv.key().to_vec()).unwrap());
+                item.set_payload(kv.value().into());
+                item
+            })
+            .collect();
+
+        items.extend(values);
+        res.set_revision(revision);
+        res.set_items(items.into());
+        Some(Ok(res))
+    }
+
+    fn store_global_config(
+        &self,
+        req: &StoreGlobalConfigRequest,
+        etcd_client: EtcdClient,
+    ) -> Option<Result<StoreGlobalConfigResponse>> {
+        for item in req.get_changes() {
+            let cli = etcd_client.clone();
+            block_on(async move {
+                match item.get_kind() {
+                    EventType::Put => {
+                        let kv =
+                            KeyValue(MetaKey(item.get_name().into()), item.get_payload().into());
+                        cli.lock().await.set(kv).await
+                    }
+                    EventType::Delete => {
+                        let key = Keys::Key(MetaKey(item.get_name().into()));
+                        cli.lock().await.delete(key).await
+                    }
+                }
+            })
+            .unwrap();
+        }
+        Some(Ok(StoreGlobalConfigResponse::default()))
+    }
+
+    fn watch_global_config(
+        &self,
+        _req: &WatchGlobalConfigRequest,
+    ) -> Option<Result<WatchGlobalConfigResponse>> {
+        unimplemented!()
     }
 
     fn get_members(&self, _: &GetMembersRequest) -> Option<Result<GetMembersResponse>> {
@@ -158,20 +214,6 @@ pub trait PdMocker {
     }
 
     fn get_operator(&self, _: &GetOperatorRequest) -> Option<Result<GetOperatorResponse>> {
-        None
-    }
-
-    fn report_ru_metrics(&self, req: &TokenBucketsRequest) -> Option<Result<TokenBucketsResponse>> {
-        req.get_requests().iter().for_each(|r| {
-            assert_eq!(r.get_is_background(), true);
-        });
-        None
-    }
-
-    fn update_service_gc_safe_point(
-        &self,
-        _: &UpdateServiceGcSafePointRequest,
-    ) -> Option<Result<UpdateServiceGcSafePointResponse>> {
         None
     }
 }

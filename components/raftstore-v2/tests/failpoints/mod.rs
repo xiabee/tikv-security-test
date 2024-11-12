@@ -13,6 +13,5 @@ mod test_bootstrap;
 mod test_bucket;
 mod test_life;
 mod test_merge;
-mod test_pd_heartbeat;
 mod test_split;
 mod test_trace_apply;

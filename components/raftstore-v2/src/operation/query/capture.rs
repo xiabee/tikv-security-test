@@ -52,26 +52,14 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: raftstore::store::Transport>
     pub fn on_capture_change(&mut self, capture_change: CaptureChange) {
         fail_point!("raft_on_capture_change");
 
-        let apply_scheduler = self.fsm.peer().apply_scheduler().cloned();
-        let id = self.fsm.peer().region_id();
-        let term = self.fsm.peer().term();
+        let apply_router = self.fsm.peer().apply_scheduler().unwrap().clone();
         let (ch, _) = QueryResChannel::with_callback(Box::new(move |res| {
-            if let QueryResult::Response(resp) = res
-                && resp.get_header().has_error()
-            {
+            if let QueryResult::Response(resp) = res && resp.get_header().has_error() {
                 // Return error
                 capture_change.snap_cb.report_error(resp.clone());
                 return;
             }
-            if let Some(scheduler) = apply_scheduler {
-                scheduler.send(ApplyTask::CaptureApply(capture_change))
-            } else {
-                let mut resp = cmd_resp::err_resp(raftstore::Error::RegionNotFound(id), term);
-                resp.mut_header()
-                    .mut_error()
-                    .set_message("apply scheduler is None".to_owned());
-                capture_change.snap_cb.report_error(resp);
-            }
+            apply_router.send(ApplyTask::CaptureApply(capture_change))
         }));
         self.on_leader_callback(ch);
     }
@@ -118,7 +106,7 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
                 self.flush();
                 let (applied_index, _) = self.apply_progress();
                 let snap = RegionSnapshot::from_snapshot(
-                    Arc::new(self.tablet().snapshot(None)),
+                    Arc::new(self.tablet().snapshot()),
                     Arc::new(self.region().clone()),
                 );
                 snap.set_apply_index(applied_index);
@@ -198,31 +186,51 @@ mod test {
     };
     use futures::executor::block_on;
     use kvproto::{
-        metapb::Region,
+        metapb::{Region, RegionEpoch},
+        raft_cmdpb::RaftRequestHeader,
         raft_serverpb::{PeerState, RegionLocalState},
     };
-    use raft::StateRole;
+    use raft::{
+        prelude::{Entry, EntryType},
+        StateRole,
+    };
     use raftstore::{
         coprocessor::{BoxCmdObserver, CmdObserver, CoprocessorHost},
         store::Config,
     };
     use slog::o;
     use tempfile::TempDir;
-    use tikv_util::{
-        store::new_peer,
-        worker::dummy_scheduler,
-        yatp_pool::{DefaultTicker, YatpPoolBuilder},
-    };
+    use tikv_util::{store::new_peer, worker::dummy_scheduler};
 
     use super::*;
     use crate::{
+        fsm::ApplyResReporter,
         operation::{
-            test_util::{create_tmp_importer, new_put_entry, MockReporter},
-            CommittedEntries,
+            test_util::create_tmp_importer, CatchUpLogs, CommittedEntries, SimpleWriteReqEncoder,
         },
         raft::Apply,
-        router::build_any_channel,
+        router::{build_any_channel, ApplyRes},
+        SimpleWriteEncoder,
     };
+
+    struct MockReporter {
+        sender: Sender<ApplyRes>,
+    }
+
+    impl MockReporter {
+        fn new() -> (Self, Receiver<ApplyRes>) {
+            let (tx, rx) = channel();
+            (MockReporter { sender: tx }, rx)
+        }
+    }
+
+    impl ApplyResReporter for MockReporter {
+        fn report(&self, apply_res: ApplyRes) {
+            let _ = self.sender.send(apply_res);
+        }
+
+        fn redirect_catch_up_logs(&self, _c: CatchUpLogs) {}
+    }
 
     #[derive(Clone)]
     struct TestObserver {
@@ -248,6 +256,29 @@ mod test {
         }
 
         fn on_applied_current_term(&self, _: StateRole, _: &Region) {}
+    }
+
+    fn new_put_entry(
+        region_id: u64,
+        region_epoch: RegionEpoch,
+        k: &[u8],
+        v: &[u8],
+        term: u64,
+        index: u64,
+    ) -> Entry {
+        let mut encoder = SimpleWriteEncoder::with_capacity(512);
+        encoder.put(CF_DEFAULT, k, v);
+        let mut header = Box::<RaftRequestHeader>::default();
+        header.set_region_id(region_id);
+        header.set_region_epoch(region_epoch);
+        let req_encoder = SimpleWriteReqEncoder::new(header, encoder.encode(), 512, false);
+        let (bin, _) = req_encoder.encode();
+        let mut e = Entry::default();
+        e.set_entry_type(EntryType::EntryNormal);
+        e.set_term(term);
+        e.set_index(index);
+        e.set_data(bin.into());
+        e
     }
 
     #[test]
@@ -286,8 +317,7 @@ mod test {
         host.registry
             .register_cmd_observer(0, BoxCmdObserver::new(ob));
 
-        let (dummy_scheduler1, _) = dummy_scheduler();
-        let high_priority_pool = YatpPoolBuilder::new(DefaultTicker::default()).build_future_pool();
+        let (dummy_scheduler, _) = dummy_scheduler();
         let mut apply = Apply::new(
             &Config::default(),
             region
@@ -307,8 +337,7 @@ mod test {
             None,
             importer,
             host,
-            dummy_scheduler1,
-            high_priority_pool,
+            dummy_scheduler,
             logger.clone(),
         );
 

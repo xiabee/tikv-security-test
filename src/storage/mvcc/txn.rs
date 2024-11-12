@@ -296,7 +296,6 @@ pub(crate) fn make_txn_error(
             },
             "alreadyexist" => ErrorInner::AlreadyExist {
                 key: key.to_raw().unwrap(),
-                existing_start_ts: start_ts,
             },
             "committsexpired" => ErrorInner::CommitTsExpired {
                 start_ts,
@@ -524,7 +523,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_mvcc_txn_pessimistic_prewrite_check_not_exist() {
+    fn test_mvcc_txn_pessmistic_prewrite_check_not_exist() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
         let k = b"k1";
         try_pessimistic_prewrite_check_not_exists(&mut engine, k, k, 3).unwrap_err();

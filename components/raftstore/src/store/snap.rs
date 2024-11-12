@@ -11,14 +11,12 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
-    thread,
-    time::{self, Duration},
-    u64,
+    thread, time, u64,
 };
 
 use collections::{HashMap, HashMapEntry as Entry};
-use encryption::{create_aes_ctr_crypter, DataKeyManager, Iv};
-use engine_traits::{CfName, KvEngine, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use encryption::{create_aes_ctr_crypter, from_engine_encryption_method, DataKeyManager, Iv};
+use engine_traits::{CfName, EncryptionKeyManager, KvEngine, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use fail::fail_point;
 use file_system::{
@@ -75,14 +73,6 @@ const META_FILE_SUFFIX: &str = ".meta";
 
 const DELETE_RETRY_MAX_TIMES: u32 = 6;
 const DELETE_RETRY_TIME_MILLIS: u64 = 500;
-
-// TTL for the recv snap concurrency limiter, specified in seconds. This TTL
-// should be longer than the typical snapshot generation and transmission time.
-// If the TTL is too short, the limiter might permit more snapshots than
-// expected to be sent, leading to the receiver dropping them and the sender
-// regenerating them, which is what the concurrency limiter is designed to
-// prevent.
-const RECV_SNAP_CONCURRENCY_LIMITER_TTL_SECS: u64 = 60;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -198,7 +188,6 @@ where
     pub abort: Arc<AtomicUsize>,
     pub write_batch_size: usize,
     pub coprocessor_host: CoprocessorHost<EK>,
-    pub ingest_copy_symlink: bool,
 }
 
 // A helper function to copy snapshot.
@@ -630,7 +619,7 @@ impl Snapshot {
 
                 if let Some(mgr) = &s.mgr.encryption_key_manager {
                     let enc_info = mgr.new_file(&file_paths[idx])?;
-                    let mthd = enc_info.method;
+                    let mthd = from_engine_encryption_method(enc_info.method);
                     if mthd != EncryptionMethod::Plaintext {
                         let file_for_recving = cf_file.file_for_recving.last_mut().unwrap();
                         file_for_recving.encrypter = Some(
@@ -777,26 +766,32 @@ impl Snapshot {
         )
     }
 
-    fn validate<F>(&self, post_check: F) -> RaftStoreResult<()>
-    where
-        F: Fn(&CfFile, usize) -> RaftStoreResult<()>,
-    {
+    fn validate(&self, for_send: bool) -> RaftStoreResult<()> {
         for cf_file in &self.cf_files {
             let file_paths = cf_file.file_paths();
-            for i in 0..file_paths.len() {
+            let clone_file_paths = cf_file.clone_file_paths();
+            for (i, file_path) in file_paths.iter().enumerate() {
                 if cf_file.size[i] == 0 {
                     // Skip empty file. The checksum of this cf file should be 0 and
                     // this is checked when loading the snapshot meta.
                     continue;
                 }
 
+                let file_path = Path::new(file_path);
                 check_file_size_and_checksum(
-                    Path::new(&file_paths[i]),
+                    file_path,
                     cf_file.size[i],
                     cf_file.checksum[i],
                     self.mgr.encryption_key_manager.as_ref(),
                 )?;
-                post_check(cf_file, i)?;
+
+                if !for_send && !plain_file_used(cf_file.cf) {
+                    sst_importer::prepare_sst_for_ingestion(
+                        file_path,
+                        Path::new(&clone_file_paths[i]),
+                        self.mgr.encryption_key_manager.as_deref(),
+                    )?;
+                }
             }
         }
         Ok(())
@@ -852,7 +847,7 @@ impl Snapshot {
     {
         fail_point!("snapshot_enter_do_build");
         if self.exists() {
-            match self.validate(|_, _| -> RaftStoreResult<()> { Ok(()) }) {
+            match self.validate(true) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     error!(?e;
@@ -912,7 +907,7 @@ impl Snapshot {
                 }
                 if let Some(ref mgr) = self.mgr.encryption_key_manager {
                     for tmp_file_path in cf_file.tmp_file_paths() {
-                        mgr.delete_file(&tmp_file_path, None)?;
+                        mgr.delete_file(&tmp_file_path)?;
                     }
                 }
             }
@@ -960,7 +955,7 @@ impl Snapshot {
                     if file_exists(&file_path) {
                         delete_file_if_exist(&file_path).unwrap();
                         if let Some(ref mgr) = self.mgr.encryption_key_manager {
-                            mgr.delete_file(file_path.to_str().unwrap(), None).unwrap();
+                            mgr.delete_file(file_path.to_str().unwrap()).unwrap();
                         }
                         file_id += 1;
                     } else {
@@ -1010,7 +1005,7 @@ impl Snapshot {
                 }
                 if let Some(ref mgr) = self.mgr.encryption_key_manager {
                     for file_path in &file_paths {
-                        mgr.delete_file(file_path, None).unwrap();
+                        mgr.delete_file(file_path).unwrap();
                     }
                 }
             }
@@ -1110,28 +1105,7 @@ impl Snapshot {
     }
 
     pub fn apply<EK: KvEngine>(&mut self, options: ApplyOptions<EK>) -> Result<()> {
-        let post_check = |cf_file: &CfFile, offset: usize| {
-            if !plain_file_used(cf_file.cf) {
-                let file_paths = cf_file.file_paths();
-                let clone_file_paths = cf_file.clone_file_paths();
-                if options.ingest_copy_symlink && is_symlink(&file_paths[offset])? {
-                    sst_importer::copy_sst_for_ingestion(
-                        &file_paths[offset],
-                        &clone_file_paths[offset],
-                        self.mgr.encryption_key_manager.as_deref(),
-                    )?;
-                } else {
-                    sst_importer::prepare_sst_for_ingestion(
-                        &file_paths[offset],
-                        &clone_file_paths[offset],
-                        self.mgr.encryption_key_manager.as_deref(),
-                    )?;
-                }
-            }
-            Ok(())
-        };
-
-        box_try!(self.validate(post_check));
+        box_try!(self.validate(false));
 
         let abort_checker = ApplyAbortChecker(options.abort);
         let coprocessor_host = options.coprocessor_host;
@@ -1159,6 +1133,7 @@ impl Snapshot {
                     cb,
                 )?;
             } else {
+                let _timer = INGEST_SST_DURATION_SECONDS.start_coarse_timer();
                 let path = cf_file.path.to_str().unwrap(); // path is not used at all
                 let clone_file_paths = cf_file.clone_file_paths();
                 let clone_files = clone_file_paths
@@ -1334,7 +1309,7 @@ impl Write for Snapshot {
             }
 
             assert!(cf_file.size[self.cf_file_index] != 0);
-            let file_for_recving = cf_file
+            let mut file_for_recving = cf_file
                 .file_for_recving
                 .get_mut(self.cf_file_index)
                 .unwrap();
@@ -1434,7 +1409,6 @@ struct SnapManagerCore {
 
     registry: Arc<RwLock<HashMap<SnapKey, Vec<SnapEntry>>>>,
     limiter: Limiter,
-    recv_concurrency_limiter: Arc<SnapRecvConcurrencyLimiter>,
     temp_sst_id: Arc<AtomicU64>,
     encryption_key_manager: Option<Arc<DataKeyManager>>,
     max_per_file_size: Arc<AtomicU64>,
@@ -1443,13 +1417,22 @@ struct SnapManagerCore {
 }
 
 /// `SnapManagerCore` trace all current processing snapshots.
-#[derive(Clone)]
 pub struct SnapManager {
     core: SnapManagerCore,
     max_total_size: Arc<AtomicU64>,
 
     // only used to receive snapshot from v2
     tablet_snap_manager: Option<TabletSnapManager>,
+}
+
+impl Clone for SnapManager {
+    fn clone(&self) -> Self {
+        SnapManager {
+            core: self.core.clone(),
+            max_total_size: self.max_total_size.clone(),
+            tablet_snap_manager: self.tablet_snap_manager.clone(),
+        }
+    }
 }
 
 impl SnapManager {
@@ -1769,10 +1752,6 @@ impl SnapManager {
         self.core.limiter.speed_limit()
     }
 
-    pub fn set_concurrent_recv_snap_limit(&self, limit: usize) {
-        self.core.recv_concurrency_limiter.set_limit(limit);
-    }
-
     pub fn collect_stat(&self, snap: SnapshotStat) {
         debug!(
             "collect snapshot stat";
@@ -1874,32 +1853,6 @@ impl SnapManager {
     pub fn limiter(&self) -> &Limiter {
         &self.core.limiter
     }
-
-    /// recv_snap_precheck is part of the snapshot recv precheck process, which
-    /// aims to reduce unnecessary snapshot drops and regenerations. When a
-    /// leader wants to generate a snapshot for a follower, it first sends a
-    /// precheck message. Upon receiving the message, the follower uses this
-    /// function to consult the concurrency limiter, determining if it can
-    /// receive a new snapshot. If the precheck is successful, the leader will
-    /// proceed to generate and send the snapshot.
-    pub fn recv_snap_precheck(&self, region_id: u64) -> bool {
-        self.core.recv_concurrency_limiter.try_recv(region_id)
-    }
-
-    /// recv_snap_complete is part of the snapshot recv precheck process, and
-    /// should be called when a follower finishes receiving a snapshot.
-    pub fn recv_snap_complete(&self, region_id: u64) {
-        self.core.recv_concurrency_limiter.finish_recv(region_id)
-    }
-
-    /// Adjusts the capacity of the snapshot receive concurrency limiter to
-    /// account for the number of pending applies. This prevents more snapshots
-    /// to be generated if there are too many snapshots waiting to be applied.
-    pub fn set_pending_apply_count(&self, num_pending_applies: usize) {
-        self.core
-            .recv_concurrency_limiter
-            .set_reserved_capacity(num_pending_applies)
-    }
 }
 
 impl SnapManagerCore {
@@ -1963,14 +1916,14 @@ impl SnapManagerCore {
                 // because without metadata file, saved cf files are nothing.
                 while let Err(e) = mgr.link_file(src, dst) {
                     if e.kind() == ErrorKind::AlreadyExists {
-                        mgr.delete_file(dst, None)?;
+                        mgr.delete_file(dst)?;
                         continue;
                     }
                     return Err(e.into());
                 }
                 let r = file_system::rename(src, dst);
                 let del_file = if r.is_ok() { src } else { dst };
-                if let Err(e) = mgr.delete_file(del_file, None) {
+                if let Err(e) = mgr.delete_file(del_file) {
                     warn!("fail to remove encryption metadata during 'rename_tmp_cf_file_for_send'";
                           "err" => ?e);
                 }
@@ -1997,100 +1950,6 @@ impl SnapManagerCore {
     }
 }
 
-/// `SnapRecvConcurrencyLimiter` enforces a limit on the number of simultaneous
-/// snapshot receives. It is consulted before a snapshot is generated. It
-/// employs a TTL mechanism to automatically evict operations that have been
-/// pending longer than the specified TTL. The TTL helps to handle scenarios
-/// where a snapshot fails to be sent for any reason. Note that a limit of 0
-/// means there's no limit.
-#[derive(Clone)]
-pub struct SnapRecvConcurrencyLimiter {
-    limit: Arc<AtomicUsize>,
-    reserved_capacity: Arc<AtomicUsize>,
-    ttl_secs: u64,
-    timestamps: Arc<Mutex<HashMap<u64, Instant>>>,
-}
-
-impl SnapRecvConcurrencyLimiter {
-    // Note that a limit of 0 means there's no limit.
-    pub fn new(limit: usize, ttl_secs: u64) -> Self {
-        SnapRecvConcurrencyLimiter {
-            limit: Arc::new(AtomicUsize::new(limit)),
-            reserved_capacity: Arc::new(AtomicUsize::new(0)),
-            ttl_secs,
-            timestamps: Arc::new(Mutex::new(HashMap::with_capacity_and_hasher(
-                limit,
-                Default::default(),
-            ))),
-        }
-    }
-
-    // Attempts to add a snapshot receive operation if below the concurrency
-    // limit. Returns true if the operation is allowed, false otherwise.
-    pub fn try_recv(&self, region_id: u64) -> bool {
-        let mut timestamps = self.timestamps.lock().unwrap();
-        let current_time = Instant::now();
-        self.evict_expired_timestamps(&mut timestamps, current_time);
-
-        let limit = self.limit.load(Ordering::Relaxed);
-        if limit == 0 {
-            // 0 means no limit. In that case, we avoid inserting into the hash
-            // map to prevent it from growing indefinitely.
-            return true;
-        }
-
-        let reserved_capacity = self.reserved_capacity.load(Ordering::Relaxed);
-        // Insert into the map if its size is within limit. If the region id is
-        // already present in the map, update its timestamp.
-        if timestamps.len() + reserved_capacity < limit || timestamps.contains_key(&region_id) {
-            timestamps.insert(region_id, current_time);
-            return true;
-        }
-        false
-    }
-
-    fn evict_expired_timestamps(
-        &self,
-        timestamps: &mut HashMap<u64, Instant>,
-        current_time: Instant,
-    ) {
-        timestamps.retain(|region_id, timestamp| {
-            if current_time.duration_since(*timestamp) <= Duration::from_secs(self.ttl_secs) {
-                true
-            } else {
-                // This shouldn't happen if the TTL is set properly. When it
-                // does happen, the limiter may permit more snapshots than the
-                // configured limit to be sent and trigger the receiver busy
-                // error.
-                warn!(
-                    "region {} expired in the snap recv concurrency limiter",
-                    region_id
-                );
-                false
-            }
-        });
-        timestamps.shrink_to(self.limit.load(Ordering::Relaxed));
-    }
-
-    // Completes a snapshot receive operation by removing a timestamp from the
-    // queue.
-    pub fn finish_recv(&self, region_id: u64) {
-        self.timestamps.lock().unwrap().remove(&region_id);
-    }
-
-    pub fn set_limit(&self, limit: usize) {
-        self.limit.store(limit, Ordering::Relaxed);
-    }
-
-    // Set the reserved capacity of the limiter. The reserved capacity is
-    // unavailable for use. The actual available capacity is calculated as
-    // the total limit minus the reserved capacity.
-    pub fn set_reserved_capacity(&self, reserved_cap: usize) {
-        self.reserved_capacity
-            .store(reserved_cap, Ordering::Relaxed);
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct SnapManagerBuilder {
     max_write_bytes_per_sec: i64,
@@ -2099,7 +1958,6 @@ pub struct SnapManagerBuilder {
     enable_multi_snapshot_files: bool,
     enable_receive_tablet_snapshot: bool,
     key_manager: Option<Arc<DataKeyManager>>,
-    concurrent_recv_snap_limit: usize,
 }
 
 impl SnapManagerBuilder {
@@ -2113,13 +1971,6 @@ impl SnapManagerBuilder {
         self.max_total_size = bytes;
         self
     }
-
-    #[must_use]
-    pub fn concurrent_recv_snap_limit(mut self, limit: usize) -> SnapManagerBuilder {
-        self.concurrent_recv_snap_limit = limit;
-        self
-    }
-
     pub fn max_per_file_size(mut self, bytes: u64) -> SnapManagerBuilder {
         self.max_per_file_size = bytes;
         self
@@ -2163,10 +2014,6 @@ impl SnapManagerBuilder {
                 base: path,
                 registry: Default::default(),
                 limiter,
-                recv_concurrency_limiter: Arc::new(SnapRecvConcurrencyLimiter::new(
-                    self.concurrent_recv_snap_limit,
-                    RECV_SNAP_CONCURRENCY_LIMITER_TTL_SECS,
-                )),
                 temp_sst_id: Arc::new(AtomicU64::new(0)),
                 encryption_key_manager: self.key_manager,
                 max_per_file_size: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2206,22 +2053,6 @@ impl TabletSnapKey {
         let index = snap.get_metadata().get_index();
         let term = snap.get_metadata().get_term();
         TabletSnapKey::new(region_id, to_peer, term, index)
-    }
-
-    pub fn from_path<T: Into<PathBuf>>(path: T) -> Result<TabletSnapKey> {
-        let path = path.into();
-        let name = path.file_name().unwrap().to_str().unwrap();
-        let numbers: Vec<u64> = name
-            .split('_')
-            .skip(1)
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if numbers.len() < 4 {
-            return Err(box_err!("invalid tablet snapshot file name:{}", name));
-        }
-        Ok(TabletSnapKey::new(
-            numbers[0], numbers[1], numbers[2], numbers[3],
-        ))
     }
 }
 
@@ -2315,7 +2146,7 @@ impl TabletSnapManager {
             .stats
             .lock()
             .unwrap()
-            .extract_if(|_, (_, stat)| stat.get_region_id() > 0)
+            .drain_filter(|_, (_, stat)| stat.get_region_id() > 0)
             .map(|(_, (_, stat))| stat)
             .filter(|stat| stat.get_total_duration_sec() > 1)
             .collect();
@@ -2343,7 +2174,6 @@ impl TabletSnapManager {
 
     pub fn delete_snapshot(&self, key: &TabletSnapKey) -> bool {
         let path = self.tablet_gen_path(key);
-        debug!("delete tablet snapshot file";"path" => %path.display());
         if path.exists() {
             if let Err(e) = encryption::trash_dir_all(&path, self.key_manager.as_deref()) {
                 error!(
@@ -2355,26 +2185,6 @@ impl TabletSnapManager {
             }
         }
         true
-    }
-
-    pub fn list_snapshot(&self) -> Result<Vec<PathBuf>> {
-        let mut paths = Vec::new();
-        for entry in file_system::read_dir(&self.base)? {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) => return Err(Error::from(e)),
-            };
-
-            let path = entry.path();
-            if path.file_name().and_then(|n| n.to_str()).map_or(true, |n| {
-                !n.starts_with(SNAP_GEN_PREFIX) || n.ends_with(TMP_FILE_SUFFIX)
-            }) {
-                continue;
-            }
-            paths.push(path);
-        }
-        Ok(paths)
     }
 
     pub fn total_snap_size(&self) -> Result<u64> {
@@ -2440,11 +2250,6 @@ impl TabletSnapManager {
     pub fn key_manager(&self) -> &Option<Arc<DataKeyManager>> {
         &self.key_manager
     }
-}
-
-fn is_symlink<P: AsRef<Path>>(path: P) -> Result<bool> {
-    let metadata = box_try!(std::fs::symlink_metadata(path));
-    Ok(metadata.is_symlink())
 }
 
 #[cfg(test)]
@@ -2654,10 +2459,6 @@ pub mod tests {
         SnapManagerCore {
             base: path.to_owned(),
             registry: Default::default(),
-            recv_concurrency_limiter: Arc::new(SnapRecvConcurrencyLimiter::new(
-                0,
-                RECV_SNAP_CONCURRENCY_LIMITER_TTL_SECS,
-            )),
             limiter: Limiter::new(f64::INFINITY),
             temp_sst_id: Arc::new(AtomicU64::new(0)),
             encryption_key_manager: None,
@@ -2784,7 +2585,7 @@ pub mod tests {
             .tempdir()
             .unwrap();
         let db = get_db(src_db_dir.path(), None, None).unwrap();
-        let snapshot = db.snapshot(None);
+        let snapshot = db.snapshot();
 
         let src_dir = Builder::new()
             .prefix("test-snap-file-db-src")
@@ -2857,7 +2658,6 @@ pub mod tests {
             abort: Arc::new(AtomicUsize::new(JOB_STATUS_RUNNING)),
             write_batch_size: TEST_WRITE_BATCH_SIZE,
             coprocessor_host: CoprocessorHost::<KvTestEngine>::default(),
-            ingest_copy_symlink: false,
         };
         // Verify the snapshot applying is ok.
         s4.apply(options).unwrap();
@@ -2892,7 +2692,7 @@ pub mod tests {
             .tempdir()
             .unwrap();
         let db = get_db(db_dir.path(), None, None).unwrap();
-        let snapshot = db.snapshot(None);
+        let snapshot = db.snapshot();
 
         let dir = Builder::new()
             .prefix("test-snap-validation")
@@ -3025,7 +2825,7 @@ pub mod tests {
             .tempdir()
             .unwrap();
         let db: KvTestEngine = open_test_db(db_dir.path(), None, None).unwrap();
-        let snapshot = db.snapshot(None);
+        let snapshot = db.snapshot();
 
         let dir = Builder::new()
             .prefix("test-snap-corruption")
@@ -3070,7 +2870,6 @@ pub mod tests {
             abort: Arc::new(AtomicUsize::new(JOB_STATUS_RUNNING)),
             write_batch_size: TEST_WRITE_BATCH_SIZE,
             coprocessor_host: CoprocessorHost::<KvTestEngine>::default(),
-            ingest_copy_symlink: false,
         };
         s2.apply(options).unwrap_err();
     }
@@ -3084,7 +2883,7 @@ pub mod tests {
             .tempdir()
             .unwrap();
         let db: KvTestEngine = open_test_db_with_100keys(db_dir.path(), None, None).unwrap();
-        let snapshot = db.snapshot(None);
+        let snapshot = db.snapshot();
 
         let dir = Builder::new()
             .prefix("test-snap-corruption-meta")
@@ -3165,7 +2964,7 @@ pub mod tests {
             .tempdir()
             .unwrap();
         let db: KvTestEngine = open_test_db(db_dir.path(), None, None).unwrap();
-        let snapshot = db.snapshot(None);
+        let snapshot = db.snapshot();
         let key1 = SnapKey::new(1, 1, 1);
         let mgr_core = create_manager_core(&path, u64::MAX);
         let mut s1 = Snapshot::new_for_building(&path, &key1, &mgr_core).unwrap();
@@ -3236,7 +3035,7 @@ pub mod tests {
             .tempdir()
             .unwrap();
         let db: KvTestEngine = open_test_db(src_db_dir.path(), None, None).unwrap();
-        let snapshot = db.snapshot(None);
+        let snapshot = db.snapshot();
 
         let key = SnapKey::new(1, 1, 1);
         let region = gen_test_region(1, 1, 1);
@@ -3318,7 +3117,7 @@ pub mod tests {
             .max_total_size(max_total_size)
             .build::<_>(snapfiles_path.path().to_str().unwrap());
         snap_mgr.init().unwrap();
-        let snapshot = engine.kv.snapshot(None);
+        let snapshot = engine.kv.snapshot();
 
         // Add an oldest snapshot for receiving.
         let recv_key = SnapKey::new(100, 100, 100);
@@ -3443,7 +3242,7 @@ pub mod tests {
             .tempdir()
             .unwrap();
         let db: KvTestEngine = open_test_db(kv_dir.path(), None, None).unwrap();
-        let snapshot = db.snapshot(None);
+        let snapshot = db.snapshot();
         let key = SnapKey::new(1, 1, 1);
         let region = gen_test_region(1, 1, 1);
 
@@ -3520,79 +3319,5 @@ pub mod tests {
         let snap_mgr = builder.build(path.to_str().unwrap());
         snap_mgr.init().unwrap();
         assert!(path.exists());
-    }
-
-    #[test]
-    fn test_from_path() {
-        let snap_dir = Builder::new().prefix("test_from_path").tempdir().unwrap();
-        let path = snap_dir.path().join("gen_1_2_3_4");
-        let key = TabletSnapKey::from_path(path).unwrap();
-        let expect_key = TabletSnapKey::new(1, 2, 3, 4);
-        assert_eq!(expect_key, key);
-        let path = snap_dir.path().join("gen_1_2_3_4.tmp");
-        TabletSnapKey::from_path(path).unwrap_err();
-    }
-
-    #[test]
-    fn test_snap_recv_limiter() {
-        let ttl_secs = 60;
-
-        let limiter = SnapRecvConcurrencyLimiter::new(1, ttl_secs);
-        limiter.finish_recv(10); // calling finish_recv() on an empty limiter is fine.
-        assert!(limiter.try_recv(1)); // first recv should succeed
-
-        // limiter.try_recv(2) should fail because we've reached the limit. But
-        // calling limiter.try_recv(1) should succeed again due to idempotence.
-        assert!(!limiter.try_recv(2));
-        assert!(limiter.try_recv(1));
-
-        // After finish_recv(1) is called, try_recv(2) should succeed.
-        limiter.finish_recv(1);
-        assert!(limiter.try_recv(2));
-
-        // Dynamically change the limit to 2, which will allow one more receive.
-        limiter.set_limit(2);
-        assert!(limiter.try_recv(1));
-        assert!(!limiter.try_recv(3));
-
-        limiter.finish_recv(1);
-        limiter.finish_recv(2);
-        // If we reserve a capacity of 1, the limiter will only allow one receive.
-        limiter.set_reserved_capacity(1);
-        assert!(limiter.try_recv(1));
-        assert!(!limiter.try_recv(2));
-
-        // Test the evict_expired_timestamps function.
-        let t_now = Instant::now();
-        let mut timestamps = [
-            (1, t_now - Duration::from_secs(ttl_secs + 2)), // expired
-            (2, t_now - Duration::from_secs(ttl_secs + 1)), // expired
-            (3, t_now - Duration::from_secs(ttl_secs - 1)), // alive
-            (4, t_now),                                     // alive
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        limiter.evict_expired_timestamps(&mut timestamps, t_now);
-        assert_eq!(timestamps.len(), 2);
-        assert!(timestamps.contains_key(&3));
-        assert!(timestamps.contains_key(&4));
-        // Test the expiring logic in try_recv(1) with a 0s TTL, which
-        // effectively means there's no limit.
-        let limiter = SnapRecvConcurrencyLimiter::new(1, 0);
-        assert!(limiter.try_recv(1));
-        assert!(limiter.try_recv(2));
-        assert!(limiter.try_recv(3));
-
-        // After canceling the limit, the capacity of the VecDeque should be 0.
-        limiter.set_limit(0);
-        assert!(limiter.try_recv(1));
-        assert!(limiter.timestamps.lock().unwrap().capacity() == 0);
-
-        // Test initializing a limiter with no limit.
-        let limiter = SnapRecvConcurrencyLimiter::new(0, 0);
-        assert!(limiter.try_recv(1));
-        assert!(limiter.timestamps.lock().unwrap().capacity() == 0);
     }
 }
