@@ -563,6 +563,8 @@ fn test_pessimistic_lock_check_valid() {
 
 #[test]
 fn test_concurrent_write_after_transfer_leader_invalidates_locks() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 1);
     cluster.cfg.pessimistic_txn.pipelined = true;
     cluster.cfg.pessimistic_txn.in_memory = true;
@@ -588,7 +590,11 @@ fn test_concurrent_write_after_transfer_leader_invalidates_locks() {
     txn_ext
         .pessimistic_locks
         .write()
-        .insert(vec![(Key::from_raw(b"key"), lock.clone())])
+        .insert(
+            vec![(Key::from_raw(b"key"), lock.clone())],
+            peer_size_limit,
+            instance_size_limit,
+        )
         .unwrap();
 
     let region = cluster.get_region(b"");
@@ -756,7 +762,7 @@ fn test_proposal_concurrent_with_conf_change_and_transfer_leader() {
 
     let handle = std::thread::spawn(move || {
         let mut mutations = vec![];
-        for key in vec![b"key3".to_vec(), b"key4".to_vec()] {
+        for key in [b"key3".to_vec(), b"key4".to_vec()] {
             let mut mutation = kvproto::kvrpcpb::Mutation::default();
             mutation.set_op(Op::Put);
             mutation.set_key(key);

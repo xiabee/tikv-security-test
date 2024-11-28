@@ -247,7 +247,7 @@ impl<P: RegionInfoProvider> SstPartitioner for CompactionGuardGenerator<P> {
     }
 }
 
-fn seek_to(all_data: &Vec<Vec<u8>>, target_key: &[u8], from_pos: usize) -> usize {
+fn seek_to(all_data: &[Vec<u8>], target_key: &[u8], from_pos: usize) -> usize {
     let mut pos = from_pos;
     let mut skip_count = 0;
     while pos < all_data.len() && all_data[pos].as_slice() <= target_key {
@@ -275,7 +275,8 @@ mod tests {
         RocksCfOptions, RocksDbOptions, RocksEngine, RocksSstPartitionerFactory, RocksSstReader,
     };
     use engine_traits::{
-        CompactExt, IterOptions, Iterator, MiscExt, RefIterable, SstReader, SyncMutable, CF_DEFAULT,
+        CompactExt, IterOptions, Iterator, ManualCompactionOptions, MiscExt, RefIterable,
+        SstReader, SyncMutable, CF_DEFAULT,
     };
     use keys::DATA_PREFIX_KEY;
     use kvproto::metapb::Region;
@@ -506,6 +507,7 @@ mod tests {
         cf_opts.set_max_bytes_for_level_base(MAX_OUTPUT_FILE_SIZE);
         cf_opts.set_max_bytes_for_level_multiplier(5);
         cf_opts.set_target_file_size_base(MAX_OUTPUT_FILE_SIZE);
+        cf_opts.set_level_compaction_dynamic_level_bytes(false);
         cf_opts.set_sst_partitioner_factory(RocksSstPartitionerFactory(
             CompactionGuardGeneratorFactory::new(
                 CF_DEFAULT,
@@ -541,7 +543,7 @@ mod tests {
     }
 
     fn collect_keys(path: &str) -> Vec<Vec<u8>> {
-        let reader = RocksSstReader::open(path).unwrap();
+        let reader = RocksSstReader::open(path, None).unwrap();
         let mut sst_reader = reader.iter(IterOptions::default()).unwrap();
         let mut valid = sst_reader.seek_to_first().unwrap();
         let mut ret = vec![];
@@ -606,10 +608,10 @@ mod tests {
         db.put(b"zc6", &value).unwrap();
         db.flush_cfs(&[], true /* wait */).unwrap();
         db.compact_range_cf(
-            CF_DEFAULT, None,  // start_key
-            None,  // end_key
-            false, // exclusive_manual
-            1,     // max_subcompactions
+            CF_DEFAULT,
+            None, // start_key
+            None, // end_key
+            ManualCompactionOptions::new(false, 1, false),
         )
         .unwrap();
 
@@ -697,7 +699,8 @@ mod tests {
         assert_eq!(level_1.len(), 1, "{:?}", level_1);
         assert_eq!(level_1[0].smallestkey, b"za0", "{:?}", level_1);
         assert_eq!(level_1[0].largestkey, b"za9", "{:?}", level_1);
-        db.compact_range(None, None, false, 1).unwrap();
+        db.compact_range(None, None, ManualCompactionOptions::new(false, 1, false))
+            .unwrap();
 
         // So... the next-level size will be almost 1024 * 15, which should reach the
         // limit.

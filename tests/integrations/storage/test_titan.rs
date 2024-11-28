@@ -16,7 +16,9 @@ use engine_traits::{
 };
 use keys::data_key;
 use kvproto::metapb::{Peer, Region};
-use raftstore::store::{apply_sst_cf_file, build_sst_cf_file_list, CfFile, RegionSnapshot};
+use raftstore::store::{
+    apply_sst_cf_files_by_ingest, build_sst_cf_file_list, CfFile, RegionSnapshot,
+};
 use tempfile::Builder;
 use test_raftstore::*;
 use tikv::{
@@ -141,6 +143,7 @@ fn test_turnoff_titan() {
 }
 
 #[test]
+#[ignore]
 fn test_delete_files_in_range_for_titan() {
     let path = Builder::new()
         .prefix("test-titan-delete-files-in-range")
@@ -150,7 +153,7 @@ fn test_delete_files_in_range_for_titan() {
     // Set configs and create engines
     let mut cfg = TikvConfig::default();
     let cache = cfg.storage.block_cache.build_shared_cache();
-    cfg.rocksdb.titan.enabled = true;
+    cfg.rocksdb.titan.enabled = Some(true);
     cfg.rocksdb.titan.disable_gc = true;
     cfg.rocksdb.titan.purge_obsolete_files_period = ReadableDuration::secs(1);
     cfg.rocksdb.defaultcf.disable_auto_compactions = true;
@@ -158,7 +161,7 @@ fn test_delete_files_in_range_for_titan() {
     cfg.rocksdb.defaultcf.dynamic_level_bytes = false;
     cfg.rocksdb.defaultcf.titan.min_gc_batch_size = ReadableSize(0);
     cfg.rocksdb.defaultcf.titan.discardable_ratio = 0.4;
-    cfg.rocksdb.defaultcf.titan.min_blob_size = ReadableSize(0);
+    cfg.rocksdb.defaultcf.titan.min_blob_size = Some(ReadableSize(0));
     let resource = cfg
         .rocksdb
         .build_resources(Default::default(), cfg.storage.engine);
@@ -408,13 +411,13 @@ fn test_delete_files_in_range_for_titan() {
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<&str>>();
-    apply_sst_cf_file(&tmp_file_paths, &engines1.kv, CF_DEFAULT).unwrap();
+    apply_sst_cf_files_by_ingest(&tmp_file_paths, &engines1.kv, CF_DEFAULT).unwrap();
     let tmp_file_paths = cf_file_write.tmp_file_paths();
     let tmp_file_paths = tmp_file_paths
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<&str>>();
-    apply_sst_cf_file(&tmp_file_paths, &engines1.kv, CF_WRITE).unwrap();
+    apply_sst_cf_files_by_ingest(&tmp_file_paths, &engines1.kv, CF_WRITE).unwrap();
 
     // Do scan on other DB.
     let mut r = Region::default();

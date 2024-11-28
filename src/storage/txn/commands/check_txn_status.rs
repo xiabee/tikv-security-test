@@ -29,9 +29,11 @@ command! {
     /// [`Prewrite`](Command::Prewrite).
     CheckTxnStatus:
         cmd_ty => TxnStatus,
-        display => "kv::command::check_txn_status {} @ {} curr({}, {}, {}, {}, {}) | {:?}",
-           (primary_key, lock_ts, caller_start_ts, current_ts, rollback_if_not_exist,
-               force_sync_commit, resolving_pessimistic_lock, ctx),
+        display => {
+            "kv::command::check_txn_status {} @ {} curr({}, {}, {}, {}, {}) | {:?}",
+            (primary_key, lock_ts, caller_start_ts, current_ts, rollback_if_not_exist,
+                force_sync_commit, resolving_pessimistic_lock, ctx),
+        }
         content => {
             /// The primary key of the transaction.
             primary_key: Key,
@@ -56,6 +58,9 @@ command! {
             // (see https://github.com/pingcap/tidb/issues/42937 for details).
             // Must be set to true, unless the client is old version that doesn't support this behavior.
             verify_is_primary: bool,
+        }
+        in_heap => {
+            primary_key,
         }
 }
 
@@ -158,6 +163,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
 
 #[cfg(test)]
 pub mod tests {
+    use std::sync::Arc;
+
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::{
         self, Context, LockInfo, PrewriteRequestPessimisticAction::*, WriteConflictReason,
@@ -221,7 +228,7 @@ pub mod tests {
                     statistics: &mut Default::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
-                    txn_status_cache: &TxnStatusCache::new_for_test(),
+                    txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
                 },
             )
             .unwrap();
@@ -275,7 +282,7 @@ pub mod tests {
                     statistics: &mut Default::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
-                    txn_status_cache: &TxnStatusCache::new_for_test(),
+                    txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
                 },
             )
             .map(|r| {

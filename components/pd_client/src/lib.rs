@@ -19,7 +19,8 @@ use std::{cmp::Ordering, ops::Deref, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use kvproto::{
-    metapb, pdpb,
+    metapb,
+    pdpb::{self, UpdateServiceGcSafePointRequest, UpdateServiceGcSafePointResponse},
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
     resource_manager::TokenBucketsRequest,
 };
@@ -42,7 +43,7 @@ pub use self::{
 pub type Key = Vec<u8>;
 pub type PdFuture<T> = BoxFuture<'static, Result<T>>;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct RegionStat {
     pub down_peers: Vec<pdpb::PeerStats>,
     pub pending_peers: Vec<metapb::Peer>,
@@ -51,6 +52,9 @@ pub struct RegionStat {
     pub read_bytes: u64,
     pub read_keys: u64,
     pub query_stats: QueryStats,
+    // Now, this info is not sent to PD (maybe in the future). It is needed here to make it
+    // collected by region collector.
+    pub cop_detail: RegionWriteCfCopDetail,
     pub approximate_size: u64,
     pub approximate_keys: u64,
     pub last_report_ts: UnixSecs,
@@ -268,38 +272,14 @@ pub const INVALID_ID: u64 = 0;
 pub const RESOURCE_CONTROL_CONFIG_PATH: &str = "resource_group/settings";
 pub const RESOURCE_CONTROL_CONTROLLER_CONFIG_PATH: &str = "resource_group/controller";
 
+pub const REGION_LABEL_PATH_PREFIX: &str = "region_label";
+
 /// PdClient communicates with Placement Driver (PD).
 /// Because now one PD only supports one cluster, so it is no need to pass
 /// cluster id in trait interface every time, so passing the cluster id when
 /// creating the PdClient is enough and the PdClient will use this cluster id
 /// all the time.
 pub trait PdClient: Send + Sync {
-    /// Load a list of GlobalConfig
-    fn load_global_config(
-        &self,
-        _config_path: String,
-    ) -> PdFuture<(Vec<pdpb::GlobalConfigItem>, i64)> {
-        unimplemented!();
-    }
-
-    /// Store a list of GlobalConfig
-    fn store_global_config(
-        &self,
-        _config_path: String,
-        _items: Vec<pdpb::GlobalConfigItem>,
-    ) -> PdFuture<()> {
-        unimplemented!();
-    }
-
-    /// Watching change of GlobalConfig
-    fn watch_global_config(
-        &self,
-        _config_path: String,
-        _revision: i64,
-    ) -> Result<grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>> {
-        unimplemented!();
-    }
-
     /// Returns the cluster ID.
     fn get_cluster_id(&self) -> Result<u64> {
         unimplemented!();
@@ -572,5 +552,77 @@ pub fn take_peer_address(store: &mut metapb::Store) -> String {
         store.take_peer_address()
     } else {
         store.take_address()
+    }
+}
+
+fn check_update_service_safe_point_resp(
+    resp: &UpdateServiceGcSafePointResponse,
+    req: &UpdateServiceGcSafePointRequest,
+) -> Result<()> {
+    if req.get_ttl() > 0 && resp.min_safe_point > req.get_safe_point() {
+        return Err(Error::UnsafeServiceGcSafePoint {
+            requested: req.get_safe_point().into(),
+            current_minimal: resp.min_safe_point.into(),
+        });
+    }
+    Ok(())
+}
+
+// Record the coprocessor details for region level.
+#[derive(Clone, Debug, Default)]
+pub struct RegionWriteCfCopDetail {
+    // How many times the `next` is called when handling cop request
+    pub next: usize,
+    // How many times the `prev` is called when handling cop request
+    pub prev: usize,
+    // How many keys that's visible to user
+    pub processed_keys: usize,
+}
+
+impl RegionWriteCfCopDetail {
+    pub fn new(next: usize, prev: usize, processed_keys: usize) -> Self {
+        Self {
+            next,
+            prev,
+            processed_keys,
+        }
+    }
+
+    pub fn add(&mut self, other: &RegionWriteCfCopDetail) {
+        self.next += other.next;
+        self.prev += other.prev;
+        self.processed_keys += other.processed_keys;
+    }
+
+    pub fn sub(&self, other: &RegionWriteCfCopDetail) -> Self {
+        Self::new(
+            self.next - other.next,
+            self.prev - other.prev,
+            self.processed_keys - other.processed_keys,
+        )
+    }
+
+    #[inline]
+    pub fn iterated_count(&self) -> usize {
+        self.next + self.prev
+    }
+
+    #[inline]
+    pub fn mvcc_amplification(&self) -> f64 {
+        // Sometimes, processed_keys is 0 even (next + prev) is pretty high
+        self.iterated_count() as f64 / (self.processed_keys as f64 + 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::RegionWriteCfCopDetail;
+
+    #[test]
+    fn test_procssed_key_0() {
+        let mut cop_detail = RegionWriteCfCopDetail::default();
+        cop_detail.next = 11;
+
+        assert_eq!(cop_detail.mvcc_amplification(), 11.0);
     }
 }

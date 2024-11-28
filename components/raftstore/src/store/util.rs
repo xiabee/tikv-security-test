@@ -124,8 +124,7 @@ pub fn is_vote_msg(msg: &eraftpb::Message) -> bool {
 /// peer or not.
 // There could be two cases:
 // 1. Target peer already exists but has not established communication with leader yet
-// 2. Target peer is added newly due to member change or region split, but it's not
-//    created yet
+// 2. Target peer is added newly due to member change or region split, but it's not created yet
 // For both cases the region start key and end key are attached in RequestVote and
 // Heartbeat message for the store of that peer to check whether to create a new peer
 // when receiving these messages, or just to wait for a pending region split to perform
@@ -241,7 +240,7 @@ pub fn admin_cmd_epoch_lookup(admin_cmp_type: AdminCmdType) -> AdminCmdEpochStat
         AdminCmdType::CommitMerge => AdminCmdEpochState::new(true, true, true, false),
         AdminCmdType::RollbackMerge => AdminCmdEpochState::new(true, true, true, false),
         // Transfer leader
-        AdminCmdType::TransferLeader => AdminCmdEpochState::new(true, true, false, false),
+        AdminCmdType::TransferLeader => AdminCmdEpochState::new(false, false, false, false),
         // PrepareFlashback could be committed successfully before a split being applied, so we need
         // to check the epoch to make sure it's sent to a correct key range.
         // NOTICE: FinishFlashback will never meet the epoch not match error since any scheduling
@@ -365,8 +364,7 @@ pub fn check_flashback_state(
 ) -> Result<()> {
     // The admin flashback cmd could be proposed/applied under any state.
     if let Some(ty) = admin_type
-        && (ty == AdminCmdType::PrepareFlashback
-            || ty == AdminCmdType::FinishFlashback)
+        && (ty == AdminCmdType::PrepareFlashback || ty == AdminCmdType::FinishFlashback)
     {
         return Ok(());
     }
@@ -426,7 +424,7 @@ pub fn check_term(header: &RaftRequestHeader, term: u64) -> Result<()> {
     if header.get_term() == 0 || term <= header.get_term() + 1 {
         Ok(())
     } else {
-        // If header's term is 2 verions behind current term,
+        // If header's term is 2 versions behind current term,
         // leadership may have been changed away.
         Err(Error::StaleCommand)
     }
@@ -767,10 +765,9 @@ pub fn get_entry_header(entry: &Entry) -> RaftRequestHeader {
     if entry.get_entry_type() != EntryType::EntryNormal {
         return RaftRequestHeader::default();
     }
-    let logger = slog_global::get_global().new(slog::o!());
     match SimpleWriteReqDecoder::new(
         |_, _, _| RaftCmdRequest::default(),
-        &logger,
+        None,
         entry.get_data(),
         entry.get_index(),
         entry.get_term(),
@@ -820,10 +817,9 @@ pub enum RaftCmd<'a> {
 }
 
 pub fn parse_raft_cmd_request<'a>(data: &'a [u8], index: u64, term: u64, tag: &str) -> RaftCmd<'a> {
-    let logger = slog_global::get_global().new(slog::o!());
     match SimpleWriteReqDecoder::new(
         |_, _, _| parse_data_at(data, index, tag),
-        &logger,
+        None,
         data,
         index,
         term,
@@ -1303,14 +1299,15 @@ impl RegionReadProgressRegistry {
     }
 
     // Get the minimum `resolved_ts` which could ensure that there will be no more
-    // locks whose `start_ts` is greater than it.
+    // locks whose `commit_ts` is smaller than it.
     pub fn get_min_resolved_ts(&self) -> u64 {
         self.registry
             .lock()
             .unwrap()
             .iter()
             .map(|(_, rrp)| rrp.resolved_ts())
-            .filter(|ts| *ts != 0) // ts == 0 means the peer is uninitialized
+            //TODO: the uninitialized peer should be taken into consideration instead of skipping it(https://github.com/tikv/tikv/issues/15506).
+            .filter(|ts| *ts != 0) // ts == 0 means the peer is uninitialized,
             .min()
             .unwrap_or(0)
     }
@@ -1408,7 +1405,9 @@ impl RegionReadProgress {
     }
 
     pub fn notify_advance_resolved_ts(&self) {
-        if let Ok(core) = self.core.try_lock() && let Some(advance_notify) = &core.advance_notify {
+        if let Ok(core) = self.core.try_lock()
+            && let Some(advance_notify) = &core.advance_notify
+        {
             advance_notify.notify_waiters();
         }
     }
@@ -1827,110 +1826,6 @@ impl RegionReadProgressCore {
 
     pub fn last_instant_of_consume_leader(&self) -> &Option<Instant> {
         &self.last_instant_of_consume_leader
-    }
-}
-
-/// Represent the duration of all stages of raftstore recorded by one
-/// inspecting.
-#[derive(Default, Debug)]
-pub struct RaftstoreDuration {
-    pub store_wait_duration: Option<std::time::Duration>,
-    pub store_process_duration: Option<std::time::Duration>,
-    pub store_write_duration: Option<std::time::Duration>,
-    pub store_commit_duration: Option<std::time::Duration>,
-    pub apply_wait_duration: Option<std::time::Duration>,
-    pub apply_process_duration: Option<std::time::Duration>,
-}
-
-impl RaftstoreDuration {
-    #[inline]
-    pub fn sum(&self) -> std::time::Duration {
-        self.delays_on_disk_io(true) + self.delays_on_net_io()
-    }
-
-    #[inline]
-    /// Returns the delayed duration on Disk I/O.
-    pub fn delays_on_disk_io(&self, include_wait_duration: bool) -> std::time::Duration {
-        let duration = self.store_process_duration.unwrap_or_default()
-            + self.store_write_duration.unwrap_or_default()
-            + self.apply_process_duration.unwrap_or_default();
-        if include_wait_duration {
-            duration
-                + self.store_wait_duration.unwrap_or_default()
-                + self.apply_wait_duration.unwrap_or_default()
-        } else {
-            duration
-        }
-    }
-
-    #[inline]
-    /// Returns the delayed duration on Network I/O.
-    ///
-    /// Normally, it can be reflected by the duraiton on
-    /// `store_commit_duraiton`.
-    pub fn delays_on_net_io(&self) -> std::time::Duration {
-        // The `store_commit_duration` serves as an indicator for latency
-        // during the duration of transferring Raft logs to peers and appending
-        // logs. In most scenarios, instances of latency fluctuations in the
-        // network are reflected by this duration. Hence, it is selected as a
-        // representative of network latency.
-        self.store_commit_duration.unwrap_or_default()
-    }
-}
-
-/// Used to inspect the latency of all stages of raftstore.
-pub struct LatencyInspector {
-    id: u64,
-    duration: RaftstoreDuration,
-    cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>,
-}
-
-impl Debug for LatencyInspector {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            fmt,
-            "LatencyInspector: id {} duration: {:?}",
-            self.id, self.duration
-        )
-    }
-}
-
-impl LatencyInspector {
-    pub fn new(id: u64, cb: Box<dyn FnOnce(u64, RaftstoreDuration) + Send>) -> Self {
-        Self {
-            id,
-            cb,
-            duration: RaftstoreDuration::default(),
-        }
-    }
-
-    pub fn record_store_wait(&mut self, duration: std::time::Duration) {
-        self.duration.store_wait_duration = Some(duration);
-    }
-
-    pub fn record_store_process(&mut self, duration: std::time::Duration) {
-        self.duration.store_process_duration = Some(duration);
-    }
-
-    pub fn record_store_write(&mut self, duration: std::time::Duration) {
-        self.duration.store_write_duration = Some(duration);
-    }
-
-    pub fn record_store_commit(&mut self, duration: std::time::Duration) {
-        self.duration.store_commit_duration = Some(duration);
-    }
-
-    pub fn record_apply_wait(&mut self, duration: std::time::Duration) {
-        self.duration.apply_wait_duration = Some(duration);
-    }
-
-    pub fn record_apply_process(&mut self, duration: std::time::Duration) {
-        self.duration.apply_process_duration = Some(duration);
-    }
-
-    /// Call the callback.
-    pub fn finish(self) {
-        (self.cb)(self.id, self.duration);
     }
 }
 
@@ -2407,7 +2302,7 @@ mod tests {
         header.set_term(7);
         check_term(&header, 7).unwrap();
         check_term(&header, 8).unwrap();
-        // If header's term is 2 verions behind current term,
+        // If header's term is 2 versions behind current term,
         // leadership may have been changed away.
         check_term(&header, 9).unwrap_err();
         check_term(&header, 10).unwrap_err();
@@ -2430,6 +2325,7 @@ mod tests {
             AdminCmdType::InvalidAdmin,
             AdminCmdType::ComputeHash,
             AdminCmdType::VerifyHash,
+            AdminCmdType::TransferLeader,
         ] {
             let mut admin = AdminRequest::default();
             admin.set_cmd_type(*ty);
@@ -2451,7 +2347,6 @@ mod tests {
             AdminCmdType::PrepareMerge,
             AdminCmdType::CommitMerge,
             AdminCmdType::RollbackMerge,
-            AdminCmdType::TransferLeader,
         ] {
             let mut admin = AdminRequest::default();
             admin.set_cmd_type(*ty);
@@ -2487,7 +2382,6 @@ mod tests {
             AdminCmdType::PrepareMerge,
             AdminCmdType::CommitMerge,
             AdminCmdType::RollbackMerge,
-            AdminCmdType::TransferLeader,
         ] {
             let mut admin = AdminRequest::default();
             admin.set_cmd_type(*ty);

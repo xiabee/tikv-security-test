@@ -2,7 +2,7 @@
 
 // #[PerformanceCriticalPath]
 use std::{
-    cell::RefCell,
+    cell::{Ref, RefCell},
     error,
     ops::{Deref, DerefMut},
     sync::{
@@ -29,6 +29,7 @@ use raft::{
     eraftpb::{self, ConfState, Entry, HardState, Snapshot},
     Error as RaftError, GetEntriesContext, RaftState, Ready, Storage, StorageError,
 };
+use rand::Rng;
 use tikv_util::{
     box_err, box_try, debug, defer, error, info,
     store::find_peer_by_id,
@@ -48,6 +49,10 @@ use crate::{
     },
     Error, Result,
 };
+
+// The maximum tick interval between precheck requests. The tick interval helps
+// prevent sending the precheck requests too aggressively.
+const SNAP_GEN_PRECHECK_MAX_TICK_INTERVAL: usize = 5;
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -96,7 +101,7 @@ impl PartialEq for SnapState {
             (&SnapState::Relax, &SnapState::Relax)
             | (&SnapState::ApplyAborted, &SnapState::ApplyAborted)
             | (&SnapState::Generating { .. }, &SnapState::Generating { .. }) => true,
-            (&SnapState::Applying(ref b1), &SnapState::Applying(ref b2)) => {
+            (SnapState::Applying(b1), SnapState::Applying(b2)) => {
                 b1.load(Ordering::Relaxed) == b2.load(Ordering::Relaxed)
             }
             _ => false,
@@ -229,7 +234,7 @@ where
 
     snap_state: RefCell<SnapState>,
     gen_snap_task: RefCell<Option<GenSnapTask>>,
-    region_scheduler: Scheduler<RegionTask<EK::Snapshot>>,
+    region_scheduler: Scheduler<RegionTask>,
     snap_tried_cnt: RefCell<usize>,
 
     entry_storage: EntryStorage<EK, ER>,
@@ -299,7 +304,7 @@ where
     pub fn new(
         engines: Engines<EK, ER>,
         region: &metapb::Region,
-        region_scheduler: Scheduler<RegionTask<EK::Snapshot>>,
+        region_scheduler: Scheduler<RegionTask>,
         raftlog_fetch_scheduler: Scheduler<ReadTask<EK>>,
         peer_id: u64,
         tag: String,
@@ -529,67 +534,103 @@ where
             panic!("{} unexpected state: {:?}", self.tag, *snap_state);
         }
 
-        let max_snap_try_cnt = (|| {
-            fail_point!("ignore_snap_try_cnt", |_| usize::MAX);
-            MAX_SNAP_TRY_CNT
-        })();
+        match find_peer_by_id(&self.region, to) {
+            Some(to_peer) => {
+                let max_snap_try_cnt = (|| {
+                    fail_point!("ignore_snap_try_cnt", |_| usize::MAX);
+                    MAX_SNAP_TRY_CNT
+                })();
 
-        if *tried_cnt >= max_snap_try_cnt {
-            let cnt = *tried_cnt;
-            *tried_cnt = 0;
-            return Err(raft::Error::Store(box_err!(
-                "failed to get snapshot after {} times",
-                cnt
-            )));
+                if *tried_cnt >= max_snap_try_cnt {
+                    let cnt = *tried_cnt;
+                    *tried_cnt = 0;
+                    return Err(raft::Error::Store(box_err!(
+                        "failed to get snapshot after {} times",
+                        cnt
+                    )));
+                }
+                if !tried || !last_canceled {
+                    *tried_cnt += 1;
+                }
+
+                info!(
+                    "requesting snapshot";
+                    "region_id" => self.region.get_id(),
+                    "peer_id" => self.peer_id,
+                    "request_index" => request_index,
+                    "request_peer" => to,
+                );
+
+                let (sender, receiver) = mpsc::sync_channel(1);
+                let canceled = Arc::new(AtomicBool::new(false));
+                let index = Arc::new(AtomicU64::new(0));
+                *snap_state = SnapState::Generating {
+                    canceled: canceled.clone(),
+                    index: index.clone(),
+                    receiver,
+                };
+
+                let task = GenSnapTask::new(
+                    self.region.get_id(),
+                    index,
+                    canceled,
+                    sender,
+                    to_peer.clone(),
+                );
+                self.set_gen_snap_task(task);
+            }
+            None => {
+                warn!(
+                    "failed to find peer";
+                    "region_id" => self.region.get_id(),
+                    "peer_id" => self.peer_id,
+                    "times" => *tried_cnt,
+                    "request_peer" => to,
+                );
+            }
         }
-        if !tried || !last_canceled {
-            *tried_cnt += 1;
-        }
-
-        info!(
-            "requesting snapshot";
-            "region_id" => self.region.get_id(),
-            "peer_id" => self.peer_id,
-            "request_index" => request_index,
-            "request_peer" => to,
-        );
-
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let canceled = Arc::new(AtomicBool::new(false));
-        let index = Arc::new(AtomicU64::new(0));
-        *snap_state = SnapState::Generating {
-            canceled: canceled.clone(),
-            index: index.clone(),
-            receiver,
-        };
-
-        let store_id = self
-            .region()
-            .get_peers()
-            .iter()
-            .find(|p| p.id == to)
-            .map(|p| p.store_id)
-            .unwrap_or(0);
-        let task = GenSnapTask::new(self.region.get_id(), index, canceled, sender, store_id);
-
-        let mut gen_snap_task = self.gen_snap_task.borrow_mut();
-        assert!(gen_snap_task.is_none());
-        *gen_snap_task = Some(task);
         Err(raft::Error::Store(
             raft::StorageError::SnapshotTemporarilyUnavailable,
         ))
+    }
+
+    pub fn need_gen_snap_precheck(&self) -> Option<metapb::Peer> {
+        let mut gen_task = self.gen_snap_task.borrow_mut();
+        let task = gen_task.as_mut()?;
+        if task.precheck_remaining_ticks == 0 {
+            // Use random tick counts to space out the requests.
+            task.precheck_remaining_ticks =
+                rand::thread_rng().gen_range(1..=SNAP_GEN_PRECHECK_MAX_TICK_INTERVAL);
+            Some(task.to_peer.clone())
+        } else {
+            task.precheck_remaining_ticks -= 1;
+            None
+        }
+    }
+
+    pub fn set_gen_snap_task_for_balance(&self) {
+        if let Some(gen_task) = self.gen_snap_task.borrow_mut().as_mut() {
+            gen_task.set_for_balance();
+        }
+    }
+
+    pub fn get_gen_snap_task(&self) -> Ref<'_, Option<GenSnapTask>> {
+        self.gen_snap_task.borrow()
     }
 
     pub fn has_gen_snap_task(&self) -> bool {
         self.gen_snap_task.borrow().is_some()
     }
 
-    pub fn mut_gen_snap_task(&mut self) -> &mut Option<GenSnapTask> {
-        self.gen_snap_task.get_mut()
+    pub fn take_gen_snap_task(&self) -> Option<GenSnapTask> {
+        let mut task = self.gen_snap_task.borrow_mut();
+        (*task).take()
     }
 
-    pub fn take_gen_snap_task(&mut self) -> Option<GenSnapTask> {
-        self.gen_snap_task.get_mut().take()
+    pub fn set_gen_snap_task(&self, task: GenSnapTask) {
+        let mut gen_snap_task = self.gen_snap_task.borrow_mut();
+        assert!(gen_snap_task.is_none(), "{:?}", gen_snap_task);
+        *gen_snap_task = Some(task);
     }
 
     pub fn on_compact_raftlog(&mut self, idx: u64) {
@@ -849,7 +890,7 @@ where
     }
 
     /// Cancel generating snapshot.
-    pub fn cancel_generating_snap(&mut self, compact_to: Option<u64>) {
+    pub fn cancel_generating_snap(&self, compact_to: Option<u64>) {
         let snap_state = self.snap_state.borrow();
         if let SnapState::Generating {
             ref canceled,
@@ -860,11 +901,20 @@ where
             if !canceled.load(Ordering::SeqCst) {
                 if let Some(idx) = compact_to {
                     let snap_index = index.load(Ordering::SeqCst);
+                    // Do not cancel if the snapshot is still valid after the
+                    // compaction.
                     if snap_index == 0 || idx <= snap_index + 1 {
                         return;
                     }
                 }
                 canceled.store(true, Ordering::SeqCst);
+                // Cancel snapshot precheck.
+                self.take_gen_snap_task();
+                info!(
+                    "canceled generating snap";
+                    "region_id" => self.region.get_id(),
+                    "peer_id" => self.peer_id,
+                );
             }
         }
     }
@@ -890,6 +940,7 @@ where
             region_id: self.get_region_id(),
             status,
             peer_id: self.peer_id,
+            create_time: Instant::now_coarse(),
         };
 
         // Don't schedule the snapshot to region worker.
@@ -1217,21 +1268,18 @@ pub mod tests {
     };
 
     use super::*;
-    use crate::{
-        coprocessor::CoprocessorHost,
-        store::{
-            async_io::{read::ReadRunner, write::write_to_db_for_test},
-            bootstrap_store,
-            entry_storage::tests::validate_cache,
-            fsm::apply::compact_raft_log,
-            initial_region, prepare_bootstrap_cluster,
-            worker::{make_region_worker_raftstore_cfg, RegionRunner, RegionTask},
-            AsyncReadNotifier, FetchedLogs, GenSnapRes,
-        },
+    use crate::store::{
+        async_io::{read::ReadRunner, write::write_to_db_for_test},
+        bootstrap_store,
+        entry_storage::tests::validate_cache,
+        fsm::apply::compact_raft_log,
+        initial_region, prepare_bootstrap_cluster,
+        worker::{RegionTask, SnapGenRunner, SnapGenTask},
+        AsyncReadNotifier, FetchedLogs, GenSnapRes,
     };
 
     fn new_storage(
-        region_scheduler: Scheduler<RegionTask<KvTestSnapshot>>,
+        region_scheduler: Scheduler<RegionTask>,
         raftlog_fetch_scheduler: Scheduler<ReadTask<KvTestEngine>>,
         path: &TempDir,
     ) -> PeerStorage<KvTestEngine, RaftTestEngine> {
@@ -1264,7 +1312,7 @@ pub mod tests {
     }
 
     pub fn new_storage_from_ents(
-        region_scheduler: Scheduler<RegionTask<KvTestSnapshot>>,
+        region_scheduler: Scheduler<RegionTask>,
         raftlog_fetch_scheduler: Scheduler<ReadTask<KvTestEngine>>,
         path: &TempDir,
         ents: &[Entry],
@@ -1596,7 +1644,7 @@ pub mod tests {
     fn generate_and_schedule_snapshot(
         gen_task: GenSnapTask,
         engines: &Engines<KvTestEngine, RaftTestEngine>,
-        sched: &Scheduler<RegionTask<KvTestSnapshot>>,
+        sched: &Scheduler<SnapGenTask<KvTestSnapshot>>,
     ) -> Result<()> {
         let apply_state: RaftApplyState = engines
             .kv
@@ -1636,27 +1684,44 @@ pub mod tests {
         let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
         mgr.init().unwrap();
-        let mut worker = Worker::new("region-worker").lazy_build("region-worker");
-        let sched = worker.scheduler();
+        let (sched, _) = dummy_scheduler();
         let (dummy_scheduler, _) = dummy_scheduler();
         let mut s = new_storage_from_ents(sched.clone(), dummy_scheduler, &td, &ents);
         let (router, _) = mpsc::sync_channel(100);
-        let cfg = make_region_worker_raftstore_cfg(true);
-        let runner = RegionRunner::new(
+
+        let mut snap_gen_worker = LazyWorker::new("snap-generator");
+        let snap_gen_sched = snap_gen_worker.scheduler();
+        let snap_gen_runner = SnapGenRunner::new(
             s.engines.kv.clone(),
             mgr,
-            cfg,
-            CoprocessorHost::<KvTestEngine>::default(),
             router,
             Option::<Arc<TestPdClient>>::None,
+            snap_gen_worker.pool(),
         );
-        worker.start_with_timer(runner);
-        let snap = s.snapshot(0, 1);
+        snap_gen_worker.start(snap_gen_runner);
+
+        let to_peer_id = s.peer_id;
         let unavailable = RaftError::Store(StorageError::SnapshotTemporarilyUnavailable);
+
+        // Verify that an unknown peer asking for a snapshot will be ignored and
+        // won't count toward `tried_cnt`.
+        let unknown_peer_id = 0;
+        assert_eq!(s.snapshot(0, unknown_peer_id).unwrap_err(), unavailable);
+        assert_eq!(*s.snap_tried_cnt.borrow(), 0);
+
+        let snap = s.snapshot(0, to_peer_id);
         assert_eq!(snap.unwrap_err(), unavailable);
         assert_eq!(*s.snap_tried_cnt.borrow(), 1);
+
+        // Verify that a fake cancellation doesn't increment `tried_cnt`. The
+        // `cancel_generating_snap` function should be a no-op if `compact_to`
+        // is so small that it doesn't make the snapshot stale.
+        s.cancel_generating_snap(Some(0));
+        assert_eq!(s.snapshot(0, to_peer_id).unwrap_err(), unavailable);
+        assert_eq!(*s.snap_tried_cnt.borrow(), 1);
+
         let gen_task = s.gen_snap_task.borrow_mut().take().unwrap();
-        generate_and_schedule_snapshot(gen_task, &s.engines, &sched).unwrap();
+        generate_and_schedule_snapshot(gen_task, &s.engines, &snap_gen_sched).unwrap();
         let snap = match *s.snap_state.borrow() {
             SnapState::Generating { ref receiver, .. } => {
                 receiver.recv_timeout(Duration::from_secs(3)).unwrap()
@@ -1675,11 +1740,11 @@ pub mod tests {
         let (tx, rx) = channel();
         s.set_snap_state(gen_snap_for_test(rx));
         // Empty channel should cause snapshot call to wait.
-        assert_eq!(s.snapshot(0, 1).unwrap_err(), unavailable);
+        assert_eq!(s.snapshot(0, to_peer_id).unwrap_err(), unavailable);
         assert_eq!(*s.snap_tried_cnt.borrow(), 1);
 
         tx.send(snap.clone()).unwrap();
-        assert_eq!(s.snapshot(0, 1), Ok(snap.clone()));
+        assert_eq!(s.snapshot(0, to_peer_id), Ok(snap.clone()));
         assert_eq!(*s.snap_tried_cnt.borrow(), 0);
 
         let (tx, rx) = channel();
@@ -1687,7 +1752,7 @@ pub mod tests {
         s.set_snap_state(gen_snap_for_test(rx));
         // stale snapshot should be abandoned, snapshot index < request index.
         assert_eq!(
-            s.snapshot(snap.get_metadata().get_index() + 1, 0)
+            s.snapshot(snap.get_metadata().get_index() + 1, to_peer_id)
                 .unwrap_err(),
             unavailable
         );
@@ -1720,15 +1785,15 @@ pub mod tests {
         s.set_snap_state(gen_snap_for_test(rx));
         *s.snap_tried_cnt.borrow_mut() = 1;
         // stale snapshot should be abandoned, snapshot index < truncated index.
-        assert_eq!(s.snapshot(0, 1).unwrap_err(), unavailable);
+        assert_eq!(s.snapshot(0, to_peer_id).unwrap_err(), unavailable);
         assert_eq!(*s.snap_tried_cnt.borrow(), 1);
 
         let gen_task = s.gen_snap_task.borrow_mut().take().unwrap();
-        generate_and_schedule_snapshot(gen_task, &s.engines, &sched).unwrap();
+        generate_and_schedule_snapshot(gen_task, &s.engines, &snap_gen_sched).unwrap();
         match *s.snap_state.borrow() {
             SnapState::Generating { ref receiver, .. } => {
                 receiver.recv_timeout(Duration::from_secs(3)).unwrap();
-                worker.stop();
+                snap_gen_worker.stop();
                 match receiver.recv_timeout(Duration::from_secs(3)) {
                     Err(RecvTimeoutError::Disconnected) => {}
                     res => panic!("unexpected result: {:?}", res),
@@ -1737,9 +1802,9 @@ pub mod tests {
             ref s => panic!("unexpected state {:?}", s),
         }
         // Disconnected channel should trigger another try.
-        assert_eq!(s.snapshot(0, 1).unwrap_err(), unavailable);
+        assert_eq!(s.snapshot(0, to_peer_id).unwrap_err(), unavailable);
         let gen_task = s.gen_snap_task.borrow_mut().take().unwrap();
-        generate_and_schedule_snapshot(gen_task, &s.engines, &sched).unwrap_err();
+        generate_and_schedule_snapshot(gen_task, &s.engines, &snap_gen_sched).unwrap_err();
         assert_eq!(*s.snap_tried_cnt.borrow(), 2);
 
         for cnt in 2..super::MAX_SNAP_TRY_CNT + 10 {
@@ -1752,13 +1817,13 @@ pub mod tests {
             }
 
             // Scheduled job failed should trigger .
-            assert_eq!(s.snapshot(0, 1).unwrap_err(), unavailable);
+            assert_eq!(s.snapshot(0, to_peer_id).unwrap_err(), unavailable);
             let gen_task = s.gen_snap_task.borrow_mut().take().unwrap();
-            generate_and_schedule_snapshot(gen_task, &s.engines, &sched).unwrap_err();
+            generate_and_schedule_snapshot(gen_task, &s.engines, &snap_gen_sched).unwrap_err();
         }
 
         // When retry too many times, it should report a different error.
-        match s.snapshot(0, 1) {
+        match s.snapshot(0, to_peer_id) {
             Err(RaftError::Store(StorageError::Other(_))) => {}
             res => panic!("unexpected res: {:?}", res),
         }
@@ -1775,10 +1840,9 @@ pub mod tests {
         mgr.init().unwrap();
         mgr.set_enable_multi_snapshot_files(true);
         mgr.set_max_per_file_size(500);
-        let mut worker = Worker::new("region-worker").lazy_build("region-worker");
-        let sched = worker.scheduler();
+        let (sched, _) = dummy_scheduler();
         let (dummy_scheduler, _) = dummy_scheduler();
-        let s = new_storage_from_ents(sched.clone(), dummy_scheduler, &td, &ents);
+        let s = new_storage_from_ents(sched, dummy_scheduler, &td, &ents);
         let (router, _) = mpsc::sync_channel(100);
         let mut pd_client = TestPdClient::new();
         let labels = vec![StoreLabel {
@@ -1789,22 +1853,24 @@ pub mod tests {
         let store = new_store(1, labels);
         pd_client.add_store(store);
         let pd_mock = Arc::new(pd_client);
-        let cfg = make_region_worker_raftstore_cfg(true);
-        let runner = RegionRunner::new(
+
+        let mut snap_gen_worker = LazyWorker::new("snap-generator");
+        let snap_gen_sched = snap_gen_worker.scheduler();
+        let snap_gen_runner = SnapGenRunner::new(
             s.engines.kv.clone(),
             mgr,
-            cfg,
-            CoprocessorHost::<KvTestEngine>::default(),
             router,
             Some(pd_mock),
+            snap_gen_worker.pool(),
         );
-        worker.start_with_timer(runner);
+        snap_gen_worker.start(snap_gen_runner);
+
         let snap = s.snapshot(0, 1);
         let unavailable = RaftError::Store(StorageError::SnapshotTemporarilyUnavailable);
         assert_eq!(snap.unwrap_err(), unavailable);
         assert_eq!(*s.snap_tried_cnt.borrow(), 1);
         let gen_task = s.gen_snap_task.borrow_mut().take().unwrap();
-        generate_and_schedule_snapshot(gen_task, &s.engines, &sched).unwrap();
+        generate_and_schedule_snapshot(gen_task, &s.engines, &snap_gen_sched).unwrap();
         let snap = match *s.snap_state.borrow() {
             SnapState::Generating { ref receiver, .. } => {
                 receiver.recv_timeout(Duration::from_secs(3)).unwrap()
@@ -1845,21 +1911,22 @@ pub mod tests {
         let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
         mgr.init().unwrap();
-        let mut worker = Worker::new("region-worker").lazy_build("region-worker");
-        let sched = worker.scheduler();
+
+        let (sched, _) = dummy_scheduler();
         let (dummy_scheduler, _) = dummy_scheduler();
-        let mut s = new_storage_from_ents(sched.clone(), dummy_scheduler, &td, &ents);
-        let cfg = make_region_worker_raftstore_cfg(true);
+        let mut s = new_storage_from_ents(sched, dummy_scheduler, &td, &ents);
         let (router, _) = mpsc::sync_channel(100);
-        let runner = RegionRunner::new(
+
+        let mut snap_gen_worker = LazyWorker::new("snap-generator");
+        let snap_gen_sched = snap_gen_worker.scheduler();
+        let snap_gen_runner = SnapGenRunner::new(
             s.engines.kv.clone(),
             mgr,
-            cfg,
-            CoprocessorHost::<KvTestEngine>::default(),
             router,
             Option::<Arc<TestPdClient>>::None,
+            snap_gen_worker.pool(),
         );
-        worker.start_with_timer(runner);
+        snap_gen_worker.start(snap_gen_runner);
 
         let mut r = s.region().clone();
         r.mut_peers().push(new_peer(2, 2));
@@ -1878,7 +1945,7 @@ pub mod tests {
             assert_eq!(snap.unwrap_err(), unavailable);
             assert_eq!(*s.snap_tried_cnt.borrow(), 1);
             let gen_task = s.gen_snap_task.borrow_mut().take().unwrap();
-            generate_and_schedule_snapshot(gen_task, &s.engines, &sched).unwrap();
+            generate_and_schedule_snapshot(gen_task, &s.engines, &snap_gen_sched).unwrap();
             let snap = match *s.snap_state.borrow() {
                 SnapState::Generating { ref receiver, .. } => {
                     receiver.recv_timeout(Duration::from_secs(3)).unwrap()
@@ -1925,24 +1992,25 @@ pub mod tests {
         let snap_dir = Builder::new().prefix("snap").tempdir().unwrap();
         let mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
         mgr.init().unwrap();
-        let mut worker = LazyWorker::new("snap-manager");
-        let sched = worker.scheduler();
+        let (sched, _) = dummy_scheduler();
         let (dummy_scheduler, _) = dummy_scheduler();
         let s1 = new_storage_from_ents(sched.clone(), dummy_scheduler.clone(), &td1, &ents);
         let (router, _) = mpsc::sync_channel(100);
-        let cfg = make_region_worker_raftstore_cfg(true);
-        let runner = RegionRunner::new(
+
+        let mut snap_gen_worker = LazyWorker::new("snap-generator");
+        let snap_gen_sched = snap_gen_worker.scheduler();
+        let snap_gen_runner = SnapGenRunner::new(
             s1.engines.kv.clone(),
             mgr,
-            cfg,
-            CoprocessorHost::<KvTestEngine>::default(),
             router,
             Option::<Arc<TestPdClient>>::None,
+            snap_gen_worker.pool(),
         );
-        worker.start(runner);
+        snap_gen_worker.start(snap_gen_runner);
+
         s1.snapshot(0, 1).unwrap_err();
         let gen_task = s1.gen_snap_task.borrow_mut().take().unwrap();
-        generate_and_schedule_snapshot(gen_task, &s1.engines, &sched).unwrap();
+        generate_and_schedule_snapshot(gen_task, &s1.engines, &snap_gen_sched).unwrap();
 
         let snap1 = match *s1.snap_state.borrow() {
             SnapState::Generating { ref receiver, .. } => {
@@ -1952,7 +2020,7 @@ pub mod tests {
         };
         assert_eq!(s1.truncated_index(), 3);
         assert_eq!(s1.truncated_term(), 3);
-        worker.stop();
+        snap_gen_worker.stop();
 
         let td2 = Builder::new().prefix("tikv-store-test").tempdir().unwrap();
         let mut s2 = new_storage(sched.clone(), dummy_scheduler.clone(), &td2);
@@ -2147,25 +2215,15 @@ pub mod tests {
         lb.put_raft_state(1, &raft_state).unwrap();
         engines.raft.consume(&mut lb, false).unwrap();
 
-        // applied_index > commit_index is invalid.
-        let mut apply_state = RaftApplyState::default();
-        apply_state.set_applied_index(13);
-        apply_state.mut_truncated_state().set_index(13);
-        apply_state
-            .mut_truncated_state()
-            .set_term(RAFT_INIT_LOG_TERM);
-        let apply_state_key = keys::apply_state_key(1);
-        engines
-            .kv
-            .put_msg_cf(CF_RAFT, &apply_state_key, &apply_state)
-            .unwrap();
-        assert!(build_storage().is_err());
-
         // It should not recover if corresponding log doesn't exist.
         engines.raft.gc(1, 14, 15, &mut lb).unwrap();
         engines.raft.consume(&mut lb, false).unwrap();
+        let mut apply_state = RaftApplyState::default();
+        apply_state.set_applied_index(13);
+        apply_state.mut_truncated_state().set_index(13);
         apply_state.set_commit_index(14);
         apply_state.set_commit_term(RAFT_INIT_LOG_TERM);
+        let apply_state_key = keys::apply_state_key(1);
         engines
             .kv
             .put_msg_cf(CF_RAFT, &apply_state_key, &apply_state)

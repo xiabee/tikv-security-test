@@ -8,11 +8,12 @@ use std::{borrow::Cow, fmt};
 use collections::HashSet;
 use engine_traits::{CompactedEvent, KvEngine, Snapshot};
 use futures::channel::mpsc::UnboundedSender;
+use health_controller::types::LatencyInspector;
 use kvproto::{
     brpb::CheckAdminResponse,
     kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp},
     metapb,
-    metapb::RegionEpoch,
+    metapb::{Region, RegionEpoch},
     pdpb::{self, CheckPolicy},
     raft_cmdpb::{RaftCmdRequest, RaftCmdResponse},
     raft_serverpb::RaftMessage,
@@ -38,7 +39,7 @@ use crate::store::{
         UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryFillOutReportSyncer,
         UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer,
     },
-    util::{KeysInfoFormatter, LatencyInspector},
+    util::KeysInfoFormatter,
     worker::{Bucket, BucketRange},
     SnapKey,
 };
@@ -171,19 +172,25 @@ where
     }
 
     pub fn has_proposed_cb(&self) -> bool {
-        let Callback::Write { proposed_cb, .. } = self else { return false; };
+        let Callback::Write { proposed_cb, .. } = self else {
+            return false;
+        };
         proposed_cb.is_some()
     }
 
     pub fn invoke_proposed(&mut self) {
-        let Callback::Write { proposed_cb, .. } = self else { return; };
+        let Callback::Write { proposed_cb, .. } = self else {
+            return;
+        };
         if let Some(cb) = proposed_cb.take() {
             cb();
         }
     }
 
     pub fn invoke_committed(&mut self) {
-        let Callback::Write { committed_cb, .. } = self else { return; };
+        let Callback::Write { committed_cb, .. } = self else {
+            return;
+        };
         if let Some(cb) = committed_cb.take() {
             cb();
         }
@@ -197,12 +204,16 @@ where
     }
 
     pub fn take_proposed_cb(&mut self) -> Option<ExtCallback> {
-        let Callback::Write { proposed_cb, .. } = self else { return None; };
+        let Callback::Write { proposed_cb, .. } = self else {
+            return None;
+        };
         proposed_cb.take()
     }
 
     pub fn take_committed_cb(&mut self) -> Option<ExtCallback> {
-        let Callback::Write { committed_cb, .. } = self else { return None; };
+        let Callback::Write { committed_cb, .. } = self else {
+            return None;
+        };
         committed_cb.take()
     }
 }
@@ -260,7 +271,9 @@ impl<S: Snapshot> ReadCallback for Callback<S> {
     }
 
     fn read_tracker(&self) -> Option<TrackerToken> {
-        let Callback::Read { tracker, .. } = self else { return None; };
+        let Callback::Read { tracker, .. } = self else {
+            return None;
+        };
         Some(*tracker)
     }
 }
@@ -438,11 +451,14 @@ impl PeerTick {
 #[derive(Debug, Clone, Copy)]
 pub enum StoreTick {
     CompactCheck,
+    PeriodicFullCompact,
+    LoadMetricsWindow,
     PdStoreHeartbeat,
     SnapGc,
     CompactLockCf,
     ConsistencyCheck,
     CleanupImportSst,
+    PdReportMinResolvedTs,
 }
 
 impl StoreTick {
@@ -450,11 +466,14 @@ impl StoreTick {
     pub fn tag(self) -> RaftEventDurationType {
         match self {
             StoreTick::CompactCheck => RaftEventDurationType::compact_check,
+            StoreTick::PeriodicFullCompact => RaftEventDurationType::periodic_full_compact,
             StoreTick::PdStoreHeartbeat => RaftEventDurationType::pd_store_heartbeat,
             StoreTick::SnapGc => RaftEventDurationType::snap_gc,
             StoreTick::CompactLockCf => RaftEventDurationType::compact_lock_cf,
             StoreTick::ConsistencyCheck => RaftEventDurationType::consistency_check,
             StoreTick::CleanupImportSst => RaftEventDurationType::cleanup_import_sst,
+            StoreTick::LoadMetricsWindow => RaftEventDurationType::load_metrics_window,
+            StoreTick::PdReportMinResolvedTs => RaftEventDurationType::pd_report_min_resolved_ts,
         }
     }
 }
@@ -533,6 +552,17 @@ where
     UnsafeRecoveryFillOutReport(UnsafeRecoveryFillOutReportSyncer),
     SnapshotBrWaitApply(SnapshotBrWaitApplyRequest),
     CheckPendingAdmin(UnboundedSender<CheckAdminResponse>),
+}
+
+/// Campaign type for triggering a Raft campaign.
+#[derive(Debug, Clone, Copy)]
+pub enum CampaignType {
+    /// Forcely campaign to be the leader.
+    ForceLeader,
+    /// Campaign triggered by the leader of a parent region. It's used to make
+    /// the new splitted peer campaign to get votes.
+    /// Only if the parent region has valid leader, will it be safe to do that.
+    UnsafeSplitCampaign,
 }
 
 /// Message that will be sent to a peer.
@@ -629,7 +659,13 @@ pub enum CasualMessage<EK: KvEngine> {
     },
 
     // Trigger raft to campaign which is used after exiting force leader
-    Campaign,
+    // or make new splitted peers campaign to get votes.
+    Campaign(CampaignType),
+    // Trigger loading pending region for in_memory_engine,
+    InMemoryEngineLoadRegion {
+        region_id: u64,
+        trigger_load_cb: Box<dyn FnOnce(&Region) + Send + 'static>,
+    },
 }
 
 impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
@@ -700,7 +736,14 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
                 "SnapshotApplied, peer_id={}, tombstone={}",
                 peer_id, tombstone
             ),
-            CasualMessage::Campaign => write!(fmt, "Campaign"),
+            CasualMessage::Campaign(_) => {
+                write!(fmt, "Campaign")
+            }
+            CasualMessage::InMemoryEngineLoadRegion { region_id, .. } => write!(
+                fmt,
+                "[region={}] try load in memory region cache",
+                region_id
+            ),
         }
     }
 }
@@ -714,12 +757,26 @@ pub struct RaftCmdExtraOpts {
 
 /// Raft command is the command that is expected to be proposed by the
 /// leader of the target raft group.
-#[derive(Debug)]
 pub struct RaftCommand<S: Snapshot> {
     pub send_time: Instant,
     pub request: RaftCmdRequest,
     pub callback: Callback<S>,
     pub extra_opts: RaftCmdExtraOpts,
+}
+
+impl<S: Snapshot> fmt::Debug for RaftCommand<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RaftCommand")
+            .field("send_time", &self.send_time)
+            .field("request", &self.request.get_requests().len())
+            .field(
+                "admin_request",
+                &self.request.get_admin_request().get_cmd_type(),
+            )
+            .field("callback", &self.callback)
+            .field("extra_opts", &self.extra_opts)
+            .finish()
+    }
 }
 
 impl<S: Snapshot> RaftCommand<S> {
@@ -753,6 +810,26 @@ impl<S: Snapshot> RaftCommand<S> {
 pub struct InspectedRaftMessage {
     pub heap_size: usize,
     pub msg: RaftMessage,
+}
+
+impl fmt::Debug for InspectedRaftMessage {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.msg.has_extra_msg() {
+            write!(
+                fmt,
+                "[{}] Raft Message with extra message {:?}",
+                self.msg.get_region_id(),
+                self.msg.get_extra_msg().get_type()
+            )
+        } else {
+            write!(
+                fmt,
+                "[{}] Raft Message {:?}",
+                self.msg.get_region_id(),
+                self.msg.get_message().get_msg_type()
+            )
+        }
+    }
 }
 
 /// Message that can be sent to a peer.
@@ -797,7 +874,9 @@ impl<EK: KvEngine> ResourceMetered for PeerMsg<EK> {}
 impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PeerMsg::RaftMessage(..) => write!(fmt, "Raft Message"),
+            PeerMsg::RaftMessage(m, _) => {
+                write!(fmt, "{:?}", m)
+            }
             PeerMsg::RaftCommand(_) => write!(fmt, "Raft Command"),
             PeerMsg::Tick(tick) => write! {
                 fmt,
@@ -830,8 +909,8 @@ impl<EK: KvEngine> PeerMsg<EK> {
             PeerMsg::RaftMessage(..) => 0,
             PeerMsg::RaftCommand(_) => 1,
             PeerMsg::Tick(_) => 2,
-            PeerMsg::SignificantMsg(_) => 3,
-            PeerMsg::ApplyRes { .. } => 4,
+            PeerMsg::ApplyRes { .. } => 3,
+            PeerMsg::SignificantMsg(_) => 4,
             PeerMsg::Start => 5,
             PeerMsg::Noop => 6,
             PeerMsg::Persisted { .. } => 7,
@@ -910,22 +989,21 @@ where
     EK: KvEngine,
 {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            StoreMsg::RaftMessage(_) => write!(fmt, "Raft Message"),
+        match self {
+            StoreMsg::RaftMessage(m) => {
+                write!(fmt, "{:?}", m)
+            }
             StoreMsg::StoreUnreachable { store_id } => {
                 write!(fmt, "Store {}  is unreachable", store_id)
             }
-            StoreMsg::CompactedEvent(ref event) => write!(fmt, "CompactedEvent cf {}", event.cf()),
-            StoreMsg::ClearRegionSizeInRange {
-                ref start_key,
-                ref end_key,
-            } => write!(
+            StoreMsg::CompactedEvent(event) => write!(fmt, "CompactedEvent cf {}", event.cf()),
+            StoreMsg::ClearRegionSizeInRange { start_key, end_key } => write!(
                 fmt,
                 "Clear Region size in range {:?} to {:?}",
                 start_key, end_key
             ),
             StoreMsg::Tick(tick) => write!(fmt, "StoreTick {:?}", tick),
-            StoreMsg::Start { ref store } => write!(fmt, "Start store {:?}", store),
+            StoreMsg::Start { store } => write!(fmt, "Start store {:?}", store),
             StoreMsg::UpdateReplicationMode(_) => write!(fmt, "UpdateReplicationMode"),
             StoreMsg::LatencyInspect { .. } => write!(fmt, "LatencyInspect"),
             StoreMsg::UnsafeRecoveryReport(..) => write!(fmt, "UnsafeRecoveryReport"),
@@ -956,7 +1034,7 @@ impl<EK: KvEngine> StoreMsg<EK> {
             StoreMsg::GcSnapshotFinish => 10,
             StoreMsg::AwakenRegions { .. } => 11,
             #[cfg(any(test, feature = "testexport"))]
-            StoreMsg::Validate(_) => 12,
+            StoreMsg::Validate(_) => 12, // Please keep this always be the last one.
         }
     }
 }

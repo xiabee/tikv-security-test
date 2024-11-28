@@ -15,20 +15,19 @@ use azure_identity::{ClientSecretCredential, TokenCredentialOptions};
 use azure_storage::{prelude::*, ConnectionString, ConnectionStringBuilder};
 use azure_storage_blobs::{blob::operations::PutBlockBlobBuilder, prelude::*};
 use cloud::blob::{
-    none_to_empty, BlobConfig, BlobStorage, BucketConf, PutResource, StringNonEmpty,
+    none_to_empty, unimplemented, BlobConfig, BlobObject, BlobStorage, BucketConf,
+    DeletableStorage, IterableStorage, PutResource, StringNonEmpty,
 };
 use futures::TryFutureExt;
 use futures_util::{
+    future::FutureExt,
     io::{AsyncRead, AsyncReadExt},
     stream,
     stream::StreamExt,
     TryStreamExt,
 };
-pub use kvproto::brpb::{
-    AzureBlobStorage as InputConfig, AzureCustomerKey, Bucket as InputBucket, CloudDynamic,
-};
+pub use kvproto::brpb::{AzureBlobStorage as InputConfig, AzureCustomerKey};
 use oauth2::{ClientId, ClientSecret};
-use openssl::sha::Sha256;
 use tikv_util::{
     debug,
     stream::{retry, RetryError},
@@ -60,18 +59,6 @@ struct CredentialInfo {
 struct EncryptionCustomer {
     encryption_key: String,
     encryption_key_sha256: String,
-}
-
-impl EncryptionCustomer {
-    fn new(encryption_key: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(encryption_key.as_bytes());
-        let encryption_key_sha256 = base64::encode(hasher.finish());
-        EncryptionCustomer {
-            encryption_key: base64::encode(encryption_key),
-            encryption_key_sha256,
-        }
-    }
 }
 
 impl From<AzureCustomerKey> for EncryptionCustomer {
@@ -162,28 +149,6 @@ impl Config {
 
     fn load_env_shared_key() -> Option<StringNonEmpty> {
         env::var(ENV_SHARED_KEY).ok().and_then(StringNonEmpty::opt)
-    }
-
-    pub fn from_cloud_dynamic(cloud_dynamic: &CloudDynamic) -> io::Result<Config> {
-        let bucket = BucketConf::from_cloud_dynamic(cloud_dynamic)?;
-        let attrs = &cloud_dynamic.attrs;
-        let def = &String::new();
-
-        Ok(Config {
-            bucket,
-            account_name: StringNonEmpty::opt(attrs.get("account_name").unwrap_or(def).clone()),
-            shared_key: StringNonEmpty::opt(attrs.get("shared_key").unwrap_or(def).clone()),
-            sas_token: StringNonEmpty::opt(attrs.get("sas_token").unwrap_or(def).clone()),
-            credential_info: Self::load_credential_info(),
-            env_account_name: Self::load_env_account_name(),
-            env_shared_key: Self::load_env_shared_key(),
-            encryption_scope: StringNonEmpty::opt(
-                attrs.get("encryption_scope").unwrap_or(def).clone(),
-            ),
-            encryption_customer: attrs
-                .get("encryption_key")
-                .map(|encryption_key| EncryptionCustomer::new(encryption_key)),
-        })
     }
 
     pub fn from_input(input: InputConfig) -> io::Result<Config> {
@@ -354,7 +319,7 @@ impl AzureUploader {
     /// This should be used only when the data is known to be short, and thus
     /// relatively cheap to retry the entire upload.
     async fn upload(&self, data: &[u8]) -> Result<(), RequestError> {
-        match timeout(Self::get_timeout(), async {
+        let res = timeout(Self::get_timeout(), async {
             let builder = self
                 .client_builder
                 .get_client()
@@ -368,8 +333,8 @@ impl AzureUploader {
             builder.await?;
             Ok(())
         })
-        .await
-        {
+        .await;
+        match res {
             Ok(res) => match res {
                 Ok(_) => Ok(()),
                 Err(err) => Err(RequestError::InvalidInput(
@@ -574,10 +539,6 @@ impl AzureStorage {
         })
     }
 
-    pub fn from_cloud_dynamic(cloud_dynamic: &CloudDynamic) -> io::Result<Self> {
-        Self::new(Config::from_cloud_dynamic(cloud_dynamic)?)
-    }
-
     pub fn new(config: Config) -> io::Result<AzureStorage> {
         Self::check_config(&config)?;
 
@@ -766,7 +727,7 @@ impl BlobStorage for AzureStorage {
     async fn put(
         &self,
         name: &str,
-        mut reader: PutResource,
+        mut reader: PutResource<'_>,
         content_length: u64,
     ) -> io::Result<()> {
         let name = self.maybe_prefix_key(name);
@@ -783,6 +744,23 @@ impl BlobStorage for AzureStorage {
 
     fn get_part(&self, name: &str, off: u64, len: u64) -> cloud::blob::BlobStream<'_> {
         self.get_range(name, Some(off..off + len))
+    }
+}
+
+impl IterableStorage for AzureStorage {
+    fn iter_prefix(
+        &self,
+        _prefix: &str,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = std::result::Result<BlobObject, io::Error>> + '_>,
+    > {
+        Box::pin(futures::future::err(unimplemented()).into_stream())
+    }
+}
+
+impl DeletableStorage for AzureStorage {
+    fn delete(&self, _name: &str) -> futures::prelude::future::LocalBoxFuture<'_, io::Result<()>> {
+        Box::pin(futures::future::err(unimplemented()))
     }
 }
 
@@ -898,47 +876,6 @@ mod tests {
         let mut buf = Vec::new();
         let get_size = reader.read_to_end(&mut buf).await.unwrap() as u64;
         assert_eq!(get_size, size);
-    }
-
-    #[test]
-    fn test_config_round_trip() {
-        let mut input = InputConfig::default();
-        input.set_bucket("bucket".to_owned());
-        input.set_prefix("backup 02/prefix/".to_owned());
-        input.set_account_name("user".to_owned());
-        let c1 = Config::from_input(input.clone()).unwrap();
-        let c2 = Config::from_cloud_dynamic(&cloud_dynamic_from_input(input)).unwrap();
-        assert_eq!(c1.bucket.bucket, c2.bucket.bucket);
-        assert_eq!(c1.bucket.prefix, c2.bucket.prefix);
-        assert_eq!(c1.account_name, c2.account_name);
-    }
-
-    fn cloud_dynamic_from_input(mut azure: InputConfig) -> CloudDynamic {
-        let mut bucket = InputBucket::default();
-        if !azure.endpoint.is_empty() {
-            bucket.endpoint = azure.take_endpoint();
-        }
-        if !azure.prefix.is_empty() {
-            bucket.prefix = azure.take_prefix();
-        }
-        if !azure.storage_class.is_empty() {
-            bucket.storage_class = azure.take_storage_class();
-        }
-        if !azure.bucket.is_empty() {
-            bucket.bucket = azure.take_bucket();
-        }
-        let mut attrs = std::collections::HashMap::new();
-        if !azure.account_name.is_empty() {
-            attrs.insert("account_name".to_owned(), azure.take_account_name());
-        }
-        if !azure.shared_key.is_empty() {
-            attrs.insert("shared_key".to_owned(), azure.take_shared_key());
-        }
-        let mut cd = CloudDynamic::default();
-        cd.set_provider_name("azure".to_owned());
-        cd.set_attrs(attrs);
-        cd.set_bucket(bucket);
-        cd
     }
 
     #[test]

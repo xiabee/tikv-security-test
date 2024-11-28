@@ -8,6 +8,7 @@
 //! raft db and then invoking callback or sending msgs if any.
 
 use std::{
+    collections::VecDeque,
     fmt, mem,
     sync::Arc,
     thread::{self, JoinHandle},
@@ -21,6 +22,7 @@ use engine_traits::{
 use error_code::ErrorCodeExt;
 use fail::fail_point;
 use file_system::{set_io_type, IoType};
+use health_controller::types::LatencyInspector;
 use kvproto::{
     metapb::RegionEpoch,
     raft_serverpb::{RaftLocalState, RaftMessage},
@@ -38,9 +40,10 @@ use tikv_util::{
     debug, info, slow_log,
     sys::thread::StdThreadBuildWrapper,
     thd_name,
-    time::{duration_to_sec, Instant},
+    time::{duration_to_sec, setup_for_spin_interval, spin_at_least, Duration, Instant},
     warn,
 };
+use tracker::TrackerTokenArray;
 
 use super::write_router::{SharedSenders, WriteSenders};
 use crate::{
@@ -50,9 +53,7 @@ use crate::{
         local_metrics::{RaftSendMessageMetrics, StoreWriteMetrics, TimeTracker},
         metrics::*,
         transport::Transport,
-        util,
-        util::LatencyInspector,
-        PeerMsg,
+        util, PeerMsg,
     },
     Result,
 };
@@ -62,6 +63,8 @@ const KV_WB_DEFAULT_SIZE: usize = 16 * 1024;
 const RAFT_WB_SHRINK_SIZE: usize = 10 * 1024 * 1024;
 const RAFT_WB_DEFAULT_SIZE: usize = 256 * 1024;
 const RAFT_WB_SPLIT_SIZE: usize = ReadableSize::gb(1).0 as usize;
+/// The default size of the raft write batch recorder.
+const RAFT_WB_DEFAULT_RECORDER_SIZE: usize = 30;
 
 /// Notify the event to the specified region.
 pub trait PersistedNotifier: Clone + Send + 'static {
@@ -290,6 +293,9 @@ where
     ER: RaftEngine,
 {
     fn consume_resource(&self, resource_ctl: &Arc<ResourceController>) -> Option<String> {
+        if !resource_ctl.is_customized() {
+            return None;
+        }
         match self {
             WriteMsg::WriteTask(t) => {
                 let mut dominant_group = "".to_owned();
@@ -371,6 +377,105 @@ impl<W: WriteBatch, L: RaftLogBatch> ExtraBatchWrite<W, L> {
     }
 }
 
+/// WriteTaskBatchRecorder is a sliding window, used to record the batch size
+/// and calculate the wait duration.
+/// If the batch size is smaller than the threshold, it will return a
+/// recommended wait duration for the caller as a hint to wait for more writes.
+/// The wait duration is calculated based on the trend of the change of the
+/// batch size. The range of the trend is [0.5, 2.0]. If the batch size is
+/// increasing, the trend will be larger than 1.0, and the wait duration will
+/// be shorter.
+/// By default, the wait duration is 20us, the relative range for wait duration
+/// is [10us, 40us].
+struct WriteTaskBatchRecorder {
+    batch_size_hint: usize,
+    capacity: usize,
+    history: VecDeque<usize>,
+    sum: usize,
+    avg: usize,
+    trend: f64,
+    /// Wait duration in nanoseconds.
+    wait_duration: Duration,
+    /// The count of wait.
+    wait_count: u64,
+    /// The max count of wait.
+    wait_max_count: u64,
+}
+
+impl WriteTaskBatchRecorder {
+    fn new(batch_size_hint: usize, wait_duration: Duration) -> Self {
+        // Initialize the spin duration in advance.
+        setup_for_spin_interval();
+        Self {
+            batch_size_hint,
+            history: VecDeque::new(),
+            capacity: RAFT_WB_DEFAULT_RECORDER_SIZE,
+            sum: 0,
+            avg: 0,
+            trend: 1.0,
+            wait_duration,
+            wait_count: 0,
+            wait_max_count: 1,
+        }
+    }
+
+    #[cfg(test)]
+    fn get_avg(&self) -> usize {
+        self.avg
+    }
+
+    #[cfg(test)]
+    fn get_trend(&self) -> f64 {
+        self.trend
+    }
+
+    #[inline]
+    fn update_config(&mut self, batch_size: usize, wait_duration: Duration) {
+        self.batch_size_hint = batch_size;
+        self.wait_duration = wait_duration;
+    }
+
+    fn record(&mut self, size: usize) {
+        self.history.push_back(size);
+        self.sum += size;
+
+        let mut len = self.history.len();
+        if len > self.capacity {
+            self.sum = self
+                .sum
+                .saturating_sub(self.history.pop_front().unwrap_or(0));
+            len = self.capacity;
+        }
+        self.avg = self.sum / len;
+
+        if len >= self.capacity && self.batch_size_hint > 0 {
+            // The trend ranges from 0.5 to 2.0.
+            let trend = self.avg as f64 / self.batch_size_hint as f64;
+            self.trend = trend.clamp(0.5, 2.0);
+        } else {
+            self.trend = 1.0;
+        }
+    }
+
+    #[inline]
+    fn reset_wait_count(&mut self) {
+        self.wait_count = 0;
+    }
+
+    #[inline]
+    fn should_wait(&self, batch_size: usize) -> bool {
+        batch_size < self.batch_size_hint && self.wait_count < self.wait_max_count
+    }
+
+    fn wait_for_a_while(&mut self) {
+        self.wait_count += 1;
+        // Use a simple linear function to calculate the wait duration.
+        spin_at_least(Duration::from_nanos(
+            (self.wait_duration.as_nanos() as f64 * (1.0 / self.trend)) as u64,
+        ));
+    }
+}
+
 /// WriteTaskBatch is used for combining several WriteTask into one.
 struct WriteTaskBatch<EK, ER>
 where
@@ -391,6 +496,7 @@ where
     // region_id -> (peer_id, ready_number)
     pub readies: HashMap<u64, (u64, u64)>,
     pub(crate) raft_wb_split_size: usize,
+    recorder: WriteTaskBatchRecorder,
 }
 
 impl<EK, ER> WriteTaskBatch<EK, ER>
@@ -398,7 +504,11 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    fn new(raft_wb: ER::LogBatch) -> Self {
+    fn new(
+        raft_wb: ER::LogBatch,
+        write_batch_size_hint: usize,
+        write_wait_duration: Duration,
+    ) -> Self {
         Self {
             raft_wbs: vec![raft_wb],
             raft_states: HashMap::default(),
@@ -408,6 +518,7 @@ where
             persisted_cbs: vec![],
             readies: HashMap::default(),
             raft_wb_split_size: RAFT_WB_SPLIT_SIZE,
+            recorder: WriteTaskBatchRecorder::new(write_batch_size_hint, write_wait_duration),
         }
     }
 
@@ -419,7 +530,11 @@ where
         }
         self.state_size = 0;
         if let ExtraBatchWrite::V2(_) = self.extra_batch_write {
-            let ExtraBatchWrite::V2(lb) = mem::replace(&mut self.extra_batch_write, ExtraBatchWrite::None) else { unreachable!() };
+            let ExtraBatchWrite::V2(lb) =
+                mem::replace(&mut self.extra_batch_write, ExtraBatchWrite::None)
+            else {
+                unreachable!()
+            };
             wb.merge(lb).unwrap();
         }
     }
@@ -451,7 +566,10 @@ where
             .unwrap();
 
         if let Some(raft_state) = task.raft_state.take()
-            && self.raft_states.insert(task.region_id, raft_state).is_none()
+            && self
+                .raft_states
+                .insert(task.region_id, raft_state)
+                .is_none()
         {
             self.state_size += std::mem::size_of::<RaftLocalState>();
         }
@@ -481,6 +599,8 @@ where
             self.persisted_cbs.push(v);
         }
         self.tasks.push(task);
+        // Record the size of the batch.
+        self.recorder.record(self.get_raft_size());
     }
 
     fn clear(&mut self) {
@@ -491,6 +611,7 @@ where
         self.state_size = 0;
         self.tasks.clear();
         self.readies.clear();
+        self.recorder.reset_wait_count();
     }
 
     #[inline]
@@ -554,6 +675,20 @@ where
             }
         }
     }
+
+    #[inline]
+    fn update_config(&mut self, batch_size: usize, wait_duration: Duration) {
+        self.recorder.update_config(batch_size, wait_duration);
+    }
+
+    #[inline]
+    fn should_wait(&self) -> bool {
+        self.recorder.should_wait(self.get_raft_size())
+    }
+
+    fn wait_for_a_while(&mut self) {
+        self.recorder.wait_for_a_while();
+    }
 }
 
 pub struct Worker<EK, ER, N, T>
@@ -595,7 +730,11 @@ where
         trans: T,
         cfg: &Arc<VersionTrack<Config>>,
     ) -> Self {
-        let batch = WriteTaskBatch::new(raft_engine.log_batch(RAFT_WB_DEFAULT_SIZE));
+        let batch = WriteTaskBatch::new(
+            raft_engine.log_batch(RAFT_WB_DEFAULT_SIZE),
+            cfg.value().raft_write_batch_size_hint.0 as usize,
+            cfg.value().raft_write_wait_duration.0,
+        );
         let perf_context =
             ER::get_perf_context(cfg.value().perf_level, PerfContextKind::RaftstoreStore);
         let cfg_tracker = cfg.clone().tracker(tag.clone());
@@ -634,7 +773,17 @@ where
                     Ok(msg) => {
                         stopped |= self.handle_msg(msg);
                     }
-                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Empty) => {
+                        // If the size of the batch is small enough, it will wait for
+                        // a while to make the batch larger. This can reduce the IOPS
+                        // amplification if there are many trivial writes.
+                        if self.batch.should_wait() {
+                            self.batch.wait_for_a_while();
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
                     Err(TryRecvError::Disconnected) => {
                         stopped = true;
                         break;
@@ -711,10 +860,12 @@ where
 
         fail_point!("raft_before_save");
 
+        let store_id = self.store_id;
+        fail_point!("raft_before_persist_on_store_1", store_id == 1, |_| {});
+
         let mut write_kv_time = 0f64;
         if let ExtraBatchWrite::V1(kv_wb) = &mut self.batch.extra_batch_write {
             if !kv_wb.is_empty() {
-                let store_id = self.store_id;
                 let raft_before_save_kv_on_store_3 = || {
                     fail_point!("raft_before_save_kv_on_store_3", store_id == 3, |_| {});
                 };
@@ -775,6 +926,8 @@ where
             self.perf_context.report_metrics(&trackers);
             write_raft_time = duration_to_sec(now.saturating_elapsed());
             STORE_WRITE_RAFTDB_DURATION_HISTOGRAM.observe(write_raft_time);
+            debug!("raft log is persisted";
+                "req_info" => TrackerTokenArray::new(trackers.as_slice()));
         }
 
         fail_point!("raft_after_save");
@@ -802,7 +955,7 @@ where
                     "tag" => &self.tag,
                     "region_id" => task.region_id,
                     "peer_id" => task.peer_id,
-                    "msg_type" => ?msg_type,
+                    "msg_type" => %util::MsgType(&msg),
                     "msg_size" => msg.get_message().compute_size(),
                     "to" => to_peer_id,
                     "disk_usage" => ?msg.get_disk_usage(),
@@ -870,6 +1023,10 @@ where
         if let Some(incoming) = self.cfg_tracker.any_new() {
             self.raft_write_size_limit = incoming.raft_write_size_limit.0 as usize;
             self.metrics.waterfall_metrics = incoming.waterfall_metrics;
+            self.batch.update_config(
+                incoming.raft_write_batch_size_hint.0 as usize,
+                incoming.raft_write_wait_duration.0,
+            );
         }
     }
 
@@ -1053,7 +1210,11 @@ pub fn write_to_db_for_test<EK, ER>(
     EK: KvEngine,
     ER: RaftEngine,
 {
-    let mut batch = WriteTaskBatch::new(engines.raft.log_batch(RAFT_WB_DEFAULT_SIZE));
+    let mut batch = WriteTaskBatch::new(
+        engines.raft.log_batch(RAFT_WB_DEFAULT_SIZE),
+        0,
+        Duration::default(),
+    );
     batch.add_write_task(&engines.raft, task);
     let metrics = StoreWriteMetrics::new(false);
     batch.before_write_to_db(&metrics);

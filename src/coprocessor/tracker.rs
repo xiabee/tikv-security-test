@@ -6,11 +6,13 @@ use ::tracker::{get_tls_tracker_token, with_tls_tracker};
 use engine_traits::{PerfContext, PerfContextExt, PerfContextKind};
 use kvproto::{kvrpcpb, kvrpcpb::ScanDetailV2};
 use pd_client::BucketMeta;
+use protobuf::Message;
 use tikv_kv::Engine;
 use tikv_util::{
     memory::HeapSize,
     time::{self, Duration, Instant},
 };
+use tipb::ResourceGroupTag;
 use txn_types::Key;
 
 use super::metrics::*;
@@ -104,6 +106,16 @@ impl<E: Engine> Tracker<E> {
             req_ctx,
             buckets: None,
             _phantom: PhantomData,
+        }
+    }
+
+    pub fn adjust_snapshot_type(&mut self, region_cache_engine: bool) {
+        if region_cache_engine {
+            if self.req_ctx.tag == ReqTag::select {
+                self.req_ctx.tag = ReqTag::select_by_in_memory_engine;
+            } else if self.req_ctx.tag == ReqTag::index {
+                self.req_ctx.tag = ReqTag::index_by_in_memory_engine;
+            }
         }
     }
 
@@ -269,9 +281,14 @@ impl<E: Engine> Tracker<E> {
 
             let source_stmt = self.req_ctx.context.get_source_stmt();
             with_tls_tracker(|tracker| {
+                let mut req_tag = ResourceGroupTag::new();
+                req_tag
+                    .merge_from_bytes(&tracker.req_info.resource_group_tag)
+                    .unwrap_or_default();
                 info!(#"slow_log", "slow-query";
                     "connection_id" => source_stmt.get_connection_id(),
                     "session_alias" => source_stmt.get_session_alias(),
+                    "query_digest" => hex::encode(req_tag.get_sql_digest()),
                     "region_id" => &self.req_ctx.context.get_region_id(),
                     "remote_host" => &self.req_ctx.peer,
                     "total_lifetime" => ?self.req_lifetime,
@@ -358,7 +375,11 @@ impl<E: Engine> Tracker<E> {
 
         // only collect metrics for select and index, exclude transient read flow such
         // like analyze and checksum.
-        if self.req_ctx.tag == ReqTag::select || self.req_ctx.tag == ReqTag::index {
+        if self.req_ctx.tag == ReqTag::select
+            || self.req_ctx.tag == ReqTag::index
+            || self.req_ctx.tag == ReqTag::select_by_in_memory_engine
+            || self.req_ctx.tag == ReqTag::index_by_in_memory_engine
+        {
             tls_collect_query(
                 region_id,
                 peer,
@@ -383,7 +404,9 @@ impl<E: Engine> Tracker<E> {
     {
         thread_local! {
             static SELECT: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
+            static SELECT_BY_IN_MEMORY_ENGINE: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static INDEX: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
+            static INDEX_BY_IN_MEMORY_ENGINE: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static ANALYZE_TABLE: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static ANALYZE_INDEX: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static ANALYZE_FULL_SAMPLING: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
@@ -393,7 +416,9 @@ impl<E: Engine> Tracker<E> {
         }
         let tls_cell = match self.req_ctx.tag {
             ReqTag::select => &SELECT,
+            ReqTag::select_by_in_memory_engine => &SELECT_BY_IN_MEMORY_ENGINE,
             ReqTag::index => &INDEX,
+            ReqTag::index_by_in_memory_engine => &INDEX_BY_IN_MEMORY_ENGINE,
             ReqTag::analyze_table => &ANALYZE_TABLE,
             ReqTag::analyze_index => &ANALYZE_INDEX,
             ReqTag::analyze_full_sampling => &ANALYZE_FULL_SAMPLING,
@@ -403,7 +428,7 @@ impl<E: Engine> Tracker<E> {
         };
         tls_cell.with(|c| {
             let mut c = c.borrow_mut();
-            let perf_context = c.get_or_insert_with(|| {
+            let perf_context: &mut Box<dyn PerfContext> = c.get_or_insert_with(|| {
                 Box::new(E::Local::get_perf_context(
                     PerfLevel::Uninitialized,
                     PerfContextKind::Coprocessor(self.req_ctx.tag.get_str()),

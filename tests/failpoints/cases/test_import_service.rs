@@ -6,8 +6,8 @@ use std::{
 };
 
 use file_system::calc_crc32;
-use futures::{executor::block_on, stream, SinkExt};
-use grpcio::{ChannelBuilder, Environment, Result, WriteFlags};
+use futures::{executor::block_on, stream::StreamExt};
+use grpcio::{ChannelBuilder, Environment};
 use kvproto::{disk_usage::DiskUsage, import_sstpb::*, tikvpb_grpc::TikvClient};
 use tempfile::{Builder, TempDir};
 use test_raftstore::{must_raw_put, Simulator};
@@ -18,9 +18,10 @@ use tikv_util::{config::ReadableSize, sys::disk, HandyRwLock};
 #[allow(dead_code)]
 #[path = "../../integrations/import/util.rs"]
 mod util;
+
 use self::util::{
-    check_ingested_kvs, new_cluster_and_tikv_import_client, new_cluster_and_tikv_import_client_tde,
-    open_cluster_and_tikv_import_client_v2, send_upload_sst,
+    new_cluster_and_tikv_import_client, new_cluster_and_tikv_import_client_tde,
+    open_cluster_and_tikv_import_client_v2,
 };
 
 // Opening sst writer involves IO operation, it may block threads for a while.
@@ -46,7 +47,7 @@ fn test_download_sst_blocking_sst_writer() {
     // Now perform a proper download.
     let mut download = DownloadRequest::default();
     download.set_sst(meta.clone());
-    download.set_storage_backend(external_storage_export::make_local_backend(temp_dir.path()));
+    download.set_storage_backend(external_storage::make_local_backend(temp_dir.path()));
     download.set_name("test.sst".to_owned());
     download.mut_sst().mut_range().set_start(vec![sst_range.1]);
     download
@@ -63,31 +64,8 @@ fn test_download_sst_blocking_sst_writer() {
     fail::remove(sst_writer_open_fp);
 
     // Do an ingest and verify the result is correct.
-    let mut ingest = IngestRequest::default();
-    ingest.set_context(ctx.clone());
-    ingest.set_sst(meta);
-    let resp = import.ingest(&ingest).unwrap();
-    assert!(!resp.has_error());
-
+    must_ingest_sst(&import, ctx.clone(), meta);
     check_ingested_kvs(&tikv, &ctx, sst_range);
-}
-
-fn upload_sst(import: &ImportSstClient, meta: &SstMeta, data: &[u8]) -> Result<UploadResponse> {
-    let mut r1 = UploadRequest::default();
-    r1.set_meta(meta.clone());
-    let mut r2 = UploadRequest::default();
-    r2.set_data(data.to_vec());
-    let reqs: Vec<_> = vec![r1, r2]
-        .into_iter()
-        .map(|r| Result::Ok((r, WriteFlags::default())))
-        .collect();
-    let (mut tx, rx) = import.upload().unwrap();
-    let mut stream = stream::iter(reqs);
-    block_on(async move {
-        tx.send_all(&mut stream).await?;
-        tx.close().await?;
-        rx.await
-    })
 }
 
 #[test]
@@ -107,7 +85,7 @@ fn test_download_to_full_disk() {
     // Now perform a proper download.
     let mut download = DownloadRequest::default();
     download.set_sst(meta.clone());
-    download.set_storage_backend(external_storage_export::make_local_backend(temp_dir.path()));
+    download.set_storage_backend(external_storage::make_local_backend(temp_dir.path()));
     download.set_name("test.sst".to_owned());
     download.mut_sst().mut_range().set_start(vec![sst_range.1]);
     download
@@ -141,11 +119,7 @@ fn test_ingest_reentrant() {
     let (mut meta, data) = gen_sst_file(sst_path, sst_range);
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
-    upload_sst(&import, &meta, &data).unwrap();
-
-    let mut ingest = IngestRequest::default();
-    ingest.set_context(ctx);
-    ingest.set_sst(meta.clone());
+    send_upload_sst(&import, &meta, &data).unwrap();
 
     // Don't delete ingested sst file or we cannot find sst file in next ingest.
     fail::cfg("dont_delete_ingested_sst", "1*return").unwrap();
@@ -161,9 +135,8 @@ fn test_ingest_reentrant() {
         .get_path(&meta);
 
     let checksum1 = calc_crc32(save_path.clone()).unwrap();
-    // Do ingest and it will ingest successs.
-    let resp = import.ingest(&ingest).unwrap();
-    assert!(!resp.has_error());
+    // Do ingest and it will ingest success.
+    must_ingest_sst(&import, ctx.clone(), meta.clone());
 
     let checksum2 = calc_crc32(save_path).unwrap();
     // TODO: Remove this once write_global_seqno is deprecated.
@@ -171,8 +144,7 @@ fn test_ingest_reentrant() {
     // updated with the default setting, which is write_global_seqno=false.
     assert_eq!(checksum1, checksum2);
     // Do ingest again and it can be reentrant
-    let resp = import.ingest(&ingest).unwrap();
-    assert!(!resp.has_error());
+    must_ingest_sst(&import, ctx.clone(), meta);
 }
 
 #[test]
@@ -190,7 +162,7 @@ fn test_ingest_key_manager_delete_file_failed() {
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
 
-    upload_sst(&import, &meta, &data).unwrap();
+    send_upload_sst(&import, &meta, &data).unwrap();
 
     let deregister_fp = "key_manager_fails_before_delete_file";
     // the first delete is in check before ingest, the second is in ingest cleanup
@@ -201,12 +173,7 @@ fn test_ingest_key_manager_delete_file_failed() {
     // Do an ingest and verify the result is correct. Though the ingest succeeded,
     // the clone file is still in the key manager
     // TODO: how to check the key manager contains the clone key
-    let mut ingest = IngestRequest::default();
-    ingest.set_context(ctx.clone());
-    ingest.set_sst(meta.clone());
-    let resp = import.ingest(&ingest).unwrap();
-
-    assert!(!resp.has_error());
+    must_ingest_sst(&import, ctx.clone(), meta.clone());
 
     fail::remove(deregister_fp);
 
@@ -230,12 +197,8 @@ fn test_ingest_key_manager_delete_file_failed() {
 
     // Do upload and ingest again, though key manager contains this file, the ingest
     // action should success.
-    upload_sst(&import, &meta, &data).unwrap();
-    let mut ingest = IngestRequest::default();
-    ingest.set_context(ctx);
-    ingest.set_sst(meta);
-    let resp = import.ingest(&ingest).unwrap();
-    assert!(!resp.has_error());
+    send_upload_sst(&import, &meta, &data).unwrap();
+    must_ingest_sst(&import, ctx, meta);
 }
 
 #[test]
@@ -252,12 +215,12 @@ fn test_ingest_file_twice_and_conflict() {
     let (mut meta, data) = gen_sst_file(sst_path, sst_range);
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
-    upload_sst(&import, &meta, &data).unwrap();
+    send_upload_sst(&import, &meta, &data).unwrap();
     let mut ingest = IngestRequest::default();
     ingest.set_context(ctx);
     ingest.set_sst(meta);
 
-    let latch_fp = "import::sst_service::ingest";
+    let latch_fp = "before_sst_service_ingest_check_file_exist";
     let (tx1, rx1) = channel();
     let (tx2, rx2) = channel();
     let tx1 = Arc::new(Mutex::new(tx1));
@@ -304,16 +267,11 @@ fn test_delete_sst_v2_after_epoch_stale() {
     // disable data flushed
     fail::cfg("on_flush_completed", "return()").unwrap();
     send_upload_sst(&import, &meta, &data).unwrap();
-    let mut ingest = IngestRequest::default();
-    ingest.set_context(ctx.clone());
-    ingest.set_sst(meta.clone());
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
     send_upload_sst(&import, &meta, &data).unwrap();
-    ingest.set_sst(meta.clone());
+    must_ingest_sst(&import, ctx.clone(), meta.clone());
 
-    let resp = import.ingest(&ingest).unwrap();
-    assert!(!resp.has_error(), "{:?}", resp.get_error());
     let (tx, rx) = channel::<()>();
     let tx = Arc::new(Mutex::new(tx));
     fail::cfg_callback("on_cleanup_import_sst_schedule", move || {
@@ -370,15 +328,10 @@ fn test_delete_sst_after_applied_sst() {
     let (mut meta, data) = gen_sst_file(sst_path, sst_range);
     // No region id and epoch.
     send_upload_sst(&import, &meta, &data).unwrap();
-    let mut ingest = IngestRequest::default();
-    ingest.set_context(ctx.clone());
-    ingest.set_sst(meta.clone());
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
     send_upload_sst(&import, &meta, &data).unwrap();
-    ingest.set_sst(meta.clone());
-    let resp = import.ingest(&ingest).unwrap();
-    assert!(!resp.has_error(), "{:?}", resp.get_error());
+    must_ingest_sst(&import, ctx.clone(), meta);
 
     // restart node
     cluster.stop_node(1);
@@ -428,16 +381,10 @@ fn test_split_buckets_after_ingest_sst_v2() {
     let sst_range = (0, 255);
     let (mut meta, data) = gen_sst_file(sst_path, sst_range);
     send_upload_sst(&import, &meta, &data).unwrap();
-    let mut ingest = IngestRequest::default();
-    ingest.set_context(ctx.clone());
-    ingest.set_sst(meta.clone());
     meta.set_region_id(ctx.get_region_id());
     meta.set_region_epoch(ctx.get_region_epoch().clone());
     send_upload_sst(&import, &meta, &data).unwrap();
-    ingest.set_sst(meta.clone());
-
-    let resp = import.ingest(&ingest).unwrap();
-    assert!(!resp.has_error(), "{:?}", resp.get_error());
+    must_ingest_sst(&import, ctx.clone(), meta);
 
     let (tx, rx) = channel::<()>();
     let tx = Arc::new(Mutex::new(tx));
@@ -512,15 +459,10 @@ fn test_flushed_applied_index_after_ingset() {
         let (mut meta, data) = gen_sst_file(sst_path.clone(), sst_range);
         // No region id and epoch.
         send_upload_sst(&import, &meta, &data).unwrap();
-        let mut ingest = IngestRequest::default();
-        ingest.set_context(ctx.clone());
-        ingest.set_sst(meta.clone());
         meta.set_region_id(ctx.get_region_id());
         meta.set_region_epoch(ctx.get_region_epoch().clone());
         send_upload_sst(&import, &meta, &data).unwrap();
-        ingest.set_sst(meta.clone());
-        let resp = import.ingest(&ingest).unwrap();
-        assert!(!resp.has_error(), "{:?}", resp.get_error());
+        must_ingest_sst(&import, ctx.clone(), meta);
     }
 
     // only 1 sst left because there is no more event to trigger a raft ready flush.
@@ -532,15 +474,10 @@ fn test_flushed_applied_index_after_ingset() {
         let (mut meta, data) = gen_sst_file(sst_path.clone(), sst_range);
         // No region id and epoch.
         send_upload_sst(&import, &meta, &data).unwrap();
-        let mut ingest = IngestRequest::default();
-        ingest.set_context(ctx.clone());
-        ingest.set_sst(meta.clone());
         meta.set_region_id(ctx.get_region_id());
         meta.set_region_epoch(ctx.get_region_epoch().clone());
         send_upload_sst(&import, &meta, &data).unwrap();
-        ingest.set_sst(meta.clone());
-        let resp = import.ingest(&ingest).unwrap();
-        assert!(!resp.has_error(), "{:?}", resp.get_error());
+        must_ingest_sst(&import, ctx.clone(), meta);
     }
 
     // ingest more sst files, unflushed index still be 1.
@@ -561,4 +498,92 @@ fn test_flushed_applied_index_after_ingset() {
 
     fail::remove("on_apply_ingest");
     fail::remove("on_flush_completed");
+}
+
+#[test]
+fn test_duplicate_detect_with_client_stop() {
+    let (_cluster, ctx, _, import) = new_cluster_and_tikv_import_client();
+    let mut req = SwitchModeRequest::default();
+    req.set_mode(SwitchMode::Import);
+    import.switch_mode(&req).unwrap();
+
+    let data_count: u64 = 4096;
+    for commit_ts in 0..4 {
+        let mut meta = new_sst_meta(0, 0);
+        meta.set_region_id(ctx.get_region_id());
+        meta.set_region_epoch(ctx.get_region_epoch().clone());
+
+        let mut keys = vec![];
+        let mut values = vec![];
+        for i in 1000..data_count {
+            let key = i.to_string();
+            keys.push(key.as_bytes().to_vec());
+            values.push(key.as_bytes().to_vec());
+        }
+        let resp = send_write_sst(&import, &meta, keys, values, commit_ts).unwrap();
+        for m in resp.metas.into_iter() {
+            must_ingest_sst(&import, ctx.clone(), m.clone());
+        }
+    }
+
+    let mut duplicate = DuplicateDetectRequest::default();
+    duplicate.set_context(ctx);
+    duplicate.set_start_key((0_u64).to_string().as_bytes().to_vec());
+
+    // failed to get snapshot. and stream is normal, it will get response with err.
+    fail::cfg("failed_to_async_snapshot", "return()").unwrap();
+    let mut stream = import.duplicate_detect(&duplicate).unwrap();
+    let resp = block_on(async move {
+        let resp: DuplicateDetectResponse = stream.next().await.unwrap().unwrap();
+        resp
+    });
+    assert_eq!(
+        resp.get_region_error().get_message(),
+        "faild to get snapshot"
+    );
+
+    // failed to get snapshot, and stream stops.
+    // A stopeed remote don't cause panic in server.
+    let stream = import.duplicate_detect(&duplicate).unwrap();
+    drop(stream);
+
+    // drop stream after received part of response.
+    // A stopped remote must not cause panic at server.
+    fail::remove("failed_to_async_snapshot");
+    let mut stream = import.duplicate_detect(&duplicate).unwrap();
+    let ret: Vec<KvPair> = block_on(async move {
+        let mut resp: DuplicateDetectResponse = stream.next().await.unwrap().unwrap();
+        let pairs = resp.take_pairs();
+        // drop stream, Do not cause panic at server.
+        drop(stream);
+        pairs.into()
+    });
+
+    assert_eq!(ret.len(), 4096);
+
+    // call duplicate_detect() successfully.
+    let mut stream = import.duplicate_detect(&duplicate).unwrap();
+    let ret = block_on(async move {
+        let mut ret: Vec<KvPair> = vec![];
+        while let Some(resp) = stream.next().await {
+            match resp {
+                Ok(mut resp) => {
+                    if resp.has_key_error() || resp.has_region_error() {
+                        break;
+                    }
+                    let pairs = resp.take_pairs();
+                    ret.append(&mut pairs.into());
+                }
+                Err(e) => {
+                    println!("receive error: {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        ret
+    });
+    assert_eq!(ret.len(), (data_count - 1000) as usize * 4);
+    req.set_mode(SwitchMode::Normal);
+    import.switch_mode(&req).unwrap();
 }

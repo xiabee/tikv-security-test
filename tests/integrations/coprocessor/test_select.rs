@@ -171,7 +171,7 @@ fn test_stream_batch_row_limit() {
 
     let resps = handle_streaming_select(&endpoint, req, check_range);
     assert_eq!(resps.len(), 3);
-    let expected_output_counts = vec![vec![2_i64], vec![2_i64], vec![1_i64]];
+    let expected_output_counts = [vec![2_i64], vec![2_i64], vec![1_i64]];
     for (i, resp) in resps.into_iter().enumerate() {
         let mut chunk = Chunk::default();
         chunk.merge_from_bytes(resp.get_data()).unwrap();
@@ -2215,7 +2215,7 @@ fn test_batch_request() {
     ];
     let prepare_req =
         |cluster: &mut Cluster<ServerCluster>, ranges: &Vec<HandleRange>| -> Request {
-            let original_range = ranges.get(0).unwrap();
+            let original_range = ranges.first().unwrap();
             let key_range = product.get_record_range(original_range.start, original_range.end);
             let region_key = Key::from_raw(&key_range.start);
             let mut req = DagSelect::from(&product)

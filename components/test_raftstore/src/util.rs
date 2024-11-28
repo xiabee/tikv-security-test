@@ -19,9 +19,12 @@ use engine_traits::{
     CfName, CfNamesExt, Engines, Iterable, KvEngine, Peekable, RaftEngineDebug, RaftEngineReadOnly,
     CF_DEFAULT, CF_RAFT, CF_WRITE,
 };
+use fail::fail_point;
 use file_system::IoRateLimiter;
 use futures::{executor::block_on, future::BoxFuture, StreamExt};
 use grpcio::{ChannelBuilder, Environment};
+use hybrid_engine::HybridEngine;
+use in_memory_engine::RegionCacheMemoryEngine;
 use kvproto::{
     encryptionpb::EncryptionMethod,
     kvrpcpb::{PrewriteRequestPessimisticAction::*, *},
@@ -46,6 +49,7 @@ use rand::{seq::SliceRandom, RngCore};
 use server::common::ConfiguredRaftEngine;
 use tempfile::TempDir;
 use test_pd_client::TestPdClient;
+use test_util::eventually;
 use tikv::{
     config::*,
     server::KvEngineFactoryBuilder,
@@ -66,6 +70,8 @@ use tikv_util::{
 use txn_types::Key;
 
 use crate::{Cluster, Config, RawEngine, ServerCluster, Simulator};
+
+pub type HybridEngineImpl = HybridEngine<RocksEngine, RegionCacheMemoryEngine>;
 
 pub fn must_get<EK: KvEngine>(
     engine: &impl RawEngine<EK>,
@@ -95,6 +101,23 @@ pub fn must_get<EK: KvEngine>(
         log_wrappers::hex_encode_upper(key),
         res
     )
+}
+
+pub fn eventually_get_equal<EK: KvEngine>(engine: &impl RawEngine<EK>, key: &[u8], value: &[u8]) {
+    eventually(
+        Duration::from_millis(100),
+        Duration::from_millis(2000),
+        || {
+            let res = engine
+                .get_value_cf("default", &keys::data_key(key))
+                .unwrap();
+            if let Some(res) = res.as_ref() {
+                value == &res[..]
+            } else {
+                false
+            }
+        },
+    );
 }
 
 pub fn must_get_equal<EK: KvEngine>(engine: &impl RawEngine<EK>, key: &[u8], value: &[u8]) {
@@ -178,7 +201,18 @@ pub fn new_tikv_config_with_api_ver(cluster_id: u64, api_ver: ApiVersion) -> Tik
     let mut cfg = TEST_CONFIG.clone();
     cfg.server.cluster_id = cluster_id;
     cfg.storage.set_api_version(api_ver);
+    cfg.raft_store.pd_report_min_resolved_ts_interval = config(ReadableDuration::secs(1));
     cfg
+}
+
+fn config(interval: ReadableDuration) -> ReadableDuration {
+    fail_point!("mock_min_resolved_ts_interval", |_| {
+        ReadableDuration::millis(50)
+    });
+    fail_point!("mock_min_resolved_ts_interval_disable", |_| {
+        ReadableDuration::millis(0)
+    });
+    interval
 }
 
 // Create a base request.
@@ -285,6 +319,12 @@ pub fn new_region_leader_cmd() -> StatusRequest {
     cmd
 }
 
+pub fn new_compute_hash_request(region_id: u64, epoch: &RegionEpoch) -> RaftCmdRequest {
+    let mut admin = AdminRequest::default();
+    admin.set_cmd_type(AdminCmdType::ComputeHash);
+    new_admin_request(region_id, epoch, admin)
+}
+
 pub fn new_admin_request(
     region_id: u64,
     epoch: &RegionEpoch,
@@ -389,6 +429,12 @@ pub fn check_raft_cmd_request(cmd: &RaftCmdRequest) -> bool {
     is_read
 }
 
+pub fn make_cb_rocks(
+    cmd: &RaftCmdRequest,
+) -> (Callback<RocksSnapshot>, future::Receiver<RaftCmdResponse>) {
+    make_cb(cmd)
+}
+
 pub fn make_cb(
     cmd: &RaftCmdRequest,
 ) -> (Callback<RocksSnapshot>, future::Receiver<RaftCmdResponse>) {
@@ -411,7 +457,7 @@ pub fn make_cb(
     (cb, rx)
 }
 
-pub fn make_cb_ext(
+pub fn make_cb_ext<EK: KvEngine>(
     cmd: &RaftCmdRequest,
     proposed: Option<ExtCallback>,
     committed: Option<ExtCallback>,
@@ -744,16 +790,16 @@ pub fn configure_for_enable_titan<T: Simulator>(
     cluster: &mut Cluster<T>,
     min_blob_size: ReadableSize,
 ) {
-    cluster.cfg.rocksdb.titan.enabled = true;
+    cluster.cfg.rocksdb.titan.enabled = Some(true);
     cluster.cfg.rocksdb.titan.purge_obsolete_files_period = ReadableDuration::secs(1);
     cluster.cfg.rocksdb.titan.max_background_gc = 10;
-    cluster.cfg.rocksdb.defaultcf.titan.min_blob_size = min_blob_size;
+    cluster.cfg.rocksdb.defaultcf.titan.min_blob_size = Some(min_blob_size);
     cluster.cfg.rocksdb.defaultcf.titan.blob_run_mode = BlobRunMode::Normal;
     cluster.cfg.rocksdb.defaultcf.titan.min_gc_batch_size = ReadableSize::kb(0);
 }
 
 pub fn configure_for_disable_titan<T: Simulator>(cluster: &mut Cluster<T>) {
-    cluster.cfg.rocksdb.titan.enabled = false;
+    cluster.cfg.rocksdb.titan.enabled = Some(false);
 }
 
 pub fn configure_for_encryption<T: Simulator>(cluster: &mut Cluster<T>) {
@@ -1281,6 +1327,21 @@ pub fn must_kv_pessimistic_rollback(
     assert!(resp.errors.is_empty(), "{:?}", resp.get_errors());
 }
 
+pub fn must_kv_pessimistic_rollback_with_scan_first(
+    client: &TikvClient,
+    ctx: Context,
+    ts: u64,
+    for_update_ts: u64,
+) {
+    let mut req = PessimisticRollbackRequest::default();
+    req.set_context(ctx);
+    req.start_version = ts;
+    req.for_update_ts = for_update_ts;
+    let resp = client.kv_pessimistic_rollback(&req).unwrap();
+    assert!(!resp.has_region_error(), "{:?}", resp.get_region_error());
+    assert!(resp.errors.is_empty(), "{:?}", resp.get_errors());
+}
+
 pub fn must_check_txn_status(
     client: &TikvClient,
     ctx: Context,
@@ -1344,6 +1405,43 @@ pub fn must_kv_have_locks(
         assert_eq!(lock_info.get_lock_version(), *expected_start_ts);
         assert_eq!(lock_info.get_lock_for_update_ts(), *expected_for_update_ts);
     }
+}
+
+/// Scan scan_limit number of locks within [start_key, end_key), the returned
+/// lock number should equal the input expected_cnt.
+pub fn must_lock_cnt(
+    client: &TikvClient,
+    ctx: Context,
+    ts: u64,
+    start_key: &[u8],
+    end_key: &[u8],
+    lock_type: Op,
+    expected_cnt: usize,
+    scan_limit: usize,
+) {
+    let mut req = ScanLockRequest::default();
+    req.set_context(ctx);
+    req.set_limit(scan_limit as u32);
+    req.set_start_key(start_key.to_vec());
+    req.set_end_key(end_key.to_vec());
+    req.set_max_version(ts);
+    let resp = client.kv_scan_lock(&req).unwrap();
+    assert!(!resp.has_region_error(), "{:?}", resp.get_region_error());
+    assert!(resp.error.is_none(), "{:?}", resp.get_error());
+
+    let lock_cnt = resp
+        .locks
+        .iter()
+        .filter(|lock_info| lock_info.get_lock_type() == lock_type)
+        .count();
+
+    assert_eq!(
+        lock_cnt,
+        expected_cnt,
+        "lock count not match, expected: {:?}; got: {:?}",
+        expected_cnt,
+        resp.locks.len()
+    );
 }
 
 pub fn get_tso(pd_client: &TestPdClient) -> u64 {

@@ -20,7 +20,7 @@ lazy_static! {
 
 fn next_shard_id() -> usize {
     thread_local! {
-        static CURRENT_SHARD_ID: Cell<usize> = Cell::new(0);
+        static CURRENT_SHARD_ID: Cell<usize> = const {Cell::new(0)};
     }
     CURRENT_SHARD_ID.with(|c| {
         let shard_id = c.get();
@@ -185,6 +185,35 @@ impl fmt::Debug for TrackerToken {
 impl Default for TrackerToken {
     fn default() -> Self {
         INVALID_TRACKER_TOKEN
+    }
+}
+
+pub struct TrackerTokenArray<'a>(&'a [TrackerToken]);
+impl<'a> slog::Value for TrackerTokenArray<'a> {
+    fn serialize(
+        &self,
+        _record: &slog::Record<'_>,
+        key: slog::Key,
+        serializer: &mut dyn slog::Serializer,
+    ) -> slog::Result {
+        let trackers_str = self
+            .0
+            .iter()
+            .map(|tracker_token| {
+                format!(
+                    "{:?}",
+                    GLOBAL_TRACKERS.with_tracker(*tracker_token, |t| t.req_info.clone())
+                )
+            })
+            .collect::<Vec<String>>()
+            .join(", ");
+        serializer.emit_str(key, &trackers_str)
+    }
+}
+
+impl<'a> TrackerTokenArray<'a> {
+    pub fn new(tokens: &'a [TrackerToken]) -> Self {
+        TrackerTokenArray(tokens)
     }
 }
 

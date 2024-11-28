@@ -19,6 +19,9 @@ make_auto_flush_static_metric! {
     //               |
     //               V
     // |success|abort|fail|delay|ignore|
+    //
+    // ingest_delay is used to record occurrences of delayed ingestions
+    // during snapshot apply (e.g. due to high L0 file count).
     pub label_enum SnapStatus {
         all,
         start,
@@ -27,6 +30,7 @@ make_auto_flush_static_metric! {
         fail,
         delay,
         ignore,
+        ingest_delay,
     }
 
     pub struct SnapCounter: LocalIntCounter {
@@ -64,6 +68,16 @@ make_static_metric! {
 
     pub struct LocalReadRejectCounter : LocalIntCounter {
        "reason" => RejectReason,
+    }
+
+    pub label_enum ClearOverlapRegionType {
+        by_key,
+        by_range,
+        by_ingest_files,
+    }
+
+    pub struct ClearOverlapRegionDuration : Histogram {
+        "type" => ClearOverlapRegionType,
     }
 }
 
@@ -148,6 +162,17 @@ lazy_static! {
         exponential_buckets(0.00001, 2.0, 26).unwrap()
     )
     .unwrap();
+    pub static ref SNAP_APPLY_WAIT_DURATION_HISTOGRAM: Histogram = register_histogram!(
+        "tikv_raftstore_snapshot_apply_wait_duration_seconds",
+        "Bucketed histogram of raftstore snapshot apply wait duration",
+        exponential_buckets(0.00001, 2.0, 26).unwrap()
+    )
+    .unwrap();
+    pub static ref SNAP_PENDING_APPLIES_GAUGE: IntGauge = register_int_gauge!(
+        "tikv_raftstore_snapshot_pending_applies",
+        "Total number of snapshots that are waiting to be applied",
+    )
+    .unwrap();
     pub static ref CHECK_SPILT_HISTOGRAM: Histogram = register_histogram!(
         "tikv_raftstore_check_split_duration_seconds",
         "Bucketed histogram of raftstore split check duration",
@@ -158,6 +183,26 @@ lazy_static! {
         "tikv_compact_range_cf_duration_seconds",
         "Bucketed histogram of compact range for cf execution",
         &["cf"]
+    )
+    .unwrap();
+    pub static ref FULL_COMPACT: Histogram = register_histogram!(
+        "tikv_storage_full_compact_duration_seconds",
+        "Bucketed histogram of full compaction for the storage."
+    )
+    .unwrap();
+    pub static ref FULL_COMPACT_INCREMENTAL: Histogram = register_histogram!(
+        "tikv_storage_full_compact_increment_duration_seconds",
+        "Bucketed histogram of full compaction increments for the storage."
+    )
+    .unwrap();
+    pub static ref FULL_COMPACT_PAUSE: Histogram = register_histogram!(
+        "tikv_storage_full_compact_pause_duration_seconds",
+        "Bucketed histogram of full compaction pauses for the storage."
+    )
+    .unwrap();
+    pub static ref PROCESS_STAT_CPU_USAGE: Gauge = register_gauge!(
+        "tikv_storage_process_stat_cpu_usage",
+        "CPU usage measured over a 30 second window",
     )
     .unwrap();
     pub static ref REGION_HASH_HISTOGRAM: Histogram = register_histogram!(
@@ -241,4 +286,12 @@ lazy_static! {
         "Total number of renewing lease in advance from local reader."
     )
     .unwrap();
+
+    pub static ref CLEAR_OVERLAP_REGION_DURATION: ClearOverlapRegionDuration = register_static_histogram_vec!(
+        ClearOverlapRegionDuration,
+        "tikv_raftstore_clear_overlap_region_duration_seconds",
+        "Bucketed histogram of clear overlap region duration.",
+        &["type"],
+        exponential_buckets(0.005, 2.0, 20).unwrap()
+    ).unwrap();
 }

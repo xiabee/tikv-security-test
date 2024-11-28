@@ -19,7 +19,7 @@ use kvproto::{
 };
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
-use raftstore::store::*;
+use raftstore::{router::RaftStoreRouter, store::*};
 use raftstore_v2::router::{PeerMsg, PeerTick};
 use test_raftstore::*;
 use test_raftstore_macro::test_case;
@@ -199,6 +199,80 @@ fn test_node_merge_restart() {
     cluster.start().unwrap();
     must_get_none(&cluster.get_engine(3), b"k1");
     must_get_none(&cluster.get_engine(3), b"k3");
+}
+
+#[test]
+fn test_async_io_apply_before_leader_persist_merge() {
+    let mut cluster = new_node_cluster(0, 3);
+    configure_for_merge(&mut cluster.cfg);
+    cluster.cfg.raft_store.cmd_batch_concurrent_ready_max_count = 0;
+    cluster.cfg.raft_store.store_io_pool_size = 1;
+    cluster.cfg.raft_store.max_apply_unpersisted_log_limit = 10000;
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.run();
+
+    let region = pd_client.get_region(b"k1").unwrap();
+    cluster.must_split(&region, b"k2");
+    let left = pd_client.get_region(b"k1").unwrap();
+    let right = pd_client.get_region(b"k2").unwrap();
+
+    let peer_1 = find_peer(&left, 1).cloned().unwrap();
+    cluster.must_transfer_leader(left.get_id(), peer_1.clone());
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    let raft_before_save_on_store_1_fp = "raft_before_persist_on_store_1";
+    // Skip persisting to simulate raft log persist lag but not block node restart.
+    fail::cfg(raft_before_save_on_store_1_fp, "return").unwrap();
+
+    let schedule_merge_fp = "on_schedule_merge";
+    fail::cfg(schedule_merge_fp, "return()").unwrap();
+
+    // Propose merge on leader will fail with timeout due to not persist.
+    let req = cluster.new_prepare_merge(left.get_id(), right.get_id());
+    cluster
+        .call_command_on_leader(req, Duration::from_secs(1))
+        .unwrap_err();
+
+    cluster.shutdown();
+    let engine = cluster.get_engine(peer_1.get_store_id());
+    let state_key = keys::region_state_key(left.get_id());
+    let state: RegionLocalState = engine.get_msg_cf(CF_RAFT, &state_key).unwrap().unwrap();
+    assert_eq!(state.get_state(), PeerState::Normal, "{:?}", state);
+    let state_key = keys::region_state_key(right.get_id());
+    let state: RegionLocalState = engine.get_msg_cf(CF_RAFT, &state_key).unwrap().unwrap();
+    assert_eq!(state.get_state(), PeerState::Normal, "{:?}", state);
+    fail::remove(schedule_merge_fp);
+    fail::remove(raft_before_save_on_store_1_fp);
+    cluster.start().unwrap();
+
+    // Wait till merge is finished.
+    pd_client.check_merged_timeout(left.get_id(), Duration::from_secs(5));
+
+    cluster.must_put(b"k4", b"v4");
+
+    for i in 1..4 {
+        must_get_equal(&cluster.get_engine(i), b"k4", b"v4");
+        let state_key = keys::region_state_key(left.get_id());
+        let state: RegionLocalState = cluster
+            .get_engine(i)
+            .get_msg_cf(CF_RAFT, &state_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.get_state(), PeerState::Tombstone, "{:?}", state);
+        let state_key = keys::region_state_key(right.get_id());
+        let state: RegionLocalState = cluster
+            .get_engine(i)
+            .get_msg_cf(CF_RAFT, &state_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.get_state(), PeerState::Normal, "{:?}", state);
+        assert!(state.get_region().get_start_key().is_empty());
+        assert!(state.get_region().get_end_key().is_empty());
+    }
 }
 
 /// Test if merge is still working when restart a cluster during catching up
@@ -1318,6 +1392,8 @@ fn test_source_peer_read_delegate_after_apply() {
 
 #[test]
 fn test_merge_with_concurrent_pessimistic_locking() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 2);
     configure_for_merge(&mut cluster.cfg);
     cluster.cfg.pessimistic_txn.pipelined = true;
@@ -1343,18 +1419,22 @@ fn test_merge_with_concurrent_pessimistic_locking() {
     txn_ext
         .pessimistic_locks
         .write()
-        .insert(vec![(
-            Key::from_raw(b"k0"),
-            PessimisticLock {
-                primary: b"k0".to_vec().into_boxed_slice(),
-                start_ts: 10.into(),
-                ttl: 3000,
-                for_update_ts: 20.into(),
-                min_commit_ts: 30.into(),
-                last_change: LastChange::make_exist(15.into(), 3),
-                is_locked_with_conflict: false,
-            },
-        )])
+        .insert(
+            vec![(
+                Key::from_raw(b"k0"),
+                PessimisticLock {
+                    primary: b"k0".to_vec().into_boxed_slice(),
+                    start_ts: 10.into(),
+                    ttl: 3000,
+                    for_update_ts: 20.into(),
+                    min_commit_ts: 30.into(),
+                    last_change: LastChange::make_exist(15.into(), 3),
+                    is_locked_with_conflict: false,
+                },
+            )],
+            peer_size_limit,
+            instance_size_limit,
+        )
         .unwrap();
 
     let addr = cluster.sim.rl().get_addr(1);
@@ -1406,6 +1486,8 @@ fn test_merge_with_concurrent_pessimistic_locking() {
 
 #[test]
 fn test_merge_pessimistic_locks_with_concurrent_prewrite() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 2);
     configure_for_merge(&mut cluster.cfg);
     cluster.cfg.pessimistic_txn.pipelined = true;
@@ -1446,10 +1528,14 @@ fn test_merge_pessimistic_locks_with_concurrent_prewrite() {
     txn_ext
         .pessimistic_locks
         .write()
-        .insert(vec![
-            (Key::from_raw(b"k0"), lock.clone()),
-            (Key::from_raw(b"k1"), lock),
-        ])
+        .insert(
+            vec![
+                (Key::from_raw(b"k0"), lock.clone()),
+                (Key::from_raw(b"k1"), lock),
+            ],
+            peer_size_limit,
+            instance_size_limit,
+        )
         .unwrap();
 
     let mut mutation = Mutation::default();
@@ -1491,6 +1577,8 @@ fn test_merge_pessimistic_locks_with_concurrent_prewrite() {
 
 #[test]
 fn test_retry_pending_prepare_merge_fail() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 2);
     configure_for_merge(&mut cluster.cfg);
     cluster.cfg.pessimistic_txn.pipelined = true;
@@ -1527,7 +1615,11 @@ fn test_retry_pending_prepare_merge_fail() {
     txn_ext
         .pessimistic_locks
         .write()
-        .insert(vec![(Key::from_raw(b"k1"), l1)])
+        .insert(
+            vec![(Key::from_raw(b"k1"), l1)],
+            peer_size_limit,
+            instance_size_limit,
+        )
         .unwrap();
 
     // Pause apply and write some data to the left region
@@ -1568,6 +1660,8 @@ fn test_retry_pending_prepare_merge_fail() {
 
 #[test]
 fn test_merge_pessimistic_locks_propose_fail() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 2);
     configure_for_merge(&mut cluster.cfg);
     cluster.cfg.pessimistic_txn.pipelined = true;
@@ -1603,7 +1697,11 @@ fn test_merge_pessimistic_locks_propose_fail() {
     txn_ext
         .pessimistic_locks
         .write()
-        .insert(vec![(Key::from_raw(b"k1"), lock)])
+        .insert(
+            vec![(Key::from_raw(b"k1"), lock)],
+            peer_size_limit,
+            instance_size_limit,
+        )
         .unwrap();
 
     fail::cfg("raft_propose", "pause").unwrap();
@@ -2104,7 +2202,6 @@ fn test_destroy_race_during_atomic_snapshot_after_merge() {
         .when(left_filter_block.clone())
         .reserve_dropped(left_blocked_messages.clone())
         .set_msg_callback(Arc::new(move |msg: &RaftMessage| {
-            debug!("dbg left msg_callback"; "msg" => ?msg);
             if left_filter_block.load(atomic::Ordering::SeqCst) {
                 return;
             }
@@ -2128,7 +2225,6 @@ fn test_destroy_race_during_atomic_snapshot_after_merge() {
         .direction(Direction::Recv)
         .when(right_filter_block.clone())
         .set_msg_callback(Arc::new(move |msg: &RaftMessage| {
-            debug!("dbg right msg_callback"; "msg" => ?msg);
             if msg.get_to_peer().get_id() == new_peer_id {
                 let _ = new_peer_id_tx.lock().unwrap().take().map(|tx| tx.send(()));
                 if msg.get_message().get_msg_type() == MessageType::MsgSnapshot {
@@ -2172,4 +2268,50 @@ fn test_destroy_race_during_atomic_snapshot_after_merge() {
     // New peer applies snapshot eventually.
     cluster.must_transfer_leader(right.get_id(), new_peer(3, new_peer_id));
     cluster.must_put(b"k4", b"v4");
+}
+
+// `test_raft_log_gc_after_merge` tests when a region is destoryed, e.g. due to
+// region merge, PeerFsm can still handle pending raft messages correctly.
+#[test]
+fn test_raft_log_gc_after_merge() {
+    let mut cluster = new_node_cluster(0, 1);
+    configure_for_merge(&mut cluster.cfg);
+    cluster.cfg.raft_store.store_batch_system.pool_size = 2;
+    cluster.run();
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    let region = cluster.get_region(b"k1");
+    cluster.must_split(&region, b"k2");
+    let left = cluster.get_region(b"k1");
+    let right = cluster.get_region(b"k3");
+
+    fail::cfg_callback("destroy_region_before_gc_flush", move || {
+        fail::cfg("pause_on_peer_collect_message", "pause").unwrap();
+    })
+    .unwrap();
+
+    let (tx, rx) = channel();
+    fail::cfg_callback("destroy_region_after_gc_flush", move || {
+        tx.send(()).unwrap();
+    })
+    .unwrap();
+
+    // the right peer's id is 1.
+    pd_client.must_merge(right.get_id(), left.get_id());
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let raft_router = cluster.get_router(1).unwrap();
+    raft_router
+        .send_casual_msg(1, CasualMessage::ForceCompactRaftLogs)
+        .unwrap();
+
+    fail::remove("pause_on_peer_collect_message");
+
+    // wait some time for merge finish.
+    std::thread::sleep(Duration::from_secs(1));
+    must_get_equal(&cluster.get_engine(1), b"k3", b"v3");
 }

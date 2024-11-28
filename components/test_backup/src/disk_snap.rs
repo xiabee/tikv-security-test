@@ -49,7 +49,7 @@ impl Suite {
         let rej = Arc::new(PrepareDiskSnapObserver::default());
         let rej2 = rej.clone();
         let mut w = self.cluster.sim.wl();
-        w.coprocessor_hooks
+        w.coprocessor_hosts
             .entry(id)
             .or_default()
             .push(Box::new(move |host| {
@@ -185,25 +185,30 @@ impl PrepareBackup {
     }
 
     pub fn send_finalize(mut self) -> bool {
-        block_on(self.tx.send({
-            let mut req = PrepareSnapshotBackupRequest::new();
-            req.set_ty(PrepareSnapshotBackupRequestType::Finish);
-            (req, WriteFlags::default())
-        }))
-        .unwrap();
-        block_on_timeout(
-            async {
-                while let Some(item) = self.rx.next().await {
-                    let item = item.unwrap();
-                    if item.ty == PrepareSnapshotBackupEventType::UpdateLeaseResult {
-                        return item.last_lease_is_valid;
+        if matches!(
+            block_on(self.tx.send({
+                let mut req = PrepareSnapshotBackupRequest::new();
+                req.set_ty(PrepareSnapshotBackupRequestType::Finish);
+                (req, WriteFlags::default())
+            })),
+            Ok(_) | Err(grpcio::Error::RpcFinished(_))
+        ) {
+            block_on_timeout(
+                async {
+                    while let Some(item) = self.rx.next().await {
+                        let item = item.unwrap();
+                        if item.ty == PrepareSnapshotBackupEventType::UpdateLeaseResult {
+                            return item.last_lease_is_valid;
+                        }
                     }
-                }
-                false
-            },
-            Duration::from_secs(2),
-        )
-        .expect("take too long to finalize the stream")
+                    false
+                },
+                Duration::from_secs(2),
+            )
+            .expect("take too long to finalize the stream")
+        } else {
+            false
+        }
     }
 
     pub fn next(&mut self) -> PrepareSnapshotBackupResponse {

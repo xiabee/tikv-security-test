@@ -17,6 +17,7 @@ mod test_gc_metrics;
 mod test_gc_worker;
 mod test_hibernate;
 mod test_import_service;
+mod test_in_memory_engine;
 mod test_kv_service;
 mod test_life;
 mod test_local_read;

@@ -118,13 +118,24 @@ where
         .map_err(|e| handle_send_error(region_id, e))
 }
 
+pub struct ReadContext {
+    pub(crate) read_id: Option<ThreadReadId>,
+    pub(crate) read_ts: Option<u64>,
+}
+
+impl ReadContext {
+    pub fn new(read_id: Option<ThreadReadId>, read_ts: Option<u64>) -> Self {
+        ReadContext { read_id, read_ts }
+    }
+}
+
 pub trait LocalReadRouter<EK>: Send + Clone
 where
     EK: KvEngine,
 {
     fn read(
         &mut self,
-        read_id: Option<ThreadReadId>,
+        ctx: ReadContext,
         req: RaftCmdRequest,
         cb: Callback<EK::Snapshot>,
     ) -> RaftStoreResult<()>;
@@ -254,11 +265,11 @@ impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for ServerRaftStoreRouter
 impl<EK: KvEngine, ER: RaftEngine> LocalReadRouter<EK> for ServerRaftStoreRouter<EK, ER> {
     fn read(
         &mut self,
-        read_id: Option<ThreadReadId>,
+        ctx: ReadContext,
         req: RaftCmdRequest,
         cb: Callback<EK::Snapshot>,
     ) -> RaftStoreResult<()> {
-        self.local_reader.read(read_id, req, cb);
+        self.local_reader.read(ctx, req, cb);
         Ok(())
     }
 

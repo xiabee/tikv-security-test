@@ -14,7 +14,7 @@ use kvproto::{
     raft_serverpb::RaftMessage,
 };
 use raftstore::{
-    router::{LocalReadRouter, RaftStoreRouter},
+    router::{LocalReadRouter, RaftStoreRouter, ReadContext},
     store::{
         cmd_resp, Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter, RaftCmdExtraOpts,
         RaftCommand, ReadResponse, RegionSnapshot, SignificantMsg, SignificantRouter, StoreMsg,
@@ -30,7 +30,7 @@ use tikv::{
         Engine,
     },
 };
-use tikv_util::{store::new_peer, time::ThreadReadId};
+use tikv_util::store::new_peer;
 use txn_types::Key;
 
 use crate::test;
@@ -121,7 +121,7 @@ impl RaftStoreRouter<RocksEngine> for SyncBenchRouter {
 impl LocalReadRouter<RocksEngine> for SyncBenchRouter {
     fn read(
         &mut self,
-        _: Option<ThreadReadId>,
+        _: ReadContext,
         req: RaftCmdRequest,
         cb: Callback<RocksSnapshot>,
     ) -> Result<()> {

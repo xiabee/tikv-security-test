@@ -299,7 +299,7 @@ fn test_stale_learner_with_read_index() {
     );
     request.mut_header().set_peer(new_peer(3, 3));
     request.mut_header().set_replica_read(true);
-    let (cb, _) = make_cb(&request);
+    let (cb, _) = make_cb_rocks(&request);
     cluster
         .sim
         .rl()

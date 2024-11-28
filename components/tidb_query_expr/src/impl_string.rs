@@ -63,13 +63,13 @@ pub fn oct_string(s: BytesRef, writer: BytesWriter) -> Result<BytesGuard> {
     if let Some(&c) = trimmed.next() {
         if c == b'-' {
             negative = true;
-        } else if (b'0'..=b'9').contains(&c) {
+        } else if c.is_ascii_digit() {
             r = Some(u64::from(c) - u64::from(b'0'));
         } else if c != b'+' {
             return Ok(writer.write(Some(b"0".to_vec())));
         }
 
-        for c in trimmed.take_while(|&c| (b'0'..=b'9').contains(c)) {
+        for c in trimmed.take_while(|&c| c.is_ascii_digit()) {
             r = r
                 .and_then(|r| r.checked_mul(10))
                 .and_then(|r| r.checked_add(u64::from(*c - b'0')));
@@ -644,7 +644,7 @@ fn field_bytes<C: Collator>(args: &[Option<BytesRef>]) -> Result<Option<Int>> {
                 if arg.is_none() {
                     continue;
                 }
-                match C::sort_compare(val, arg.unwrap()) {
+                match C::sort_compare(val, arg.unwrap(), false) {
                     Ok(Ordering::Equal) => return Ok(Some(pos as i64)),
                     _ => continue,
                 }
@@ -698,7 +698,7 @@ pub fn elt(raw_args: &[ScalarValueRef]) -> Result<Option<Bytes>> {
         None => None,
         Some(i) => {
             let i = *i;
-            if i <= 0 || i + 1 > raw_args.len() as i64 {
+            if i <= 0 || i >= raw_args.len() as i64 {
                 return Ok(None);
             }
             raw_args[i as usize].as_bytes().map(|x| x.to_vec())
@@ -781,7 +781,7 @@ pub fn substring_index(
 #[inline]
 pub fn strcmp<C: Collator>(left: BytesRef, right: BytesRef) -> Result<Option<i64>> {
     use std::cmp::Ordering::*;
-    Ok(Some(match C::sort_compare(left, right)? {
+    Ok(Some(match C::sort_compare(left, right, false)? {
         Less => -1,
         Equal => 0,
         Greater => 1,
@@ -818,7 +818,7 @@ pub fn find_in_set<C: Collator>(s: BytesRef, str_list: BytesRef) -> Result<Optio
     let result = str_list
         .split_str(",")
         .position(|str_in_set| {
-            C::sort_compare(str_in_set.as_bytes(), s)
+            C::sort_compare(str_in_set.as_bytes(), s, false)
                 .ok()
                 .filter(|o| *o == Ordering::Equal)
                 .is_some()
@@ -886,7 +886,7 @@ impl TrimDirection {
 }
 
 #[inline]
-fn trim<'a, 'b>(string: &'a [u8], pattern: &'b [u8], direction: TrimDirection) -> &'a [u8] {
+fn trim<'a>(string: &'a [u8], pattern: &[u8], direction: TrimDirection) -> &'a [u8] {
     if pattern.is_empty() {
         return string;
     }
@@ -1132,7 +1132,7 @@ mod tests {
 
     use tidb_query_datatype::{
         builder::FieldTypeBuilder,
-        codec::mysql::charset::{CHARSET_GBK, CHARSET_UTF8MB4},
+        codec::mysql::charset::{CHARSET_GB18030, CHARSET_GBK, CHARSET_UTF8MB4},
     };
     use tipb::ScalarFuncSig;
 
@@ -2860,6 +2860,10 @@ mod tests {
                 Some("قاعدة البيانات".as_bytes().to_vec()),
                 Some("قاعدة البيانات".as_bytes().to_vec()),
             ),
+            (
+                Some("ßßåı".as_bytes().to_vec()),
+                Some("ßßÅI".as_bytes().to_vec()),
+            ),
             (None, None),
         ];
 
@@ -2880,6 +2884,7 @@ mod tests {
 
     #[test]
     fn test_upper() {
+        // Test binary string case
         let cases = vec![
             (Some(b"hello".to_vec()), Some(b"hello".to_vec())),
             (Some(b"123".to_vec()), Some(b"123".to_vec())),
@@ -2908,7 +2913,7 @@ mod tests {
                     arg.clone(),
                     FieldTypeBuilder::new()
                         .tp(FieldTypeTp::VarString)
-                        .charset(CHARSET_UTF8MB4)
+                        .collation(Collation::Binary)
                         .build(),
                 )
                 .evaluate(ScalarFuncSig::Upper)
@@ -2920,11 +2925,32 @@ mod tests {
     #[test]
     fn test_gbk_lower_upper() {
         // Test GBK string case
-        let sig = vec![ScalarFuncSig::Lower, ScalarFuncSig::Upper];
-        for s in sig {
-            let output = RpnFnScalarEvaluator::new()
+        let cases = vec![
+            (
+                ScalarFuncSig::LowerUtf8,
+                "àáèéêìíòóùúüāēěīńňōūǎǐǒǔǖǘǚǜⅪⅫ".as_bytes().to_vec(),
+                "àáèéêìíòóùúüāēěīńňōūǎǐǒǔǖǘǚǜⅪⅫ".as_bytes().to_vec(),
+            ),
+            (
+                ScalarFuncSig::UpperUtf8,
+                "àáèéêìíòóùúüāēěīńňōūǎǐǒǔǖǘǚǜⅪⅫ".as_bytes().to_vec(),
+                "àáèéêìíòóùúüāēěīńňōūǎǐǒǔǖǘǚǜⅪⅫ".as_bytes().to_vec(),
+            ),
+            (
+                ScalarFuncSig::LowerUtf8,
+                "İİIIÅI".as_bytes().to_vec(),
+                "iiiiåi".as_bytes().to_vec(),
+            ),
+            (
+                ScalarFuncSig::UpperUtf8,
+                "ßßåı".as_bytes().to_vec(),
+                "ßßÅI".as_bytes().to_vec(),
+            ),
+        ];
+        for (s, input, output) in cases {
+            let result = RpnFnScalarEvaluator::new()
                 .push_param_with_field_type(
-                    Some("àáèéêìíòóùúüāēěīńňōūǎǐǒǔǖǘǚǜⅪⅫ".as_bytes().to_vec()).clone(),
+                    Some(input).clone(),
                     FieldTypeBuilder::new()
                         .tp(FieldTypeTp::VarString)
                         .charset(CHARSET_GBK)
@@ -2932,52 +2958,76 @@ mod tests {
                 )
                 .evaluate(s)
                 .unwrap();
+            assert_eq!(result, Some(output),);
+        }
+    }
+
+    #[test]
+    fn test_gb18030_lower_upper() {
+        // Test GB18030 string case
+        let raw_upper_lower: Vec<(&str, &str, &str)> = vec![
+            ("µ", "µ", "μ"),       // "B5" "B5" "3BC"
+            ("ǅǈǋ", "ǅǈǋ", "ǆǉǌ"), // "1C5" "1C8" "1CB"
+            ("ǄǇǊ", "ǄǇǊ", "ǆǉǌ"), // "1C4" "1C7" "1CA"
+            ("ǆǉǌ", "ǄǇǊ", "ǆǉǌ"), // "1C6" "1C9" "1CC"
+            (
+                "ɥɪჾᏸᏻᏽᵽꮕàáèéêìíòóùúüāēěīńňōūǎǐǒǔǖǘǚǜⅪⅫ",
+                "ɥɪჾᏸᏻᏽᵽꮕÀÁÈÉÊÌÍÒÓÙÚÜĀĒĚĪŃŇŌŪǍǏǑǓǕǗǙǛⅪⅫ",
+                "ɥɪჾᏸᏻᏽᵽꮕàáèéêìíòóùúüāēěīńňōūǎǐǒǔǖǘǚǜⅺⅻ",
+            ),
+            ("ǲɜɡ", "ǲɜɡ", "ǳɜɡ"), // "1F2" "25C" "261"
+            (
+                "𐒰𐓘𐲀𐳀𑢠𖹀𞤀", // "104B0 104D8 10C80 10CC0 118A0 16E40 1E900"
+                "𐒰𐓘𐲀𐳀𑢠𖹀𞤀",
+                "𐒰𐓘𐲀𐳀𑢠𖹀𞤀",
+            ),
+            (
+                "ẛι", // 1E9B 1FBE
+                "ẛι", "ṡι",
+            ),
+        ];
+
+        for (i, test_case) in raw_upper_lower.iter().enumerate() {
+            let output = RpnFnScalarEvaluator::new()
+                .push_param_with_field_type(
+                    Some((test_case.0).as_bytes().to_vec()).clone(),
+                    FieldTypeBuilder::new()
+                        .tp(FieldTypeTp::VarString)
+                        .charset(CHARSET_GB18030)
+                        .build(),
+                )
+                .evaluate(ScalarFuncSig::UpperUtf8)
+                .unwrap();
             assert_eq!(
                 output,
-                Some("àáèéêìíòóùúüāēěīńňōūǎǐǒǔǖǘǚǜⅪⅫ".as_bytes().to_vec())
+                Some((test_case.1).as_bytes().to_vec()),
+                "error in upper cases #{} ({})",
+                i + 1,
+                (test_case.0)
+            );
+
+            let output = RpnFnScalarEvaluator::new()
+                .push_param_with_field_type(
+                    Some((test_case.0).as_bytes().to_vec()).clone(),
+                    FieldTypeBuilder::new()
+                        .tp(FieldTypeTp::VarString)
+                        .charset(CHARSET_GB18030)
+                        .build(),
+                )
+                .evaluate(ScalarFuncSig::LowerUtf8)
+                .unwrap();
+            assert_eq!(
+                output,
+                Some((test_case.2).as_bytes().to_vec()),
+                "error in lower cases #{} ({})",
+                i + 1,
+                (test_case.0)
             );
         }
     }
 
     #[test]
     fn test_lower() {
-        // Test non-binary string case
-        let cases = vec![
-            (Some(b"HELLO".to_vec()), Some(b"hello".to_vec())),
-            (Some(b"123".to_vec()), Some(b"123".to_vec())),
-            (
-                Some("CAFÉ".as_bytes().to_vec()),
-                Some("café".as_bytes().to_vec()),
-            ),
-            (
-                Some("数据库".as_bytes().to_vec()),
-                Some("数据库".as_bytes().to_vec()),
-            ),
-            (
-                Some("НОЧЬ НА ОКРАИНЕ МОСКВЫ".as_bytes().to_vec()),
-                Some("ночь на окраине москвы".as_bytes().to_vec()),
-            ),
-            (
-                Some("قاعدة البيانات".as_bytes().to_vec()),
-                Some("قاعدة البيانات".as_bytes().to_vec()),
-            ),
-            (None, None),
-        ];
-
-        for (arg, exp) in cases {
-            let output = RpnFnScalarEvaluator::new()
-                .push_param_with_field_type(
-                    arg.clone(),
-                    FieldTypeBuilder::new()
-                        .tp(FieldTypeTp::VarString)
-                        .charset(CHARSET_UTF8MB4)
-                        .build(),
-                )
-                .evaluate(ScalarFuncSig::Lower)
-                .unwrap();
-            assert_eq!(output, exp);
-        }
-
         // Test binary string case
         let cases = vec![
             (Some(b"hello".to_vec()), Some(b"hello".to_vec())),
@@ -2996,6 +3046,10 @@ mod tests {
             (
                 Some("قاعدة البيانات".as_bytes().to_vec()),
                 Some("قاعدة البيانات".as_bytes().to_vec()),
+            ),
+            (
+                Some("İİIIÅI".as_bytes().to_vec()),
+                Some("İİIIÅI".as_bytes().to_vec()),
             ),
             (None, None),
         ];
@@ -3042,6 +3096,10 @@ mod tests {
             (
                 Some("قاعدة البيانات".as_bytes().to_vec()),
                 Some("قاعدة البيانات".as_bytes().to_vec()),
+            ),
+            (
+                Some("İİIIÅI".as_bytes().to_vec()),
+                Some("iiiiåi".as_bytes().to_vec()),
             ),
             (None, None),
         ];
@@ -3668,6 +3726,14 @@ mod tests {
             (
                 vec![
                     Some(-1).into(),
+                    None::<Bytes>.into(),
+                    Some(b"Hello World!".to_vec()).into(),
+                ],
+                None,
+            ),
+            (
+                vec![
+                    Some(9223372036854775807).into(),
                     None::<Bytes>.into(),
                     Some(b"Hello World!".to_vec()).into(),
                 ],

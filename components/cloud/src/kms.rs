@@ -5,7 +5,7 @@ use derive_more::Deref;
 use kvproto::encryptionpb::MasterKeyKms;
 use tikv_util::box_err;
 
-use crate::error::{Error, KmsError, Result};
+use crate::error::{Error, KmsError, OtherError, Result};
 
 #[derive(Debug, Clone)]
 pub struct Location {
@@ -35,12 +35,26 @@ pub struct SubConfigAzure {
     pub client_secret: Option<String>,
 }
 
+/// Configurations for GCP KMS.
+#[derive(Debug, Default, Clone)]
+pub struct SubConfigGcp {
+    pub credential_file_path: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SubConfigAws {
+    pub access_key: Option<String>,
+    pub secret_access_key: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub key_id: KeyId,
     pub location: Location,
-    pub azure: Option<SubConfigAzure>,
     pub vendor: String,
+    pub azure: Option<SubConfigAzure>,
+    pub gcp: Option<SubConfigGcp>,
+    pub aws: Option<SubConfigAws>,
 }
 
 impl Config {
@@ -51,14 +65,22 @@ impl Config {
                 region: mk.region,
                 endpoint: mk.endpoint,
             },
-            azure: None,
             vendor: mk.vendor,
+            azure: None,
+            gcp: None,
+            aws: None,
         })
     }
 
     pub fn from_azure_kms_config(mk: MasterKeyKms, azure_kms_cfg: SubConfigAzure) -> Result<Self> {
         let mut cfg = Config::from_proto(mk)?;
         cfg.azure = Some(azure_kms_cfg);
+        Ok(cfg)
+    }
+
+    pub fn from_gcp_kms_config(mk: MasterKeyKms, gcp_kms_cfg: SubConfigGcp) -> Result<Self> {
+        let mut cfg = Config::from_proto(mk)?;
+        cfg.gcp = Some(gcp_kms_cfg);
         Ok(cfg)
     }
 }
@@ -84,6 +106,12 @@ impl KeyId {
     }
 }
 
+impl std::fmt::Display for KeyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 // EncryptedKey is a newtype used to mark data as an encrypted key
 // It requires the vec to be non-empty
 #[derive(PartialEq, Clone, Debug, Deref)]
@@ -102,6 +130,10 @@ impl EncryptedKey {
 
     pub fn into_inner(self) -> Vec<u8> {
         self.0
+    }
+
+    pub fn as_raw(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -134,11 +166,13 @@ impl PlainKey {
     pub fn new(key: Vec<u8>, t: CryptographyType) -> Result<Self> {
         let limitation = t.target_key_size();
         if limitation > 0 && key.len() != limitation {
-            Err(Error::KmsError(KmsError::Other(box_err!(
-                "encryption method and key length mismatch, expect {} get
+            Err(Error::KmsError(KmsError::Other(OtherError::from_box(
+                box_err!(
+                    "encryption method and key length mismatch, expect {} get
                     {}",
-                limitation,
-                key.len()
+                    limitation,
+                    key.len()
+                ),
             ))))
         } else {
             Ok(Self { key, tag: t })

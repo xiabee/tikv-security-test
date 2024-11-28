@@ -226,7 +226,7 @@ impl From<Error> for errorpb::Error {
                     .mut_proposal_in_merging_mode()
                     .set_region_id(region_id);
             }
-            Error::Transport(reason) if reason == DiscardReason::Full => {
+            Error::Transport(DiscardReason::Full) => {
                 let mut server_is_busy_err = errorpb::ServerIsBusy::default();
                 server_is_busy_err.set_reason(RAFTSTORE_IS_BUSY.to_owned());
                 errorpb.set_server_is_busy(server_is_busy_err);
@@ -290,6 +290,9 @@ impl From<Error> for errorpb::Error {
                 e.set_store_peer_id(store_peer_id);
                 errorpb.set_mismatch_peer_id(e);
             }
+            Error::DeadlineExceeded => {
+                set_deadline_exceeded_busy_error(&mut errorpb);
+            }
             Error::Coprocessor(CopError::RequireDelay {
                 after,
                 reason: hint,
@@ -298,9 +301,6 @@ impl From<Error> for errorpb::Error {
                 e.set_backoff_ms(after.as_millis() as _);
                 e.set_reason(hint);
                 errorpb.set_server_is_busy(e);
-            }
-            Error::DeadlineExceeded => {
-                set_deadline_exceeded_busy_error(&mut errorpb);
             }
             _ => {}
         };

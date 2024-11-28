@@ -119,7 +119,7 @@ impl SstApplyState {
         for sst in ssts {
             let cf_index = data_cf_offset(sst.get_cf_name());
             if let Some(metas) = sst_list.get_mut(cf_index) {
-                metas.drain_filter(|entry| entry.sst.get_uuid() == sst.get_uuid());
+                metas.retain(|entry| entry.sst.get_uuid() != sst.get_uuid());
             }
         }
     }
@@ -217,7 +217,7 @@ impl PersistenceListener {
             })
         })();
         // The correctness relies on the assumption that there will be only one
-        // thread writting to the DB and increasing apply index.
+        // thread writing to the DB and increasing apply index.
         // Apply index will be set within DB lock, so it's correct even with manual
         // flush.
         let offset = data_cf_offset(&cf);

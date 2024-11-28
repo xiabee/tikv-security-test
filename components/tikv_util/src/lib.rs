@@ -5,6 +5,7 @@
 #![feature(box_patterns)]
 #![feature(vec_into_raw_parts)]
 #![feature(let_chains)]
+#![feature(iterator_try_collect)]
 
 #[cfg(test)]
 extern crate test;
@@ -32,7 +33,6 @@ use nix::{
     sys::wait::{wait, WaitStatus},
     unistd::{fork, ForkResult},
 };
-use rand::rngs::ThreadRng;
 
 use crate::sys::thread::StdThreadBuildWrapper;
 
@@ -54,6 +54,8 @@ pub mod memory;
 pub mod metrics;
 pub mod mpsc;
 pub mod quota_limiter;
+pub mod resource_control;
+pub mod smoother;
 pub mod store;
 pub mod stream;
 pub mod sys;
@@ -61,7 +63,6 @@ pub mod thread_group;
 pub mod time;
 pub mod timer;
 pub mod topn;
-pub mod trend;
 pub mod worker;
 pub mod yatp_pool;
 
@@ -130,38 +131,6 @@ pub fn slices_in_range<T>(entry: &VecDeque<T>, low: usize, high: usize) -> (&[T]
         (&first[low..high], &[])
     } else {
         (&first[low..], &second[..high - first.len()])
-    }
-}
-
-pub struct DefaultRng {
-    rng: ThreadRng,
-}
-
-impl DefaultRng {
-    fn new() -> DefaultRng {
-        DefaultRng {
-            rng: rand::thread_rng(),
-        }
-    }
-}
-
-impl Default for DefaultRng {
-    fn default() -> DefaultRng {
-        DefaultRng::new()
-    }
-}
-
-impl Deref for DefaultRng {
-    type Target = ThreadRng;
-
-    fn deref(&self) -> &ThreadRng {
-        &self.rng
-    }
-}
-
-impl DerefMut for DefaultRng {
-    fn deref_mut(&mut self) -> &mut ThreadRng {
-        &mut self.rng
     }
 }
 

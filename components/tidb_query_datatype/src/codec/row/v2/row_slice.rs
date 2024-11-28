@@ -306,7 +306,7 @@ impl<'a, T: PrimInt> LeBytes<'a, T> {
     fn new(slice: &'a [u8]) -> Self {
         Self {
             slice,
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         }
     }
 

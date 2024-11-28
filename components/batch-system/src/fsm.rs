@@ -12,7 +12,7 @@ use std::{
 
 use resource_control::ResourceMetered;
 
-use crate::mailbox::BasicMailbox;
+use crate::{mailbox::BasicMailbox, metrics::FsmType};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Priority {
@@ -40,6 +40,8 @@ pub trait FsmScheduler {
 /// updating internal state according to incoming messages.
 pub trait Fsm: Send + 'static {
     type Message: Send + ResourceMetered;
+
+    const FSM_TYPE: FsmType;
 
     fn is_stopped(&self) -> bool;
 
@@ -149,7 +151,9 @@ impl<N: Fsm> FsmState<N> {
                 Ok(_) => return,
                 Err(Self::NOTIFYSTATE_DROP) => {
                     let ptr = self.data.swap(ptr::null_mut(), Ordering::AcqRel);
-                    unsafe { Box::from_raw(ptr) };
+                    unsafe {
+                        let _ = Box::from_raw(ptr);
+                    };
                     return;
                 }
                 Err(s) => s,
@@ -179,7 +183,9 @@ impl<N> Drop for FsmState<N> {
     fn drop(&mut self) {
         let ptr = self.data.swap(ptr::null_mut(), Ordering::SeqCst);
         if !ptr.is_null() {
-            unsafe { Box::from_raw(ptr) };
+            unsafe {
+                let _ = Box::from_raw(ptr);
+            };
         }
         self.state_cnt.fetch_sub(1, Ordering::Relaxed);
     }

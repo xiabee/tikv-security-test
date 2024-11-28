@@ -37,7 +37,10 @@ use txn_types::Lock;
 
 use super::config_manager::CopConfigManager;
 use crate::{
-    coprocessor::{cache::CachedRequestHandler, interceptors::*, metrics::*, tracker::Tracker, *},
+    coprocessor::{
+        cache::CachedRequestHandler, interceptors::*, metrics::*,
+        statistics::analyze_context::AnalyzeContext, tracker::Tracker, *,
+    },
     read_pool::ReadPoolHandle,
     server::Config,
     storage::{
@@ -174,7 +177,7 @@ impl<E: Engine> Endpoint<E> {
         req: coppb::Request,
         peer: Option<String>,
         is_streaming: bool,
-    ) -> Result<(RequestHandlerBuilder<E::Snap>, ReqContext)> {
+    ) -> Result<(RequestHandlerBuilder<E::IMSnap>, ReqContext)> {
         dispatch_api_version!(req.get_context().get_api_version(), {
             self.parse_request_and_check_memory_locks_impl::<API>(req, peer, is_streaming)
         })
@@ -189,7 +192,7 @@ impl<E: Engine> Endpoint<E> {
         mut req: coppb::Request,
         peer: Option<String>,
         is_streaming: bool,
-    ) -> Result<(RequestHandlerBuilder<E::Snap>, ReqContext)> {
+    ) -> Result<(RequestHandlerBuilder<E::IMSnap>, ReqContext)> {
         fail_point!("coprocessor_parse_request", |_| Err(box_err!(
             "unsupported tp (failpoint)"
         )));
@@ -210,7 +213,7 @@ impl<E: Engine> Endpoint<E> {
         input.set_recursion_limit(self.recursion_limit);
 
         let mut req_ctx: ReqContext;
-        let builder: RequestHandlerBuilder<E::Snap>;
+        let builder: RequestHandlerBuilder<E::IMSnap>;
         match req.get_tp() {
             REQ_TYPE_DAG => {
                 let mut dag = DagRequest::default();
@@ -318,7 +321,7 @@ impl<E: Engine> Endpoint<E> {
                 let quota_limiter = self.quota_limiter.clone();
 
                 builder = Box::new(move |snap, req_ctx| {
-                    statistics::analyze::AnalyzeContext::<_, F>::new(
+                    AnalyzeContext::<_, F>::new(
                         analyze,
                         req_ctx.ranges.clone(),
                         start_ts,
@@ -391,10 +394,10 @@ impl<E: Engine> Endpoint<E> {
     }
 
     #[inline]
-    fn async_snapshot(
+    fn async_in_memory_snapshot(
         engine: &mut E,
         ctx: &ReqContext,
-    ) -> impl std::future::Future<Output = Result<E::Snap>> {
+    ) -> impl std::future::Future<Output = Result<E::IMSnap>> {
         let mut snap_ctx = SnapContext {
             pb_ctx: &ctx.context,
             start_ts: Some(ctx.txn_start_ts),
@@ -412,7 +415,7 @@ impl<E: Engine> Endpoint<E> {
                 snap_ctx.key_ranges.push(key_range);
             }
         }
-        kv::snapshot(engine, snap_ctx).map_err(Error::from)
+        kv::in_memory_snapshot(engine, snap_ctx).map_err(Error::from)
     }
 
     /// The real implementation of handling a unary request.
@@ -424,7 +427,7 @@ impl<E: Engine> Endpoint<E> {
     async fn handle_unary_request_impl(
         semaphore: Option<Arc<Semaphore>>,
         mut tracker: Box<Tracker<E>>,
-        handler_builder: RequestHandlerBuilder<E::Snap>,
+        handler_builder: RequestHandlerBuilder<E::IMSnap>,
     ) -> Result<MemoryTraceGuard<coppb::Response>> {
         // When this function is being executed, it may be queued for a long time, so
         // that deadline may exceed.
@@ -433,22 +436,27 @@ impl<E: Engine> Endpoint<E> {
 
         // Safety: spawning this function using a `FuturePool` ensures that a TLS engine
         // exists.
-        let snapshot =
-            unsafe { with_tls_engine(|engine| Self::async_snapshot(engine, &tracker.req_ctx)) }
-                .await?;
+        let snapshot = unsafe {
+            with_tls_engine(|engine| Self::async_in_memory_snapshot(engine, &tracker.req_ctx))
+        }
+        .await?;
         let latest_buckets = snapshot.ext().get_buckets();
+
+        let region_cache_snap = snapshot.ext().in_memory_engine_hit();
+        tracker.adjust_snapshot_type(region_cache_snap);
 
         // Check if the buckets version is latest.
         // skip if request don't carry this bucket version.
-        if let Some(ref buckets) = latest_buckets&&
-            buckets.version > tracker.req_ctx.context.buckets_version &&
-            tracker.req_ctx.context.buckets_version!=0 {
-                let mut bucket_not_match = errorpb::BucketVersionNotMatch::default();
-                bucket_not_match.set_version(buckets.version);
-                bucket_not_match.set_keys(buckets.keys.clone().into());
-                let mut err = errorpb::Error::default();
-                err.set_bucket_version_not_match(bucket_not_match);
-                return Err(Error::Region(err));
+        if let Some(ref buckets) = latest_buckets
+            && buckets.version > tracker.req_ctx.context.buckets_version
+            && tracker.req_ctx.context.buckets_version != 0
+        {
+            let mut bucket_not_match = errorpb::BucketVersionNotMatch::default();
+            bucket_not_match.set_version(buckets.version);
+            bucket_not_match.set_keys(buckets.keys.clone().into());
+            let mut err = errorpb::Error::default();
+            err.set_bucket_version_not_match(bucket_not_match);
+            return Err(Error::Region(err));
         }
         // When snapshot is retrieved, deadline may exceed.
         tracker.on_snapshot_finished();
@@ -509,7 +517,7 @@ impl<E: Engine> Endpoint<E> {
     fn handle_unary_request(
         &self,
         req_ctx: ReqContext,
-        handler_builder: RequestHandlerBuilder<E::Snap>,
+        handler_builder: RequestHandlerBuilder<E::IMSnap>,
     ) -> impl Future<Output = Result<MemoryTraceGuard<coppb::Response>>> {
         let priority = req_ctx.context.get_priority();
         let task_id = req_ctx.build_task_id();
@@ -571,6 +579,7 @@ impl<E: Engine> Endpoint<E> {
         mut req: coppb::Request,
         peer: Option<String>,
     ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
+        let now = Instant::now();
         // Check the load of the read pool. If it's too busy, generate and return
         // error in the gRPC thread to avoid waiting in the queue of the read pool.
         if let Err(busy_err) = self.read_pool.check_busy_threshold(Duration::from_millis(
@@ -592,6 +601,9 @@ impl<E: Engine> Endpoint<E> {
         let result_of_future = self
             .parse_request_and_check_memory_locks(req, peer, false)
             .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
+        with_tls_tracker(|tracker| {
+            tracker.metrics.grpc_process_nanos = now.saturating_elapsed().as_nanos() as u64;
+        });
         let fut = async move {
             let res = match result_of_future {
                 Err(e) => {
@@ -605,7 +617,9 @@ impl<E: Engine> Endpoint<E> {
                     let mut res = handle_res.unwrap_or_else(|e| make_error_response(e).into());
                     res.set_batch_responses(batch_res.into());
                     GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                        tracker.write_scan_detail(res.mut_exec_details_v2().mut_scan_detail_v2());
+                        let exec_detail_v2 = res.mut_exec_details_v2();
+                        tracker.write_scan_detail(exec_detail_v2.mut_scan_detail_v2());
+                        tracker.write_time_detail(exec_detail_v2.mut_time_detail_v2());
                     });
                     res
                 }
@@ -703,7 +717,7 @@ impl<E: Engine> Endpoint<E> {
     fn handle_stream_request_impl(
         semaphore: Option<Arc<Semaphore>>,
         mut tracker: Box<Tracker<E>>,
-        handler_builder: RequestHandlerBuilder<E::Snap>,
+        handler_builder: RequestHandlerBuilder<E::IMSnap>,
     ) -> impl futures::stream::Stream<Item = Result<coppb::Response>> {
         try_stream! {
             let _permit = if let Some(semaphore) = semaphore.as_ref() {
@@ -720,7 +734,7 @@ impl<E: Engine> Endpoint<E> {
             // Safety: spawning this function using a `FuturePool` ensures that a TLS engine
             // exists.
             let snapshot = unsafe {
-                with_tls_engine(|engine| Self::async_snapshot(engine, &tracker.req_ctx))
+                with_tls_engine(|engine| Self::async_in_memory_snapshot(engine, &tracker.req_ctx))
             }
             .await?;
             // When snapshot is retrieved, deadline may exceed.
@@ -777,7 +791,7 @@ impl<E: Engine> Endpoint<E> {
     fn handle_stream_request(
         &self,
         req_ctx: ReqContext,
-        handler_builder: RequestHandlerBuilder<E::Snap>,
+        handler_builder: RequestHandlerBuilder<E::IMSnap>,
     ) -> Result<impl futures::stream::Stream<Item = Result<coppb::Response>>> {
         let (tx, rx) = mpsc::channel::<Result<coppb::Response>>(self.stream_channel_size);
         let priority = req_ctx.context.get_priority();

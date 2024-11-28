@@ -824,8 +824,8 @@ fn test_node_split_update_region_right_derive() {
     let new_leader = right
         .get_peers()
         .iter()
+        .find(|&p| p.get_id() != origin_leader.get_id())
         .cloned()
-        .find(|p| p.get_id() != origin_leader.get_id())
         .unwrap();
 
     // Make sure split is done in the new_leader.
@@ -896,6 +896,8 @@ fn test_split_with_epoch_not_match() {
 #[test_case(test_raftstore::new_server_cluster)]
 #[test_case(test_raftstore_v2::new_server_cluster)]
 fn test_split_with_in_memory_pessimistic_locks() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_cluster(0, 3);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -932,10 +934,14 @@ fn test_split_with_in_memory_pessimistic_locks() {
     {
         let mut locks = txn_ext.pessimistic_locks.write();
         locks
-            .insert(vec![
-                (Key::from_raw(b"a"), lock_a.clone()),
-                (Key::from_raw(b"c"), lock_c.clone()),
-            ])
+            .insert(
+                vec![
+                    (Key::from_raw(b"a"), lock_a.clone()),
+                    (Key::from_raw(b"c"), lock_c.clone()),
+                ],
+                peer_size_limit,
+                instance_size_limit,
+            )
             .unwrap();
     }
 
@@ -1168,6 +1174,9 @@ fn test_gen_split_check_bucket_ranges() {
     cluster.cfg.coprocessor.enable_region_bucket = Some(true);
     // disable report buckets; as it will reset the user traffic stats to randomize
     // the test result
+    cluster.cfg.raft_store.check_leader_lease_interval = ReadableDuration::secs(5);
+    // Make merge check resume quickly.
+    cluster.cfg.raft_store.merge_check_tick_interval = ReadableDuration::millis(100);
     cluster.run();
     let pd_client = Arc::clone(&cluster.pd_client);
 
@@ -1187,6 +1196,7 @@ fn test_gen_split_check_bucket_ranges() {
         .insert(0, region.get_start_key().to_vec());
     expected_buckets.keys.push(region.get_end_key().to_vec());
     let buckets = vec![bucket];
+
     // initialize fsm.peer.bucket_regions
     cluster.refresh_region_bucket_keys(
         &region,
@@ -1490,4 +1500,44 @@ fn test_node_split_during_read_index() {
             panic!("{:?}", other);
         }
     }
+}
+
+#[test_case(test_raftstore::new_node_cluster)]
+fn test_clear_uncampaigned_regions_after_split() {
+    let mut cluster = new_cluster(0, 3);
+    cluster.cfg.raft_store.raft_base_tick_interval = ReadableDuration::millis(50);
+    cluster.cfg.raft_store.raft_election_timeout_ticks = 10;
+
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    cluster.run();
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k2", b"v2");
+    cluster.must_put(b"k3", b"v3");
+    // Transfer leader to peer 3.
+    let region = pd_client.get_region(b"k2").unwrap();
+    cluster.must_transfer_leader(region.get_id(), new_peer(3, 3));
+
+    // New split regions will be recorded into uncampaigned region list of
+    // followers (in peer 1 and peer 2).
+    cluster.split_region(
+        &region,
+        b"k2",
+        Callback::write(Box::new(move |_write_resp: WriteResponse| {})),
+    );
+    // Wait the old lease of the leader timeout and followers clear its
+    // uncampaigned region list.
+    thread::sleep(
+        cluster.cfg.raft_store.raft_base_tick_interval.0
+            * cluster.cfg.raft_store.raft_election_timeout_ticks as u32
+            * 3,
+    );
+    // The leader of the parent region should still be peer 3 as no
+    // other peers can become leader.
+    cluster.reset_leader_of_region(region.get_id());
+    assert_eq!(
+        cluster.leader_of_region(region.get_id()).unwrap(),
+        new_peer(3, 3)
+    );
 }

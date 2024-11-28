@@ -23,17 +23,25 @@ use engine_rocks::{
 };
 use engine_traits::{
     data_cf_offset, CachedTablet, CfOptions, CfOptionsExt, FlowControlFactorsExt, KvEngine,
-    RaftEngine, StatisticsReporter, TabletRegistry, CF_DEFAULT, DATA_CFS,
+    RaftEngine, RegionCacheEngine, StatisticsReporter, TabletRegistry, CF_DEFAULT, DATA_CFS,
 };
 use error_code::ErrorCodeExt;
 use file_system::{get_io_rate_limiter, set_io_rate_limiter, BytesFetcher, File, IoBudgetAdjustor};
 use grpcio::Environment;
+use hybrid_engine::HybridEngine;
+use in_memory_engine::{
+    flush_in_memory_engine_statistics, InMemoryEngineContext, InMemoryEngineStatistics,
+    RegionCacheMemoryEngine,
+};
 use pd_client::{PdClient, RpcClient};
 use raft_log_engine::RaftLogEngine;
+use raftstore::{coprocessor::RegionInfoProvider, store::CasualRouter};
 use security::SecurityManager;
 use tikv::{
     config::{ConfigController, DbConfigManger, DbType, TikvConfig},
-    server::{status_server::StatusServer, DEFAULT_CLUSTER_ID},
+    server::{
+        gc_worker::compaction_filter::GC_CONTEXT, status_server::StatusServer, DEFAULT_CLUSTER_ID,
+    },
 };
 use tikv_util::{
     config::{ensure_dir_exist, RaftDataStateMachine},
@@ -438,7 +446,7 @@ const RESERVED_OPEN_FDS: u64 = 1000;
 pub fn check_system_config(config: &TikvConfig) {
     info!("beginning system configuration check");
     let mut rocksdb_max_open_files = config.rocksdb.max_open_files;
-    if config.rocksdb.titan.enabled {
+    if let Some(true) = config.rocksdb.titan.enabled {
         // Titan engine maintains yet another pool of blob files and uses the same max
         // number of open files setup as rocksdb does. So we double the max required
         // open files here
@@ -550,26 +558,28 @@ impl EnginesResourceInfo {
             });
 
         for (_, cache) in cached_latest_tablets.iter_mut() {
-            let Some(tablet) = cache.latest() else { continue };
+            let Some(tablet) = cache.latest() else {
+                continue;
+            };
             for cf in DATA_CFS {
                 fetch_engine_cf(tablet, cf);
             }
         }
 
         let mut normalized_pending_bytes = 0;
-        for (i, (pending, limit)) in compaction_pending_bytes
+        for (i, (pending, evict_threshold)) in compaction_pending_bytes
             .iter()
             .zip(soft_pending_compaction_bytes_limit)
             .enumerate()
         {
-            if limit > 0 {
+            if evict_threshold > 0 {
                 normalized_pending_bytes = cmp::max(
                     normalized_pending_bytes,
-                    (*pending * EnginesResourceInfo::SCALE_FACTOR / limit) as u32,
+                    (*pending * EnginesResourceInfo::SCALE_FACTOR / evict_threshold) as u32,
                 );
                 let base = self.base_max_compactions[i];
                 if base > 0 {
-                    let level = *pending as f32 / limit as f32;
+                    let level = *pending as f32 / evict_threshold as f32;
                     // 50% -> 1, 70% -> 2, 85% -> 3, 95% -> 6, 98% -> 1024.
                     let delta1 = if level > 0.98 {
                         1024
@@ -603,7 +613,7 @@ impl EnginesResourceInfo {
                             "cf" => cf,
                             "n" => base + delta,
                             "pending_bytes" => *pending,
-                            "soft_limit" => limit,
+                            "evict_threshold" => evict_threshold,
                             "level0_ratio" => level0_ratio[i],
                         );
                     }
@@ -685,6 +695,40 @@ impl<T: fmt::Display + Send + 'static> Stop for LazyWorker<T> {
     fn stop(self: Box<Self>) {
         self.stop_worker();
     }
+}
+
+pub fn build_hybrid_engine(
+    region_cache_engine_context: InMemoryEngineContext,
+    disk_engine: RocksEngine,
+    pd_client: Option<Arc<RpcClient>>,
+    region_info_provider: Option<Arc<dyn RegionInfoProvider>>,
+    casual_router: Box<dyn CasualRouter<RocksEngine>>,
+) -> HybridEngine<RocksEngine, RegionCacheMemoryEngine> {
+    // todo(SpadeA): add config for it
+    let mut memory_engine = RegionCacheMemoryEngine::with_region_info_provider(
+        region_cache_engine_context.clone(),
+        region_info_provider,
+        Some(casual_router),
+    );
+    memory_engine.set_disk_engine(disk_engine.clone());
+    if let Some(pd_client) = pd_client.as_ref() {
+        memory_engine.start_hint_service(
+            <RegionCacheMemoryEngine as RegionCacheEngine>::RangeHintService::from(
+                pd_client.clone(),
+            ),
+        )
+    }
+
+    memory_engine.start_cross_check(
+        disk_engine.clone(),
+        region_cache_engine_context.pd_client(),
+        Box::new(|| {
+            let ctx = GC_CONTEXT.lock().unwrap();
+            ctx.as_ref().map(|ctx| ctx.safe_point())
+        }),
+    );
+
+    HybridEngine::new(disk_engine, memory_engine)
 }
 
 pub trait ConfiguredRaftEngine: RaftEngine {
@@ -805,6 +849,7 @@ const DEFAULT_ENGINE_METRICS_RESET_INTERVAL: Duration = Duration::from_millis(60
 pub struct EngineMetricsManager<EK: KvEngine, ER: RaftEngine> {
     tablet_registry: TabletRegistry<EK>,
     kv_statistics: Option<Arc<RocksStatistics>>,
+    in_memory_engine_statistics: Option<Arc<InMemoryEngineStatistics>>,
     kv_is_titan: bool,
     raft_engine: ER,
     raft_statistics: Option<Arc<RocksStatistics>>,
@@ -815,6 +860,7 @@ impl<EK: KvEngine, ER: RaftEngine> EngineMetricsManager<EK, ER> {
     pub fn new(
         tablet_registry: TabletRegistry<EK>,
         kv_statistics: Option<Arc<RocksStatistics>>,
+        in_memory_engine_statistics: Option<Arc<InMemoryEngineStatistics>>,
         kv_is_titan: bool,
         raft_engine: ER,
         raft_statistics: Option<Arc<RocksStatistics>>,
@@ -822,6 +868,7 @@ impl<EK: KvEngine, ER: RaftEngine> EngineMetricsManager<EK, ER> {
         EngineMetricsManager {
             tablet_registry,
             kv_statistics,
+            in_memory_engine_statistics,
             kv_is_titan,
             raft_engine,
             raft_statistics,
@@ -846,6 +893,9 @@ impl<EK: KvEngine, ER: RaftEngine> EngineMetricsManager<EK, ER> {
         }
         if let Some(s) = self.raft_statistics.as_ref() {
             flush_engine_statistics(s, "raft", false);
+        }
+        if let Some(s) = self.in_memory_engine_statistics.as_ref() {
+            flush_in_memory_engine_statistics(s);
         }
         if now.saturating_duration_since(self.last_reset) >= DEFAULT_ENGINE_METRICS_RESET_INTERVAL {
             if let Some(s) = self.kv_statistics.as_ref() {
@@ -1178,9 +1228,9 @@ mod tests {
         )
         .unwrap();
         let disk_usage_checker = DiskUsageChecker::new(
-            kvdb_path,
-            raft_path,
-            Some(raft_spill_path),
+            kvdb_path.clone(),
+            raft_path.clone(),
+            Some(raft_spill_path.clone()),
             true,
             true,
             true,

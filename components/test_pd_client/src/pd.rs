@@ -581,6 +581,20 @@ impl PdCluster {
             .and_then(|k| self.regions.get(k).cloned()))
     }
 
+    fn scan_regions(&self, start: &[u8], end: &[u8], limit: i32) -> Vec<metapb::Region> {
+        let mut regions = vec![];
+        for (_, region) in self.regions.range((Excluded(start.to_vec()), Unbounded)) {
+            if !end.is_empty() && region.start_key.as_slice() >= end {
+                break;
+            }
+            regions.push(region.clone());
+            if regions.len() as i32 >= limit {
+                break;
+            }
+        }
+        regions
+    }
+
     fn get_region_approximate_size(&self, region_id: u64) -> Option<u64> {
         self.region_approximate_size.get(&region_id).cloned()
     }
@@ -923,12 +937,12 @@ pub struct TestPdClient {
     feature_gate: FeatureGate,
     trigger_leader_info_loss: AtomicBool,
 
-    pub gc_safepoints: RwLock<Vec<GcSafePoint>>,
+    pub gc_safepoints: RwLock<Vec<ServiceSafePoint>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct GcSafePoint {
-    pub serivce: String,
+pub struct ServiceSafePoint {
+    pub service: String,
     pub ttl: Duration,
     pub safepoint: TimeStamp,
 }
@@ -1369,13 +1383,19 @@ impl TestPdClient {
     pub fn region_leader_must_be(&self, region_id: u64, peer: metapb::Peer) {
         for _ in 0..500 {
             sleep_ms(10);
-            if let Some(p) = self.cluster.rl().leaders.get(&region_id) {
-                if *p == peer {
-                    return;
-                }
+            if self.check_region_leader(region_id, peer.clone()) {
+                return;
             }
         }
         panic!("region {} must have leader: {:?}", region_id, peer);
+    }
+
+    pub fn check_region_leader(&self, region_id: u64, peer: metapb::Peer) -> bool {
+        self.cluster
+            .rl()
+            .leaders
+            .get(&region_id)
+            .map_or(false, |p| *p == peer)
     }
 
     // check whether region is split by split_key or not.
@@ -1446,23 +1466,15 @@ impl TestPdClient {
         let status = cluster.replication_status.as_mut().unwrap();
         if state.is_none() {
             status.set_mode(ReplicationMode::Majority);
-            let mut dr = status.mut_dr_auto_sync();
+            let dr = status.mut_dr_auto_sync();
             dr.state_id += 1;
             return;
         }
         status.set_mode(ReplicationMode::DrAutoSync);
-        let mut dr = status.mut_dr_auto_sync();
+        let dr = status.mut_dr_auto_sync();
         dr.state_id += 1;
         dr.set_state(state.unwrap());
         dr.available_stores = available_stores;
-    }
-
-    pub fn switch_to_drautosync_mode(&self) {
-        let mut cluster = self.cluster.wl();
-        let status = cluster.replication_status.as_mut().unwrap();
-        status.set_mode(ReplicationMode::DrAutoSync);
-        let mut dr = status.mut_dr_auto_sync();
-        dr.state_id += 1;
     }
 
     pub fn region_replication_status(&self, region_id: u64) -> RegionReplicationStatus {
@@ -1662,6 +1674,28 @@ impl PdClient for TestPdClient {
             }
             Err(e) => Box::pin(err(e)),
         }
+    }
+
+    fn scan_regions(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: i32,
+    ) -> Result<Vec<pdpb::Region>> {
+        self.check_bootstrap()?;
+
+        let result: Vec<_> = self
+            .cluster
+            .rl()
+            .scan_regions(start_key, end_key, limit)
+            .into_iter()
+            .map(|r| {
+                let mut res = pdpb::Region::new();
+                res.set_region(r);
+                res
+            })
+            .collect();
+        Ok(result)
     }
 
     fn get_cluster_config(&self) -> Result<metapb::Cluster> {
@@ -1946,8 +1980,8 @@ impl PdClient for TestPdClient {
         ttl: Duration,
     ) -> PdFuture<()> {
         if ttl.as_secs() > 0 {
-            self.gc_safepoints.wl().push(GcSafePoint {
-                serivce: name,
+            self.gc_safepoints.wl().push(ServiceSafePoint {
+                service: name,
                 ttl,
                 safepoint,
             });

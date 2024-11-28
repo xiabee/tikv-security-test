@@ -9,12 +9,11 @@ use std::{
     time::Duration,
 };
 
-use engine_rocks::RocksSnapshot;
 use kvproto::{metapb, raft_serverpb::RaftMessage};
 use more_asserts::assert_le;
 use pd_client::PdClient;
 use raft::eraftpb::{ConfChangeType, MessageType};
-use raftstore::store::{Callback, RegionSnapshot};
+use raftstore::store::Callback;
 use test_raftstore::*;
 use test_raftstore_macro::test_case;
 use tikv_util::{config::*, future::block_on_timeout, time::Instant, HandyRwLock};
@@ -347,7 +346,7 @@ fn test_node_batch_id_in_lease() {
         .map(|(p, r)| (p.clone(), r))
         .collect();
     let responses = batch_read_on_peer(&mut cluster, &requests);
-    let snaps: Vec<RegionSnapshot<RocksSnapshot>> = responses
+    let snaps: Vec<_> = responses
         .into_iter()
         .map(|response| {
             assert!(!response.response.get_header().has_error());
@@ -369,7 +368,7 @@ fn test_node_batch_id_in_lease() {
     // make sure that region 2 could renew lease.
     cluster.must_put(b"k55", b"v2");
     let responses = batch_read_on_peer(&mut cluster, &requests);
-    let snaps2: Vec<RegionSnapshot<RocksSnapshot>> = responses
+    let snaps2: Vec<_> = responses
         .into_iter()
         .map(|response| {
             assert!(!response.response.get_header().has_error());
@@ -427,7 +426,7 @@ fn test_node_callback_when_destroyed() {
     let get = new_get_cmd(b"k1");
     let mut req = new_request(1, epoch, vec![get], true);
     req.mut_header().set_peer(leader);
-    let (cb, mut rx) = make_cb(&req);
+    let (cb, mut rx) = make_cb_rocks(&req);
     cluster
         .sim
         .rl()
@@ -451,6 +450,8 @@ fn test_node_callback_when_destroyed() {
 /// Test if the callback proposed by read index is cleared correctly.
 #[test_case(test_raftstore::new_server_cluster)]
 #[test_case(test_raftstore_v2::new_server_cluster)]
+// transfer leader means eviction
+// #[test_case(test_raftstore::new_node_cluster_with_hybrid_engine)]
 fn test_lease_read_callback_destroy() {
     // Only server cluster can fake sending message successfully in raftstore layer.
     let mut cluster = new_cluster(0, 3);
@@ -648,7 +649,7 @@ fn test_not_leader_read_lease() {
         true,
     );
     req.mut_header().set_peer(new_peer(1, 1));
-    let (cb, mut rx) = make_cb(&req);
+    let (cb, mut rx) = make_cb_rocks(&req);
     cluster.sim.rl().async_command_on_node(1, req, cb).unwrap();
 
     cluster.must_transfer_leader(region_id, new_peer(3, 3));
@@ -701,7 +702,7 @@ fn test_read_index_after_write() {
     req.mut_header()
         .set_peer(new_peer(1, region_on_store1.get_id()));
     // Don't care about the first one's read index
-    let (cb, _) = make_cb(&req);
+    let (cb, _) = make_cb_rocks(&req);
     cluster.sim.rl().async_command_on_node(1, req, cb).unwrap();
 
     cluster.must_put(b"k2", b"v2");
@@ -715,7 +716,7 @@ fn test_read_index_after_write() {
     );
     req.mut_header()
         .set_peer(new_peer(1, region_on_store1.get_id()));
-    let (cb, mut rx) = make_cb(&req);
+    let (cb, mut rx) = make_cb_rocks(&req);
     cluster.sim.rl().async_command_on_node(1, req, cb).unwrap();
 
     cluster.sim.wl().clear_recv_filters(2);

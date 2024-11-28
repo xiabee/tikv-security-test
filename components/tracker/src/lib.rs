@@ -9,7 +9,7 @@ use std::time::Instant;
 use kvproto::kvrpcpb as pb;
 
 pub use self::{
-    slab::{TrackerToken, GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN},
+    slab::{TrackerToken, TrackerTokenArray, GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN},
     tls::*,
 };
 
@@ -27,6 +27,10 @@ impl Tracker {
             req_info,
             metrics: Default::default(),
         }
+    }
+
+    pub fn write_time_detail(&self, detail_v2: &mut pb::TimeDetailV2) {
+        detail_v2.set_kv_grpc_process_time_ns(self.metrics.grpc_process_nanos);
     }
 
     pub fn write_scan_detail(&self, detail_v2: &mut pb::ScanDetailV2) {
@@ -81,13 +85,17 @@ impl Tracker {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RequestInfo {
     pub region_id: u64,
     pub start_ts: u64,
     pub task_id: u64,
     pub resource_group_tag: Vec<u8>,
+
+    // Information recorded after the task is scheduled.
     pub request_type: RequestType,
+    pub cid: u64,
+    pub is_external_req: bool,
 }
 
 impl RequestInfo {
@@ -98,6 +106,8 @@ impl RequestInfo {
             task_id: ctx.get_task_id(),
             resource_group_tag: ctx.get_resource_group_tag().to_vec(),
             request_type,
+            cid: 0,
+            is_external_req: ctx.get_request_source().starts_with("external"),
         }
     }
 }
@@ -125,10 +135,13 @@ pub enum RequestType {
     CoprocessorDag,
     CoprocessorAnalyze,
     CoprocessorChecksum,
+    KvFlush,
+    KvBufferBatchGet,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct RequestMetrics {
+    pub grpc_process_nanos: u64,
     pub get_snapshot_nanos: u64,
     pub read_index_propose_wait_nanos: u64,
     pub read_index_confirm_wait_nanos: u64,
