@@ -47,7 +47,6 @@ fn test_region_meta_endpoint() {
         router,
         None,
         GrpcServiceManager::dummy(),
-        None,
     )
     .unwrap();
     let addr = format!("127.0.0.1:{}", test_util::alloc_port());

@@ -22,16 +22,6 @@ use crate::{
     RegionCacheMemoryEngine, RegionState,
 };
 
-// Cross check stops for some reason.
-#[derive(Debug)]
-pub enum StopReason {
-    RegionMetaChanged,
-    KeyGcInRocksDB,
-    TiKVSafepointGetFailed,
-}
-
-type Result<T> = std::result::Result<T, StopReason>;
-
 #[derive(Debug)]
 pub(crate) enum CrossCheckTask {
     CrossCheck,
@@ -54,7 +44,6 @@ pub(crate) struct CrossChecker {
     memory_engine: RegionCacheMemoryEngine,
     rocks_engine: RocksEngine,
     interval: Duration,
-    get_tikv_safe_point: Box<dyn Fn() -> Option<u64> + Send>,
 }
 
 impl CrossChecker {
@@ -63,29 +52,23 @@ impl CrossChecker {
         memory_engine: RegionCacheMemoryEngine,
         rocks_engine: RocksEngine,
         interval: Duration,
-        get_tikv_safe_point: Box<dyn Fn() -> Option<u64> + Send>,
     ) -> CrossChecker {
         CrossChecker {
             pd_client,
             memory_engine,
             rocks_engine,
             interval,
-            get_tikv_safe_point,
         }
     }
 
-    fn cross_check_region(
-        &self,
-        region_snap: &RegionCacheSnapshot,
-        rocks_snap: &RocksSnapshot,
-    ) -> Result<()> {
+    fn cross_check_range(&self, range_snap: &RegionCacheSnapshot, rocks_snap: &RocksSnapshot) {
         info!(
-            "ime cross check region";
-            "region" => ?region_snap.snapshot_meta().region,
+            "cross check region";
+            "region" => ?range_snap.snapshot_meta().region,
         );
         let opts = iter_option(
-            &region_snap.snapshot_meta().region.start,
-            &region_snap.snapshot_meta().region.end,
+            &range_snap.snapshot_meta().region.start,
+            &range_snap.snapshot_meta().region.end,
             false,
         );
         let mut safe_point = {
@@ -95,14 +78,14 @@ impl CrossChecker {
                 .region_manager()
                 .regions_map()
                 .read();
-            let Some(s) = region_maps.region_meta(region_snap.snapshot_meta().region.id) else {
-                return Ok(());
+            let Some(s) = region_maps.region_meta(range_snap.snapshot_meta().region.id) else {
+                return;
             };
             s.safe_point()
         };
 
         for cf in &[CF_LOCK, CF_WRITE] {
-            let mut mem_iter = region_snap.iterator_opt(cf, opts.clone()).unwrap();
+            let mut mem_iter = range_snap.iterator_opt(cf, opts.clone()).unwrap();
             let mut disk_iter = rocks_snap.iterator_opt(cf, opts.clone()).unwrap();
 
             let mem_valid = mem_iter.seek_to_first().unwrap();
@@ -113,9 +96,9 @@ impl CrossChecker {
                 let mut last_disk_user_key = vec![];
                 let mut last_disk_user_key_delete = false;
                 let mut prev_key_info = KeyCheckingInfo::default();
-                CrossChecker::check_remain_disk_key(
+                if !CrossChecker::check_remain_disk_key(
                     cf,
-                    &region_snap.snapshot_meta().region,
+                    &range_snap.snapshot_meta().region,
                     &mut safe_point,
                     &mem_iter,
                     &mut disk_iter,
@@ -123,33 +106,18 @@ impl CrossChecker {
                     &mut last_disk_user_key,
                     &mut last_disk_user_key_delete,
                     &self.memory_engine,
-                )?;
+                ) {
+                    return;
+                }
                 continue;
             }
 
             if !disk_valid {
-                if *cf != CF_LOCK {
-                    let Some(tikv_safe_point) = (self.get_tikv_safe_point)() else {
-                        return Err(StopReason::TiKVSafepointGetFailed);
-                    };
-                    // The keys in rocksdb may have been gced, so keys in ime should have mvcc
-                    // versions less or equal to the safe point of tikv.
-                    loop {
-                        let (_, mvcc) = split_ts(mem_iter.key()).unwrap();
-                        if mvcc > tikv_safe_point {
-                            break;
-                        }
-                        mem_iter.next().unwrap();
-                        if !mem_iter.valid().unwrap() {
-                            return Err(StopReason::KeyGcInRocksDB);
-                        }
-                    }
-                }
                 panic!(
-                    "ime cross check fail(key should not exist): {:?} cf not match when seek_to_first;
+                    "cross check fail(key should not exist): {:?} cf not match when seek_to_first;
                     cache_region={:?}; cache_key={:?}; sequence_numer={};",
                     cf,
-                    region_snap.snapshot_meta().region,
+                    range_snap.snapshot_meta().region,
                     log_wrappers::Value(mem_iter.key()),
                     mem_iter.sequence_number,
                 );
@@ -161,14 +129,14 @@ impl CrossChecker {
                     let start_ts = write.start_ts;
                     let (user_key, _) = split_ts(iter.key()).unwrap();
                     let default_key = Key::from_encoded(user_key.to_vec()).append_ts(start_ts);
-                    if let Ok(Some(_)) = region_snap.get_value(default_key.as_encoded()) {
+                    if let Ok(Some(_)) = range_snap.get_value(default_key.as_encoded()) {
                     } else {
                         // check again
-                        if let Ok(Some(_)) = region_snap.get_value_cf(CF_WRITE, iter.key()) {
+                        if let Ok(Some(_)) = range_snap.get_value_cf(CF_WRITE, iter.key()) {
                             panic!(
-                                "ime cross check fail(key should exist): default not found;
+                                "cross check fail(key should exist): default not found;
                                 cache_region={:?}; default_key={:?}, write_key={:?}, start_ts={}; sequence_numer={};",
-                                region_snap.snapshot_meta().region,
+                                range_snap.snapshot_meta().region,
                                 log_wrappers::Value(default_key.as_encoded()),
                                 log_wrappers::Value(iter.key()),
                                 start_ts,
@@ -227,9 +195,9 @@ impl CrossChecker {
                     Ok(write) => write,
                     Err(e) => {
                         panic!(
-                            "ime cross check fail(parse error);
+                            "cross check fail(parse error); 
                             cache_region={:?}; cache_key={:?}, cache_val={:?}; sequence_numer={}; Error={:?}",
-                            region_snap.snapshot_meta().region,
+                            range_snap.snapshot_meta().region,
                             log_wrappers::Value(mem_iter.key()),
                             log_wrappers::Value(mem_iter.value()),
                             mem_iter.sequence_number,
@@ -253,13 +221,12 @@ impl CrossChecker {
                 false,
                 &mut safe_point,
                 &self.memory_engine,
-                &region_snap.snapshot_meta().region,
+                &range_snap.snapshot_meta().region,
                 &mut prev_key_info,
                 &mut cur_key_info,
                 &mut last_disk_user_key_delete,
                 &mut last_disk_user_key,
-                &self.get_tikv_safe_point,
-            )?;
+            );
 
             if *cf == CF_WRITE {
                 check_default(&mem_iter);
@@ -272,9 +239,9 @@ impl CrossChecker {
                         Ok(write) => write,
                         Err(e) => {
                             panic!(
-                                "ime cross check fail(parse error);
+                                "cross check fail(parse error); 
                                 cache_region={:?}; cache_key={:?}, cache_val={:?}; sequence_numer={}; Error={:?}",
-                                region_snap.snapshot_meta().region,
+                                range_snap.snapshot_meta().region,
                                 log_wrappers::Value(mem_iter.key()),
                                 log_wrappers::Value(mem_iter.value()),
                                 mem_iter.sequence_number,
@@ -306,13 +273,12 @@ impl CrossChecker {
                     true,
                     &mut safe_point,
                     &self.memory_engine,
-                    &region_snap.snapshot_meta().region,
+                    &range_snap.snapshot_meta().region,
                     &mut prev_key_info,
                     &mut cur_key_info,
                     &mut last_disk_user_key_delete,
                     &mut last_disk_user_key,
-                    &self.get_tikv_safe_point,
-                )?;
+                );
 
                 if *cf == CF_WRITE {
                     check_default(&mem_iter);
@@ -320,9 +286,9 @@ impl CrossChecker {
             }
             prev_key_info = cur_key_info;
             disk_iter.next().unwrap();
-            CrossChecker::check_remain_disk_key(
+            if !CrossChecker::check_remain_disk_key(
                 cf,
-                &region_snap.snapshot_meta().region,
+                &range_snap.snapshot_meta().region,
                 &mut safe_point,
                 &mem_iter,
                 &mut disk_iter,
@@ -330,15 +296,15 @@ impl CrossChecker {
                 &mut last_disk_user_key,
                 &mut last_disk_user_key_delete,
                 &self.memory_engine,
-            )?;
+            ) {
+                return;
+            }
         }
 
         info!(
-            "ime cross check range done";
-            "region" => ?region_snap.snapshot_meta().region,
+            "cross check range done";
+            "region" => ?range_snap.snapshot_meta().region,
         );
-
-        Ok(())
     }
 
     // In-memory engine may have GCed some versions, so we should call next of
@@ -359,30 +325,18 @@ impl CrossChecker {
         cur_key_info: &mut KeyCheckingInfo,
         last_disk_user_key_delete: &mut bool,
         last_disk_user_key: &mut Vec<u8>,
-        get_tikv_safe_point: &(dyn Fn() -> Option<u64> + Send),
-    ) -> Result<()> {
+    ) -> bool {
         let read_ts = mem_iter.snapshot_read_ts;
         let mem_key = mem_iter.key();
-        if next_fisrt {
-            if !disk_iter.next().unwrap() {
-                if cf != CF_LOCK {
-                    let (_, mem_mvcc) = split_ts(mem_key).unwrap();
-                    // The keys in rocksdb may have been gced. Check the mvcc version of `mem_key`,
-                    // and if it has mvcc less or equal to the safe point of tikv, for simplicity,
-                    // break the check in such cases.
-                    if mem_mvcc <= get_tikv_safe_point().unwrap() {
-                        return Err(StopReason::KeyGcInRocksDB);
-                    }
-                }
-                panic!(
-                    "ime cross check fail(key should not exist): disk iterator next failed;
-                        cache_region={:?}; cache_key={:?}; sequence_numer={}; cf={:?}",
-                    cached_region,
-                    log_wrappers::Value(mem_key),
-                    mem_iter.sequence_number,
-                    cf,
-                );
-            }
+        if next_fisrt && !disk_iter.next().unwrap() {
+            panic!(
+                "cross check fail(key should not exist): disk iterator next failed;
+                    cache_region={:?}; cache_key={:?}; sequence_numer={}; cf={:?}",
+                cached_region,
+                log_wrappers::Value(mem_key),
+                mem_iter.sequence_number,
+                cf,
+            );
         }
 
         loop {
@@ -391,7 +345,7 @@ impl CrossChecker {
                 // CF_LOCK should always have the same view
                 if disk_key != mem_key {
                     panic!(
-                        "ime cross check fail(key not equal): lock cf not match;
+                        "cross check fail(key not equal): lock cf not match; 
                         cache_region={:?}; cache_key={:?}, disk_key={:?}; sequence_numer={};",
                         cached_region,
                         log_wrappers::Value(mem_key),
@@ -401,7 +355,7 @@ impl CrossChecker {
                 }
                 if mem_iter.value() != disk_iter.value() {
                     panic!(
-                        "ime cross check fail(value not equal): lock cf not match;
+                        "cross check fail(value not equal): lock cf not match; 
                         cache_region={:?}; key={:?}, mem_value={:?} disk_key={:?};",
                         cached_region,
                         log_wrappers::Value(mem_key),
@@ -415,7 +369,7 @@ impl CrossChecker {
             if disk_key == mem_key {
                 if mem_iter.value() != disk_iter.value() {
                     panic!(
-                        "ime cross check fail(value not equal): write cf not match;
+                        "cross check fail(value not equal): write cf not match; 
                         cache_region={:?}; key={:?}, mem_value={:?} disk_key={:?};",
                         cached_region,
                         log_wrappers::Value(mem_key),
@@ -433,7 +387,7 @@ impl CrossChecker {
                 Ok(write) => write,
                 Err(e) => {
                     panic!(
-                        "ime cross check fail(parse error);
+                        "cross check fail(parse error); 
                         cache_region={:?}; cache_key={:?}, cache_val={:?}; sequence_numer={}; Error={:?}",
                         cached_region,
                         log_wrappers::Value(mem_iter.key()),
@@ -450,7 +404,7 @@ impl CrossChecker {
                         || write.write_type == WriteType::Lock
                     {
                         info!(
-                            "ime cross check: meet gced rollback or lock";
+                            "cross check: meet gced rollback or lock";
                             "cache_key" => log_wrappers::Value(mem_key),
                             "disk_key" => log_wrappers::Value(disk_key),
                             "cache_region" => ?cached_region,
@@ -477,7 +431,7 @@ impl CrossChecker {
                                     let meta = region_maps.region_meta(cached_region.id).unwrap();
                                     // region might have split
                                     if meta.get_region() != cached_region {
-                                        return Err(StopReason::RegionMetaChanged);
+                                        return false;
                                     }
                                     assert!(meta.safe_point() >= *safe_point);
                                     meta.safe_point()
@@ -487,7 +441,7 @@ impl CrossChecker {
                             if disk_mvcc >= *safe_point {
                                 if write.write_type == WriteType::Put || disk_mvcc > *safe_point {
                                     panic!(
-                                        "ime cross check fail(key should exist): miss valid mvcc version(larger than safe point);
+                                        "cross check fail(key should exist): miss valid mvcc version(larger than safe point);
                                         cache_region={:?}; cache_key={:?}, disk_key={:?}; sequence_numer={}; read_ts={}, safe_point={}; cur_key_info={:?}",
                                         cached_region,
                                         log_wrappers::Value(mem_key),
@@ -516,7 +470,7 @@ impl CrossChecker {
                                 && write.write_type != WriteType::Lock)
                         {
                             panic!(
-                                "ime cross check fail(key should exist): miss valid mvcc version(less than safe point);
+                                "cross check fail(key should exist): miss valid mvcc version(less than safe point);
                                 cache_region={:?}; cache_key={:?}, disk_key={:?}; sequence_numer={}; read_ts={}, safe_point={}; cur_key_info={:?}",
                                 cached_region,
                                 log_wrappers::Value(mem_key),
@@ -536,14 +490,14 @@ impl CrossChecker {
                         let meta = region_maps.region_meta(cached_region.id).unwrap();
                         // region might have split
                         if meta.get_region() != cached_region {
-                            return Err(StopReason::RegionMetaChanged);
+                            return false;
                         }
                         assert!(meta.safe_point() >= *safe_point);
                         meta.safe_point()
                     };
                     if disk_mvcc > *safe_point {
                         panic!(
-                            "ime cross check fail(key should exist): keys newer than safe_point have been gced;
+                            "cross check fail(key should exist): keys newer than safe_point have been gced;
                             cache_region={:?}; disk_key={:?}; sequence_numer={}; read_ts={}, safe_point={}",
                             cached_region,
                             log_wrappers::Value(disk_key),
@@ -554,7 +508,7 @@ impl CrossChecker {
                     }
                 }
 
-                CrossChecker::check_duplicated_mvcc_version_for_last_user_key(
+                if !CrossChecker::check_duplicated_mvcc_version_for_last_user_key(
                     cf,
                     cached_region,
                     mem_iter,
@@ -567,19 +521,14 @@ impl CrossChecker {
                     last_disk_user_key,
                     last_disk_user_key_delete,
                     engine,
-                )?;
+                ) {
+                    return false;
+                }
             }
 
             if disk_key > mem_key {
-                // The keys in rocksdb may have been gced. Check the mvcc version of `mem_key`,
-                // and if it has mvcc less or equal to the safe point of tikv, for simplicity,
-                // break the check in such cases.
-                if mem_mvcc <= get_tikv_safe_point().unwrap() {
-                    return Err(StopReason::KeyGcInRocksDB);
-                }
-
                 panic!(
-                    "ime cross check fail(key should not exist): write cf not match;
+                    "cross check fail(key should not exist): write cf not match;
                     cache_region={:?}; cache_key={:?}, disk_key={:?}; sequence_numer={}; read_ts={}, safe_point={}",
                     cached_region,
                     log_wrappers::Value(mem_key),
@@ -593,11 +542,13 @@ impl CrossChecker {
             assert!(disk_iter.next().unwrap());
         }
 
-        Ok(())
+        true
     }
 
     // IME iterator has reached to end, now check the validity of the remaining keys
     // in rocksdb iterator.
+    // Return false means the range has been evicted, and for simplicity, stop the
+    // check.
     fn check_remain_disk_key(
         cf: &&str,
         cached_region: &CacheRegion,
@@ -608,12 +559,12 @@ impl CrossChecker {
         last_disk_user_key: &mut Vec<u8>,
         last_disk_user_key_delete: &mut bool,
         engine: &RegionCacheMemoryEngine,
-    ) -> Result<()> {
+    ) -> bool {
         while disk_iter.valid().unwrap() {
             // IME and rocks enigne should have the same data view for CF_LOCK
             if *cf == CF_LOCK {
                 panic!(
-                    "ime cross check fail(key should exist): lock cf not match;
+                    "cross check fail(key should exist): lock cf not match; 
                     cache_region={:?}; disk_key={:?}; sequence_numer={};",
                     cached_region,
                     log_wrappers::Value(disk_iter.key()),
@@ -632,14 +583,14 @@ impl CrossChecker {
                     let meta = region_maps.region_meta(cached_region.id).unwrap();
                     // region might have split
                     if meta.get_region() != cached_region {
-                        return Err(StopReason::RegionMetaChanged);
+                        return false;
                     }
                     assert!(meta.safe_point() >= *safe_point);
                     meta.safe_point()
                 };
                 if disk_mvcc > *safe_point {
                     panic!(
-                        "ime cross check fail(key should exist): write cf not match;
+                        "cross check fail(key should exist): write cf not match;
                         cache_region={:?}; disk_key={:?}, disk_mvcc={}; sequence_numer={}; prev_key_info={:?}",
                         cached_region,
                         log_wrappers::Value(disk_iter.key()),
@@ -653,7 +604,7 @@ impl CrossChecker {
                 Ok(write) => write,
                 Err(e) => {
                     panic!(
-                        "ime cross check fail(parse error);
+                        "cross check fail(parse error); 
                         cache_region={:?}; cache_key={:?}, cache_val={:?}; sequence_numer={}; Error={:?}",
                         cached_region,
                         log_wrappers::Value(mem_iter.key()),
@@ -664,7 +615,7 @@ impl CrossChecker {
                 }
             };
 
-            CrossChecker::check_duplicated_mvcc_version_for_last_user_key(
+            if !CrossChecker::check_duplicated_mvcc_version_for_last_user_key(
                 cf,
                 cached_region,
                 mem_iter,
@@ -677,12 +628,14 @@ impl CrossChecker {
                 last_disk_user_key,
                 last_disk_user_key_delete,
                 engine,
-            )?;
+            ) {
+                return false;
+            };
 
             disk_iter.next().unwrap();
         }
 
-        Ok(())
+        true
     }
 
     // mem_iter has pointed to the next user key whereas disk_iter still has some
@@ -701,16 +654,16 @@ impl CrossChecker {
         last_disk_user_key: &mut Vec<u8>,
         last_disk_user_key_delete: &mut bool,
         engine: &RegionCacheMemoryEngine,
-    ) -> Result<()> {
+    ) -> bool {
         if write.write_type == WriteType::Rollback || write.write_type == WriteType::Lock {
             info!(
-                "ime meet gced rollback or lock";
+                "meet gced rollback or lock";
                 "disk_key" => log_wrappers::Value(disk_key),
                 "cache_region" => ?cached_region,
                 "seqno" => mem_iter.sequence_number,
                 "cf" => ?cf,
             );
-            return Ok(());
+            return true;
         }
 
         if disk_user_key == prev_key_info.user_key {
@@ -730,7 +683,7 @@ impl CrossChecker {
                     let meta = region_maps.region_meta(cached_region.id).unwrap();
                     // region might have split
                     if meta.get_region() != cached_region {
-                        return Err(StopReason::RegionMetaChanged);
+                        return false;
                     }
                     assert!(meta.safe_point() >= *safe_point);
                     meta.safe_point()
@@ -747,7 +700,7 @@ impl CrossChecker {
                         *last_disk_user_key_delete = true;
                     } else {
                         panic!(
-                            "ime cross check fail(key should exist): miss valid mvcc version;
+                            "cross check fail(key should exist): miss valid mvcc version;
                             cache_region={:?}; disk_key={:?}; sequence_numer={}; read_ts={}, safe_point={}; prev_key_info={:?}",
                             cached_region,
                             log_wrappers::Value(disk_key),
@@ -764,7 +717,7 @@ impl CrossChecker {
                         || write.write_type == WriteType::Lock
                     {
                         info!(
-                            "ime meet gced rollback or lock";
+                            "meet gced rollback or lock";
                             "disk_key" => log_wrappers::Value(disk_key),
                             "cache_region" => ?cached_region,
                             "seqno" => mem_iter.sequence_number,
@@ -772,7 +725,7 @@ impl CrossChecker {
                         );
                     } else {
                         panic!(
-                            "ime cross check fail(key should exist): miss valid mvcc version;
+                            "cross check fail(key should exist): miss valid mvcc version;
                             cache_region={:?}; disk_key={:?}; sequence_numer={}; read_ts={}, safe_point={}",
                             cached_region,
                             log_wrappers::Value(disk_key),
@@ -801,7 +754,7 @@ impl CrossChecker {
                     *last_disk_user_key_delete = true;
                 } else {
                     panic!(
-                        "ime cross check fail(key should exist): miss valid mvcc version;
+                        "cross check fail(key should exist): miss valid mvcc version;
                         cache_region={:?}; disk_key={:?}; sequence_numer={}; read_ts={}, safe_point={}",
                         cached_region,
                         log_wrappers::Value(disk_key),
@@ -813,7 +766,7 @@ impl CrossChecker {
             }
         }
 
-        Ok(())
+        true
     }
 }
 
@@ -848,7 +801,7 @@ impl Runnable for CrossChecker {
             Ok(Ok(ts)) => ts,
             err => {
                 error!(
-                    "ime schedule gc failed ";
+                    "schedule range cache engine gc failed ";
                     "timeout_duration" => ?tso_timeout,
                     "error" => ?err,
                 );
@@ -870,7 +823,7 @@ impl Runnable for CrossChecker {
                     Ok(range_snap) => Some(range_snap),
                     Err(_) => {
                         warn!(
-                            "ime failed to get snap in cross check";
+                            "failed to get snap in cross check";
                             "range" => ?range,
                         );
                         None
@@ -885,17 +838,11 @@ impl Runnable for CrossChecker {
 
         let now = Instant::now();
 
-        ranges_to_audit.into_iter().for_each(|r| {
-            if let Err(e) = self.cross_check_region(&r, &snap) {
-                info!(
-                    "ime cross check stopped";
-                    "reason" => ?e,
-                    "region" => ?r.snapshot_meta().region,
-                );
-            }
-        });
+        ranges_to_audit
+            .into_iter()
+            .for_each(|r| self.cross_check_range(&r, &snap));
         info!(
-            "ime cross check finished";
+            "cross check finished";
             "duration" => ?now.saturating_elapsed(),
         );
     }
@@ -962,7 +909,6 @@ mod tests {
     use tikv_util::{config::VersionTrack, store::new_peer};
     use txn_types::{Key, TimeStamp, Write, WriteType};
 
-    use super::Result;
     use crate::{
         cross_check::CrossChecker, InMemoryEngineConfig, InMemoryEngineContext,
         RegionCacheMemoryEngine, RegionCacheWriteBatch,
@@ -994,10 +940,7 @@ mod tests {
         }
     }
 
-    fn cross_check<F>(
-        prepare_data: F,
-        get_tikv_safe_point: Option<Box<dyn Fn() -> Option<u64> + Send>>,
-    ) -> Result<()>
+    fn cross_check<F>(prepare_data: F)
     where
         F: FnOnce(&mut RegionCacheWriteBatch, &mut RocksWriteBatchVec),
     {
@@ -1049,12 +992,11 @@ mod tests {
             engine.clone(),
             rocks_engine.clone(),
             Duration::from_secs(100000),
-            get_tikv_safe_point.unwrap_or(Box::new(|| None)),
         );
 
         {
             let mut wb = engine.write_batch();
-            wb.prepare_for_region(&region);
+            wb.prepare_for_region(cache_region.clone());
             let mut disk_wb = rocks_engine.write_batch();
 
             prepare_data(&mut wb, &mut disk_wb);
@@ -1066,7 +1008,7 @@ mod tests {
             let snap = engine.snapshot(cache_region.clone(), 10, 10000).unwrap();
             let disk_snap = rocks_engine.snapshot();
 
-            cross_checker.cross_check_region(&snap, &disk_snap)
+            cross_checker.cross_check_range(&snap, &disk_snap);
         }
     }
 
@@ -1082,360 +1024,271 @@ mod tests {
         // Safe point: 6
         // IME:
         // Disk: k1-4-r,
-        cross_check(
-            |_wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 4, WriteType::Rollback);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+        cross_check(|_wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 4, WriteType::Rollback);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:
         // Disk: k1-4-d,
-        cross_check(
-            |_wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 4, WriteType::Delete);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+        cross_check(|_wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 4, WriteType::Delete);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:
         // Disk: k1-4-d, k1-3
-        cross_check(
-            |_wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 4, WriteType::Delete);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|_wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 4, WriteType::Delete);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 3, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-1", 3, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:
         // Disk: k1-5-r, k1-4-d, k1-3
-        cross_check(
-            |_wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 5, WriteType::Rollback);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|_wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 5, WriteType::Rollback);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Delete);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Delete);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 3, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-1", 3, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:  k1-9, k1-5,
         // Disk: k1-9, k1-5, k1-4, k1-2
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:  k2-5,
         // Disk: k2-5, k2-4, k2-2
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-2", 5, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-2", 5, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:  k1-5,       k2-4,       k3-4,       k4-4
         // Disk: k1-5, k1-3, k2-4, k2-2, k3-4, k3-2, k4-4, k4-2
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 5, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 5, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 3, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 3, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 4, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 4, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-3", 4, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-3", 4, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-3", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-3", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-4", 4, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-4", 4, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-4", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-4", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:  k1-9, k1-5,             k2-7
         // Disk: k1-9, k1-5, k1-4, k1-2, k2-7,
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Temporary state in GC: k1-4 is filtered
         // Safe point: 6
         // IME:  k1-9, k1-5-d,       k1-2  k2-7
         // Disk: k1-9, k1-5-d, k1-4, k1-2, k2-7,
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Delete);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Delete);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:  k1-9,                     k2-7
         // Disk: k1-9, k1-5-d, k1-4, k1-2, k2-7,
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Delete);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Delete);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:  k1-9, k1-5,                           k3-7
         // Disk: k1-9, k1-5, k1-4, k1-2, k2-4-d, k2-3, k3-7
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 4, WriteType::Delete);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 4, WriteType::Delete);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 3, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 3, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-3", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-3", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:  k1-9,                     k2-4-d        k2-1 k3-7
         // Disk: k1-9, k1-5-d, k1-4, k1-2, k2-4-d, k2-3, k2-1 k3-7
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Delete);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Delete);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 4, WriteType::Delete);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 4, WriteType::Delete);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 3, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 3, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 2, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 2, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-3", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-3", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
 
         // Safe point: 6
         // IME:  k1-9,                                   k3-7
         // Disk: k1-9, k1-5-d, k1-4, k1-2, k2-4-d, k2-3, k3-7
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 4, WriteType::Delete);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 4, WriteType::Delete);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 3, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-2", 3, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-3", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn test_keys_are_gced_in_rocksdb() {
-        // TiKV Safe point: 6
-        // IME:  k1-4-d, k1-3
-        // Disk:
-        cross_check(
-            |wb, _| {
-                let (k, v) = write_key(b"k-1", 4, WriteType::Delete);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-
-                let (k, v) = write_key(b"k-1", 3, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            Some(Box::new(|| Some(6))),
-        )
-        .unwrap_err();
-
-        // TiKV Safe point: 6
-        // IME:  k1-6, k1-4-d, k1-3
-        // Disk: k1-6
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 6, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-
-                let (k, v) = write_key(b"k-1", 4, WriteType::Delete);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-
-                let (k, v) = write_key(b"k-1", 3, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            Some(Box::new(|| Some(6))),
-        )
-        .unwrap_err();
+            let (k, v) = write_key(b"k-3", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1444,29 +1297,25 @@ mod tests {
         // Safe point: 6
         // IME:  k1-9, k1-5-r,             k2-7
         // Disk: k1-9, k1-5-r, k1-4, k1-2, k2-7,
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Rollback);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Rollback);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1475,29 +1324,25 @@ mod tests {
         // Safe point: 6
         // IME:  k1-9,       k1-4,       k2-7
         // Disk: k1-9, k1-5, k1-4, k1-2, k2-7,
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1506,27 +1351,23 @@ mod tests {
         // Safe point: 6
         // IME:  k1-9,
         // Disk: k1-9, k1-5, k1-4, k1-2, k-2-7
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 5, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 5, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 2, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            let (k, v) = write_key(b"k-1", 2, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 7, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 7, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1535,18 +1376,14 @@ mod tests {
         // Safe point: 6
         // IME:        k2-7
         // Disk: k1-9, k2-7,
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1555,14 +1392,10 @@ mod tests {
         // Safe point: 6
         // IME:
         // Disk: k1-9,
-        cross_check(
-            |_wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+        cross_check(|_wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1571,14 +1404,10 @@ mod tests {
         // Safe point: 6
         // IME:
         // Disk: k1-4,
-        cross_check(
-            |_wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 4, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+        cross_check(|_wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 4, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1587,17 +1416,13 @@ mod tests {
         // Safe point: 6
         // IME:
         // Disk: k1-4-r, k1-3
-        cross_check(
-            |_wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 4, WriteType::Rollback);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|_wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 4, WriteType::Rollback);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-1", 3, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-1", 3, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1606,14 +1431,10 @@ mod tests {
         // Safe point: 6
         // IME:  k1-4
         // Disk:
-        cross_check(
-            |wb, _disk_wb| {
-                let (k, v) = write_key(b"k-1", 4, WriteType::Rollback);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+        cross_check(|wb, _disk_wb| {
+            let (k, v) = write_key(b"k-1", 4, WriteType::Rollback);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1622,14 +1443,10 @@ mod tests {
         // Safe point: 6
         // IME:  k1-7, k2-4
         // Disk: k1-7
-        cross_check(
-            |wb, _disk_wb| {
-                let (k, v) = write_key(b"k-1", 4, WriteType::Rollback);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+        cross_check(|wb, _disk_wb| {
+            let (k, v) = write_key(b"k-1", 4, WriteType::Rollback);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 
     #[test]
@@ -1638,17 +1455,13 @@ mod tests {
         // Safe point: 6
         // IME:        k2-7
         // Disk: k1-9, k2-7,
-        cross_check(
-            |wb, disk_wb| {
-                let (k, v) = write_key(b"k-1", 9, WriteType::Put);
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        cross_check(|wb, disk_wb| {
+            let (k, v) = write_key(b"k-1", 9, WriteType::Put);
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
 
-                let (k, v) = write_key(b"k-2", 7, WriteType::Put);
-                wb.put_cf(CF_WRITE, &k, &v).unwrap();
-                disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
-            },
-            None,
-        )
-        .unwrap();
+            let (k, v) = write_key(b"k-2", 7, WriteType::Put);
+            wb.put_cf(CF_WRITE, &k, &v).unwrap();
+            disk_wb.put_cf(CF_WRITE, &k, &v).unwrap();
+        });
     }
 }

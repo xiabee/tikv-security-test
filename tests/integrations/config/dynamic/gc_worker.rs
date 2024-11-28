@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use raftstore::coprocessor::{region_info_accessor::MockRegionInfoProvider, CoprocessorHost};
+use raftstore::coprocessor::region_info_accessor::MockRegionInfoProvider;
 use tikv::{
     config::{ConfigController, Module, TikvConfig},
     server::gc_worker::{GcConfig, GcTask, GcWorker},
@@ -35,8 +35,7 @@ fn setup_cfg_controller(
         Default::default(),
         Arc::new(MockRegionInfoProvider::new(Vec::new())),
     );
-    let coprocessor_host = CoprocessorHost::default();
-    gc_worker.start(0, coprocessor_host).unwrap();
+    gc_worker.start(0).unwrap();
 
     let cfg_controller = ConfigController::new(cfg);
     cfg_controller.register(Module::Gc, Box::new(gc_worker.get_config_manager()));

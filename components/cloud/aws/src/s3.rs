@@ -2,50 +2,33 @@
 use std::{
     error::Error as StdError,
     io,
-    pin::Pin,
     time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
-use aws_config::{sts::AssumeRoleProvider, BehaviorVersion, Region, SdkConfig};
-use aws_credential_types::{provider::ProvideCredentials, Credentials};
-use aws_sdk_s3::{
-    config::HttpClient,
-    operation::get_object::GetObjectError,
-    types::{CompletedMultipartUpload, CompletedPart},
-    Client,
-};
-use bytes::Bytes;
 use cloud::{
-    blob::{
-        none_to_empty, BlobConfig, BlobObject, BlobStorage, BucketConf, DeletableStorage,
-        IterableStorage, PutResource, StringNonEmpty,
-    },
+    blob::{none_to_empty, BlobConfig, BlobStorage, BucketConf, PutResource, StringNonEmpty},
     metrics::CLOUD_REQUEST_HISTOGRAM_VEC,
 };
 use fail::fail_point;
-use futures::{executor::block_on, stream::Stream};
 use futures_util::{
-    future::{FutureExt, LocalBoxFuture},
+    future::FutureExt,
     io::{AsyncRead, AsyncReadExt},
     stream::TryStreamExt,
-    StreamExt,
 };
 pub use kvproto::brpb::S3 as InputConfig;
+use rusoto_core::{request::DispatchSignedRequest, ByteStream, RusotoError};
+use rusoto_credential::{ProvideAwsCredentials, StaticProvider};
+use rusoto_s3::{util::AddressingStyle, *};
+use rusoto_sts::{StsAssumeRoleSessionCredentialsProvider, StsClient};
 use thiserror::Error;
-use tikv_util::{
-    debug,
-    stream::{error_stream, RetryError},
-    time::Instant,
-};
+use tikv_util::{debug, stream::error_stream, time::Instant};
 use tokio::time::{sleep, timeout};
-use tokio_util::io::ReaderStream;
 
-use crate::util::{self, retry_and_count, SdkError};
+use crate::util::{self, retry_and_count};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(900);
 pub const STORAGE_VENDOR_NAME_AWS: &str = "aws";
-const DEFAULT_SEP: char = '/';
 
 #[derive(Clone)]
 pub struct AccessKeyPair {
@@ -152,15 +135,10 @@ impl BlobConfig for Config {
     }
 }
 
-pub struct S3CompletedPart {
-    pub e_tag: Option<String>,
-    pub part_number: i32,
-}
-
 #[derive(Clone)]
 pub struct S3Storage {
     config: Config,
-    client: Client,
+    client: S3Client,
 }
 
 impl S3Storage {
@@ -177,197 +155,129 @@ impl S3Storage {
     }
 
     /// Create a new S3 storage for the given config.
-    pub fn new(config: Config) -> io::Result<Self> {
-        let client = util::new_http_client();
-        Self::new_with_client(config, client)
+    pub fn new(config: Config) -> io::Result<S3Storage> {
+        Self::with_request_dispatcher(config, util::new_http_client()?)
     }
 
-    fn new_with_client<Http>(config: Config, client: Http) -> io::Result<Self>
-    where
-        Http: HttpClient + Clone + 'static,
-    {
-        // static credentials are used with minio
-        if let Some(access_key_pair) = &config.access_key_pair {
-            let creds = Credentials::from_keys(
-                (*access_key_pair.access_key).to_owned(),
-                (*access_key_pair.secret_access_key).to_owned(),
-                access_key_pair
-                    .session_token
-                    .as_deref()
-                    .map(|s| s.to_owned()),
-            );
-            Self::maybe_assume_role(config, client, creds)
-        } else {
-            let creds = util::new_credentials_provider(client.clone());
-            Self::maybe_assume_role(config, client, creds)
-        }
-    }
-
-    fn maybe_assume_role<Creds, Http>(
+    fn new_creds_dispatcher<Creds, Dispatcher>(
         config: Config,
-        client: Http,
+        dispatcher: Dispatcher,
         credentials_provider: Creds,
-    ) -> io::Result<Self>
+    ) -> io::Result<S3Storage>
     where
-        Http: HttpClient + 'static,
-        Creds: ProvideCredentials + 'static,
+        Creds: ProvideAwsCredentials + Send + Sync + 'static,
+        Dispatcher: DispatchSignedRequest + Send + Sync + 'static,
+    {
+        let bucket_region = none_to_empty(config.bucket.region.clone());
+        let bucket_endpoint = config.bucket.endpoint.clone();
+        let region = util::get_region(&bucket_region, &none_to_empty(bucket_endpoint))?;
+        let mut client = S3Client::new_with(dispatcher, credentials_provider, region);
+        if config.force_path_style {
+            client.config_mut().addressing_style = AddressingStyle::Path;
+        }
+        Ok(S3Storage { config, client })
+    }
+
+    fn maybe_assume_role<P, D>(
+        config: Config,
+        cred_provider: P,
+        dispatcher: D,
+    ) -> io::Result<S3Storage>
+    where
+        P: ProvideAwsCredentials + Send + Sync + 'static,
+        D: DispatchSignedRequest + Send + Sync + 'static,
     {
         if config.role_arn.is_some() {
+            // try use role arn anyway with current creds when it's not nil.
+            let bucket_region = none_to_empty(config.bucket.region.clone());
+            let bucket_endpoint = config.bucket.endpoint.clone();
+            let region = util::get_region(&bucket_region, &none_to_empty(bucket_endpoint))?;
+            // cannot use the same dispatcher because of move, so use another http client.
+            let sts = StsClient::new_with(util::new_http_client()?, cred_provider, region);
             let duration_since_epoch = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap();
             let timestamp_secs = duration_since_epoch.as_secs();
-
-            let mut builder = AssumeRoleProvider::builder(config.role_arn.as_deref().unwrap())
-                .session_name(format!("{}", timestamp_secs));
-
-            if let Some(external_id) = &config.external_id {
-                builder = builder.external_id(external_id.as_str());
-            }
-
-            if let Some(region) = &config.bucket.region {
-                builder = builder.region(Region::new(region.to_string()));
-            }
-
-            let credentials_provider: io::Result<AssumeRoleProvider> = block_on(async {
-                let sdk_config =
-                    Self::load_sdk_config(&config, util::new_http_client(), credentials_provider)
-                        .await?;
-                builder = builder.configure(&sdk_config);
-                Ok(builder.build().await)
-            });
-            Self::new_with_creds_client(config, client, credentials_provider?)
+            let cred_provider = StsAssumeRoleSessionCredentialsProvider::new(
+                sts,
+                String::clone(config.role_arn.as_deref().unwrap()),
+                format!("{}", timestamp_secs),
+                config.external_id.as_deref().cloned(),
+                // default duration is 15min
+                None,
+                None,
+                None,
+            );
+            Self::new_creds_dispatcher(config, dispatcher, cred_provider)
         } else {
             // or just use original cred_provider to access s3.
-            Self::new_with_creds_client(config, client, credentials_provider)
+            Self::new_creds_dispatcher(config, dispatcher, cred_provider)
         }
     }
 
-    async fn load_sdk_config<Http, Creds>(
-        config: &Config,
-        client: Http,
-        creds: Creds,
-    ) -> io::Result<SdkConfig>
+    pub fn with_request_dispatcher<D>(config: Config, dispatcher: D) -> io::Result<S3Storage>
     where
-        Http: HttpClient + 'static,
-        Creds: ProvideCredentials + 'static,
+        D: DispatchSignedRequest + Send + Sync + 'static,
     {
-        let bucket_region = none_to_empty(config.bucket.region.clone());
-        let bucket_endpoint = none_to_empty(config.bucket.endpoint.clone());
-
-        let mut loader =
-            aws_config::defaults(BehaviorVersion::latest()).credentials_provider(creds);
-
-        loader = util::configure_region(loader, &bucket_region, !bucket_endpoint.is_empty())?;
-        loader = util::configure_endpoint(loader, &bucket_endpoint);
-        loader = loader.http_client(client);
-        Ok(loader.load().await)
-    }
-
-    fn new_with_creds_client<Creds, Http>(
-        config: Config,
-        client: Http,
-        credentials_provider: Creds,
-    ) -> io::Result<Self>
-    where
-        Http: HttpClient + 'static,
-        Creds: ProvideCredentials + 'static,
-    {
-        block_on(Self::new_with_creds_client_async(
-            config,
-            client,
-            credentials_provider,
-        ))
-    }
-
-    async fn new_with_creds_client_async<Creds, Http>(
-        config: Config,
-        client: Http,
-        credentials_provider: Creds,
-    ) -> io::Result<Self>
-    where
-        Http: HttpClient + 'static,
-        Creds: ProvideCredentials + 'static,
-    {
-        let sdk_config = Self::load_sdk_config(&config, client, credentials_provider).await?;
-
-        let mut builder = aws_sdk_s3::config::Builder::from(&sdk_config);
-        builder.set_force_path_style(Some(config.force_path_style));
-
-        let client = Client::from_conf(builder.build());
-
-        Ok(S3Storage { config, client })
+        // static credentials are used with minio
+        if let Some(access_key_pair) = &config.access_key_pair {
+            let cred_provider = StaticProvider::new(
+                (*access_key_pair.access_key).to_owned(),
+                (*access_key_pair.secret_access_key).to_owned(),
+                access_key_pair.session_token.as_deref().cloned(),
+                None,
+            );
+            Self::maybe_assume_role(config, cred_provider, dispatcher)
+        } else {
+            let cred_provider = util::CredentialsProvider::new()?;
+            Self::maybe_assume_role(config, cred_provider, dispatcher)
+        }
     }
 
     fn maybe_prefix_key(&self, key: &str) -> String {
         if let Some(prefix) = &self.config.bucket.prefix {
-            return format!("{}{}{}", *prefix, DEFAULT_SEP, key);
+            return format!("{}/{}", *prefix, key);
         }
         key.to_owned()
-    }
-
-    fn strip_prefix_if_needed(&self, key: String) -> String {
-        if let Some(prefix) = &self.config.bucket.prefix {
-            if key.starts_with(prefix.as_str()) {
-                return key[prefix.len()..]
-                    .trim_start_matches(DEFAULT_SEP)
-                    .to_owned();
-            }
-        }
-        key
     }
 
     fn get_range(&self, name: &str, range: Option<String>) -> cloud::blob::BlobStream<'_> {
         let key = self.maybe_prefix_key(name);
         let bucket = self.config.bucket.bucket.clone();
         debug!("read file from s3 storage"; "key" => %key);
-
-        let async_read = self
-            .client
-            .get_object()
-            .key(key.clone())
-            .bucket((*bucket).clone())
-            .set_range(range)
-            .send()
-            .map(move |fut| {
-                let stream: Box<dyn Stream<Item = io::Result<Bytes>> + Unpin + Send> = match fut {
-                    Ok(out) => Box::new(ReaderStream::new(out.body.into_async_read())),
-                    Err(SdkError::ServiceError(service_err)) => match service_err.err() {
-                        GetObjectError::NoSuchKey(_) => create_error_stream(
+        let req = GetObjectRequest {
+            key,
+            bucket: (*bucket).clone(),
+            range,
+            ..Default::default()
+        };
+        Box::new(
+            self.client
+                .get_object(req)
+                .map(move |future| match future {
+                    Ok(out) => out.body.unwrap(),
+                    Err(RusotoError::Service(GetObjectError::NoSuchKey(key))) => {
+                        ByteStream::new(error_stream(io::Error::new(
                             io::ErrorKind::NotFound,
                             format!("no key {} at bucket {}", key, *bucket),
-                        ),
-                        _ => create_error_stream(
-                            io::ErrorKind::Other,
-                            format!("failed to get object {:?}", service_err),
-                        ),
-                    },
-                    Err(e) => create_error_stream(
+                        )))
+                    }
+                    Err(e) => ByteStream::new(error_stream(io::Error::new(
                         io::ErrorKind::Other,
                         format!("failed to get object {}", e),
-                    ),
-                };
-                stream
-            })
-            .flatten_stream()
-            .into_async_read();
-
-        Box::new(Box::pin(async_read))
+                    ))),
+                })
+                .flatten_stream()
+                .into_async_read(),
+        )
     }
-}
-
-fn create_error_stream(
-    kind: io::ErrorKind,
-    msg: String,
-) -> Box<dyn Stream<Item = io::Result<Bytes>> + Unpin + Send + Sync> {
-    Box::new(error_stream(io::Error::new(kind, msg)))
 }
 
 /// A helper for uploading a large files to S3 storage.
 ///
 /// Note: this uploader does not support uploading files larger than 19.5 GiB.
 struct S3Uploader<'client> {
-    client: &'client Client,
+    client: &'client S3Client,
 
     bucket: String,
     key: String,
@@ -379,36 +289,23 @@ struct S3Uploader<'client> {
     object_lock_enabled: bool,
 
     upload_id: String,
-    parts: Vec<S3CompletedPart>,
+    parts: Vec<CompletedPart>,
 }
 
 /// The errors a uploader can meet.
 /// This was made for make the result of [S3Uploader::run] get [Send].
 #[derive(Debug, Error)]
-pub enum UploadError {
+enum UploadError {
     #[error("io error {0}")]
     Io(#[from] io::Error),
-    #[error("aws-sdk error: {msg}")]
+    #[error("rusoto error {0}")]
     // Maybe make it a trait if needed?
-    Sdk { msg: String, retryable: bool },
+    Rusoto(String),
 }
 
-impl RetryError for UploadError {
-    fn is_retryable(&self) -> bool {
-        match self {
-            UploadError::Io(_) => false,
-            UploadError::Sdk { msg: _, retryable } => *retryable,
-        }
-    }
-}
-
-impl<T: 'static + StdError> From<SdkError<T>> for UploadError {
-    fn from(err: SdkError<T>) -> Self {
-        let msg = format!("{:?}", err);
-        Self::Sdk {
-            msg,
-            retryable: util::is_retryable(&err),
-        }
+impl<T: 'static + StdError> From<RusotoError<T>> for UploadError {
+    fn from(r: RusotoError<T>) -> Self {
+        Self::Rusoto(format!("{}", r))
     }
 }
 
@@ -449,7 +346,7 @@ const MINIMUM_PART_SIZE: usize = 5 * 1024 * 1024;
 impl<'client> S3Uploader<'client> {
     /// Creates a new uploader with a given target location and upload
     /// configuration.
-    fn new(client: &'client Client, config: &Config, key: String) -> Self {
+    fn new(client: &'client S3Client, config: &Config, key: String) -> Self {
         Self {
             client,
             key,
@@ -475,7 +372,7 @@ impl<'client> S3Uploader<'client> {
             // For short files, execute one put_object to upload the entire thing.
             let mut data = Vec::with_capacity(est_len as usize);
             reader.read_to_end(&mut data).await?;
-            Box::pin(retry_and_count(|| self.upload(&data), "upload_small_file")).await?;
+            retry_and_count(|| self.upload(&data), "upload_small_file").await?;
             Ok(())
         } else {
             // Otherwise, use multipart upload to improve robustness.
@@ -510,92 +407,76 @@ impl<'client> S3Uploader<'client> {
     }
 
     /// Starts a multipart upload process.
-    async fn begin(&self) -> Result<String, UploadError> {
-        let request = async {
+    async fn begin(&self) -> Result<String, RusotoError<CreateMultipartUploadError>> {
+        match timeout(
+            Self::get_timeout(),
             self.client
-                .create_multipart_upload()
-                .bucket(self.bucket.clone())
-                .key(&self.key)
-                .set_acl(self.acl.as_ref().map(|s| s.as_str().into()))
-                .set_server_side_encryption(
-                    self.server_side_encryption
+                .create_multipart_upload(CreateMultipartUploadRequest {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    acl: self.acl.as_ref().map(|s| s.to_string()),
+                    server_side_encryption: self
+                        .server_side_encryption
                         .as_ref()
-                        .map(|s| s.as_str().into()),
+                        .map(|s| s.to_string()),
+                    ssekms_key_id: self.sse_kms_key_id.as_ref().map(|s| s.to_string()),
+                    storage_class: self.storage_class.as_ref().map(|s| s.to_string()),
+                    ..Default::default()
+                }),
+        )
+        .await
+        {
+            Ok(output) => output?.upload_id.ok_or_else(|| {
+                RusotoError::ParseError(
+                    "missing upload-id from create_multipart_upload()".to_owned(),
                 )
-                .set_ssekms_key_id(self.sse_kms_key_id.as_ref().map(|s| s.to_string()))
-                .set_storage_class(self.storage_class.as_ref().map(|s| s.as_str().into()))
-                .send()
-                .await?
-                .upload_id()
-                .ok_or_else(|| UploadError::Sdk {
-                    msg: "missing upload-id from create_multipart_upload()".to_owned(),
-                    retryable: false,
-                })
-                .map(|s| s.into())
-        };
-        timeout(Self::get_timeout(), request)
-            .await
-            .map_err(|_| UploadError::Sdk {
-                msg: "timeout after 15mins for begin in s3 storage".to_owned(),
-                retryable: false,
-            })?
+            }),
+            Err(_) => Err(RusotoError::ParseError(
+                "timeout after 15mins for begin in s3 storage".to_owned(),
+            )),
+        }
     }
 
     /// Completes a multipart upload process, asking S3 to join all parts into a
     /// single file.
-    async fn complete(&self) -> Result<(), UploadError> {
-        let request = async {
-            let aws_parts: Vec<_> = self
-                .parts
-                .iter()
-                .map(|p| {
-                    CompletedPart::builder()
-                        .part_number(p.part_number)
-                        .set_e_tag(p.e_tag.clone())
-                        .build()
-                })
-                .collect();
-
+    async fn complete(&self) -> Result<(), RusotoError<CompleteMultipartUploadError>> {
+        let res = timeout(
+            Self::get_timeout(),
             self.client
-                .complete_multipart_upload()
-                .bucket(self.bucket.clone())
-                .key(&self.key)
-                .upload_id(&self.upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(aws_parts))
-                        .build(),
-                )
-                .send()
-                .await?;
-            Ok(())
-        };
-        timeout(Self::get_timeout(), request)
-            .await
-            .map_err(|_| UploadError::Sdk {
-                msg: "timeout after 15mins for upload in s3 storage".to_owned(),
-                retryable: false,
-            })?
+                .complete_multipart_upload(CompleteMultipartUploadRequest {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    upload_id: self.upload_id.clone(),
+                    multipart_upload: Some(CompletedMultipartUpload {
+                        parts: Some(self.parts.clone()),
+                    }),
+                    ..Default::default()
+                }),
+        )
+        .await
+        .map_err(|_| {
+            RusotoError::ParseError("timeout after 15mins for complete in s3 storage".to_owned())
+        })?;
+        res.map(|_| ())
     }
 
     /// Aborts the multipart upload process, deletes all uploaded parts.
-    async fn abort(&self) -> Result<(), UploadError> {
-        let request = async {
+    async fn abort(&self) -> Result<(), RusotoError<AbortMultipartUploadError>> {
+        let res = timeout(
+            Self::get_timeout(),
             self.client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(&self.upload_id)
-                .send()
-                .await?;
-            Ok(())
-        };
-        timeout(Self::get_timeout(), request)
-            .await
-            .map_err(|_| UploadError::Sdk {
-                msg: "timeout after 15mins for upload in s3 storage".to_owned(),
-                retryable: false,
-            })?
+                .abort_multipart_upload(AbortMultipartUploadRequest {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    upload_id: self.upload_id.clone(),
+                    ..Default::default()
+                }),
+        )
+        .await
+        .map_err(|_| {
+            RusotoError::ParseError("timeout after 15mins for abort in s3 storage".to_owned())
+        })?;
+        res.map(|_| ())
     }
 
     /// Uploads a part of the file.
@@ -605,106 +486,93 @@ impl<'client> S3Uploader<'client> {
         &self,
         part_number: i64,
         data: &[u8],
-    ) -> Result<S3CompletedPart, UploadError> {
-        let request = async {
-            let result = self
-                .client
-                .upload_part()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(&self.upload_id)
-                .part_number(part_number as i32)
-                .content_length(data.len() as i64)
-                .set_content_md5(get_content_md5(self.object_lock_enabled, data))
-                .body(data.to_vec().into())
-                .send()
-                .await?;
-            Ok(S3CompletedPart {
-                e_tag: result.e_tag().map(|t| t.into()),
-                part_number: part_number as i32,
-            })
-        };
-        timeout(Self::get_timeout(), async {
+    ) -> Result<CompletedPart, RusotoError<UploadPartError>> {
+        let res = timeout(Self::get_timeout(), async {
             let start = Instant::now();
-            let result = request.await;
+            let r = self
+                .client
+                .upload_part(UploadPartRequest {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    upload_id: self.upload_id.clone(),
+                    part_number,
+                    content_length: Some(data.len() as i64),
+                    content_md5: get_content_md5(self.object_lock_enabled, data),
+                    body: Some(data.to_vec().into()),
+                    ..Default::default()
+                })
+                .await;
             CLOUD_REQUEST_HISTOGRAM_VEC
                 .with_label_values(&["s3", "upload_part"])
                 .observe(start.saturating_elapsed().as_secs_f64());
-            result
+            r
         })
-        .await
-        .map_err(|_| UploadError::Sdk {
-            msg: "timeout after 15mins for upload part in s3 storage".to_owned(),
-            retryable: false,
-        })?
+        .await;
+        match res {
+            Ok(part) => Ok(CompletedPart {
+                e_tag: part?.e_tag,
+                part_number: Some(part_number),
+            }),
+            Err(_) => Err(RusotoError::ParseError(
+                "timeout after 15mins for upload part in s3 storage".to_owned(),
+            )),
+        }
     }
 
     /// Uploads a file atomically.
     ///
     /// This should be used only when the data is known to be short, and thus
     /// relatively cheap to retry the entire upload.
-    async fn upload(&self, data: &[u8]) -> Result<(), UploadError> {
-        let request = async {
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .set_acl(self.acl.as_ref().map(|s| s.as_str().into()))
-                .set_ssekms_key_id(self.sse_kms_key_id.as_ref().map(|s| s.to_string()))
-                .set_storage_class(self.storage_class.as_ref().map(|s| s.as_str().into()))
-                .content_length(data.len() as i64)
-                .body(data.to_vec().into())
-                .set_server_side_encryption(
-                    self.server_side_encryption
-                        .as_ref()
-                        .map(|s| s.as_str().into()),
-                )
-                .set_content_md5(get_content_md5(self.object_lock_enabled, data))
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|err| err.into())
-        };
-        timeout(
-            Self::get_timeout(),
-            Box::pin(async {
-                #[cfg(feature = "failpoints")]
-                let delay_duration = (|| {
-                    fail_point!("s3_sleep_injected", |t| {
-                        let t = t.unwrap().parse::<u64>().unwrap();
-                        Duration::from_millis(t)
-                    });
-                    Duration::from_millis(0)
-                })();
-                #[cfg(not(feature = "failpoints"))]
-                let delay_duration = Duration::from_millis(0);
-
-                if delay_duration > Duration::from_millis(0) {
-                    sleep(delay_duration).await;
-                }
-
-                fail_point!("s3_put_obj_err", |_| {
-                    Err(UploadError::Sdk {
-                        msg: "failed to put object".to_owned(),
-                        retryable: false,
-                    })
+    async fn upload(&self, data: &[u8]) -> Result<(), RusotoError<PutObjectError>> {
+        let res = timeout(Self::get_timeout(), async {
+            #[cfg(feature = "failpoints")]
+            let delay_duration = (|| {
+                fail_point!("s3_sleep_injected", |t| {
+                    let t = t.unwrap().parse::<u64>().unwrap();
+                    Duration::from_millis(t)
                 });
+                Duration::from_millis(0)
+            })();
+            #[cfg(not(feature = "failpoints"))]
+            let delay_duration = Duration::from_millis(0);
 
-                let start = Instant::now();
+            if delay_duration > Duration::from_millis(0) {
+                sleep(delay_duration).await;
+            }
 
-                let result = request.await;
+            fail_point!("s3_put_obj_err", |_| {
+                Err(RusotoError::ParseError("failed to put object".to_owned()))
+            });
 
-                CLOUD_REQUEST_HISTOGRAM_VEC
-                    .with_label_values(&["s3", "put_object"])
-                    .observe(start.saturating_elapsed().as_secs_f64());
-                result
-            }),
-        )
+            let start = Instant::now();
+            let r = self
+                .client
+                .put_object(PutObjectRequest {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    acl: self.acl.as_ref().map(|s| s.to_string()),
+                    server_side_encryption: self
+                        .server_side_encryption
+                        .as_ref()
+                        .map(|s| s.to_string()),
+                    ssekms_key_id: self.sse_kms_key_id.as_ref().map(|s| s.to_string()),
+                    storage_class: self.storage_class.as_ref().map(|s| s.to_string()),
+                    content_length: Some(data.len() as i64),
+                    content_md5: get_content_md5(self.object_lock_enabled, data),
+                    body: Some(data.to_vec().into()),
+                    ..Default::default()
+                })
+                .await;
+            CLOUD_REQUEST_HISTOGRAM_VEC
+                .with_label_values(&["s3", "put_object"])
+                .observe(start.saturating_elapsed().as_secs_f64());
+            r
+        })
         .await
-        .map_err(|_| UploadError::Sdk {
-            msg: "timeout after 15mins for upload in s3 storage".to_owned(),
-            retryable: false,
-        })?
+        .map_err(|_| {
+            RusotoError::ParseError("timeout after 15mins for upload in s3 storage".to_owned())
+        })?;
+        res.map(|_| ())
     }
 
     fn get_timeout() -> Duration {
@@ -727,14 +595,14 @@ impl BlobStorage for S3Storage {
     async fn put(
         &self,
         name: &str,
-        mut reader: PutResource<'_>,
+        mut reader: PutResource,
         content_length: u64,
     ) -> io::Result<()> {
         let key = self.maybe_prefix_key(name);
         debug!("save file to s3 storage"; "key" => %key);
 
         let uploader = S3Uploader::new(&self.client, &self.config, key);
-        let result = Box::pin(uploader.run(&mut reader, content_length)).await;
+        let result = uploader.run(&mut reader, content_length).await;
         result.map_err(|e| {
             let error_code = if let UploadError::Io(ref io_error) = e {
                 io_error.kind()
@@ -758,84 +626,13 @@ impl BlobStorage for S3Storage {
     }
 }
 
-impl DeletableStorage for S3Storage {
-    fn delete(&self, name: &str) -> LocalBoxFuture<'_, io::Result<()>> {
-        let key = self.maybe_prefix_key(name);
-        async move {
-            let now = Instant::now();
-            let res = self
-                .client
-                .delete_object()
-                .bucket(self.config.bucket.bucket.to_string())
-                .key(key.clone())
-                .send()
-                .await;
-            CLOUD_REQUEST_HISTOGRAM_VEC
-                .with_label_values(&["s3", "delete_object"])
-                .observe(now.saturating_elapsed().as_secs_f64());
-            match res {
-                Ok(_) => Ok(()),
-                Err(e) => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to delete object {}", e),
-                )),
-            }
-        }
-        .boxed_local()
-    }
-}
-
-impl IterableStorage for S3Storage {
-    fn iter_prefix(
-        &self,
-        prefix: &str,
-    ) -> Pin<Box<dyn Stream<Item = std::result::Result<BlobObject, io::Error>> + '_>> {
-        let builder = self
-            .client
-            .list_objects_v2()
-            .bucket(self.config.bucket.bucket.to_string())
-            .prefix(self.maybe_prefix_key(prefix));
-        let mut page_stream = builder.into_paginator().send();
-        let stream = futures::stream::poll_fn(move |cx| page_stream.poll_next(cx));
-
-        stream
-            .map_ok(|page| {
-                page.contents
-                    .map(|cs| {
-                        futures::stream::iter(cs.into_iter().map(|v| {
-                            Ok(BlobObject {
-                                key: v.key.map(|k| self.strip_prefix_if_needed(k)).ok_or_else(
-                                    || {
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "object key is empty",
-                                        )
-                                    },
-                                )?,
-                            })
-                        }))
-                        .left_stream()
-                    })
-                    .unwrap_or_else(|| futures::stream::empty().right_stream())
-            })
-            .map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("sdk encounters an unexpected error: {:?}", err),
-                )
-            })
-            .try_flatten()
-            .boxed_local()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::assert_matches::assert_matches;
 
-    use aws_sdk_s3::{config::Credentials, primitives::SdkBody};
-    use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
-    use http::Uri;
+    use rusoto_core::signature::SignedRequest;
+    use rusoto_mock::{MockRequestDispatcher, MultipleMockRequestDispatcher};
+    use tikv_util::stream::block_on_external_io;
 
     use super::*;
 
@@ -886,90 +683,32 @@ mod tests {
         let magic_contents = "567890";
 
         let bucket_name = StringNonEmpty::required("mybucket".to_string()).unwrap();
-        let mut bucket = BucketConf::default(bucket_name);
-        bucket.region = Some(StringNonEmpty::required("cn-north-1".to_string()).unwrap());
-
+        let bucket = BucketConf::default(bucket_name);
         let mut config = Config::default(bucket);
         let multi_part_size = 2;
         // set multi_part_size to use upload_part function
         config.multi_part_size = multi_part_size;
-        config.force_path_style = true;
 
         // split magic_contents into 3 parts, so we mock 5 requests here(1 begin + 3
         // part + 1 complete)
-        let client = StaticReplayClient::new(vec![
-            ReplayEvent::new(
-                http::Request::builder()
-                    .uri(Uri::from_static(
-                        "https://s3.cn-north-1.amazonaws.com.cn/mybucket/mykey?uploads"
-                    ))
-                    .body(SdkBody::from(""))
-                    .unwrap(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(
-                        r#"<?xml version="1.0" encoding="UTF-8"?>
-                            <InitiateMultipartUploadResult>
-                                <Bucket>mybucket</Bucket>
-                                <Key>mykey</Key>
-                                <UploadId>1</UploadId>
-                            </InitiateMultipartUploadResult>"#
-                    )).unwrap()
+        let dispatcher = MultipleMockRequestDispatcher::new(vec![
+            MockRequestDispatcher::with_status(200).with_body(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+               <root>
+                 <UploadId>1</UploadId>
+               </root>"#,
             ),
-            ReplayEvent::new(
-                http::Request::builder()
-                    .uri(Uri::from_static(
-                        "https://s3.cn-north-1.amazonaws.com.cn/mybucket/mykey?x-id=UploadPart&partNumber=1&uploadId=1"
-                    ))
-                    .body(SdkBody::from("56"))
-                    .unwrap(),
-                http::Response::builder().status(200).body(SdkBody::from("")).unwrap()
-            ),
-            ReplayEvent::new(
-                http::Request::builder()
-                    .uri(Uri::from_static(
-                        "https://s3.cn-north-1.amazonaws.com.cn/mybucket/mykey?x-id=UploadPart&partNumber=2&uploadId=1"
-                    ))
-                    .body(SdkBody::from("78"))
-                    .unwrap(),
-                http::Response::builder().status(200).body(SdkBody::from("")).unwrap()
-            ),
-            ReplayEvent::new(
-                http::Request::builder()
-                    .uri(Uri::from_static(
-                        "https://s3.cn-north-1.amazonaws.com.cn/mybucket/mykey?x-id=UploadPart&partNumber=3&uploadId=1"
-                    ))
-                    .body(SdkBody::from("90"))
-                    .unwrap(),
-                http::Response::builder().status(200).body(SdkBody::from("")).unwrap()
-            ),
-            ReplayEvent::new(
-                http::Request::builder()
-                    .uri(Uri::from_static(
-                        "https://s3.cn-north-1.amazonaws.com.cn/mybucket/mykey?uploadId=1"
-                    ))
-                    .body(SdkBody::from(
-                        r#"<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Part><PartNumber>1</PartNumber></Part><Part><PartNumber>2</PartNumber></Part><Part><PartNumber>3</PartNumber></Part></CompleteMultipartUpload>"#
-                    ))
-                    .unwrap(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(
-                        r#"<?xml version="1.0" encoding="UTF-8"?>
-                            <CompleteMultipartUploadResult>
-                                <Location>https://s3.cn-north-1.amazonaws.com.cn/mybucket/mykey</Location>
-                                <Bucket>mybucket</Bucket>
-                                <Key>mykey</Key>
-                                <Etag></ETag>
-                            </CompleteMultipartUploadResult>
-                            "#
-                    )).unwrap()
-            ),
+            MockRequestDispatcher::with_status(200),
+            MockRequestDispatcher::with_status(200),
+            MockRequestDispatcher::with_status(200),
+            MockRequestDispatcher::with_status(200),
         ]);
 
-        let creds = Credentials::from_keys("abc".to_string(), "xyz".to_string(), None);
+        let credentials_provider =
+            StaticProvider::new_minimal("abc".to_string(), "xyz".to_string());
 
-        let s = S3Storage::new_with_creds_client(config.clone(), client.clone(), creds).unwrap();
+        let s = S3Storage::new_creds_dispatcher(config, dispatcher, credentials_provider).unwrap();
+
         s.put(
             "mykey",
             PutResource(Box::new(magic_contents.as_bytes())),
@@ -977,9 +716,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        client.assert_requests_match(&[]);
-
         assert_eq!(
             CLOUD_REQUEST_HISTOGRAM_VEC
                 .get_metric_with_label_values(&["s3", "upload_part"])
@@ -1000,52 +736,18 @@ mod tests {
         bucket.prefix = StringNonEmpty::opt("myprefix".to_string());
         let mut config = Config::default(bucket);
         config.force_path_style = true;
-
-        let client = StaticReplayClient::new(vec![
-            ReplayEvent::new(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(Uri::from_static(
-                        "https://s3.ap-southeast-2.amazonaws.com/mybucket/myprefix/mykey?x-id=PutObject",
-                    ))
-                    .body(SdkBody::from("5678"))
-                    .unwrap(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(""))
-                    .unwrap(),
-            ),
-            ReplayEvent::new(
-                http::Request::builder()
-                    .method("GET")
-                    .uri(Uri::from_static(
-                        "https://s3.ap-southeast-2.amazonaws.com/mybucket/myprefix/mykey?x-id=GetObject",
-                    ))
-                    .body(SdkBody::from(""))
-                    .unwrap(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from("5678"))
-                    .unwrap(),
-            ),
-            ReplayEvent::new(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(Uri::from_static(
-                        "https://s3.ap-southeast-2.amazonaws.com/mybucket/myprefix/mykey?x-id=PutObject",
-                    ))
-                    .body(SdkBody::from("5678"))
-                    .unwrap(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(""))
-                    .unwrap(),
-            ),
-        ]);
-
-        let creds = Credentials::from_keys("abc".to_string(), "xyz".to_string(), None);
-
-        let s = S3Storage::new_with_creds_client(config.clone(), client.clone(), creds).unwrap();
+        let dispatcher = MockRequestDispatcher::with_status(200).with_request_checker(
+            move |req: &SignedRequest| {
+                assert_eq!(req.region.name(), "ap-southeast-2");
+                assert_eq!(req.hostname(), "s3.ap-southeast-2.amazonaws.com");
+                assert_eq!(req.path(), "/mybucket/myprefix/mykey");
+                // PutObject is translated to HTTP PUT.
+                assert_eq!(req.payload.is_some(), req.method() == "PUT");
+            },
+        );
+        let credentials_provider =
+            StaticProvider::new_minimal("abc".to_string(), "xyz".to_string());
+        let s = S3Storage::new_creds_dispatcher(config, dispatcher, credentials_provider).unwrap();
         s.put(
             "mykey",
             PutResource(Box::new(magic_contents.as_bytes())),
@@ -1057,8 +759,8 @@ mod tests {
         let mut reader = s.get("mykey");
         let mut buf = Vec::new();
         let ret = reader.read_to_end(&mut buf).await;
-        assert!(ret.unwrap() == 4);
-        assert!(!buf.is_empty());
+        assert!(ret.unwrap() == 0);
+        assert!(buf.is_empty());
 
         // inject put error
         let s3_put_obj_err_fp = "s3_put_obj_err";
@@ -1070,7 +772,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-
         fail::remove(s3_put_obj_err_fp);
 
         // test timeout
@@ -1102,12 +803,10 @@ mod tests {
         .unwrap();
         fail::remove(s3_sleep_injected_fp);
         fail::remove(s3_timeout_injected_fp);
-
-        client.assert_requests_match(&[]);
     }
 
-    #[tokio::test]
-    async fn test_s3_storage_with_virtual_host() {
+    #[test]
+    fn test_s3_storage_with_virtual_host() {
         let magic_contents = "abcd";
         let bucket_name = StringNonEmpty::required("bucket2".to_string()).unwrap();
         let mut bucket = BucketConf::default(bucket_name);
@@ -1115,75 +814,58 @@ mod tests {
         bucket.prefix = StringNonEmpty::opt("prefix2".to_string());
         let mut config = Config::default(bucket);
         config.force_path_style = false;
-
-        let client = StaticReplayClient::new(vec![ReplayEvent::new(
-            http::Request::builder()
-                .method("PUT")
-                .uri(Uri::from_static(
-                    "https://bucket2.s3.ap-southeast-1.amazonaws.com/prefix2/key2?x-id=PutObject",
-                ))
-                .body(SdkBody::from("abcd"))
-                .unwrap(),
-            http::Response::builder()
-                .status(200)
-                .body(SdkBody::from(""))
-                .unwrap(),
-        )]);
-
-        let creds = Credentials::from_keys("abc".to_string(), "xyz".to_string(), None);
-
-        let s = S3Storage::new_with_creds_client(config.clone(), client.clone(), creds).unwrap();
-        s.put(
+        let dispatcher = MockRequestDispatcher::with_status(200).with_request_checker(
+            move |req: &SignedRequest| {
+                assert_eq!(req.region.name(), "ap-southeast-1");
+                assert_eq!(req.hostname(), "bucket2.s3.ap-southeast-1.amazonaws.com");
+                assert_eq!(req.path(), "/prefix2/key2");
+                // PutObject is translated to HTTP PUT.
+                assert_eq!(req.payload.is_some(), req.method() == "PUT");
+            },
+        );
+        let credentials_provider =
+            StaticProvider::new_minimal("abc".to_string(), "xyz".to_string());
+        let s = S3Storage::new_creds_dispatcher(config, dispatcher, credentials_provider).unwrap();
+        block_on_external_io(s.put(
             "key2",
             PutResource(Box::new(magic_contents.as_bytes())),
             magic_contents.len() as u64,
-        )
-        .await
+        ))
         .unwrap();
-
-        client.assert_requests_match(&[]);
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(FALSE)]
     // FIXME: enable this (or move this to an integration test) if we've got a
-    // reliable way to test s3 (aws test_util requires custom logic to verify the
+    // reliable way to test s3 (rusoto_mock requires custom logic to verify the
     // body stream which itself can have bug)
-    async fn test_real_s3_storage() {
+    fn test_real_s3_storage() {
         use tikv_util::time::Limiter;
 
         let bucket = BucketConf {
-            endpoint: Some(StringNonEmpty::required("http://127.0.0.1:9000".to_owned()).unwrap()),
-            bucket: StringNonEmpty::required("bucket".to_owned()).unwrap(),
-            prefix: Some(StringNonEmpty::required("prefix".to_owned()).unwrap()),
-            region: None,
-            storage_class: None,
+            endpoint: "http://127.0.0.1:9000".to_owned(),
+            bucket: "bucket".to_owned(),
+            prefix: "prefix".to_owned(),
+            ..BucketConf::default()
         };
         let s3 = Config {
-            access_key_pair: Some(AccessKeyPair {
-                access_key: StringNonEmpty::required("93QZ01QRBYQQXC37XHZV".to_owned()).unwrap(),
-                secret_access_key: StringNonEmpty::required(
-                    "N2VcI4Emg0Nm7fDzGBMJvguHHUxLGpjfwt2y4+vJ".to_owned(),
-                )
-                .unwrap(),
-                session_token: None,
-            }),
+            access_key: "93QZ01QRBYQQXC37XHZV".to_owned(),
+            secret_access_key: "N2VcI4Emg0Nm7fDzGBMJvguHHUxLGpjfwt2y4+vJ".to_owned(),
             force_path_style: true,
-            ..Config::default(bucket)
+            ..Config::default()
         };
 
         let limiter = Limiter::new(f64::INFINITY);
 
-        let storage = S3Storage::new(s3).unwrap();
+        let storage = S3Storage::new(&s3).unwrap();
         const LEN: usize = 1024 * 1024 * 4;
         static CONTENT: [u8; LEN] = [50_u8; LEN];
         storage
-            .put(
+            .write(
                 "huge_file",
-                PutResource(Box::new(limiter.limit(&CONTENT[..]))),
+                Box::new(limiter.limit(&CONTENT[..])),
                 LEN as u64,
             )
-            .await
             .unwrap();
 
         let mut reader = storage.get("huge_file");

@@ -19,6 +19,5 @@ pub use self::{
     config::Config,
     fsm::{Fsm, FsmScheduler, Priority},
     mailbox::{BasicMailbox, Mailbox},
-    metrics::FsmType,
     router::Router,
 };

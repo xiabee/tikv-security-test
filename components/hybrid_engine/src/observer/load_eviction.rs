@@ -4,18 +4,18 @@ use std::sync::Arc;
 
 use engine_traits::{CacheRegion, EvictReason, KvEngine, RegionCacheEngineExt, RegionEvent};
 use kvproto::{
-    metapb::{Peer, Region},
+    metapb::Region,
     raft_cmdpb::AdminCmdType,
     raft_serverpb::{ExtraMessage, ExtraMessageType, RaftApplyState},
 };
 use raft::StateRole;
 use raftstore::coprocessor::{
-    dispatcher::{BoxDestroyPeerObserver, BoxExtraMessageObserver},
-    AdminObserver, ApplyCtxInfo, ApplySnapshotObserver, BoxAdminObserver, BoxApplySnapshotObserver,
-    BoxQueryObserver, BoxRoleObserver, Cmd, Coprocessor, CoprocessorHost, DestroyPeerObserver,
-    ExtraMessageObserver, ObserverContext, QueryObserver, RegionState, RoleObserver,
+    dispatcher::BoxExtraMessageObserver, AdminObserver, ApplyCtxInfo, ApplySnapshotObserver,
+    BoxAdminObserver, BoxApplySnapshotObserver, BoxQueryObserver, BoxRoleObserver, Cmd,
+    Coprocessor, CoprocessorHost, ExtraMessageObserver, ObserverContext, QueryObserver,
+    RegionState, RoleObserver,
 };
-use tikv_util::{debug, warn};
+use tikv_util::info;
 
 #[derive(Clone)]
 pub struct LoadEvictionObserver {
@@ -53,10 +53,6 @@ impl LoadEvictionObserver {
         coprocessor_host
             .registry
             .register_extra_message_observer(priority, BoxExtraMessageObserver::new(self.clone()));
-        // Eviction the cached region when the peer is destroyed.
-        coprocessor_host
-            .registry
-            .register_destroy_peer_observer(priority, BoxDestroyPeerObserver::new(self.clone()));
     }
 
     fn post_exec_cmd(
@@ -82,7 +78,7 @@ impl LoadEvictionObserver {
                 ))
         {
             let cache_region = CacheRegion::from_region(ctx.region());
-            debug!(
+            info!(
                 "ime evict range due to apply commands";
                 "region" => ?cache_region,
                 "is_ingest_sst" => apply.pending_handle_ssts.is_some(),
@@ -94,7 +90,7 @@ impl LoadEvictionObserver {
         if !state.new_regions.is_empty() {
             let cmd_type = cmd.request.get_admin_request().get_cmd_type();
             assert!(cmd_type == AdminCmdType::BatchSplit || cmd_type == AdminCmdType::Split);
-            debug!(
+            info!(
                 "ime handle region split";
                 "region_id" => ctx.region().get_id(),
                 "admin_command" => ?cmd.request.get_admin_request().get_cmd_type(),
@@ -137,31 +133,6 @@ impl LoadEvictionObserver {
 impl Coprocessor for LoadEvictionObserver {}
 
 impl QueryObserver for LoadEvictionObserver {
-    fn pre_exec_query(
-        &self,
-        _: &mut ObserverContext<'_>,
-        reqs: &[kvproto::raft_cmdpb::Request],
-        _: u64,
-        _: u64,
-    ) -> bool {
-        reqs.iter().for_each(|r| {
-            if r.has_delete_range() {
-                self.cache_engine
-                    .on_region_event(RegionEvent::EvictByRange {
-                        range: CacheRegion::new(
-                            0,
-                            0,
-                            keys::data_key(r.get_delete_range().get_start_key()),
-                            keys::data_key(r.get_delete_range().get_end_key()),
-                        ),
-                        reason: EvictReason::DeleteRange,
-                    })
-            }
-        });
-
-        false
-    }
-
     fn post_exec_query(
         &self,
         ctx: &mut ObserverContext<'_>,
@@ -178,21 +149,6 @@ impl QueryObserver for LoadEvictionObserver {
 }
 
 impl AdminObserver for LoadEvictionObserver {
-    fn pre_exec_admin(
-        &self,
-        ctx: &mut ObserverContext<'_>,
-        req: &kvproto::raft_cmdpb::AdminRequest,
-        _: u64,
-        _: u64,
-    ) -> bool {
-        if req.cmd_type == AdminCmdType::PrepareFlashback {
-            let cache_region = CacheRegion::from_region(ctx.region());
-            self.evict_region(cache_region, EvictReason::Flashback);
-        }
-
-        false
-    }
-
     fn post_exec_admin(
         &self,
         ctx: &mut ObserverContext<'_>,
@@ -246,7 +202,7 @@ impl RoleObserver for LoadEvictionObserver {
         if let StateRole::Leader = change.state {
             // Currently, it is only used by the manual load.
             let cache_region = CacheRegion::from_region(ctx.region());
-            debug!(
+            info!(
                 "ime try to load region due to became leader";
                 "region" => ?cache_region,
             );
@@ -255,7 +211,7 @@ impl RoleObserver for LoadEvictionObserver {
             && change.initialized
         {
             let cache_region = CacheRegion::from_region(ctx.region());
-            debug!(
+            info!(
                 "ime try to evict region due to became follower";
                 "region" => ?cache_region,
             );
@@ -269,23 +225,6 @@ impl ExtraMessageObserver for LoadEvictionObserver {
         if extra_msg.get_type() == ExtraMessageType::MsgPreLoadRegionRequest {
             self.cache_engine.load_region(r);
         }
-    }
-}
-
-impl DestroyPeerObserver for LoadEvictionObserver {
-    fn on_destroy_peer(&self, r: &Region) {
-        let mut region = r.clone();
-        if region.get_peers().is_empty() {
-            warn!("ime evict an uninitialized region"; "region" => ?region);
-            // In some cases, the region may have no peer, such as an
-            // uninitialized peer being destroyed. We need to push an empty peer
-            // to prevent panic in `CacheRegion::from_region`.
-            region.mut_peers().push(Peer::default());
-        }
-        self.cache_engine.on_region_event(RegionEvent::Eviction {
-            region: CacheRegion::from_region(&region),
-            reason: EvictReason::PeerDestroy,
-        });
     }
 }
 
@@ -312,11 +251,11 @@ mod tests {
             self.region_events.lock().unwrap().push(event);
         }
 
-        fn region_cached(&self, _: &Region) -> bool {
+        fn region_cached(&self, range: &Region) -> bool {
             unreachable!()
         }
 
-        fn load_region(&self, _: &Region) {
+        fn load_region(&self, range: &Region) {
             unreachable!()
         }
     }
@@ -405,7 +344,7 @@ mod tests {
         region.set_id(1);
         region.mut_peers().push(Peer::default());
         let mut ctx = ObserverContext::new(&region);
-        let role_change = RoleChange::new_for_test(StateRole::Leader);
+        let role_change = RoleChange::new(StateRole::Leader);
         observer.on_role_change(&mut ctx, &role_change);
         let cached_region = CacheRegion::from_region(&region);
         let expected = RegionEvent::TryLoad {

@@ -144,7 +144,6 @@ make_static_metric! {
         snapshot,
         pending_region,
         has_ready_region,
-        propose_delay,
     }
 
     pub label_enum RaftSentMessageCounterType {
@@ -519,13 +518,6 @@ lazy_static! {
             exponential_buckets(0.00001, 2.0, 26).unwrap()
         ).unwrap();
 
-    pub static ref APPLY_MSG_LEN: Histogram =
-        register_histogram!(
-            "tikv_raftstore_apply_msg_len",
-            "Length of apply msg.",
-            exponential_buckets(1.0, 2.0, 20).unwrap() // max 1024 * 1024
-        ).unwrap();
-
     pub static ref STORE_RAFT_READY_COUNTER_VEC: IntCounterVec =
         register_int_counter_vec!(
             "tikv_raftstore_raft_ready_handled_total",
@@ -746,7 +738,7 @@ lazy_static! {
         register_histogram!(
             "tikv_raftstore_peer_msg_len",
             "Length of peer msg.",
-            exponential_buckets(1.0, 2.0, 20).unwrap() // max 1024 * 1024
+            exponential_buckets(1.0, 2.0, 20).unwrap() // max 1000s
         ).unwrap();
 
     pub static ref RAFT_READ_INDEX_PENDING_DURATION: Histogram =

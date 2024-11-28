@@ -12,11 +12,12 @@ mod raftlog_gc;
 mod read;
 mod refresh_config;
 mod region;
-mod snap_gen;
 mod split_check;
 mod split_config;
 mod split_controller;
 
+#[cfg(test)]
+pub use self::region::tests::make_raftstore_cfg as make_region_worker_raftstore_cfg;
 pub use self::{
     check_leader::{Runner as CheckLeaderRunner, Task as CheckLeaderTask},
     cleanup::{Runner as CleanupRunner, Task as CleanupTask},
@@ -43,7 +44,6 @@ pub use self::{
         Task as RefreshConfigTask, WriterContoller,
     },
     region::{Runner as RegionRunner, Task as RegionTask},
-    snap_gen::{Runner as SnapGenRunner, Task as SnapGenTask, SNAP_GENERATOR_MAX_POOL_SIZE},
     split_check::{
         Bucket, BucketRange, BucketStatsInfo, KeyEntry, Runner as SplitCheckRunner,
         Task as SplitCheckTask,

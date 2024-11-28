@@ -137,7 +137,7 @@ impl Iterable for RegionCacheSnapshot {
             || upper_bound > self.snapshot_meta.region.end
         {
             return Err(Error::Other(box_err!(
-                "the boundaries required [{}, {}] exceeds the range of the snapshot [{}, {}]",
+                "the bounderies required [{}, {}] exceeds the range of the snapshot [{}, {}]",
                 log_wrappers::Value(&lower_bound),
                 log_wrappers::Value(&upper_bound),
                 log_wrappers::Value(&self.snapshot_meta.region.start),
@@ -177,6 +177,7 @@ impl Peekable for RegionCacheSnapshot {
         cf: &str,
         key: &[u8],
     ) -> Result<Option<Self::DbVector>> {
+        fail::fail_point!("on_region_cache_get_value");
         if !self.snapshot_meta.region.contains_key(key) {
             return Err(Error::Other(box_err!(
                 "key {} not in range[{}, {}]",
@@ -531,7 +532,7 @@ impl Iterator for RegionCacheIterator {
     }
 
     fn seek(&mut self, key: &[u8]) -> Result<bool> {
-        fail::fail_point!("ime_on_iterator_seek");
+        fail::fail_point!("on_region_cache_iterator_seek");
         let begin = Instant::now();
         self.direction = Direction::Forward;
         if let Some(ref mut extractor) = self.prefix_extractor {
@@ -2047,7 +2048,7 @@ mod tests {
         engine.new_region(region.clone());
 
         let mut wb = engine.write_batch();
-        wb.prepare_for_region(&region);
+        wb.prepare_for_region(range.clone());
         put_entries(&mut wb);
         wb.set_sequence_number(wb_sequence).unwrap();
         wb.write().unwrap();
@@ -2109,7 +2110,8 @@ mod tests {
 
         let mut wb = engine.write_batch();
         let region = new_region(1, b"", b"z");
-        wb.prepare_for_region(&region);
+        let cache_region = CacheRegion::from_region(&region);
+        wb.prepare_for_region(cache_region);
         wb.put(b"zb", b"f").unwrap();
         wb.set_sequence_number(200).unwrap();
 

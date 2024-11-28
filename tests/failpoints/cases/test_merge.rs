@@ -19,7 +19,7 @@ use kvproto::{
 };
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
-use raftstore::{router::RaftStoreRouter, store::*};
+use raftstore::store::*;
 use raftstore_v2::router::{PeerMsg, PeerTick};
 use test_raftstore::*;
 use test_raftstore_macro::test_case;
@@ -2202,6 +2202,7 @@ fn test_destroy_race_during_atomic_snapshot_after_merge() {
         .when(left_filter_block.clone())
         .reserve_dropped(left_blocked_messages.clone())
         .set_msg_callback(Arc::new(move |msg: &RaftMessage| {
+            debug!("dbg left msg_callback"; "msg" => ?msg);
             if left_filter_block.load(atomic::Ordering::SeqCst) {
                 return;
             }
@@ -2225,6 +2226,7 @@ fn test_destroy_race_during_atomic_snapshot_after_merge() {
         .direction(Direction::Recv)
         .when(right_filter_block.clone())
         .set_msg_callback(Arc::new(move |msg: &RaftMessage| {
+            debug!("dbg right msg_callback"; "msg" => ?msg);
             if msg.get_to_peer().get_id() == new_peer_id {
                 let _ = new_peer_id_tx.lock().unwrap().take().map(|tx| tx.send(()));
                 if msg.get_message().get_msg_type() == MessageType::MsgSnapshot {
@@ -2268,50 +2270,4 @@ fn test_destroy_race_during_atomic_snapshot_after_merge() {
     // New peer applies snapshot eventually.
     cluster.must_transfer_leader(right.get_id(), new_peer(3, new_peer_id));
     cluster.must_put(b"k4", b"v4");
-}
-
-// `test_raft_log_gc_after_merge` tests when a region is destoryed, e.g. due to
-// region merge, PeerFsm can still handle pending raft messages correctly.
-#[test]
-fn test_raft_log_gc_after_merge() {
-    let mut cluster = new_node_cluster(0, 1);
-    configure_for_merge(&mut cluster.cfg);
-    cluster.cfg.raft_store.store_batch_system.pool_size = 2;
-    cluster.run();
-    let pd_client = Arc::clone(&cluster.pd_client);
-    pd_client.disable_default_operator();
-
-    cluster.must_put(b"k1", b"v1");
-    cluster.must_put(b"k3", b"v3");
-
-    let region = cluster.get_region(b"k1");
-    cluster.must_split(&region, b"k2");
-    let left = cluster.get_region(b"k1");
-    let right = cluster.get_region(b"k3");
-
-    fail::cfg_callback("destroy_region_before_gc_flush", move || {
-        fail::cfg("pause_on_peer_collect_message", "pause").unwrap();
-    })
-    .unwrap();
-
-    let (tx, rx) = channel();
-    fail::cfg_callback("destroy_region_after_gc_flush", move || {
-        tx.send(()).unwrap();
-    })
-    .unwrap();
-
-    // the right peer's id is 1.
-    pd_client.must_merge(right.get_id(), left.get_id());
-    rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-    let raft_router = cluster.get_router(1).unwrap();
-    raft_router
-        .send_casual_msg(1, CasualMessage::ForceCompactRaftLogs)
-        .unwrap();
-
-    fail::remove("pause_on_peer_collect_message");
-
-    // wait some time for merge finish.
-    std::thread::sleep(Duration::from_secs(1));
-    must_get_equal(&cluster.get_engine(1), b"k3", b"v3");
 }

@@ -534,7 +534,7 @@ mod tests {
     use grpcio::EnvBuilder;
     use kvproto::raft_serverpb::RaftMessage;
     use raftstore::{
-        coprocessor::{region_info_accessor::MockRegionInfoProvider, CoprocessorHost},
+        coprocessor::region_info_accessor::MockRegionInfoProvider,
         router::RaftStoreRouter,
         store::{transport::Transport, *},
     };
@@ -633,8 +633,7 @@ mod tests {
             Default::default(),
             Arc::new(MockRegionInfoProvider::new(Vec::new())),
         );
-        let coprocessor_host = CoprocessorHost::default();
-        gc_worker.start(mock_store_id, coprocessor_host).unwrap();
+        gc_worker.start(mock_store_id).unwrap();
 
         let quick_fail = Arc::new(AtomicBool::new(false));
         let cfg = Arc::new(VersionTrack::new(cfg));

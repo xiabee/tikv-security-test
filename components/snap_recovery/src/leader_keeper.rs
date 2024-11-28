@@ -11,9 +11,7 @@ use engine_traits::KvEngine;
 use futures::compat::Future01CompatExt;
 use raftstore::{
     errors::{Error, Result},
-    store::{
-        msg::CampaignType, Callback, CasualMessage, CasualRouter, SignificantMsg, SignificantRouter,
-    },
+    store::{Callback, CasualMessage, CasualRouter, SignificantMsg, SignificantRouter},
 };
 use tikv_util::{future::paired_future_callback, timer::GLOBAL_TIMER_HANDLE};
 
@@ -127,7 +125,7 @@ where
     }
 
     fn force_leader(&self, region_id: u64) -> Result<()> {
-        let msg = CasualMessage::Campaign(CampaignType::ForceLeader);
+        let msg = CasualMessage::Campaign;
         self.router.send(region_id, msg)?;
         // We have nothing to do...
         Ok(())
@@ -194,7 +192,7 @@ mod test {
             msg: raftstore::store::CasualMessage<EK>,
         ) -> raftstore::errors::Result<()> {
             match msg {
-                raftstore::store::CasualMessage::Campaign(_) => {
+                raftstore::store::CasualMessage::Campaign => {
                     if !self.regions.contains(&region_id) {
                         return Err(raftstore::Error::RegionNotFound(region_id));
                     }

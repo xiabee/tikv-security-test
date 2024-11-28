@@ -4,8 +4,8 @@ use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 
 use ::encryption::DataKeyManager;
 use engine_traits::{
-    CfName, ExternalSstFileInfo, ExternalSstFileReader, IterOptions, Iterable, Iterator,
-    RefIterable, Result, SstCompressionType, SstExt, SstReader, SstWriter, SstWriterBuilder,
+    CfName, ExternalSstFileInfo, IterOptions, Iterable, Iterator, RefIterable, Result,
+    SstCompressionType, SstExt, SstReader, SstWriter, SstWriterBuilder,
 };
 
 use crate::engine::PanicEngine;
@@ -154,12 +154,6 @@ impl ExternalSstFileInfo for PanicExternalSstFileInfo {
 }
 
 pub struct PanicExternalSstFileReader;
-
-impl ExternalSstFileReader for PanicExternalSstFileReader {
-    fn reset(&mut self) -> Result<()> {
-        panic!()
-    }
-}
 
 impl std::io::Read for PanicExternalSstFileReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {

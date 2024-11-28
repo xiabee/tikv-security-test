@@ -146,8 +146,7 @@ fn test_txn_gc_keys_handled() {
         feature_gate,
         Arc::new(MockRegionInfoProvider::new(vec![])),
     );
-    let coprocessor_host = CoprocessorHost::default();
-    gc_worker.start(store_id, coprocessor_host).unwrap();
+    gc_worker.start(store_id).unwrap();
 
     let mut r1 = Region::default();
     r1.set_id(1);
@@ -292,8 +291,7 @@ fn test_raw_gc_keys_handled() {
         feature_gate,
         Arc::new(MockRegionInfoProvider::new(vec![])),
     );
-    let coprocessor_host = CoprocessorHost::default();
-    gc_worker.start(store_id, coprocessor_host).unwrap();
+    gc_worker.start(store_id).unwrap();
 
     let mut r1 = Region::default();
     r1.set_id(1);
