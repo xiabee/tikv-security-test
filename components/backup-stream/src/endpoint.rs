@@ -5,7 +5,6 @@ use std::{
     collections::HashSet,
     fmt,
     marker::PhantomData,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -58,7 +57,7 @@ use crate::{
     metadata::{store::MetaStore, MetadataClient, MetadataEvent, StreamTask},
     metrics::{self, TaskStatus},
     observer::BackupStreamObserver,
-    router::{ApplyEvents, Router, TaskSelector},
+    router::{self, ApplyEvents, Router, TaskSelector},
     subscription_manager::{RegionSubscriptionManager, ResolvedRegions},
     subscription_track::{Ref, RefMut, ResolveResult, SubscriptionTracer},
     try_send,
@@ -127,12 +126,7 @@ where
             .expect("failed to create tokio runtime for backup stream worker.");
 
         let meta_client = MetadataClient::new(store, store_id);
-        let range_router = Router::new(
-            PathBuf::from(config.temp_path.clone()),
-            scheduler.clone(),
-            config.file_size_limit.0,
-            config.max_flush_interval.0,
-        );
+        let range_router = Router::new(scheduler.clone(), router::Config::from(config.clone()));
 
         // spawn a worker to watch task changes from etcd periodically.
         let meta_client_clone = meta_client.clone();
@@ -565,7 +559,7 @@ where
             .await;
         match range_init_result {
             Ok(()) => {
-                info!("backup stream success to initialize"; 
+                info!("backup stream success to initialize";
                         "start_key" => utils::redact(&start_key),
                         "end_key" => utils::redact(&end_key),
                         "take" => ?start.saturating_elapsed(),)
@@ -650,7 +644,7 @@ where
                 info!(
                     "register backup stream ranges";
                     "task" => ?task,
-                    "ranges-count" => ranges.inner.len(),
+                    "ranges_count" => ranges.inner.len(),
                 );
                 let ranges = ranges
                     .inner
@@ -874,7 +868,7 @@ where
                             {
                                 warn!("backup stream failed to set global checkpoint.";
                                     "task" => ?task,
-                                    "global-checkpoint" => global_checkpoint,
+                                    "global_checkpoint" => global_checkpoint,
                                     "err" => ?err,
                                 );
                             }
@@ -882,7 +876,7 @@ where
                         Ok(false) => {
                             debug!("backup stream no need update global checkpoint.";
                                 "task" => ?task,
-                                "global-checkpoint" => global_checkpoint,
+                                "global_checkpoint" => global_checkpoint,
                             );
                         }
                         Err(e) => {
@@ -1088,7 +1082,7 @@ where
 /// Create a standard tokio runtime
 /// (which allows io and time reactor, involve thread memory accessor),
 fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<Runtime> {
-    info!("create tokio runtime for backup stream"; "thread_name" => thread_name, "thread-count" => thread_count);
+    info!("create tokio runtime for backup stream"; "thread_name" => thread_name, "thread_count" => thread_count);
 
     tokio::runtime::Builder::new_multi_thread()
         .thread_name(thread_name)
@@ -1097,14 +1091,9 @@ fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<R
         // (`File` API in `tokio::io` would use this pool.)
         .max_blocking_threads(thread_count * 8)
         .worker_threads(thread_count)
+        .with_sys_hooks()
         .enable_io()
         .enable_time()
-        .after_start_wrapper(|| {
-            tikv_alloc::add_thread_memory_accessor();
-        })
-        .before_stop_wrapper(|| {
-            tikv_alloc::remove_thread_memory_accessor();
-        })
         .build()
 }
 

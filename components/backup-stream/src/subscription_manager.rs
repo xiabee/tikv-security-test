@@ -328,10 +328,12 @@ where
 /// Create a pool for doing initial scanning.
 fn create_scan_pool(num_threads: usize) -> ScanPool {
     tokio::runtime::Builder::new_multi_thread()
-        .after_start_wrapper(move || {
-            file_system::set_io_type(file_system::IoType::Replication);
-        })
-        .before_stop_wrapper(|| {})
+        .with_sys_and_custom_hooks(
+            move || {
+                file_system::set_io_type(file_system::IoType::Replication);
+            },
+            || {},
+        )
         .thread_name("log-backup-scan")
         .enable_time()
         .worker_threads(num_threads)

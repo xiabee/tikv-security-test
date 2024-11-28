@@ -12,10 +12,8 @@ use std::{
 };
 
 use fail::fail_point;
-use futures::{
-    channel::oneshot::{self, Canceled},
-    FutureExt,
-};
+use futures::channel::oneshot::{self, Canceled};
+use futures_util::future::FutureExt;
 use prometheus::{IntCounter, IntGauge};
 use tracker::TrackedFuture;
 use yatp::{queue::Extras, task::future};
@@ -110,6 +108,22 @@ impl FuturePool {
         F::Output: Send,
     {
         self.inner.spawn_handle(TrackedFuture::new(future))
+    }
+
+    /// Return the min thread count and the max thread count that this pool can
+    /// scale to.
+    pub fn thread_count_limit(&self) -> (usize, usize) {
+        self.inner.pool.thread_count_limit()
+    }
+
+    /// Cancel all pending futures and join all threads.
+    pub fn shutdown(&self) {
+        self.inner.pool.shutdown();
+    }
+
+    //  Get a remote queue for spawning tasks without owning the thread pool.
+    pub fn remote(&self) -> &yatp::Remote<future::TaskCell> {
+        self.inner.pool.remote()
     }
 }
 

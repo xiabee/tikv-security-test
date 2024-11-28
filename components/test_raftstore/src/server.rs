@@ -45,6 +45,7 @@ use raftstore::{
 use resource_control::ResourceGroupManager;
 use resource_metering::{CollectorRegHandle, ResourceTagFactory};
 use security::SecurityManager;
+use service::service_manager::GrpcServiceManager;
 use tempfile::TempDir;
 use test_pd_client::TestPdClient;
 use tikv::{
@@ -112,8 +113,8 @@ impl StoreAddrResolver for AddressMap {
     fn resolve(
         &self,
         store_id: u64,
-        cb: Box<dyn FnOnce(ServerResult<String>) + Send>,
-    ) -> ServerResult<()> {
+        cb: Box<dyn FnOnce(resolve::Result<String>) + Send>,
+    ) -> resolve::Result<()> {
         let addr = self.get(store_id);
         match addr {
             Some(addr) => cb(Ok(addr)),
@@ -422,6 +423,7 @@ impl ServerCluster {
             resource_manager
                 .as_ref()
                 .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
+            resource_manager.clone(),
         )?;
         self.storages.insert(node_id, raft_engine);
 
@@ -436,6 +438,7 @@ impl ServerCluster {
                     dir,
                     key_manager.clone(),
                     cfg.storage.api_version(),
+                    false,
                 )
                 .unwrap(),
             )
@@ -446,6 +449,8 @@ impl ServerCluster {
             engine,
             LocalTablets::Singleton(engines.kv.clone()),
             Arc::clone(&importer),
+            None,
+            resource_manager.clone(),
             Arc::new(region_info_accessor.clone()),
         );
 
@@ -476,6 +481,7 @@ impl ServerCluster {
             concurrency_manager.clone(),
             res_tag_factory,
             quota_limiter,
+            resource_manager.clone(),
         );
         let copr_v2 = coprocessor_v2::Endpoint::new(&cfg.coprocessor_v2);
         let mut server = None;
@@ -484,13 +490,16 @@ impl ServerCluster {
             TokioBuilder::new_multi_thread()
                 .thread_name(thd_name!("debugger"))
                 .worker_threads(1)
-                .after_start_wrapper(|| {})
-                .before_stop_wrapper(|| {})
+                .with_sys_hooks()
                 .build()
                 .unwrap(),
         );
 
-        let debugger = DebuggerImpl::new(engines.clone(), ConfigController::default());
+        let debugger = DebuggerImpl::new(
+            engines.clone(),
+            ConfigController::new(cfg.tikv.clone()),
+            Some(store.clone()),
+        );
         let debug_thread_handle = debug_thread_pool.handle().clone();
         let debug_service = DebugService::new(
             debugger,
@@ -509,6 +518,7 @@ impl ServerCluster {
                 cfg.coprocessor.region_split_size(),
                 cfg.coprocessor.enable_region_bucket(),
                 cfg.coprocessor.region_bucket_size,
+                false,
             )
             .unwrap();
         let health_service = HealthService::default();
@@ -607,6 +617,7 @@ impl ServerCluster {
             concurrency_manager.clone(),
             collector_reg_handle,
             causal_ts_provider,
+            GrpcServiceManager::dummy(),
             Arc::new(AtomicU64::new(0)),
         )?;
         assert!(node_id == 0 || node_id == node.id());
@@ -927,6 +938,20 @@ pub fn must_new_cluster_and_debug_client() -> (Cluster<ServerCluster>, DebugClie
     let client = DebugClient::new(channel);
 
     (cluster, client, leader.get_store_id())
+}
+
+pub fn must_new_cluster_kv_client_and_debug_client()
+-> (Cluster<ServerCluster>, TikvClient, DebugClient, Context) {
+    let (cluster, leader, ctx) = must_new_cluster_mul(1);
+
+    let env = Arc::new(Environment::new(1));
+    let channel =
+        ChannelBuilder::new(env).connect(&cluster.sim.rl().get_addr(leader.get_store_id()));
+
+    let kv_client = TikvClient::new(channel.clone());
+    let debug_client = DebugClient::new(channel);
+
+    (cluster, kv_client, debug_client, ctx)
 }
 
 pub fn must_new_and_configure_cluster_and_kv_client(

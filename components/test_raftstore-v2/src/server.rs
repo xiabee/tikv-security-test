@@ -43,6 +43,7 @@ use raftstore_v2::{router::RaftRouter, StateStorage, StoreMeta, StoreRouter};
 use resource_control::ResourceGroupManager;
 use resource_metering::{CollectorRegHandle, ResourceTagFactory};
 use security::SecurityManager;
+use service::service_manager::GrpcServiceManager;
 use slog_global::debug;
 use tempfile::TempDir;
 use test_pd_client::TestPdClient;
@@ -222,6 +223,11 @@ impl<EK: KvEngine> RaftExtension for TestExtension<EK> {
     }
 
     #[inline]
+    fn report_store_maybe_tombstone(&self, store_id: u64) {
+        self.extension.report_store_maybe_tombstone(store_id)
+    }
+
+    #[inline]
     fn report_snapshot_status(
         &self,
         region_id: u64,
@@ -381,10 +387,18 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 cfg.coprocessor.region_split_size(),
                 cfg.coprocessor.enable_region_bucket(),
                 cfg.coprocessor.region_bucket_size,
+                true,
             )
             .unwrap();
 
-        let mut node = NodeV2::new(&cfg.server, self.pd_client.clone(), None);
+        let mut node = NodeV2::new(
+            &cfg.server,
+            self.pd_client.clone(),
+            None,
+            resource_manager
+                .as_ref()
+                .map(|r| r.derive_controller("raft-v2".into(), false)),
+        );
         node.try_bootstrap_store(&raft_store, &raft_engine).unwrap();
         assert_eq!(node.id(), node_id);
 
@@ -486,7 +500,8 @@ impl<EK: KvEngine> ServerCluster<EK> {
         let (res_tag_factory, collector_reg_handle, rsmeter_cleanup) =
             self.init_resource_metering(&cfg.resource_metering);
 
-        let check_leader_runner = CheckLeaderRunner::new(store_meta, coprocessor_host.clone());
+        let check_leader_runner =
+            CheckLeaderRunner::new(store_meta.clone(), coprocessor_host.clone());
         let check_leader_scheduler = bg_worker.start("check-leader", check_leader_runner);
 
         let mut lock_mgr = LockManager::new(&cfg.pessimistic_txn);
@@ -518,6 +533,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
             resource_manager
                 .as_ref()
                 .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
+            resource_manager.clone(),
         )?;
         self.storages.insert(node_id, raft_kv_v2.clone());
 
@@ -532,6 +548,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
                     dir,
                     key_manager.clone(),
                     cfg.storage.api_version(),
+                    true,
                 )
                 .unwrap(),
             )
@@ -542,6 +559,8 @@ impl<EK: KvEngine> ServerCluster<EK> {
             raft_kv_v2,
             LocalTablets::Registry(tablet_registry.clone()),
             Arc::clone(&importer),
+            Some(store_meta),
+            resource_manager.clone(),
             Arc::new(region_info_accessor.clone()),
         );
 
@@ -565,6 +584,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
             concurrency_manager.clone(),
             res_tag_factory,
             quota_limiter,
+            resource_manager.clone(),
         );
         let copr_v2 = coprocessor_v2::Endpoint::new(&cfg.coprocessor_v2);
         let mut server = None;
@@ -574,8 +594,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
             TokioBuilder::new_multi_thread()
                 .thread_name(thd_name!("debugger"))
                 .worker_threads(1)
-                .after_start_wrapper(|| {})
-                .before_stop_wrapper(|| {})
+                .with_sys_hooks()
                 .build()
                 .unwrap(),
         );
@@ -661,6 +680,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
             &state,
             importer,
             key_manager,
+            GrpcServiceManager::dummy(),
         )?;
         assert!(node_id == 0 || node_id == node.id());
         let node_id = node.id();

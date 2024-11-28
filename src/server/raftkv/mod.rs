@@ -23,7 +23,7 @@ use std::{
 use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{CfName, KvEngine, MvccProperties, Snapshot};
-use futures::{future::BoxFuture, task::AtomicWaker, Future, Stream, StreamExt};
+use futures::{future::BoxFuture, task::AtomicWaker, Future, Stream, StreamExt, TryFutureExt};
 use kvproto::{
     errorpb,
     kvrpcpb::{Context, IsolationLevel},
@@ -55,6 +55,7 @@ use tikv_util::{
     future::{paired_future_callback, paired_must_called_future_callback},
     time::Instant,
 };
+use tracker::{get_tls_tracker_token, GLOBAL_TRACKERS};
 use txn_types::{Key, TimeStamp, TxnExtra, TxnExtraScheduler, WriteBatchFlags};
 
 use super::metrics::*;
@@ -195,18 +196,36 @@ fn exec_admin<E: KvEngine, S: RaftStoreRouter<E>>(
     router: &S,
     req: RaftCmdRequest,
 ) -> BoxFuture<'static, kv::Result<()>> {
+    let region_id = req.get_header().get_region_id();
+    let peer_id = req.get_header().get_peer().get_id();
+    let term = req.get_header().get_term();
+    let epoch = req.get_header().get_region_epoch().clone();
+    let admin_type = req.get_admin_request().get_cmd_type();
     let (cb, f) = paired_future_callback();
     let res = router.send_command(
         req,
         raftstore::store::Callback::write(cb),
         RaftCmdExtraOpts::default(),
     );
-    Box::pin(async move {
-        res?;
-        let mut resp = box_try!(f.await);
-        check_raft_cmd_response(&mut resp.response)?;
-        Ok(())
-    })
+    Box::pin(
+        async move {
+            res?;
+            let mut resp = box_try!(f.await);
+            check_raft_cmd_response(&mut resp.response)?;
+            Ok(())
+        }
+        .map_err(move |e| {
+            warn!("failed to execute admin command";
+                "err" => ?e,
+                "admin_type" => ?admin_type,
+                "term" => term,
+                "region_epoch" => ?epoch,
+                "peer_id" => peer_id,
+                "region_id" => region_id,
+            );
+            e
+        }),
+    )
 }
 
 pub fn drop_snapshot_callback<T>() -> kv::Result<T> {
@@ -591,7 +610,7 @@ where
                 .set_key_ranges(mem::take(&mut ctx.key_ranges).into());
         }
         ASYNC_REQUESTS_COUNTER_VEC.snapshot.all.inc();
-        let begin_instant = Instant::now_coarse();
+        let begin_instant = Instant::now();
         let (cb, f) = paired_must_called_future_callback(drop_snapshot_callback);
 
         let mut header = new_request_header(ctx.pb_ctx);
@@ -615,10 +634,34 @@ where
         let mut cmd = RaftCmdRequest::default();
         cmd.set_header(header);
         cmd.set_requests(vec![req].into());
+        let tracker = get_tls_tracker_token();
         let store_cb = StoreCallback::read(Box::new(move |resp| {
             let res = on_read_result(resp).map_err(Error::into);
             if res.is_ok() {
                 let elapse = begin_instant.saturating_elapsed_secs();
+                GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                    if tracker.metrics.read_index_propose_wait_nanos > 0 {
+                        ASYNC_REQUESTS_DURATIONS_VEC
+                            .snapshot_read_index_propose_wait
+                            .observe(
+                                tracker.metrics.read_index_propose_wait_nanos as f64
+                                    / 1_000_000_000.0,
+                            );
+                        // snapshot may be handled by lease read in raftstore
+                        if tracker.metrics.read_index_confirm_wait_nanos > 0 {
+                            ASYNC_REQUESTS_DURATIONS_VEC
+                                .snapshot_read_index_confirm
+                                .observe(
+                                    tracker.metrics.read_index_confirm_wait_nanos as f64
+                                        / 1_000_000_000.0,
+                                );
+                        }
+                    } else if tracker.metrics.local_read {
+                        ASYNC_REQUESTS_DURATIONS_VEC
+                            .snapshot_local_read
+                            .observe(elapse);
+                    }
+                });
                 ASYNC_REQUESTS_DURATIONS_VEC.snapshot.observe(elapse);
                 ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
             }

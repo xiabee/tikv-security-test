@@ -14,10 +14,7 @@ use tikv_util::{
     sys::SysQuota,
 };
 
-use crate::config::{
-    BLOCK_CACHE_RATE, DEFAULT_ROCKSDB_SUB_DIR, DEFAULT_TABLET_SUB_DIR, MIN_BLOCK_CACHE_SHARD_SIZE,
-    RAFTSTORE_V2_BLOCK_CACHE_RATE,
-};
+use crate::config::{DEFAULT_ROCKSDB_SUB_DIR, DEFAULT_TABLET_SUB_DIR, MIN_BLOCK_CACHE_SHARD_SIZE};
 
 pub const DEFAULT_DATA_DIR: &str = "./";
 const DEFAULT_GC_RATIO_THRESHOLD: f64 = 1.1;
@@ -33,6 +30,17 @@ const DEFAULT_SCHED_PENDING_WRITE_MB: u64 = 100;
 
 const DEFAULT_RESERVED_SPACE_GB: u64 = 5;
 const DEFAULT_RESERVED_RAFT_SPACE_GB: u64 = 1;
+
+// In tests, we've observed 1.2M entries in the TxnStatusCache. We
+// conservatively set the limit to 5M entries in total.
+// As TxnStatusCache have 128 slots by default. We round it to 5.12M.
+// This consumes at most around 300MB memory theoretically, but usually it's
+// much less as it's hard to see the capacity being used up.
+const DEFAULT_TXN_STATUS_CACHE_CAPACITY: usize = 40_000 * 128;
+
+// Block cache capacity used when TikvConfig isn't validated. It should only
+// occur in tests.
+const FALLBACK_BLOCK_CACHE_CAPACITY: ReadableSize = ReadableSize::mb(128);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -75,6 +83,8 @@ pub struct Config {
     pub background_error_recovery_window: ReadableDuration,
     /// Interval to check TTL for all SSTs,
     pub ttl_check_poll_interval: ReadableDuration,
+    #[online_config(skip)]
+    pub txn_status_cache_capacity: usize,
     #[online_config(submodule)]
     pub flow_control: FlowControlConfig,
     #[online_config(submodule)]
@@ -104,6 +114,7 @@ impl Default for Config {
             api_version: 1,
             enable_ttl: false,
             ttl_check_poll_interval: ReadableDuration::hours(12),
+            txn_status_cache_capacity: DEFAULT_TXN_STATUS_CACHE_CAPACITY,
             flow_control: FlowControlConfig::default(),
             block_cache: BlockCacheConfig::default(),
             io_rate_limit: IoRateLimitConfig::default(),
@@ -276,21 +287,11 @@ impl BlockCacheConfig {
         }
     }
 
-    pub fn build_shared_cache(&self, engine_type: EngineType) -> Cache {
+    pub fn build_shared_cache(&self) -> Cache {
         if self.shared == Some(false) {
             warn!("storage.block-cache.shared is deprecated, cache is always shared.");
         }
-        let capacity = match self.capacity {
-            None => {
-                let total_mem = SysQuota::memory_limit_in_bytes();
-                if engine_type == EngineType::RaftKv2 {
-                    ((total_mem as f64) * RAFTSTORE_V2_BLOCK_CACHE_RATE) as usize
-                } else {
-                    ((total_mem as f64) * BLOCK_CACHE_RATE) as usize
-                }
-            }
-            Some(c) => c.0 as usize,
-        };
+        let capacity = self.capacity.unwrap_or(FALLBACK_BLOCK_CACHE_CAPACITY).0 as usize;
         let mut cache_opts = LRUCacheOptions::new();
         cache_opts.set_capacity(capacity);
         cache_opts.set_num_shard_bits(self.adjust_shard_bits(capacity) as c_int);

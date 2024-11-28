@@ -17,7 +17,7 @@ use engine_rocks::{config::BlobRunMode, RocksEngine, RocksSnapshot, RocksStatist
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{
     CfName, CfNamesExt, Engines, Iterable, KvEngine, Peekable, RaftEngineDebug, RaftEngineReadOnly,
-    CF_DEFAULT, CF_RAFT,
+    CF_DEFAULT, CF_RAFT, CF_WRITE,
 };
 use file_system::IoRateLimiter;
 use futures::{executor::block_on, future::BoxFuture, StreamExt};
@@ -86,15 +86,14 @@ pub fn must_get<EK: KvEngine>(
     }
     debug!("last try to get {}", log_wrappers::hex_encode_upper(key));
     let res = engine.get_value_cf(cf, &keys::data_key(key)).unwrap();
-    if value.is_none() && res.is_none()
-        || value.is_some() && res.is_some() && value.unwrap() == &*res.unwrap()
-    {
+    if value == res.as_ref().map(|r| r.as_ref()) {
         return;
     }
     panic!(
-        "can't get value {:?} for key {}",
+        "can't get value {:?} for key {}, actual={:?}",
         value.map(escape),
-        log_wrappers::hex_encode_upper(key)
+        log_wrappers::hex_encode_upper(key),
+        res
     )
 }
 
@@ -615,6 +614,7 @@ pub fn must_error_read_on_peer<T: Simulator>(
     }
 }
 
+#[track_caller]
 pub fn must_contains_error(resp: &RaftCmdResponse, msg: &str) {
     let header = resp.get_header();
     assert!(header.has_error());
@@ -644,10 +644,7 @@ pub fn create_test_engine(
         data_key_manager_from_config(&cfg.security.encryption, dir.path().to_str().unwrap())
             .unwrap()
             .map(Arc::new);
-    let cache = cfg
-        .storage
-        .block_cache
-        .build_shared_cache(cfg.storage.engine);
+    let cache = cfg.storage.block_cache.build_shared_cache();
     let env = cfg
         .build_shared_rocks_env(key_manager.clone(), limiter)
         .unwrap();
@@ -657,8 +654,8 @@ pub fn create_test_engine(
 
     let (raft_engine, raft_statistics) = RaftTestEngine::build(&cfg, &env, &key_manager, &cache);
 
-    let mut builder =
-        KvEngineFactoryBuilder::new(env, &cfg, cache).sst_recovery_sender(Some(scheduler));
+    let mut builder = KvEngineFactoryBuilder::new(env, &cfg, cache, key_manager.clone())
+        .sst_recovery_sender(Some(scheduler));
     if let Some(router) = router {
         builder = builder.compaction_event_sender(Arc::new(RaftRouterCompactedEventSender {
             router: Mutex::new(router),
@@ -677,11 +674,11 @@ pub fn create_test_engine(
     )
 }
 
-pub fn configure_for_request_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
+pub fn configure_for_request_snapshot(config: &mut Config) {
     // We don't want to generate snapshots due to compact log.
-    cluster.cfg.raft_store.raft_log_gc_threshold = 1000;
-    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(1000);
-    cluster.cfg.raft_store.raft_log_gc_size_limit = Some(ReadableSize::mb(20));
+    config.raft_store.raft_log_gc_threshold = 1000;
+    config.raft_store.raft_log_gc_count_limit = Some(1000);
+    config.raft_store.raft_log_gc_size_limit = Some(ReadableSize::mb(20));
 }
 
 pub fn configure_for_hibernate(config: &mut Config) {
@@ -792,6 +789,14 @@ pub fn put_till_size<T: Simulator>(
     put_cf_till_size(cluster, CF_DEFAULT, limit, range)
 }
 
+pub fn put_till_count<T: Simulator>(
+    cluster: &mut Cluster<T>,
+    limit: u64,
+    range: &mut dyn Iterator<Item = u64>,
+) -> Vec<u8> {
+    put_cf_till_count(cluster, CF_WRITE, limit, range)
+}
+
 pub fn put_cf_till_size<T: Simulator>(
     cluster: &mut Cluster<T>,
     cf: &'static str,
@@ -816,6 +821,36 @@ pub fn put_cf_till_size<T: Simulator>(
             len += value.len() as u64;
             reqs.push(new_put_cf_cmd(cf, key.as_bytes(), &value));
         }
+        cluster.batch_put(key.as_bytes(), reqs).unwrap();
+        // Approximate size of memtable is inaccurate for small data,
+        // we flush it to SST so we can use the size properties instead.
+        cluster.must_flush_cf(cf, true);
+    }
+    key.into_bytes()
+}
+
+pub fn put_cf_till_count<T: Simulator>(
+    cluster: &mut Cluster<T>,
+    cf: &'static str,
+    limit: u64,
+    range: &mut dyn Iterator<Item = u64>,
+) -> Vec<u8> {
+    assert!(limit > 0);
+    let mut len = 0;
+    let mut rng = rand::thread_rng();
+    let mut key = String::new();
+    let mut value = vec![0; 64];
+    while len < limit {
+        let batch_size = std::cmp::min(5, limit - len);
+        let mut reqs = vec![];
+        for _ in 0..batch_size {
+            key.clear();
+            let key_id = range.next().unwrap();
+            write!(key, "{:09}", key_id).unwrap();
+            rng.fill_bytes(&mut value);
+            reqs.push(new_put_cf_cmd(cf, key.as_bytes(), &value));
+        }
+        len += batch_size;
         cluster.batch_put(key.as_bytes(), reqs).unwrap();
         // Approximate size of memtable is inaccurate for small data,
         // we flush it to SST so we can use the size properties instead.
@@ -967,6 +1002,7 @@ pub fn must_kv_prewrite_with(
     client: &TikvClient,
     ctx: Context,
     muts: Vec<Mutation>,
+    pessimistic_actions: Vec<PrewriteRequestPessimisticAction>,
     pk: Vec<u8>,
     ts: u64,
     for_update_ts: u64,
@@ -976,7 +1012,7 @@ pub fn must_kv_prewrite_with(
     let mut prewrite_req = PrewriteRequest::default();
     prewrite_req.set_context(ctx);
     if for_update_ts != 0 {
-        prewrite_req.pessimistic_actions = vec![DoPessimisticCheck; muts.len()];
+        prewrite_req.pessimistic_actions = pessimistic_actions;
     }
     prewrite_req.set_mutations(muts.into_iter().collect());
     prewrite_req.primary_lock = pk;
@@ -1003,6 +1039,7 @@ pub fn try_kv_prewrite_with(
     client: &TikvClient,
     ctx: Context,
     muts: Vec<Mutation>,
+    pessimistic_actions: Vec<PrewriteRequestPessimisticAction>,
     pk: Vec<u8>,
     ts: u64,
     for_update_ts: u64,
@@ -1013,6 +1050,7 @@ pub fn try_kv_prewrite_with(
         client,
         ctx,
         muts,
+        pessimistic_actions,
         pk,
         ts,
         for_update_ts,
@@ -1026,6 +1064,7 @@ pub fn try_kv_prewrite_with_impl(
     client: &TikvClient,
     ctx: Context,
     muts: Vec<Mutation>,
+    pessimistic_actions: Vec<PrewriteRequestPessimisticAction>,
     pk: Vec<u8>,
     ts: u64,
     for_update_ts: u64,
@@ -1035,7 +1074,7 @@ pub fn try_kv_prewrite_with_impl(
     let mut prewrite_req = PrewriteRequest::default();
     prewrite_req.set_context(ctx);
     if for_update_ts != 0 {
-        prewrite_req.pessimistic_actions = vec![DoPessimisticCheck; muts.len()];
+        prewrite_req.pessimistic_actions = pessimistic_actions;
     }
     prewrite_req.set_mutations(muts.into_iter().collect());
     prewrite_req.primary_lock = pk;
@@ -1055,7 +1094,7 @@ pub fn try_kv_prewrite(
     pk: Vec<u8>,
     ts: u64,
 ) -> PrewriteResponse {
-    try_kv_prewrite_with(client, ctx, muts, pk, ts, 0, false, false)
+    try_kv_prewrite_with(client, ctx, muts, vec![], pk, ts, 0, false, false)
 }
 
 pub fn try_kv_prewrite_pessimistic(
@@ -1065,7 +1104,18 @@ pub fn try_kv_prewrite_pessimistic(
     pk: Vec<u8>,
     ts: u64,
 ) -> PrewriteResponse {
-    try_kv_prewrite_with(client, ctx, muts, pk, ts, ts, false, false)
+    let len = muts.len();
+    try_kv_prewrite_with(
+        client,
+        ctx,
+        muts,
+        vec![DoPessimisticCheck; len],
+        pk,
+        ts,
+        ts,
+        false,
+        false,
+    )
 }
 
 pub fn must_kv_prewrite(
@@ -1075,7 +1125,7 @@ pub fn must_kv_prewrite(
     pk: Vec<u8>,
     ts: u64,
 ) {
-    must_kv_prewrite_with(client, ctx, muts, pk, ts, 0, false, false)
+    must_kv_prewrite_with(client, ctx, muts, vec![], pk, ts, 0, false, false)
 }
 
 pub fn must_kv_prewrite_pessimistic(
@@ -1085,7 +1135,18 @@ pub fn must_kv_prewrite_pessimistic(
     pk: Vec<u8>,
     ts: u64,
 ) {
-    must_kv_prewrite_with(client, ctx, muts, pk, ts, ts, false, false)
+    let len = muts.len();
+    must_kv_prewrite_with(
+        client,
+        ctx,
+        muts,
+        vec![DoPessimisticCheck; len],
+        pk,
+        ts,
+        ts,
+        false,
+        false,
+    )
 }
 
 pub fn must_kv_commit(
@@ -1239,6 +1300,50 @@ pub fn must_check_txn_status(
     assert!(!resp.has_region_error(), "{:?}", resp.get_region_error());
     assert!(resp.error.is_none(), "{:?}", resp.get_error());
     resp
+}
+
+pub fn must_kv_have_locks(
+    client: &TikvClient,
+    ctx: Context,
+    ts: u64,
+    start_key: &[u8],
+    end_key: &[u8],
+    expected_locks: &[(
+        // key
+        &[u8],
+        Op,
+        // start_ts
+        u64,
+        // for_update_ts
+        u64,
+    )],
+) {
+    let mut req = ScanLockRequest::default();
+    req.set_context(ctx);
+    req.set_limit(100);
+    req.set_start_key(start_key.to_vec());
+    req.set_end_key(end_key.to_vec());
+    req.set_max_version(ts);
+    let resp = client.kv_scan_lock(&req).unwrap();
+    assert!(!resp.has_region_error(), "{:?}", resp.get_region_error());
+    assert!(resp.error.is_none(), "{:?}", resp.get_error());
+
+    assert_eq!(
+        resp.locks.len(),
+        expected_locks.len(),
+        "lock count not match, expected: {:?}; got: {:?}",
+        expected_locks,
+        resp.locks
+    );
+
+    for (lock_info, (expected_key, expected_op, expected_start_ts, expected_for_update_ts)) in
+        resp.locks.into_iter().zip(expected_locks.iter())
+    {
+        assert_eq!(lock_info.get_key(), *expected_key);
+        assert_eq!(lock_info.get_lock_type(), *expected_op);
+        assert_eq!(lock_info.get_lock_version(), *expected_start_ts);
+        assert_eq!(lock_info.get_lock_for_update_ts(), *expected_for_update_ts);
+    }
 }
 
 pub fn get_tso(pd_client: &TestPdClient) -> u64 {
@@ -1465,11 +1570,31 @@ impl PeerClient {
     }
 
     pub fn must_kv_prewrite_async_commit(&self, muts: Vec<Mutation>, pk: Vec<u8>, ts: u64) {
-        must_kv_prewrite_with(&self.cli, self.ctx.clone(), muts, pk, ts, 0, true, false)
+        must_kv_prewrite_with(
+            &self.cli,
+            self.ctx.clone(),
+            muts,
+            vec![],
+            pk,
+            ts,
+            0,
+            true,
+            false,
+        )
     }
 
     pub fn must_kv_prewrite_one_pc(&self, muts: Vec<Mutation>, pk: Vec<u8>, ts: u64) {
-        must_kv_prewrite_with(&self.cli, self.ctx.clone(), muts, pk, ts, 0, false, true)
+        must_kv_prewrite_with(
+            &self.cli,
+            self.ctx.clone(),
+            muts,
+            vec![],
+            pk,
+            ts,
+            0,
+            false,
+            true,
+        )
     }
 
     pub fn must_kv_commit(&self, keys: Vec<Vec<u8>>, start_ts: u64, commit_ts: u64) {
@@ -1566,4 +1691,37 @@ pub fn test_delete_range<T: Simulator>(cluster: &mut Cluster<T>, cf: CfName) {
         let k = &data_set.choose(&mut rng).unwrap().0;
         assert!(cluster.get_cf(cf, k).is_none());
     }
+}
+
+pub fn put_with_timeout<T: Simulator>(
+    cluster: &mut Cluster<T>,
+    node_id: u64,
+    key: &[u8],
+    value: &[u8],
+    timeout: Duration,
+) -> Result<RaftCmdResponse> {
+    let mut region = cluster.get_region(key);
+    let region_id = region.get_id();
+    let req = new_request(
+        region_id,
+        region.take_region_epoch(),
+        vec![new_put_cf_cmd(CF_DEFAULT, key, value)],
+        false,
+    );
+    cluster.call_command_on_node(node_id, req, timeout)
+}
+
+pub fn wait_down_peers<T: Simulator>(cluster: &Cluster<T>, count: u64, peer: Option<u64>) {
+    let mut peers = cluster.get_down_peers();
+    for _ in 1..1000 {
+        if peers.len() == count as usize && peer.as_ref().map_or(true, |p| peers.contains_key(p)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        peers = cluster.get_down_peers();
+    }
+    panic!(
+        "got {:?}, want {} peers which should include {:?}",
+        peers, count, peer
+    );
 }

@@ -31,7 +31,7 @@ use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_traits::{
     util::SequenceNumber, DeleteStrategy, KvEngine, Mutable, PerfContext, PerfContextKind,
     RaftEngine, RaftEngineReadOnly, Range as EngineRange, Snapshot, SstMetaInfo, WriteBatch,
-    ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
+    WriteOptions, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
 };
 use fail::fail_point;
 use kvproto::{
@@ -678,7 +678,7 @@ where
             exec_res: results,
             metrics: mem::take(&mut delegate.metrics),
             applied_term: delegate.applied_term,
-            bucket_stat: delegate.buckets.clone().map(Box::new),
+            bucket_stat: delegate.buckets.clone(),
         });
         if !self.kv_wb().is_empty() {
             // Pending writes not flushed, need to set seqno to following ApplyRes later
@@ -1958,8 +1958,9 @@ where
                     e
                 )
             };
+            let wopts = WriteOptions::default();
             engine
-                .delete_ranges_cf(cf, DeleteStrategy::DeleteFiles, &range)
+                .delete_ranges_cf(&wopts, cf, DeleteStrategy::DeleteFiles, &range)
                 .unwrap_or_else(|e| fail_f(e, DeleteStrategy::DeleteFiles));
 
             let strategy = if use_delete_range {
@@ -1969,10 +1970,10 @@ where
             };
             // Delete all remaining keys.
             engine
-                .delete_ranges_cf(cf, strategy.clone(), &range)
+                .delete_ranges_cf(&wopts, cf, strategy.clone(), &range)
                 .unwrap_or_else(move |e| fail_f(e, strategy));
             engine
-                .delete_ranges_cf(cf, DeleteStrategy::DeleteBlobs, &range)
+                .delete_ranges_cf(&wopts, cf, DeleteStrategy::DeleteBlobs, &range)
                 .unwrap_or_else(move |e| fail_f(e, DeleteStrategy::DeleteBlobs));
         }
 
@@ -2123,14 +2124,14 @@ where
 
         match change_type {
             ConfChangeType::AddNode => {
-                let add_ndoe_fp = || {
+                let add_node_fp = || {
                     fail_point!(
                         "apply_on_add_node_1_2",
                         self.id() == 2 && self.region_id() == 1,
                         |_| {}
                     )
                 };
-                add_ndoe_fp();
+                add_node_fp();
 
                 PEER_ADMIN_CMD_COUNTER_VEC
                     .with_label_values(&["add_peer", "all"])
@@ -2393,8 +2394,8 @@ where
                             "region_id" => self.region_id(),
                             "peer_id" => self.id(),
                             "peer" => ?peer,
-                            "exist peer" => ?exist_peer,
-                            "confchange type" => ?change_type,
+                            "exist_peer" => ?exist_peer,
+                            "confchange_type" => ?change_type,
                             "region" => ?&self.region
                         );
                         return Err(box_err!(
@@ -3373,10 +3374,10 @@ where
     }
 
     fn update_memory_trace(&mut self, event: &mut TraceEvent) {
-        let pending_cmds = self.pending_cmds.heap_size();
+        let pending_cmds = self.pending_cmds.approximate_heap_size();
         let merge_yield = if let Some(ref mut state) = self.yield_state {
             if state.heap_size.is_none() {
-                state.heap_size = Some(state.heap_size());
+                state.heap_size = Some(state.approximate_heap_size());
             }
             state.heap_size.unwrap()
         } else {
@@ -3773,6 +3774,9 @@ where
 
 impl<EK: KvEngine> ResourceMetered for Box<Msg<EK>> {
     fn consume_resource(&self, resource_ctl: &Arc<ResourceController>) -> Option<String> {
+        if !resource_ctl.is_customized() {
+            return None;
+        }
         match **self {
             Msg::Apply { ref apply, .. } => {
                 let mut dominant_group = "".to_owned();
@@ -3882,7 +3886,7 @@ where
     pub applied_term: u64,
     pub exec_res: VecDeque<ExecResult<S>>,
     pub metrics: ApplyMetrics,
-    pub bucket_stat: Option<Box<BucketStat>>,
+    pub bucket_stat: Option<BucketStat>,
     pub write_seqno: Vec<SequenceNumber>,
 }
 
@@ -4958,7 +4962,7 @@ mod memtrace {
     }
 
     impl<C> HeapSize for PendingCmdQueue<C> {
-        fn heap_size(&self) -> usize {
+        fn approximate_heap_size(&self) -> usize {
             // Some fields of `PendingCmd` are on stack, but ignore them because they are
             // just some small boxed closures.
             self.normals.capacity() * mem::size_of::<PendingCmd<C>>()
@@ -4969,7 +4973,7 @@ mod memtrace {
     where
         EK: KvEngine,
     {
-        fn heap_size(&self) -> usize {
+        fn approximate_heap_size(&self) -> usize {
             let mut size = self.pending_entries.capacity() * mem::size_of::<Entry>();
             for e in &self.pending_entries {
                 size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
@@ -4977,7 +4981,7 @@ mod memtrace {
 
             size += self.pending_msgs.capacity() * mem::size_of::<Msg<EK>>();
             for msg in &self.pending_msgs {
-                size += msg.heap_size();
+                size += msg.approximate_heap_size();
             }
 
             size
@@ -4989,9 +4993,9 @@ mod memtrace {
         EK: KvEngine,
     {
         /// Only consider large fields in `Msg`.
-        fn heap_size(&self) -> usize {
+        fn approximate_heap_size(&self) -> usize {
             match self {
-                Msg::LogsUpToDate(l) => l.heap_size(),
+                Msg::LogsUpToDate(l) => l.approximate_heap_size(),
                 // For entries in `Msg::Apply`, heap size is already updated when fetching them
                 // from `raft::Storage`. So use `0` here.
                 Msg::Apply { .. } => 0,
@@ -5009,7 +5013,7 @@ mod memtrace {
     }
 
     impl HeapSize for CatchUpLogs {
-        fn heap_size(&self) -> usize {
+        fn approximate_heap_size(&self) -> usize {
             let mut size: usize = 0;
             for e in &self.merge.entries {
                 size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
@@ -5079,7 +5083,14 @@ mod tests {
     pub fn create_tmp_importer(path: &str) -> (TempDir, Arc<SstImporter>) {
         let dir = Builder::new().prefix(path).tempdir().unwrap();
         let importer = Arc::new(
-            SstImporter::new(&ImportConfig::default(), dir.path(), None, ApiVersion::V1).unwrap(),
+            SstImporter::new(
+                &ImportConfig::default(),
+                dir.path(),
+                None,
+                ApiVersion::V1,
+                false,
+            )
+            .unwrap(),
         );
         (dir, importer)
     }
@@ -5399,6 +5410,9 @@ mod tests {
         reg.apply_state.set_applied_index(3);
         router.schedule_task(2, Msg::Registration(reg.dup()));
         validate(&router, 2, move |delegate| {
+            // Migrated to 2021 migration. This let statement is probably not needed, see
+            //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+            let _ = &reg;
             assert_eq!(delegate.id(), 1);
             assert_eq!(delegate.peer, peer);
             assert_eq!(delegate.tag, "[region 2] 1");
@@ -5774,7 +5788,6 @@ mod tests {
                 self.header.clone(),
                 bin,
                 1000,
-                false,
             );
             let (bytes, _) = req_encoder.encode();
             self.entry.set_data(bytes.into());
@@ -6962,7 +6975,7 @@ mod tests {
         router.schedule_task(1, Msg::apply(apply2));
 
         let res = fetch_apply_res(&rx);
-        let bucket_version = res.bucket_stat.unwrap().as_ref().meta.version;
+        let bucket_version = res.bucket_stat.unwrap().meta.version;
 
         assert_eq!(bucket_version, 2);
 

@@ -27,14 +27,16 @@ use strum::{EnumCount, EnumVariantNames};
 use tikv_util::{deadline::Deadline, escape, memory::HeapSize, time::Instant};
 use tracker::{get_tls_tracker_token, TrackerToken};
 
-use super::{local_metrics::TimeTracker, region_meta::RegionMeta, FetchedLogs, RegionSnapshot};
+use super::{
+    local_metrics::TimeTracker, region_meta::RegionMeta,
+    snapshot_backup::SnapshotBrWaitApplyRequest, FetchedLogs, RegionSnapshot,
+};
 use crate::store::{
     fsm::apply::{CatchUpLogs, ChangeObserver, TaskRes as ApplyTaskRes},
     metrics::RaftEventDurationType,
-    peer::{
-        SnapshotRecoveryWaitApplySyncer, UnsafeRecoveryExecutePlanSyncer,
-        UnsafeRecoveryFillOutReportSyncer, UnsafeRecoveryForceLeaderSyncer,
-        UnsafeRecoveryWaitApplySyncer,
+    unsafe_recovery::{
+        UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryFillOutReportSyncer,
+        UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer,
     },
     util::{KeysInfoFormatter, LatencyInspector},
     worker::{Bucket, BucketRange},
@@ -529,7 +531,7 @@ where
     UnsafeRecoveryDestroy(UnsafeRecoveryExecutePlanSyncer),
     UnsafeRecoveryWaitApply(UnsafeRecoveryWaitApplySyncer),
     UnsafeRecoveryFillOutReport(UnsafeRecoveryFillOutReportSyncer),
-    SnapshotRecoveryWaitApply(SnapshotRecoveryWaitApplySyncer),
+    SnapshotBrWaitApply(SnapshotBrWaitApplyRequest),
     CheckPendingAdmin(UnboundedSender<CheckAdminResponse>),
 }
 
@@ -558,12 +560,14 @@ pub enum CasualMessage<EK: KvEngine> {
     /// Approximate size of target region. This message can only be sent by
     /// split-check thread.
     RegionApproximateSize {
-        size: u64,
+        size: Option<u64>,
+        splitable: Option<bool>,
     },
 
     /// Approximate key count of target region.
     RegionApproximateKeys {
-        keys: u64,
+        keys: Option<u64>,
+        splitable: Option<bool>,
     },
     CompactionDeclinedBytes {
         bytes: u64,
@@ -618,7 +622,11 @@ pub enum CasualMessage<EK: KvEngine> {
     RenewLease,
 
     // Snapshot is applied
-    SnapshotApplied,
+    SnapshotApplied {
+        peer_id: u64,
+        /// Whether the peer is destroyed after applying the snapshot
+        tombstone: bool,
+    },
 
     // Trigger raft to campaign which is used after exiting force leader
     Campaign,
@@ -648,11 +656,19 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
                 KeysInfoFormatter(split_keys.iter()),
                 source,
             ),
-            CasualMessage::RegionApproximateSize { size } => {
-                write!(fmt, "Region's approximate size [size: {:?}]", size)
+            CasualMessage::RegionApproximateSize { size, splitable } => {
+                write!(
+                    fmt,
+                    "Region's approximate size [size: {:?}], [splitable: {:?}]",
+                    size, splitable
+                )
             }
-            CasualMessage::RegionApproximateKeys { keys } => {
-                write!(fmt, "Region's approximate keys [keys: {:?}]", keys)
+            CasualMessage::RegionApproximateKeys { keys, splitable } => {
+                write!(
+                    fmt,
+                    "Region's approximate keys [keys: {:?}], [splitable: {:?}",
+                    keys, splitable
+                )
             }
             CasualMessage::CompactionDeclinedBytes { bytes } => {
                 write!(fmt, "compaction declined bytes {}", bytes)
@@ -679,7 +695,11 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
             }
             CasualMessage::RefreshRegionBuckets { .. } => write!(fmt, "RefreshRegionBuckets"),
             CasualMessage::RenewLease => write!(fmt, "RenewLease"),
-            CasualMessage::SnapshotApplied => write!(fmt, "SnapshotApplied"),
+            CasualMessage::SnapshotApplied { peer_id, tombstone } => write!(
+                fmt,
+                "SnapshotApplied, peer_id={}, tombstone={}",
+                peer_id, tombstone
+            ),
             CasualMessage::Campaign => write!(fmt, "Campaign"),
         }
     }
@@ -737,12 +757,11 @@ pub struct InspectedRaftMessage {
 
 /// Message that can be sent to a peer.
 #[derive(EnumCount, EnumVariantNames)]
-#[repr(u8)]
 pub enum PeerMsg<EK: KvEngine> {
     /// Raft message is the message sent between raft nodes in the same
     /// raft group. Messages need to be redirected to raftstore if target
     /// peer doesn't exist.
-    RaftMessage(Box<InspectedRaftMessage>),
+    RaftMessage(Box<InspectedRaftMessage>, Option<Instant>),
     /// Raft command is the command that is expected to be proposed by the
     /// leader of the target raft group. If it's failed to be sent, callback
     /// usually needs to be called before dropping in case of resource leak.
@@ -778,7 +797,7 @@ impl<EK: KvEngine> ResourceMetered for PeerMsg<EK> {}
 impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PeerMsg::RaftMessage(_) => write!(fmt, "Raft Message"),
+            PeerMsg::RaftMessage(..) => write!(fmt, "Raft Message"),
             PeerMsg::RaftCommand(_) => write!(fmt, "Raft Command"),
             PeerMsg::Tick(tick) => write! {
                 fmt,
@@ -953,6 +972,6 @@ mod tests {
         use super::*;
 
         // make sure the msg is small enough
-        assert_eq!(mem::size_of::<PeerMsg<RocksEngine>>(), 24);
+        assert_eq!(mem::size_of::<PeerMsg<RocksEngine>>(), 32);
     }
 }

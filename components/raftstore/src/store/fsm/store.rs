@@ -48,6 +48,7 @@ use protobuf::Message;
 use raft::StateRole;
 use resource_control::{channel::unbounded, ResourceGroupManager};
 use resource_metering::CollectorRegHandle;
+use service::service_manager::GrpcServiceManager;
 use sst_importer::SstImporter;
 use strum::{EnumCount, VariantNames};
 use tikv_alloc::trace::TraceEvent;
@@ -66,6 +67,7 @@ use tikv_util::{
     timer::SteadyTimer,
     warn,
     worker::{LazyWorker, Scheduler, Worker},
+    yatp_pool::FuturePool,
     Either, RingQueue,
 };
 use time::{self, Timespec};
@@ -99,13 +101,14 @@ use crate::{
         util::{is_initial_msg, RegionReadProgressRegistry},
         worker::{
             AutoSplitController, CleanupRunner, CleanupSstRunner, CleanupSstTask, CleanupTask,
-            CompactRunner, CompactTask, CompactThreshold, ConsistencyCheckRunner,
-            ConsistencyCheckTask, GcSnapshotRunner, GcSnapshotTask, PdRunner, RaftlogGcRunner,
-            RaftlogGcTask, ReadDelegate, RefreshConfigRunner, RefreshConfigTask, RegionRunner,
-            RegionTask, SplitCheckTask,
+            CompactRunner, CompactTask, ConsistencyCheckRunner, ConsistencyCheckTask,
+            GcSnapshotRunner, GcSnapshotTask, PdRunner, RaftlogGcRunner, RaftlogGcTask,
+            ReadDelegate, RefreshConfigRunner, RefreshConfigTask, RegionRunner, RegionTask,
+            SplitCheckTask,
         },
-        Callback, CasualMessage, GlobalReplicationState, InspectedRaftMessage, MergeResultKind,
-        PdTask, PeerMsg, PeerTick, RaftCommand, SignificantMsg, SnapManager, StoreMsg, StoreTick,
+        Callback, CasualMessage, CompactThreshold, GlobalReplicationState, InspectedRaftMessage,
+        MergeResultKind, PdTask, PeerMsg, PeerTick, RaftCommand, SignificantMsg, SnapManager,
+        StoreMsg, StoreTick,
     },
     Error, Result,
 };
@@ -177,6 +180,10 @@ pub struct StoreMeta {
     pub region_read_progress: RegionReadProgressRegistry,
     /// record sst_file_name -> (sst_smallest_key, sst_largest_key)
     pub damaged_ranges: HashMap<String, (Vec<u8>, Vec<u8>)>,
+    /// Record regions are damaged on some corner cases, the relative peer must
+    /// be safely removed from the store, such as applying snapshot or
+    /// compacting raft logs.
+    pub damaged_regions: HashSet<u64>,
     /// Record peers are busy with applying logs
     /// (applied_index <= last_idx - leader_transfer_max_log_lag).
     /// `busy_apply_peers` and `completed_apply_peers_count` are used
@@ -239,6 +246,7 @@ impl StoreMeta {
             destroyed_region_for_snap: HashMap::default(),
             region_read_progress: RegionReadProgressRegistry::new(),
             damaged_ranges: HashMap::default(),
+            damaged_regions: HashSet::default(),
             busy_apply_peers: HashSet::default(),
             completed_apply_peers_count: Some(0),
         }
@@ -402,7 +410,10 @@ where
         for e in msg.get_message().get_entries() {
             heap_size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
         }
-        let peer_msg = PeerMsg::RaftMessage(Box::new(InspectedRaftMessage { heap_size, msg }));
+        let peer_msg = PeerMsg::RaftMessage(
+            Box::new(InspectedRaftMessage { heap_size, msg }),
+            Some(TiInstant::now()),
+        );
         let event = TraceEvent::Add(heap_size);
         let send_failed = Cell::new(true);
 
@@ -417,13 +428,13 @@ where
                 send_failed.set(false);
                 return Ok(());
             }
-            Either::Left(Err(TrySendError::Full(PeerMsg::RaftMessage(im)))) => {
+            Either::Left(Err(TrySendError::Full(PeerMsg::RaftMessage(im, _)))) => {
                 return Err(TrySendError::Full(im.msg));
             }
-            Either::Left(Err(TrySendError::Disconnected(PeerMsg::RaftMessage(im)))) => {
+            Either::Left(Err(TrySendError::Disconnected(PeerMsg::RaftMessage(im, _)))) => {
                 return Err(TrySendError::Disconnected(im.msg));
             }
-            Either::Right(PeerMsg::RaftMessage(im)) => StoreMsg::RaftMessage(im),
+            Either::Right(PeerMsg::RaftMessage(im, _)) => StoreMsg::RaftMessage(im),
             _ => unreachable!(),
         };
         match self.send_control(store_msg) {
@@ -1224,8 +1235,8 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
     feature_gate: FeatureGate,
     write_senders: WriteSenders<EK, ER>,
-    safe_point: Arc<AtomicU64>,
     node_start_time: Timespec, // monotonic_raw_now
+    safe_point: Arc<AtomicU64>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
@@ -1391,9 +1402,11 @@ impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
             .map(|(start, end)| Range::new(start, end))
             .collect();
 
-        self.engines
-            .kv
-            .delete_ranges_cfs(DeleteStrategy::DeleteFiles, &ranges)?;
+        self.engines.kv.delete_ranges_cfs(
+            &WriteOptions::default(),
+            DeleteStrategy::DeleteFiles,
+            &ranges,
+        )?;
 
         info!(
             "cleans up garbage data";
@@ -1534,8 +1547,8 @@ where
             global_replication_state: self.global_replication_state.clone(),
             feature_gate: self.feature_gate.clone(),
             write_senders: self.write_senders.clone(),
-            safe_point: self.safe_point.clone(),
             node_start_time: self.node_start_time,
+            safe_point: self.safe_point.clone(),
         }
     }
 }
@@ -1609,6 +1622,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         collector_reg_handle: CollectorRegHandle,
         health_service: Option<HealthService>,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used for rawkv apiv2
+        grpc_service_mgr: GrpcServiceManager,
         safe_point: Arc<AtomicU64>,
     ) -> Result<()> {
         assert!(self.workers.is_none());
@@ -1661,6 +1675,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             self.router(),
             Some(Arc::clone(&pd_client)),
         );
+        let snap_generator_pool = region_runner.snap_generator_pool();
         let region_scheduler = workers
             .region_worker
             .start_with_timer("snapshot-worker", region_runner);
@@ -1729,8 +1744,8 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             pending_create_peers: Arc::new(Mutex::new(HashMap::default())),
             feature_gate: pd_client.feature_gate().clone(),
             write_senders: self.store_writers.senders(),
-            safe_point,
             node_start_time: self.node_start_time,
+            safe_point,
         };
         let region_peers = builder.init()?;
         self.start_system::<T, C>(
@@ -1745,6 +1760,8 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             region_read_progress,
             health_service,
             causal_ts_provider,
+            snap_generator_pool,
+            grpc_service_mgr,
         )?;
         Ok(())
     }
@@ -1762,6 +1779,8 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         region_read_progress: RegionReadProgressRegistry,
         health_service: Option<HealthService>,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used for rawkv apiv2
+        snap_generator_pool: FuturePool,
+        grpc_service_mgr: GrpcServiceManager,
     ) -> Result<()> {
         let cfg = builder.cfg.value().clone();
         let store = builder.store.clone();
@@ -1834,6 +1853,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             self.router.router.clone(),
             self.apply_system.build_pool_state(apply_builder),
             self.system.build_pool_state(raft_builder),
+            snap_generator_pool,
         );
         assert!(workers.refresh_config_worker.start(refresh_config_runner));
 
@@ -1852,6 +1872,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             health_service,
             coprocessor_host,
             causal_ts_provider,
+            grpc_service_mgr,
         );
         assert!(workers.pd_worker.start_with_timer(pd_runner));
 
@@ -2092,14 +2113,18 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
         });
 
         let region_id = msg.msg.get_region_id();
-        let msg = match self.ctx.router.send(region_id, PeerMsg::RaftMessage(msg)) {
+        let msg = match self
+            .ctx
+            .router
+            .send(region_id, PeerMsg::RaftMessage(msg, None))
+        {
             Ok(()) => {
                 forwarded.set(true);
                 return Ok(());
             }
             Err(TrySendError::Full(_)) => return Ok(()),
             Err(TrySendError::Disconnected(_)) if self.ctx.router.is_shutdown() => return Ok(()),
-            Err(TrySendError::Disconnected(PeerMsg::RaftMessage(im))) => im.msg,
+            Err(TrySendError::Disconnected(PeerMsg::RaftMessage(im, None))) => im.msg,
             Err(_) => unreachable!(),
         };
 
@@ -2171,8 +2196,10 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
                     check_msg_status == CheckMsgStatus::NewPeerFirst,
                 )? {
                     // Peer created, send the message again.
-                    let peer_msg =
-                        PeerMsg::RaftMessage(Box::new(InspectedRaftMessage { heap_size, msg }));
+                    let peer_msg = PeerMsg::RaftMessage(
+                        Box::new(InspectedRaftMessage { heap_size, msg }),
+                        None,
+                    );
                     if self.ctx.router.send(region_id, peer_msg).is_ok() {
                         forwarded.set(true);
                     }
@@ -2196,7 +2223,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
             } else {
                 drop(store_meta);
                 let peer_msg =
-                    PeerMsg::RaftMessage(Box::new(InspectedRaftMessage { heap_size, msg }));
+                    PeerMsg::RaftMessage(Box::new(InspectedRaftMessage { heap_size, msg }), None);
                 if let Err(e) = self.ctx.router.force_send(region_id, peer_msg) {
                     warn!("handle first request failed"; "region_id" => region_id, "error" => ?e);
                 } else {
@@ -2539,7 +2566,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
                     self.ctx.cfg.region_compact_min_tombstones,
                     self.ctx.cfg.region_compact_tombstones_percent,
                     self.ctx.cfg.region_compact_min_redundant_rows,
-                    self.ctx.cfg.region_compact_redundant_rows_percent,
+                    self.ctx.cfg.region_compact_redundant_rows_percent(),
                 ),
             },
         )) {
@@ -2627,6 +2654,14 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
             if !meta.damaged_ranges.is_empty() {
                 let damaged_regions_id = meta.get_all_damaged_region_ids().into_iter().collect();
                 stats.set_damaged_regions_id(damaged_regions_id);
+            }
+
+            if !meta.damaged_regions.is_empty() {
+                // Note: no need to filter overlapped regions, since the regions in
+                // `damaged_ranges` are already non-overlapping.
+                stats
+                    .mut_damaged_regions_id()
+                    .extend(meta.damaged_regions.iter());
             }
             completed_apply_peers_count = meta.completed_apply_peers_count;
             busy_apply_peers_count = meta.busy_apply_peers.len() as u64;
@@ -3167,6 +3202,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
         drop(meta);
 
         if let Err(e) = self.ctx.engines.kv.delete_ranges_cfs(
+            &WriteOptions::default(),
             DeleteStrategy::DeleteByKey,
             &[Range::new(&start_key, &end_key)],
         ) {

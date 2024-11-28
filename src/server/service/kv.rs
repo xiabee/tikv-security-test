@@ -192,17 +192,17 @@ macro_rules! handle_request {
         handle_request!($fn_name, $future_name, $req_ty, $resp_ty, no_time_detail);
     };
     ($fn_name: ident, $future_name: ident, $req_ty: ident, $resp_ty: ident, $time_detail: tt) => {
-        fn $fn_name(&mut self, ctx: RpcContext<'_>, mut req: $req_ty, sink: UnarySink<$resp_ty>) {
+        fn $fn_name(&mut self, ctx: RpcContext<'_>, req: $req_ty, sink: UnarySink<$resp_ty>) {
             forward_unary!(self.proxy, $fn_name, ctx, req, sink);
             let begin_instant = Instant::now();
 
-            let source = req.mut_context().take_request_source();
+            let source = req.get_context().get_request_source().to_owned();
             let resource_control_ctx = req.get_context().get_resource_control_context();
             if let Some(resource_manager) = &self.resource_manager {
                 resource_manager.consume_penalty(resource_control_ctx);
             }
             GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
+                    .with_label_values(&[resource_control_ctx.get_resource_group_name(), resource_control_ctx.get_resource_group_name()])
                     .inc();
             let resp = $future_name(&self.storage, req);
             let task = async move {
@@ -417,13 +417,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     fn kv_prepare_flashback_to_version(
         &mut self,
         ctx: RpcContext<'_>,
-        mut req: PrepareFlashbackToVersionRequest,
+        req: PrepareFlashbackToVersionRequest,
         sink: UnarySink<PrepareFlashbackToVersionResponse>,
     ) {
         let begin_instant = Instant::now();
 
-        let source = req.mut_context().take_request_source();
-        let resp = future_prepare_flashback_to_version(&self.storage, req);
+        let source = req.get_context().get_request_source().to_owned();
+        let resp = future_prepare_flashback_to_version(self.storage.clone(), req);
         let task = async move {
             let resp = resp.await?;
             let elapsed = begin_instant.saturating_elapsed();
@@ -448,13 +448,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     fn kv_flashback_to_version(
         &mut self,
         ctx: RpcContext<'_>,
-        mut req: FlashbackToVersionRequest,
+        req: FlashbackToVersionRequest,
         sink: UnarySink<FlashbackToVersionResponse>,
     ) {
         let begin_instant = Instant::now();
 
-        let source = req.mut_context().take_request_source();
-        let resp = future_flashback_to_version(&self.storage, req);
+        let source = req.get_context().get_request_source().to_owned();
+        let resp = future_flashback_to_version(self.storage.clone(), req);
         let task = async move {
             let resp = resp.await?;
             let elapsed = begin_instant.saturating_elapsed();
@@ -476,15 +476,18 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         ctx.spawn(task);
     }
 
-    fn coprocessor(&mut self, ctx: RpcContext<'_>, mut req: Request, sink: UnarySink<Response>) {
+    fn coprocessor(&mut self, ctx: RpcContext<'_>, req: Request, sink: UnarySink<Response>) {
         forward_unary!(self.proxy, coprocessor, ctx, req, sink);
-        let source = req.mut_context().take_request_source();
+        let source = req.get_context().get_request_source().to_owned();
         let resource_control_ctx = req.get_context().get_resource_control_context();
         if let Some(resource_manager) = &self.resource_manager {
             resource_manager.consume_penalty(resource_control_ctx);
         }
         GRPC_RESOURCE_GROUP_COUNTER_VEC
-            .with_label_values(&[resource_control_ctx.get_resource_group_name()])
+            .with_label_values(&[
+                resource_control_ctx.get_resource_group_name(),
+                resource_control_ctx.get_resource_group_name(),
+            ])
             .inc();
 
         let begin_instant = Instant::now();
@@ -513,16 +516,19 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     fn raw_coprocessor(
         &mut self,
         ctx: RpcContext<'_>,
-        mut req: RawCoprocessorRequest,
+        req: RawCoprocessorRequest,
         sink: UnarySink<RawCoprocessorResponse>,
     ) {
-        let source = req.mut_context().take_request_source();
+        let source = req.get_context().get_request_source().to_owned();
         let resource_control_ctx = req.get_context().get_resource_control_context();
         if let Some(resource_manager) = &self.resource_manager {
             resource_manager.consume_penalty(resource_control_ctx);
         }
         GRPC_RESOURCE_GROUP_COUNTER_VEC
-            .with_label_values(&[resource_control_ctx.get_resource_group_name()])
+            .with_label_values(&[
+                resource_control_ctx.get_resource_group_name(),
+                resource_control_ctx.get_resource_group_name(),
+            ])
             .inc();
 
         let begin_instant = Instant::now();
@@ -561,7 +567,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         assert!(!req.get_start_key().is_empty());
         assert!(!req.get_end_key().is_empty());
 
-        let source = req.mut_context().take_request_source();
+        let source = req.get_context().get_request_source().to_owned();
         let (cb, f) = paired_future_callback();
         let res = self.gc_worker.unsafe_destroy_range(
             req.take_context(),
@@ -611,7 +617,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             resource_manager.consume_penalty(resource_control_ctx);
         }
         GRPC_RESOURCE_GROUP_COUNTER_VEC
-            .with_label_values(&[resource_control_ctx.get_resource_group_name()])
+            .with_label_values(&[
+                resource_control_ctx.get_resource_group_name(),
+                resource_control_ctx.get_resource_group_name(),
+            ])
             .inc();
 
         let mut stream = self
@@ -1004,6 +1013,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         mut request: CheckLeaderRequest,
         sink: UnarySink<CheckLeaderResponse>,
     ) {
+        let begin_instant = Instant::now();
         let addr = ctx.peer();
         let ts = request.get_ts();
         let leaders = request.take_regions().into();
@@ -1025,6 +1035,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                 }
                 return Err(Error::from(e));
             }
+            let elapsed = begin_instant.saturating_elapsed();
+            GRPC_MSG_HISTOGRAM_STATIC
+                .check_leader
+                .observe(elapsed.as_secs_f64());
             ServerResult::Ok(())
         }
         .map_err(move |e| {
@@ -1144,58 +1158,58 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
                     let resp = future::ok(batch_commands_response::Response::default());
                     response_batch_commands_request(id, resp, tx.clone(), begin_instant, GrpcTypeKind::invalid, String::default());
                 },
-                Some(batch_commands_request::request::Cmd::Get(mut req)) => {
+                Some(batch_commands_request::request::Cmd::Get(req)) => {
                     let resource_control_ctx = req.get_context().get_resource_control_context();
                     if let Some(resource_manager) = resource_manager {
                         resource_manager.consume_penalty(resource_control_ctx);
                     }
                     GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
+                        .with_label_values(&[resource_control_ctx.get_resource_group_name(), resource_control_ctx.get_resource_group_name()])
+                        .inc();
                     if batcher.as_mut().map_or(false, |req_batch| {
                         req_batch.can_batch_get(&req)
                     }) {
                         batcher.as_mut().unwrap().add_get_request(req, id);
                     } else {
                        let begin_instant = Instant::now();
-                       let source = req.mut_context().take_request_source();
+                       let source = req.get_context().get_request_source().to_owned();
                        let resp = future_get(storage, req)
                             .map_ok(oneof!(batch_commands_response::response::Cmd::Get))
                             .map_err(|_| GRPC_MSG_FAIL_COUNTER.kv_get.inc());
                         response_batch_commands_request(id, resp, tx.clone(), begin_instant, GrpcTypeKind::kv_get, source);
                     }
                 },
-                Some(batch_commands_request::request::Cmd::RawGet(mut req)) => {
+                Some(batch_commands_request::request::Cmd::RawGet(req)) => {
                     let resource_control_ctx = req.get_context().get_resource_control_context();
                     if let Some(resource_manager) = resource_manager {
                         resource_manager.consume_penalty(resource_control_ctx);
                     }
                     GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
+                        .with_label_values(&[resource_control_ctx.get_resource_group_name(), resource_control_ctx.get_resource_group_name()])
+                        .inc();
                     if batcher.as_mut().map_or(false, |req_batch| {
                         req_batch.can_batch_raw_get(&req)
                     }) {
                         batcher.as_mut().unwrap().add_raw_get_request(req, id);
                     } else {
                        let begin_instant = Instant::now();
-                       let source = req.mut_context().take_request_source();
+                       let source = req.get_context().get_request_source().to_owned();
                        let resp = future_raw_get(storage, req)
                             .map_ok(oneof!(batch_commands_response::response::Cmd::RawGet))
                             .map_err(|_| GRPC_MSG_FAIL_COUNTER.raw_get.inc());
                         response_batch_commands_request(id, resp, tx.clone(), begin_instant, GrpcTypeKind::raw_get, source);
                     }
                 },
-                Some(batch_commands_request::request::Cmd::Coprocessor(mut req)) => {
+                Some(batch_commands_request::request::Cmd::Coprocessor(req)) => {
                     let resource_control_ctx = req.get_context().get_resource_control_context();
                     if let Some(resource_manager) = resource_manager {
                         resource_manager.consume_penalty(resource_control_ctx);
                     }
                     GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
+                        .with_label_values(&[resource_control_ctx.get_resource_group_name(), resource_control_ctx.get_resource_group_name()])
+                        .inc();
                     let begin_instant = Instant::now();
-                    let source = req.mut_context().take_request_source();
+                    let source = req.get_context().get_request_source().to_owned();
                     let resp = future_copr(copr, Some(peer.to_string()), req)
                         .map_ok(|resp| {
                             resp.map(oneof!(batch_commands_response::response::Cmd::Coprocessor))
@@ -1220,16 +1234,16 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
                         String::default(),
                     );
                 }
-                $(Some(batch_commands_request::request::Cmd::$cmd(mut req)) => {
+                $(Some(batch_commands_request::request::Cmd::$cmd(req)) => {
                     let resource_control_ctx = req.get_context().get_resource_control_context();
                     if let Some(resource_manager) = resource_manager {
                         resource_manager.consume_penalty(resource_control_ctx);
                     }
                     GRPC_RESOURCE_GROUP_COUNTER_VEC
-                    .with_label_values(&[resource_control_ctx.get_resource_group_name()])
-                    .inc();
+                        .with_label_values(&[resource_control_ctx.get_resource_group_name(), resource_control_ctx.get_resource_group_name()])
+                        .inc();
                     let begin_instant = Instant::now();
-                    let source = req.mut_context().take_request_source();
+                    let source = req.get_context().get_request_source().to_owned();
                     let resp = $future_fn($($arg,)* req)
                         .map_ok(oneof!(batch_commands_response::response::Cmd::$cmd))
                         .map_err(|_| GRPC_MSG_FAIL_COUNTER.$metric_name.inc());
@@ -1254,8 +1268,8 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
         ResolveLock, future_resolve_lock(storage), kv_resolve_lock;
         Gc, future_gc(), kv_gc;
         DeleteRange, future_delete_range(storage), kv_delete_range;
-        PrepareFlashbackToVersion, future_prepare_flashback_to_version(storage), kv_prepare_flashback_to_version;
-        FlashbackToVersion, future_flashback_to_version(storage), kv_flashback_to_version;
+        PrepareFlashbackToVersion, future_prepare_flashback_to_version(storage.clone()), kv_prepare_flashback_to_version;
+        FlashbackToVersion, future_flashback_to_version(storage.clone()), kv_flashback_to_version;
         RawBatchGet, future_raw_batch_get(storage), raw_batch_get;
         RawPut, future_raw_put(storage), raw_put;
         RawBatchPut, future_raw_batch_put(storage), raw_batch_put;
@@ -1534,7 +1548,6 @@ fn future_scan_lock<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
-#[allow(clippy::unused_async)]
 async fn future_gc(_: GcRequest) -> ServerResult<GcResponse> {
     Err(Error::Grpc(GrpcError::RpcFailure(RpcStatus::new(
         RpcStatusCode::UNIMPLEMENTED,
@@ -1574,65 +1587,59 @@ fn future_delete_range<E: Engine, L: LockManager, F: KvFormat>(
 // the actual flashback operation.
 // NOTICE: the caller needs to make sure the version we want to flashback won't
 // be between any transactions that have not been fully committed.
-fn future_prepare_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
+pub async fn future_prepare_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
     // Keep this param to hint the type of E for the compiler.
-    storage: &Storage<E, L, F>,
+    storage: Storage<E, L, F>,
     req: PrepareFlashbackToVersionRequest,
-) -> impl Future<Output = ServerResult<PrepareFlashbackToVersionResponse>> {
-    let storage = storage.clone();
-    async move {
-        let f = storage
-            .get_engine()
-            .start_flashback(req.get_context(), req.get_start_ts());
-        let mut res = f.await.map_err(storage::Error::from);
+) -> ServerResult<PrepareFlashbackToVersionResponse> {
+    let f = storage
+        .get_engine()
+        .start_flashback(req.get_context(), req.get_start_ts());
+    let mut res = f.await.map_err(storage::Error::from);
+    if matches!(res, Ok(())) {
+        // After the region is put into the flashback state, we need to do a special
+        // prewrite to prevent `resolved_ts` from advancing.
+        let (cb, f) = paired_future_callback();
+        res = storage.sched_txn_command(req.clone().into(), cb);
         if matches!(res, Ok(())) {
-            // After the region is put into the flashback state, we need to do a special
-            // prewrite to prevent `resolved_ts` from advancing.
-            let (cb, f) = paired_future_callback();
-            res = storage.sched_txn_command(req.clone().into(), cb);
-            if matches!(res, Ok(())) {
-                res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
-            }
+            res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
         }
-        let mut resp = PrepareFlashbackToVersionResponse::default();
-        if let Some(e) = extract_region_error(&res) {
-            resp.set_region_error(e);
-        } else if let Err(e) = res {
-            resp.set_error(format!("{}", e));
-        }
-        Ok(resp)
     }
+    let mut resp = PrepareFlashbackToVersionResponse::default();
+    if let Some(e) = extract_region_error(&res) {
+        resp.set_region_error(e);
+    } else if let Err(e) = res {
+        resp.set_error(format!("{}", e));
+    }
+    Ok(resp)
 }
 
 // Flashback the region to a specific point with the given `version`, please
 // make sure the region is "locked" by `PrepareFlashbackToVersion` first,
 // otherwise this request will fail.
-fn future_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
-    storage: &Storage<E, L, F>,
+pub async fn future_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
+    storage: Storage<E, L, F>,
     req: FlashbackToVersionRequest,
-) -> impl Future<Output = ServerResult<FlashbackToVersionResponse>> {
-    let storage = storage.clone();
-    async move {
-        // Perform the data flashback transaction command. We will check if the region
-        // is in the flashback state when proposing the flashback modification.
-        let (cb, f) = paired_future_callback();
-        let mut res = storage.sched_txn_command(req.clone().into(), cb);
-        if matches!(res, Ok(())) {
-            res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
-        }
-        if matches!(res, Ok(())) {
-            // Only finish when flashback executed successfully.
-            let f = storage.get_engine().end_flashback(req.get_context());
-            res = f.await.map_err(storage::Error::from);
-        }
-        let mut resp = FlashbackToVersionResponse::default();
-        if let Some(err) = extract_region_error(&res) {
-            resp.set_region_error(err);
-        } else if let Err(e) = res {
-            resp.set_error(format!("{}", e));
-        }
-        Ok(resp)
+) -> ServerResult<FlashbackToVersionResponse> {
+    // Perform the data flashback transaction command. We will check if the region
+    // is in the flashback state when proposing the flashback modification.
+    let (cb, f) = paired_future_callback();
+    let mut res = storage.sched_txn_command(req.clone().into(), cb);
+    if matches!(res, Ok(())) {
+        res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
     }
+    if matches!(res, Ok(())) {
+        // Only finish when flashback executed successfully.
+        let f = storage.get_engine().end_flashback(req.get_context());
+        res = f.await.map_err(storage::Error::from);
+    }
+    let mut resp = FlashbackToVersionResponse::default();
+    if let Some(err) = extract_region_error(&res) {
+        resp.set_region_error(err);
+    } else if let Err(e) = res {
+        resp.set_error(format!("{}", e));
+    }
+    Ok(resp)
 }
 
 fn future_raw_get<E: Engine, L: LockManager, F: KvFormat>(
@@ -2018,7 +2025,31 @@ fn future_raw_coprocessor<E: Engine, L: LockManager, F: KvFormat>(
 }
 
 macro_rules! txn_command_future {
-    ($fn_name: ident, $req_ty: ident, $resp_ty: ident, ($req: ident) {$($prelude: stmt)*}; ($v: ident, $resp: ident, $tracker: ident) { $else_branch: expr }) => {
+    ($fn_name: ident, $req_ty: ident, $resp_ty: ident, ($req: ident) {$($prelude: stmt)*}; ($v: ident, $resp: ident, $tracker: ident) $else_branch: block) => {
+        txn_command_future!(inner $fn_name, $req_ty, $resp_ty, ($req) {$($prelude)*}; ($v, $resp, $tracker) {
+            $else_branch
+            GLOBAL_TRACKERS.with_tracker($tracker, |tracker| {
+                tracker.write_scan_detail($resp.mut_exec_details_v2().mut_scan_detail_v2());
+                tracker.write_write_detail($resp.mut_exec_details_v2().mut_write_detail());
+            });
+        });
+    };
+
+    ($fn_name: ident, $req_ty: ident, $resp_ty: ident, ($v: ident, $resp: ident, $tracker: ident) $else_branch: block ) => {
+        txn_command_future!(inner $fn_name, $req_ty, $resp_ty, (req) {}; ($v, $resp, $tracker) {
+            $else_branch
+            GLOBAL_TRACKERS.with_tracker($tracker, |tracker| {
+                tracker.write_scan_detail($resp.mut_exec_details_v2().mut_scan_detail_v2());
+                tracker.write_write_detail($resp.mut_exec_details_v2().mut_write_detail());
+            });
+        });
+    };
+
+    ($fn_name: ident, $req_ty: ident, $resp_ty: ident, ($v: ident, $resp: ident) $else_branch: block ) => {
+        txn_command_future!(inner $fn_name, $req_ty, $resp_ty, (req) {}; ($v, $resp, tracker) { $else_branch });
+    };
+
+    (inner $fn_name: ident, $req_ty: ident, $resp_ty: ident, ($req: ident) {$($prelude: stmt)*}; ($v: ident, $resp: ident, $tracker: ident) $else_branch: block) => {
         fn $fn_name<E: Engine, L: LockManager, F: KvFormat>(
             storage: &Storage<E, L, F>,
             $req: $req_ty,
@@ -2045,31 +2076,21 @@ macro_rules! txn_command_future {
                 if let Some(err) = extract_region_error(&$v) {
                     $resp.set_region_error(err);
                 } else {
-                    $else_branch;
+                    $else_branch
                 }
                 Ok($resp)
             }
         }
     };
-    ($fn_name: ident, $req_ty: ident, $resp_ty: ident, ($v: ident, $resp: ident, $tracker: ident) { $else_branch: expr }) => {
-        txn_command_future!($fn_name, $req_ty, $resp_ty, (req) {}; ($v, $resp, $tracker) { $else_branch });
-    };
-    ($fn_name: ident, $req_ty: ident, $resp_ty: ident, ($v: ident, $resp: ident) { $else_branch: expr }) => {
-        txn_command_future!($fn_name, $req_ty, $resp_ty, (req) {}; ($v, $resp, tracker) { $else_branch });
-    };
 }
 
-txn_command_future!(future_prewrite, PrewriteRequest, PrewriteResponse, (v, resp, tracker) {{
+txn_command_future!(future_prewrite, PrewriteRequest, PrewriteResponse, (v, resp, tracker) {
     if let Ok(v) = &v {
         resp.set_min_commit_ts(v.min_commit_ts.into_inner());
         resp.set_one_pc_commit_ts(v.one_pc_commit_ts.into_inner());
-        GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-            tracker.write_scan_detail(resp.mut_exec_details_v2().mut_scan_detail_v2());
-            tracker.write_write_detail(resp.mut_exec_details_v2().mut_write_detail());
-        });
     }
     resp.set_errors(extract_key_errors(v.map(|v| v.locks)).into());
-}});
+});
 txn_command_future!(future_acquire_pessimistic_lock, PessimisticLockRequest, PessimisticLockResponse,
     (req) {
         let mode = req.get_wake_up_mode()
@@ -2100,21 +2121,17 @@ txn_command_future!(future_acquire_pessimistic_lock, PessimisticLockRequest, Pes
                 resp.set_errors(vec![extract_key_error(&e)].into())
             },
         }
-        GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-            tracker.write_scan_detail(resp.mut_exec_details_v2().mut_scan_detail_v2());
-            tracker.write_write_detail(resp.mut_exec_details_v2().mut_write_detail());
-        });
     }}
 );
-txn_command_future!(future_pessimistic_rollback, PessimisticRollbackRequest, PessimisticRollbackResponse, (v, resp) {
+txn_command_future!(future_pessimistic_rollback, PessimisticRollbackRequest, PessimisticRollbackResponse, (v, resp, tracker) {
     resp.set_errors(extract_key_errors(v).into())
 });
-txn_command_future!(future_batch_rollback, BatchRollbackRequest, BatchRollbackResponse, (v, resp) {
+txn_command_future!(future_batch_rollback, BatchRollbackRequest, BatchRollbackResponse, (v, resp, tracker) {
     if let Err(e) = v {
         resp.set_error(extract_key_error(&e));
-    }
+    };
 });
-txn_command_future!(future_resolve_lock, ResolveLockRequest, ResolveLockResponse, (v, resp) {
+txn_command_future!(future_resolve_lock, ResolveLockRequest, ResolveLockResponse, (v, resp, tracker) {
     if let Err(e) = v {
         resp.set_error(extract_key_error(&e));
     }
@@ -2123,11 +2140,7 @@ txn_command_future!(future_commit, CommitRequest, CommitResponse, (v, resp, trac
     match v {
         Ok(TxnStatus::Committed { commit_ts }) => {
             resp.set_commit_version(commit_ts.into_inner());
-            GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                tracker.write_scan_detail(resp.mut_exec_details_v2().mut_scan_detail_v2());
-                tracker.write_write_detail(resp.mut_exec_details_v2().mut_write_detail());
-            });
-        }
+        },
         Ok(_) => unreachable!(),
         Err(e) => resp.set_error(extract_key_error(&e)),
     }
@@ -2141,7 +2154,7 @@ txn_command_future!(future_cleanup, CleanupRequest, CleanupResponse, (v, resp) {
         }
     }
 });
-txn_command_future!(future_txn_heart_beat, TxnHeartBeatRequest, TxnHeartBeatResponse, (v, resp) {
+txn_command_future!(future_txn_heart_beat, TxnHeartBeatRequest, TxnHeartBeatResponse, (v, resp, tracker) {
     match v {
         Ok(txn_status) => {
             if let TxnStatus::Uncommitted { lock, .. } = txn_status {
@@ -2154,7 +2167,7 @@ txn_command_future!(future_txn_heart_beat, TxnHeartBeatRequest, TxnHeartBeatResp
     }
 });
 txn_command_future!(future_check_txn_status, CheckTxnStatusRequest, CheckTxnStatusResponse,
-    (v, resp) {
+    (v, resp, tracker) {
         match v {
             Ok(txn_status) => match txn_status {
                 TxnStatus::RolledBack => resp.set_action(Action::NoAction),
@@ -2177,7 +2190,7 @@ txn_command_future!(future_check_txn_status, CheckTxnStatusRequest, CheckTxnStat
             Err(e) => resp.set_error(extract_key_error(&e)),
         }
 });
-txn_command_future!(future_check_secondary_locks, CheckSecondaryLocksRequest, CheckSecondaryLocksResponse, (status, resp) {
+txn_command_future!(future_check_secondary_locks, CheckSecondaryLocksRequest, CheckSecondaryLocksResponse, (status, resp, tracker) {
     match status {
         Ok(SecondaryLocksStatus::Locked(locks)) => {
             resp.set_locks(locks.into());
@@ -2292,12 +2305,13 @@ fn needs_reject_raft_append(reject_messages_on_memory_ratio: f64) -> bool {
         if (raft_msg_usage + cached_entries + applying_entries) as f64
             > usage as f64 * reject_messages_on_memory_ratio
         {
+            // FIXME: this doesn't output to logfile.
             debug!("need reject log append on memory limit";
-                "raft messages" => raft_msg_usage,
-                "cached entries" => cached_entries,
-                "applying entries" => applying_entries,
-                "current usage" => usage,
-                "reject ratio" => reject_messages_on_memory_ratio);
+                "raft_messages" => raft_msg_usage,
+                "cached_entries" => cached_entries,
+                "applying_entries" => applying_entries,
+                "current_usage" => usage,
+                "reject_ratio" => reject_messages_on_memory_ratio);
             return true;
         }
     }
