@@ -7,7 +7,6 @@ use std::{
 
 use engine_rocks::RocksEngine;
 use grpcio::{EnvBuilder, ResourceQuota};
-use online_config::ConfigManager;
 use raft_log_engine::RaftLogEngine;
 use raftstore::store::{fsm::create_raft_batch_system, SnapManager};
 use security::SecurityManager;
@@ -24,14 +23,6 @@ use tikv_util::{
     config::{ReadableSize, VersionTrack},
     worker::{LazyWorker, Scheduler, Worker},
 };
-
-struct MockCfgManager;
-
-impl ConfigManager for MockCfgManager {
-    fn dispatch(&mut self, _: online_config::ConfigChange) -> online_config::Result<()> {
-        Ok(())
-    }
-}
 
 fn start_server(
     cfg: TikvConfig,
@@ -54,8 +45,7 @@ fn start_server(
             .name_prefix(thd_name!("test-server"))
             .build(),
     );
-    let (raft_router, _) =
-        create_raft_batch_system::<RocksEngine, RaftLogEngine>(&cfg.raft_store, &None);
+    let (raft_router, _) = create_raft_batch_system::<RocksEngine, RaftLogEngine>(&cfg.raft_store);
     let mut snap_worker = Worker::new("snap-handler").lazy_build("snap-handler");
     let snap_worker_scheduler = snap_worker.scheduler();
     let server_config = Arc::new(VersionTrack::new(cfg.server.clone()));
@@ -66,7 +56,6 @@ fn start_server(
             snap_worker_scheduler,
             server_config.clone(),
             ResourceQuota::new(None),
-            Box::new(MockCfgManager),
         )),
     );
     let snap_runner = SnapHandler::new(
@@ -105,7 +94,7 @@ fn test_update_server_config() {
     let change = {
         let mut m = std::collections::HashMap::new();
         m.insert(
-            "server.snap-io-max-bytes-per-sec".to_owned(),
+            "server.snap-max-write-bytes-per-sec".to_owned(),
             "512MB".to_owned(),
         );
         m.insert(
@@ -116,7 +105,7 @@ fn test_update_server_config() {
     };
     cfg_controller.update(change).unwrap();
 
-    svr_cfg.snap_io_max_bytes_per_sec = ReadableSize::mb(512);
+    svr_cfg.snap_max_write_bytes_per_sec = ReadableSize::mb(512);
     svr_cfg.concurrent_send_snap_limit = 100;
     // config should be updated
     assert_eq!(snap_mgr.get_speed_limit() as u64, 536870912);

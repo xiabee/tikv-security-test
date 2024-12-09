@@ -2,18 +2,20 @@
 use std::{
     cell::RefCell,
     fs,
+    fs::{File, OpenOptions},
     io::{self, BufReader, Read, Write},
     sync::Arc,
     usize,
 };
 
-use encryption::{DataKeyManager, DecrypterReader, EncrypterWriter, Iv};
+use encryption::{
+    from_engine_encryption_method, DataKeyManager, DecrypterReader, EncrypterWriter, Iv,
+};
 use engine_traits::{
-    CfName, Error as EngineError, IterOptions, Iterable, Iterator, KvEngine, Mutable, RefIterable,
+    CfName, EncryptionKeyManager, Error as EngineError, Iterable, KvEngine, Mutable,
     SstCompressionType, SstReader, SstWriter, SstWriterBuilder, WriteBatch,
 };
 use fail::fail_point;
-use file_system::{File, OpenOptions};
 use kvproto::encryptionpb::EncryptionMethod;
 use tikv_util::{
     box_try,
@@ -59,7 +61,7 @@ where
 
     if let Some(key_mgr) = key_mgr {
         let enc_info = box_try!(key_mgr.new_file(path));
-        let mthd = enc_info.method;
+        let mthd = from_engine_encryption_method(enc_info.method);
         if mthd != EncryptionMethod::Plaintext {
             let writer = box_try!(EncrypterWriter::new(
                 file.take().unwrap(),
@@ -159,7 +161,11 @@ where
             });
         })();
 
-        let sst_reader = E::SstReader::open(&path, key_mgr)?;
+        let sst_reader = if let Some(mgr) = key_mgr {
+            E::SstReader::open_encrypted(&path, mgr)?
+        } else {
+            E::SstReader::open(&path)?
+        };
         if let Err(e) = sst_reader.verify_checksum() {
             // use sst reader to verify block checksum, it would detect corrupted SST due to
             // memory bit-flip
@@ -238,9 +244,6 @@ where
 
 /// Apply the given snapshot file into a column family. `callback` will be
 /// invoked after each batch of key value pairs written to db.
-///
-/// Attention, callers should manually flush and sync the column family after
-/// applying all sst files to make sure the data durability.
 pub fn apply_plain_cf_file<E, F>(
     path: &str,
     key_mgr: Option<&Arc<DataKeyManager>>,
@@ -248,7 +251,7 @@ pub fn apply_plain_cf_file<E, F>(
     db: &E,
     cf: &str,
     batch_size: usize,
-    callback: &mut F,
+    mut callback: F,
 ) -> Result<(), Error>
 where
     E: KvEngine,
@@ -298,104 +301,17 @@ where
     }
 }
 
-pub fn apply_sst_cf_files_by_ingest<E>(files: &[&str], db: &E, cf: &str) -> Result<(), Error>
+pub fn apply_sst_cf_file<E>(files: &[&str], db: &E, cf: &str) -> Result<(), Error>
 where
     E: KvEngine,
 {
     if files.len() > 1 {
         info!(
-            "apply_sst_cf_files_by_ingest starts on cf {}. All files {:?}",
+            "apply_sst_cf_file starts on cf {}. All files {:?}",
             cf, files
         );
     }
     box_try!(db.ingest_external_file_cf(cf, files));
-    Ok(())
-}
-
-fn apply_sst_cf_file_without_ingest<E, F>(
-    path: &str,
-    db: &E,
-    cf: &str,
-    key_mgr: Option<Arc<DataKeyManager>>,
-    stale_detector: &impl StaleDetector,
-    batch_size: usize,
-    callback: &mut F,
-) -> Result<(), Error>
-where
-    E: KvEngine,
-    F: for<'r> FnMut(&'r [(Vec<u8>, Vec<u8>)]),
-{
-    let sst_reader = E::SstReader::open(path, key_mgr)?;
-    let mut iter = sst_reader.iter(IterOptions::default())?;
-    iter.seek_to_first()?;
-
-    let mut wb = db.write_batch();
-    let mut write_to_db = |batch: &mut Vec<(Vec<u8>, Vec<u8>)>| -> Result<(), EngineError> {
-        batch.iter().try_for_each(|(k, v)| wb.put_cf(cf, k, v))?;
-        wb.write()?;
-        wb.clear();
-        callback(batch);
-        batch.clear();
-        Ok(())
-    };
-
-    // Collect keys to a vec rather than wb so that we can invoke the callback less
-    // times.
-    let mut batch = Vec::with_capacity(1024);
-    let mut batch_data_size = 0;
-    loop {
-        if stale_detector.is_stale() {
-            return Err(Error::Abort);
-        }
-        if !iter.valid()? {
-            break;
-        }
-        let key = iter.key().to_vec();
-        let value = iter.value().to_vec();
-        batch_data_size += key.len() + value.len();
-        batch.push((key, value));
-        if batch_data_size >= batch_size {
-            box_try!(write_to_db(&mut batch));
-            batch_data_size = 0;
-        }
-        iter.next()?;
-    }
-    if !batch.is_empty() {
-        box_try!(write_to_db(&mut batch));
-    }
-    Ok(())
-}
-
-/// Apply the given snapshot file into a column family by directly writing kv
-/// pairs to db, without ingesting them. `callback` will be invoked after each
-/// batch of key value pairs written to db.
-///
-/// Attention, callers should manually flush and sync the column family after
-/// applying all sst files to make sure the data durability.
-pub fn apply_sst_cf_files_without_ingest<E, F>(
-    files: &[&str],
-    db: &E,
-    cf: &str,
-    key_mgr: Option<Arc<DataKeyManager>>,
-    stale_detector: &impl StaleDetector,
-    batch_size: usize,
-    callback: &mut F,
-) -> Result<(), Error>
-where
-    E: KvEngine,
-    F: for<'r> FnMut(&'r [(Vec<u8>, Vec<u8>)]),
-{
-    for path in files {
-        box_try!(apply_sst_cf_file_without_ingest(
-            path,
-            db,
-            cf,
-            key_mgr.clone(),
-            stale_detector,
-            batch_size,
-            callback
-        ));
-    }
     Ok(())
 }
 
@@ -417,7 +333,7 @@ pub fn get_decrypter_reader(
     encryption_key_manager: &DataKeyManager,
 ) -> Result<Box<dyn Read + Send>, Error> {
     let enc_info = box_try!(encryption_key_manager.get_file(file));
-    let mthd = enc_info.method;
+    let mthd = from_engine_encryption_method(enc_info.method);
     debug!(
         "get_decrypter_reader gets enc_info for {:?}, method: {:?}",
         file, mthd
@@ -457,7 +373,7 @@ mod tests {
         for db_creater in db_creaters {
             let (_enc_dir, enc_opts) =
                 gen_db_options_with_encryption("test_cf_build_and_apply_plain_files_enc");
-            for db_opt in [None, Some(enc_opts)] {
+            for db_opt in vec![None, Some(enc_opts)] {
                 let dir = Builder::new().prefix("test-snap-cf-db").tempdir().unwrap();
                 let db: KvTestEngine = db_creater(dir.path(), db_opt.clone(), None).unwrap();
                 // Collect keys via the key_callback into a collection.
@@ -496,19 +412,11 @@ mod tests {
 
                     let detector = TestStaleDetector {};
                     let tmp_file_path = &cf_file.tmp_file_paths()[0];
-                    apply_plain_cf_file(
-                        tmp_file_path,
-                        None,
-                        &detector,
-                        &db1,
-                        cf,
-                        16,
-                        &mut |v: &[(Vec<u8>, Vec<u8>)]| {
-                            v.iter()
-                                .cloned()
-                                .for_each(|pair| applied_keys.entry(cf).or_default().push(pair))
-                        },
-                    )
+                    apply_plain_cf_file(tmp_file_path, None, &detector, &db1, cf, 16, |v| {
+                        v.iter()
+                            .cloned()
+                            .for_each(|pair| applied_keys.entry(cf).or_default().push(pair))
+                    })
                     .unwrap();
                 }
 
@@ -546,7 +454,7 @@ mod tests {
             for db_creater in db_creaters {
                 let (_enc_dir, enc_opts) =
                     gen_db_options_with_encryption("test_cf_build_and_apply_sst_files_enc");
-                for db_opt in [None, Some(enc_opts)] {
+                for db_opt in vec![None, Some(enc_opts)] {
                     let dir = Builder::new().prefix("test-snap-cf-db").tempdir().unwrap();
                     let db = db_creater(dir.path(), db_opt.clone(), None).unwrap();
                     let snap_cf_dir = Builder::new().prefix("test-snap-cf").tempdir().unwrap();
@@ -596,7 +504,7 @@ mod tests {
                         .iter()
                         .map(|s| s.as_str())
                         .collect::<Vec<&str>>();
-                    apply_sst_cf_files_by_ingest(&tmp_file_paths, &db1, CF_DEFAULT).unwrap();
+                    apply_sst_cf_file(&tmp_file_paths, &db1, CF_DEFAULT).unwrap();
                     assert_eq_db(&db, &db1);
                 }
             }

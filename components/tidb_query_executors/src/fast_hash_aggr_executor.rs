@@ -27,7 +27,7 @@ use crate::{
 macro_rules! match_template_hashable {
     ($t:tt, $($tail:tt)*) => {{
         match_template::match_template! {
-            $t = [Int, Real, Bytes, Duration, Decimal, DateTime, Enum, VectorFloat32],
+            $t = [Int, Real, Bytes, Duration, Decimal, DateTime, Enum],
             $($tail)*
         }
     }}
@@ -96,8 +96,7 @@ impl BatchFastHashAggregationExecutor<Box<dyn BatchExecutor<StorageStats = ()>>>
             | EvalType::Bytes
             | EvalType::Duration
             | EvalType::Decimal
-            | EvalType::DateTime
-            | EvalType::VectorFloat32 => {}
+            | EvalType::DateTime => {}
             _ => return Err(other_err!("Eval type {} is not supported", eval_type)),
         }
 
@@ -210,7 +209,6 @@ enum Groups {
     Decimal(HashMap<Option<Decimal>, usize>),
     DateTime(HashMap<Option<DateTime>, usize>),
     Enum(HashMap<Option<Enum>, usize>),
-    VectorFloat32(HashMap<Option<VectorFloat32>, usize>),
 }
 
 impl Groups {
@@ -269,7 +267,7 @@ impl<Src: BatchExecutor> AggregationExecutorImpl<Src> for FastHashAggregationImp
         match group_by_result {
             RpnStackNode::Scalar { value, .. } => {
                 match_template::match_template! {
-                    TT = [Int, Bytes, Real, Duration, Decimal, DateTime, Enum, VectorFloat32],
+                    TT = [Int, Bytes, Real, Duration, Decimal, DateTime, Enum],
                     match value {
                         ScalarValue::TT(v) => {
                             if let Groups::TT(group) = &mut self.groups {
@@ -294,7 +292,7 @@ impl<Src: BatchExecutor> AggregationExecutorImpl<Src> for FastHashAggregationImp
                 let group_by_logical_rows = value.logical_rows_struct();
 
                 match_template::match_template! {
-                    TT = [Int, Real, Duration, Decimal, DateTime, Enum, VectorFloat32],
+                    TT = [Int, Real, Duration, Decimal, DateTime, Enum],
                     match group_by_physical_vec {
                         VectorValue::TT(v) => {
                             if let Groups::TT(group) = &mut self.groups {

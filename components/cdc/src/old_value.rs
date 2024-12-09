@@ -8,7 +8,7 @@ use tikv::storage::{
     mvcc::near_load_data_by_write, Cursor, CursorBuilder, ScanMode, Snapshot as EngineSnapshot,
     Statistics,
 };
-use tikv_kv::Snapshot;
+use tikv_kv::Iterator;
 use tikv_util::{
     config::ReadableSize,
     lru::{LruCache, SizePolicy},
@@ -235,15 +235,13 @@ pub fn near_seek_old_value<S: EngineSnapshot>(
     }
 }
 
-pub struct OldValueCursors<S: Snapshot> {
-    pub write: Cursor<S::Iter>,
-    pub default: Cursor<S::Iter>,
+pub struct OldValueCursors<I: Iterator> {
+    pub write: Cursor<I>,
+    pub default: Cursor<I>,
 }
 
-impl<S: Snapshot> OldValueCursors<S> {
-    pub fn new(snapshot: &S) -> Self {
-        let write = new_old_value_cursor(snapshot, CF_WRITE);
-        let default = new_old_value_cursor(snapshot, CF_DEFAULT);
+impl<I: Iterator> OldValueCursors<I> {
+    pub fn new(write: Cursor<I>, default: Cursor<I>) -> Self {
         OldValueCursors { write, default }
     }
 }
@@ -573,8 +571,7 @@ mod tests {
             assert_eq!(stats.write.next, 144);
             if use_default_cursor {
                 assert_eq!(stats.data.seek, 2);
-                // some unnecessary near seek is avoided
-                assert!(stats.data.next < stats.write.next);
+                assert_eq!(stats.data.next, 144);
                 assert_eq!(stats.data.get, 0);
             } else {
                 assert_eq!(stats.data.seek, 0);

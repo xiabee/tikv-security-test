@@ -5,7 +5,6 @@ use rocksdb::{DBStatisticsHistogramType as HistType, DBStatisticsTickerType as T
 pub const ROCKSDB_TOTAL_SST_FILES_SIZE: &str = "rocksdb.total-sst-files-size";
 pub const ROCKSDB_TABLE_READERS_MEM: &str = "rocksdb.estimate-table-readers-mem";
 pub const ROCKSDB_CUR_SIZE_ALL_MEM_TABLES: &str = "rocksdb.cur-size-all-mem-tables";
-pub const ROCKSDB_SIZE_ALL_MEM_TABLES: &str = "rocksdb.size-all-mem-tables";
 pub const ROCKSDB_ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
 pub const ROCKSDB_PENDING_COMPACTION_BYTES: &str = "rocksdb.\
                                                     estimate-pending-compaction-bytes";
@@ -64,10 +63,12 @@ pub const ENGINE_TICKER_TYPES: &[TickerType] = &[
     TickerType::BlockCacheIndexHit,
     TickerType::BlockCacheIndexAdd,
     TickerType::BlockCacheIndexBytesInsert,
+    TickerType::BlockCacheIndexBytesEvict,
     TickerType::BlockCacheFilterMiss,
     TickerType::BlockCacheFilterHit,
     TickerType::BlockCacheFilterAdd,
     TickerType::BlockCacheFilterBytesInsert,
+    TickerType::BlockCacheFilterBytesEvict,
     TickerType::BlockCacheDataMiss,
     TickerType::BlockCacheDataHit,
     TickerType::BlockCacheDataAdd,
@@ -95,6 +96,7 @@ pub const ENGINE_TICKER_TYPES: &[TickerType] = &[
     TickerType::NumberDbNextFound,
     TickerType::NumberDbPrevFound,
     TickerType::IterBytesRead,
+    TickerType::NoFileCloses,
     TickerType::NoFileOpens,
     TickerType::NoFileErrors,
     TickerType::StallMicros,
@@ -104,6 +106,7 @@ pub const ENGINE_TICKER_TYPES: &[TickerType] = &[
     TickerType::WalFileBytes,
     TickerType::WriteDoneBySelf,
     TickerType::WriteDoneByOther,
+    TickerType::WriteTimedout,
     TickerType::WriteWithWal,
     TickerType::CompactReadBytes,
     TickerType::CompactWriteBytes,
@@ -135,11 +138,8 @@ pub const TITAN_ENGINE_TICKER_TYPES: &[TickerType] = &[
     TickerType::TitanGcNoNeed,
     TickerType::TitanGcRemain,
     TickerType::TitanGcDiscardable,
+    TickerType::TitanGcSample,
     TickerType::TitanGcSmallFile,
-    TickerType::TitanGcLevelMergeMark,
-    TickerType::TitanGcLevelMergeDelete,
-    TickerType::TitanGcNoNeed,
-    TickerType::TitanGcRemain,
     TickerType::TitanGcFailure,
     TickerType::TitanGcSuccess,
     TickerType::TitanGcTriggerNext,
@@ -153,6 +153,11 @@ pub const ENGINE_HIST_TYPES: &[HistType] = &[
     HistType::CompactionOutfileSyncMicros,
     HistType::WalFileSyncMicros,
     HistType::ManifestFileSyncMicros,
+    HistType::StallL0SlowdownCount,
+    HistType::StallMemtableCompactionCount,
+    HistType::StallL0NumFilesCount,
+    HistType::HardRateLimitDelayCount,
+    HistType::SoftRateLimitDelayCount,
     HistType::NumFilesInSingleCompaction,
     HistType::DbSeek,
     HistType::WriteStall,

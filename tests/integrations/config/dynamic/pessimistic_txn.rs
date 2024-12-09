@@ -9,7 +9,11 @@ use security::SecurityManager;
 use test_pd_client::TestPdClient;
 use tikv::{
     config::*,
-    server::{lock_manager::*, resolve},
+    server::{
+        lock_manager::*,
+        resolve::{Callback, StoreAddrResolver},
+        Error, Result,
+    },
 };
 use tikv_util::config::ReadableDuration;
 
@@ -21,6 +25,14 @@ fn test_config_validate() {
     let mut invalid_cfg = Config::default();
     invalid_cfg.wait_for_lock_timeout = ReadableDuration::millis(0);
     invalid_cfg.validate().unwrap_err();
+}
+
+#[derive(Clone)]
+struct MockResolver;
+impl StoreAddrResolver for MockResolver {
+    fn resolve(&self, _store_id: u64, _cb: Callback) -> Result<()> {
+        Err(Error::Other(box_err!("unimplemented")))
+    }
 }
 
 fn setup(
@@ -38,7 +50,7 @@ fn setup(
         .start(
             1,
             pd_client,
-            resolve::MockStoreAddrResolver::default(),
+            MockResolver,
             security_mgr,
             &cfg.pessimistic_txn,
         )
@@ -83,8 +95,6 @@ where
 fn test_lock_manager_cfg_update() {
     const DEFAULT_TIMEOUT: u64 = 3000;
     const DEFAULT_DELAY: u64 = 100;
-    const DEFAULT_IN_MEMORY_PEER_SIZE_LIMIT: u64 = 512 << 10;
-    const DEFAULT_IN_MEMORY_INSTANCE_SIZE_LIMIT: u64 = 100 << 20;
     let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
     cfg.pessimistic_txn.wait_for_lock_timeout = ReadableDuration::millis(DEFAULT_TIMEOUT);
     cfg.pessimistic_txn.wake_up_delay_duration = ReadableDuration::millis(DEFAULT_DELAY);
@@ -166,44 +176,6 @@ fn test_lock_manager_cfg_update() {
             .wake_up_delay_duration_ms
             .load(Ordering::SeqCst),
         500
-    );
-
-    // update in-memory-peer-size-limit.
-    assert_eq!(
-        lock_mgr
-            .get_storage_dynamic_configs()
-            .in_memory_peer_size_limit
-            .load(Ordering::SeqCst),
-        DEFAULT_IN_MEMORY_PEER_SIZE_LIMIT
-    );
-    cfg_controller
-        .update_config("pessimistic-txn.in-memory-peer-size-limit", "2MiB")
-        .unwrap();
-    assert_eq!(
-        lock_mgr
-            .get_storage_dynamic_configs()
-            .in_memory_peer_size_limit
-            .load(Ordering::SeqCst),
-        2 << 20
-    );
-
-    // update in-memory-peer-size-limit.
-    assert_eq!(
-        lock_mgr
-            .get_storage_dynamic_configs()
-            .in_memory_instance_size_limit
-            .load(Ordering::SeqCst),
-        DEFAULT_IN_MEMORY_INSTANCE_SIZE_LIMIT
-    );
-    cfg_controller
-        .update_config("pessimistic-txn.in-memory-instance-size-limit", "1GiB")
-        .unwrap();
-    assert_eq!(
-        lock_mgr
-            .get_storage_dynamic_configs()
-            .in_memory_instance_size_limit
-            .load(Ordering::SeqCst),
-        1 << 30
     );
 
     lock_mgr.stop();

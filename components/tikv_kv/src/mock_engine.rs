@@ -154,7 +154,7 @@ impl Engine for MockEngine {
     }
 
     type RaftExtension = <RocksEngine as Engine>::RaftExtension;
-    fn raft_extension(&self) -> Self::RaftExtension {
+    fn raft_extension(&self) -> &Self::RaftExtension {
         self.base.raft_extension()
     }
 
@@ -165,12 +165,6 @@ impl Engine for MockEngine {
     type SnapshotRes = <RocksEngine as Engine>::SnapshotRes;
     fn async_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::SnapshotRes {
         self.base.async_snapshot(ctx)
-    }
-
-    type IMSnap = Self::Snap;
-    type IMSnapshotRes = Self::SnapshotRes;
-    fn async_in_memory_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::IMSnapshotRes {
-        self.async_snapshot(ctx)
     }
 
     type WriteRes = <RocksEngine as Engine>::WriteRes;

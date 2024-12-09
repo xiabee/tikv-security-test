@@ -458,7 +458,7 @@ impl CoprocessorPlugin for LoadedPlugin {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 fn is_library_file<P: AsRef<Path>>(path: P) -> bool {
     path.as_ref().extension() == Some(OsStr::new("so"))
 }

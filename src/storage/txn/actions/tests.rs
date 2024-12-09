@@ -2,27 +2,19 @@
 
 //! This file contains tests and testing tools which affects multiple actions
 
-use std::sync::Arc;
-
 use concurrency_manager::ConcurrencyManager;
 use kvproto::kvrpcpb::{
-    Assertion, AssertionLevel, Context, ExtraOp,
+    Assertion, AssertionLevel, Context,
     PrewriteRequestPessimisticAction::{self, *},
 };
 use prewrite::{prewrite, CommitKind, TransactionKind, TransactionProperties};
-use tikv_kv::{SnapContext, Statistics};
+use tikv_kv::SnapContext;
 
 use super::*;
 use crate::storage::{
     kv::WriteData,
-    lock_manager::MockLockManager,
     mvcc::{tests::write, Error, Key, Mutation, MvccTxn, SnapshotReader, TimeStamp},
-    txn,
-    txn::{
-        commands::{Flush, WriteContext, WriteResult},
-        txn_status_cache::TxnStatusCache,
-    },
-    Engine,
+    txn, Engine,
 };
 
 pub fn must_prewrite_put_impl<E: Engine>(
@@ -41,7 +33,7 @@ pub fn must_prewrite_put_impl<E: Engine>(
     is_retry_request: bool,
     assertion: Assertion,
     assertion_level: AssertionLevel,
-) -> TimeStamp {
+) {
     must_prewrite_put_impl_with_should_not_exist(
         engine,
         key,
@@ -50,7 +42,6 @@ pub fn must_prewrite_put_impl<E: Engine>(
         secondary_keys,
         ts,
         pessimistic_action,
-        None,
         lock_ttl,
         for_update_ts,
         txn_size,
@@ -62,7 +53,7 @@ pub fn must_prewrite_put_impl<E: Engine>(
         false,
         None,
         0,
-    )
+    );
 }
 
 pub fn must_prewrite_insert_impl<E: Engine>(
@@ -90,7 +81,6 @@ pub fn must_prewrite_insert_impl<E: Engine>(
         secondary_keys,
         ts,
         pessimistic_action,
-        None,
         lock_ttl,
         for_update_ts,
         txn_size,
@@ -113,7 +103,6 @@ pub fn must_prewrite_put_impl_with_should_not_exist<E: Engine>(
     secondary_keys: &Option<Vec<Vec<u8>>>,
     ts: TimeStamp,
     pessimistic_action: PrewriteRequestPessimisticAction,
-    expected_for_update_ts: Option<TimeStamp>,
     lock_ttl: u64,
     for_update_ts: TimeStamp,
     txn_size: u64,
@@ -125,7 +114,7 @@ pub fn must_prewrite_put_impl_with_should_not_exist<E: Engine>(
     should_not_exist: bool,
     region_id: Option<u64>,
     txn_source: u64,
-) -> TimeStamp {
+) {
     let mut ctx = Context::default();
     ctx.set_txn_source(txn_source);
     if let Some(region_id) = region_id {
@@ -155,7 +144,7 @@ pub fn must_prewrite_put_impl_with_should_not_exist<E: Engine>(
     } else {
         CommitKind::TwoPc
     };
-    let (min_commit_ts, _) = prewrite(
+    prewrite(
         &mut txn,
         &mut reader,
         &TransactionProperties {
@@ -174,11 +163,9 @@ pub fn must_prewrite_put_impl_with_should_not_exist<E: Engine>(
         mutation,
         secondary_keys,
         pessimistic_action,
-        expected_for_update_ts,
     )
     .unwrap();
     write(engine, &ctx, txn.into_modifies());
-    min_commit_ts
 }
 
 pub fn must_prewrite_put<E: Engine>(
@@ -207,87 +194,6 @@ pub fn must_prewrite_put<E: Engine>(
     );
 }
 
-pub fn flush_put_impl<E: Engine>(
-    engine: &mut E,
-    key: &[u8],
-    value: impl Into<Vec<u8>>,
-    pk: impl Into<Vec<u8>>,
-    start_ts: impl Into<TimeStamp>,
-    generation: u64,
-    should_not_exist: bool,
-) -> txn::Result<WriteResult> {
-    flush_put_impl_with_assertion(
-        engine,
-        key,
-        value,
-        pk,
-        start_ts,
-        generation,
-        should_not_exist,
-        Assertion::None,
-    )
-}
-
-pub fn flush_put_impl_with_assertion<E: Engine>(
-    engine: &mut E,
-    key: &[u8],
-    value: impl Into<Vec<u8>>,
-    pk: impl Into<Vec<u8>>,
-    start_ts: impl Into<TimeStamp>,
-    generation: u64,
-    should_not_exist: bool,
-    assertion: Assertion,
-) -> txn::Result<WriteResult> {
-    let key = Key::from_raw(key);
-    let start_ts = start_ts.into();
-    let mut m = if should_not_exist {
-        Mutation::make_insert(key, value.into())
-    } else {
-        Mutation::make_put(key, value.into())
-    };
-    m.set_assertion(assertion);
-    let cmd = Flush::new(
-        start_ts,
-        pk.into(),
-        vec![m],
-        generation,
-        3000,
-        AssertionLevel::Strict,
-        Context::new(),
-    );
-    let mut statistics = Statistics::default();
-    let cm = ConcurrencyManager::new(start_ts);
-    let context = WriteContext {
-        lock_mgr: &MockLockManager::new(),
-        concurrency_manager: cm.clone(),
-        extra_op: ExtraOp::Noop,
-        statistics: &mut statistics,
-        async_apply_prewrite: false,
-        raw_ext: None,
-        txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
-    };
-    let snapshot = engine.snapshot(Default::default()).unwrap();
-    cmd.cmd.process_write(snapshot.clone(), context)
-}
-
-pub fn must_flush_put<E: Engine>(
-    engine: &mut E,
-    key: &[u8],
-    value: impl Into<Vec<u8>>,
-    pk: impl Into<Vec<u8>>,
-    start_ts: impl Into<TimeStamp>,
-    generation: u64,
-) {
-    let res = flush_put_impl(engine, key, value, pk, start_ts, generation, false);
-    assert!(res.is_ok());
-    let res = res.unwrap();
-    let to_be_write = res.to_be_write;
-    if to_be_write.modifies.is_empty() {
-        return;
-    }
-    engine.write(&Context::new(), to_be_write).unwrap();
-}
-
 pub fn must_prewrite_put_on_region<E: Engine>(
     engine: &mut E,
     region_id: u64,
@@ -304,7 +210,6 @@ pub fn must_prewrite_put_on_region<E: Engine>(
         &None,
         ts.into(),
         SkipPessimisticCheck,
-        None,
         0,
         TimeStamp::default(),
         0,
@@ -335,7 +240,6 @@ pub fn must_prewrite_put_with_txn_soucre<E: Engine>(
         &None,
         ts.into(),
         SkipPessimisticCheck,
-        None,
         0,
         TimeStamp::default(),
         0,
@@ -511,7 +415,7 @@ pub fn must_pessimistic_prewrite_put_async_commit<E: Engine>(
     for_update_ts: impl Into<TimeStamp>,
     pessimistic_action: PrewriteRequestPessimisticAction,
     min_commit_ts: impl Into<TimeStamp>,
-) -> TimeStamp {
+) {
     assert!(secondary_keys.is_some());
     must_prewrite_put_impl(
         engine,
@@ -529,38 +433,6 @@ pub fn must_pessimistic_prewrite_put_async_commit<E: Engine>(
         false,
         Assertion::None,
         AssertionLevel::Off,
-    )
-}
-
-pub fn must_pessimistic_prewrite_put_check_for_update_ts<E: Engine>(
-    engine: &mut E,
-    key: &[u8],
-    value: &[u8],
-    pk: &[u8],
-    ts: impl Into<TimeStamp>,
-    for_update_ts: impl Into<TimeStamp>,
-    expected_for_update_ts: Option<u64>,
-) {
-    must_prewrite_put_impl_with_should_not_exist(
-        engine,
-        key,
-        value,
-        pk,
-        &None,
-        ts.into(),
-        DoPessimisticCheck,
-        expected_for_update_ts.map(Into::into),
-        0,
-        for_update_ts.into(),
-        0,
-        TimeStamp::default(),
-        TimeStamp::default(),
-        false,
-        Assertion::None,
-        AssertionLevel::Off,
-        false,
-        None,
-        0,
     );
 }
 
@@ -613,8 +485,6 @@ pub fn must_prewrite_put_err_impl<E: Engine>(
         ts.into(),
         for_update_ts.into(),
         pessimistic_action,
-        None,
-        0,
         max_commit_ts.into(),
         is_retry_request,
         assertion,
@@ -646,8 +516,6 @@ pub fn must_prewrite_insert_err_impl<E: Engine>(
         ts.into(),
         for_update_ts.into(),
         pessimistic_action,
-        None,
-        0,
         max_commit_ts.into(),
         is_retry_request,
         assertion,
@@ -665,8 +533,6 @@ pub fn must_prewrite_put_err_impl_with_should_not_exist<E: Engine>(
     ts: impl Into<TimeStamp>,
     for_update_ts: impl Into<TimeStamp>,
     pessimistic_action: PrewriteRequestPessimisticAction,
-    expected_for_update_ts: Option<TimeStamp>,
-    min_commit_ts: impl Into<TimeStamp>,
     max_commit_ts: impl Into<TimeStamp>,
     is_retry_request: bool,
     assertion: Assertion,
@@ -693,16 +559,14 @@ pub fn must_prewrite_put_err_impl_with_should_not_exist<E: Engine>(
     props.is_retry_request = is_retry_request;
     props.commit_kind = commit_kind;
     props.assertion_level = assertion_level;
-    props.min_commit_ts = min_commit_ts.into();
 
     prewrite(
         &mut txn,
         &mut reader,
         &props,
         mutation,
-        secondary_keys,
+        &None,
         pessimistic_action,
-        expected_for_update_ts,
     )
     .unwrap_err()
 }
@@ -780,34 +644,6 @@ pub fn must_pessimistic_prewrite_insert_err<E: Engine>(
     )
 }
 
-pub fn must_pessimistic_prewrite_put_check_for_update_ts_err<E: Engine>(
-    engine: &mut E,
-    key: &[u8],
-    value: &[u8],
-    pk: &[u8],
-    ts: impl Into<TimeStamp>,
-    for_update_ts: impl Into<TimeStamp>,
-    expected_for_update_ts: Option<u64>,
-) -> Error {
-    must_prewrite_put_err_impl_with_should_not_exist(
-        engine,
-        key,
-        value,
-        pk,
-        &None,
-        ts,
-        for_update_ts,
-        DoPessimisticCheck,
-        expected_for_update_ts.map(Into::into),
-        0,
-        0,
-        false,
-        Assertion::None,
-        AssertionLevel::Off,
-        false,
-    )
-}
-
 pub fn must_retry_pessimistic_prewrite_put_err<E: Engine>(
     engine: &mut E,
     key: &[u8],
@@ -867,7 +703,6 @@ fn must_prewrite_delete_impl<E: Engine>(
         mutation,
         &None,
         pessimistic_action,
-        None,
     )
     .unwrap();
 
@@ -946,7 +781,6 @@ fn must_prewrite_lock_impl<E: Engine>(
         mutation,
         &None,
         pessimistic_action,
-        None,
     )
     .unwrap();
 
@@ -983,7 +817,6 @@ pub fn must_prewrite_lock_err<E: Engine>(
         Mutation::make_lock(Key::from_raw(key)),
         &None,
         SkipPessimisticCheck,
-        None,
     )
     .unwrap_err();
 }

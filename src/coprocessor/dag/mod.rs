@@ -2,9 +2,8 @@
 
 mod storage_impl;
 
-use std::{marker::PhantomData, sync::Arc};
+use std::sync::Arc;
 
-use api_version::KvFormat;
 use async_trait::async_trait;
 use kvproto::coprocessor::{KeyRange, Response};
 use protobuf::Message;
@@ -19,7 +18,7 @@ use crate::{
     tikv_util::quota_limiter::QuotaLimiter,
 };
 
-pub struct DagHandlerBuilder<S: Store + 'static, F: KvFormat> {
+pub struct DagHandlerBuilder<S: Store + 'static> {
     req: DagRequest,
     ranges: Vec<KeyRange>,
     store: S,
@@ -30,10 +29,9 @@ pub struct DagHandlerBuilder<S: Store + 'static, F: KvFormat> {
     is_cache_enabled: bool,
     paging_size: Option<u64>,
     quota_limiter: Arc<QuotaLimiter>,
-    _phantom: PhantomData<F>,
 }
 
-impl<S: Store + 'static, F: KvFormat> DagHandlerBuilder<S, F> {
+impl<S: Store + 'static> DagHandlerBuilder<S> {
     pub fn new(
         req: DagRequest,
         ranges: Vec<KeyRange>,
@@ -56,7 +54,6 @@ impl<S: Store + 'static, F: KvFormat> DagHandlerBuilder<S, F> {
             is_cache_enabled,
             paging_size,
             quota_limiter,
-            _phantom: PhantomData,
         }
     }
 
@@ -68,7 +65,7 @@ impl<S: Store + 'static, F: KvFormat> DagHandlerBuilder<S, F> {
 
     pub fn build(self) -> Result<Box<dyn RequestHandler>> {
         COPR_DAG_REQ_COUNT.with_label_values(&["batch"]).inc();
-        Ok(BatchDagHandler::new::<_, F>(
+        Ok(BatchDagHandler::new(
             self.req,
             self.ranges,
             self.store,
@@ -90,7 +87,7 @@ pub struct BatchDagHandler {
 }
 
 impl BatchDagHandler {
-    pub fn new<S: Store + 'static, F: KvFormat>(
+    pub fn new<S: Store + 'static>(
         req: DagRequest,
         ranges: Vec<KeyRange>,
         store: S,
@@ -103,7 +100,7 @@ impl BatchDagHandler {
         quota_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self> {
         Ok(Self {
-            runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request::<_, F>(
+            runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request(
                 req,
                 ranges,
                 TikvStorage::new(store, is_cache_enabled),
@@ -143,9 +140,7 @@ fn handle_qe_response(
     can_be_cached: bool,
     data_version: Option<u64>,
 ) -> Result<Response> {
-    use tidb_query_common::error::{ErrorInner, EvaluateError};
-
-    use crate::coprocessor::Error;
+    use tidb_query_common::error::ErrorInner;
 
     match result {
         Ok((sel_resp, range)) => {
@@ -164,7 +159,6 @@ fn handle_qe_response(
         }
         Err(err) => match *err.0 {
             ErrorInner::Storage(err) => Err(err.into()),
-            ErrorInner::Evaluate(EvaluateError::DeadlineExceeded) => Err(Error::DeadlineExceeded),
             ErrorInner::Evaluate(err) => {
                 let mut resp = Response::default();
                 let mut sel_resp = SelectResponse::default();
@@ -182,9 +176,7 @@ fn handle_qe_response(
 fn handle_qe_stream_response(
     result: tidb_query_common::Result<(Option<(StreamResponse, IntervalRange)>, bool)>,
 ) -> Result<(Option<Response>, bool)> {
-    use tidb_query_common::error::{ErrorInner, EvaluateError};
-
-    use crate::coprocessor::Error;
+    use tidb_query_common::error::ErrorInner;
 
     match result {
         Ok((Some((s_resp, range)), finished)) => {
@@ -197,7 +189,6 @@ fn handle_qe_stream_response(
         Ok((None, finished)) => Ok((None, finished)),
         Err(err) => match *err.0 {
             ErrorInner::Storage(err) => Err(err.into()),
-            ErrorInner::Evaluate(EvaluateError::DeadlineExceeded) => Err(Error::DeadlineExceeded),
             ErrorInner::Evaluate(err) => {
                 let mut resp = Response::default();
                 let mut s_resp = StreamResponse::default();
@@ -207,45 +198,5 @@ fn handle_qe_stream_response(
                 Ok((Some(resp), true))
             }
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use anyhow::anyhow;
-    use protobuf::Message;
-    use tidb_query_common::error::{Error as CommonError, EvaluateError, StorageError};
-
-    use super::*;
-    use crate::coprocessor::Error;
-
-    #[test]
-    fn test_handle_qe_response() {
-        // Ok Response
-        let ok_res = Ok((SelectResponse::default(), None));
-        let res = handle_qe_response(ok_res, true, Some(1)).unwrap();
-        assert!(res.can_be_cached);
-        assert_eq!(res.get_cache_last_version(), 1);
-        let mut select_res = SelectResponse::new();
-        Message::merge_from_bytes(&mut select_res, res.get_data()).unwrap();
-        assert!(!select_res.has_error());
-
-        // Storage Error
-        let storage_err = CommonError::from(StorageError(anyhow!("unknown")));
-        let res = handle_qe_response(Err(storage_err), false, None);
-        assert!(matches!(res, Err(Error::Other(_))));
-
-        // Evaluate Error
-        let err = CommonError::from(EvaluateError::DeadlineExceeded);
-        let res = handle_qe_response(Err(err), false, None);
-        assert!(matches!(res, Err(Error::DeadlineExceeded)));
-
-        let err = CommonError::from(EvaluateError::InvalidCharacterString {
-            charset: "test".into(),
-        });
-        let res = handle_qe_response(Err(err), false, None).unwrap();
-        let mut select_res = SelectResponse::new();
-        Message::merge_from_bytes(&mut select_res, res.get_data()).unwrap();
-        assert_eq!(select_res.get_error().get_code(), 1300);
     }
 }

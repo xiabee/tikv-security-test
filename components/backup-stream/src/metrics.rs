@@ -30,8 +30,6 @@ pub fn remove_task_status_metric(task: &str) -> Result<()> {
     TASK_STATUS.remove_label_values(&[task])
 }
 
-// When adding new metrics, remember to update in the grafana dashboard, for
-// example update the tikv_details.dashboard.py.
 lazy_static! {
     pub static ref INTERNAL_ACTOR_MESSAGE_HANDLE_DURATION: HistogramVec = register_histogram_vec!(
         "tikv_log_backup_interal_actor_acting_duration_sec",
@@ -171,28 +169,6 @@ lazy_static! {
         exponential_buckets(0.001, 2.0, 16).unwrap()
     )
     .unwrap();
-    pub static ref TEMP_FILE_MEMORY_USAGE: IntGauge = register_int_gauge!(
-        "tikv_log_backup_temp_file_memory_usage",
-        "The total memory usage of temporary files.",
-    )
-    .unwrap();
-    pub static ref TEMP_FILE_COUNT: IntGauge = register_int_gauge!(
-        "tikv_log_backup_temp_file_count",
-        "The number of temporary files."
-    )
-    .unwrap();
-    pub static ref TEMP_FILE_SWAP_OUT_BYTES: IntCounter = register_int_counter!(
-        "tikv_log_backup_temp_file_swap_out_bytes",
-        "The number of total bytes being swapped out to disk."
-    )
-    .unwrap();
-    pub static ref IN_DISK_TEMP_FILE_SIZE: Histogram = register_histogram!(
-        "tikv_log_backup_in_disk_temp_file_size",
-        "The histogram of the size of the temp files get swapped out in bytes.",
-        // The default minimal size of a file being able to be swapped out is 1M.
-        exponential_buckets((1024 * 1024) as f64, 2.0, 8).unwrap()
-    ).unwrap();
-
 }
 
 make_static_metric! {

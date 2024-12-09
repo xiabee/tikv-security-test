@@ -66,55 +66,23 @@ impl DbOptions for RocksDbOptions {
     }
 
     fn get_rate_bytes_per_sec(&self) -> Option<i64> {
-        self.0.get_rate_limiter().map(|r| r.get_bytes_per_second())
+        self.0.get_rate_bytes_per_sec()
     }
 
     fn set_rate_bytes_per_sec(&mut self, rate_bytes_per_sec: i64) -> Result<()> {
-        if let Some(r) = self.0.get_rate_limiter() {
-            r.set_bytes_per_second(rate_bytes_per_sec);
-        } else {
-            return Err(box_err!("rate limiter not found"));
-        }
-        Ok(())
+        self.0
+            .set_rate_bytes_per_sec(rate_bytes_per_sec)
+            .map_err(|e| box_err!(e))
     }
 
     fn get_rate_limiter_auto_tuned(&self) -> Option<bool> {
-        self.0.get_rate_limiter().map(|r| r.get_auto_tuned())
+        self.0.get_auto_tuned()
     }
 
     fn set_rate_limiter_auto_tuned(&mut self, rate_limiter_auto_tuned: bool) -> Result<()> {
-        if let Some(r) = self.0.get_rate_limiter() {
-            r.set_auto_tuned(rate_limiter_auto_tuned);
-        } else {
-            return Err(box_err!("rate limiter not found"));
-        }
-        Ok(())
-    }
-
-    fn set_flush_size(&mut self, f: usize) -> Result<()> {
-        if let Some(m) = self.0.get_write_buffer_manager() {
-            m.set_flush_size(f);
-        } else {
-            return Err(box_err!("write buffer manager not found"));
-        }
-        Ok(())
-    }
-
-    fn get_flush_size(&self) -> Result<u64> {
-        if let Some(m) = self.0.get_write_buffer_manager() {
-            return Ok(m.flush_size() as u64);
-        }
-
-        Err(box_err!("write buffer manager not found"))
-    }
-
-    fn set_flush_oldest_first(&mut self, f: bool) -> Result<()> {
-        if let Some(m) = self.0.get_write_buffer_manager() {
-            m.set_flush_oldest_first(f);
-        } else {
-            return Err(box_err!("write buffer manager not found"));
-        }
-        Ok(())
+        self.0
+            .set_auto_tuned(rate_limiter_auto_tuned)
+            .map_err(|e| box_err!(e))
     }
 
     fn set_titandb_options(&mut self, opts: &Self::TitanDbOptions) {

@@ -13,10 +13,7 @@ use std::{
 
 use collections::HashMap;
 use engine_panic::PanicEngine;
-use engine_traits::{
-    CfName, IterMetricsCollector, IterOptions, MetricsExt, ReadOptions, CF_DEFAULT, CF_LOCK,
-    CF_WRITE,
-};
+use engine_traits::{CfName, IterOptions, ReadOptions, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use futures::{future, stream, Future, Stream};
 use kvproto::kvrpcpb::Context;
 use txn_types::{Key, Value};
@@ -112,12 +109,6 @@ impl Engine for BTreeEngine {
     /// the later modifies!
     fn async_snapshot(&mut self, _ctx: SnapContext<'_>) -> Self::SnapshotRes {
         futures::future::ready(Ok(BTreeEngineSnapshot::new(self)))
-    }
-
-    type IMSnap = Self::Snap;
-    type IMSnapshotRes = Self::SnapshotRes;
-    fn async_in_memory_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::IMSnapshotRes {
-        self.async_snapshot(ctx)
     }
 }
 
@@ -236,25 +227,6 @@ impl Iterator for BTreeEngineIterator {
     }
 }
 
-pub struct BTreeEngineIterMetricsCollector;
-
-impl IterMetricsCollector for BTreeEngineIterMetricsCollector {
-    fn internal_delete_skipped_count(&self) -> u64 {
-        0
-    }
-
-    fn internal_key_skipped_count(&self) -> u64 {
-        0
-    }
-}
-
-impl MetricsExt for BTreeEngineIterator {
-    type Collector = BTreeEngineIterMetricsCollector;
-    fn metrics_collector(&self) -> Self::Collector {
-        BTreeEngineIterMetricsCollector {}
-    }
-}
-
 impl Snapshot for BTreeEngineSnapshot {
     type Iter = BTreeEngineIterator;
     type Ext<'a> = DummySnapshotExt;
@@ -318,7 +290,6 @@ fn write_modifies(engine: &BTreeEngine, modifies: Vec<Modify>) -> EngineResult<(
                 cf_tree.write().unwrap().insert(k, v);
             }
             Modify::DeleteRange(_cf, _start_key, _end_key, _notify_only) => unimplemented!(),
-            Modify::Ingest(_) => unimplemented!(),
         };
     }
     Ok(())

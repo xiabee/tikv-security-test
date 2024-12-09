@@ -12,13 +12,11 @@ use engine_rocks::{
 use engine_test::new_temp_engine;
 use engine_traits::{
     CfOptionsExt, CompactExt, DeleteStrategy, Engines, KvEngine, MiscExt, Range, SstWriter,
-    SstWriterBuilder, SyncMutable, WriteOptions, CF_DEFAULT, CF_WRITE,
+    SstWriterBuilder, SyncMutable, CF_DEFAULT, CF_WRITE,
 };
 use keys::data_key;
 use kvproto::metapb::{Peer, Region};
-use raftstore::store::{
-    apply_sst_cf_files_by_ingest, build_sst_cf_file_list, CfFile, RegionSnapshot,
-};
+use raftstore::store::{apply_sst_cf_file, build_sst_cf_file_list, CfFile, RegionSnapshot};
 use tempfile::Builder;
 use test_raftstore::*;
 use tikv::{
@@ -143,7 +141,6 @@ fn test_turnoff_titan() {
 }
 
 #[test]
-#[ignore]
 fn test_delete_files_in_range_for_titan() {
     let path = Builder::new()
         .prefix("test-titan-delete-files-in-range")
@@ -153,7 +150,7 @@ fn test_delete_files_in_range_for_titan() {
     // Set configs and create engines
     let mut cfg = TikvConfig::default();
     let cache = cfg.storage.block_cache.build_shared_cache();
-    cfg.rocksdb.titan.enabled = Some(true);
+    cfg.rocksdb.titan.enabled = true;
     cfg.rocksdb.titan.disable_gc = true;
     cfg.rocksdb.titan.purge_obsolete_files_period = ReadableDuration::secs(1);
     cfg.rocksdb.defaultcf.disable_auto_compactions = true;
@@ -161,18 +158,11 @@ fn test_delete_files_in_range_for_titan() {
     cfg.rocksdb.defaultcf.dynamic_level_bytes = false;
     cfg.rocksdb.defaultcf.titan.min_gc_batch_size = ReadableSize(0);
     cfg.rocksdb.defaultcf.titan.discardable_ratio = 0.4;
-    cfg.rocksdb.defaultcf.titan.min_blob_size = Some(ReadableSize(0));
-    let resource = cfg
+    cfg.rocksdb.defaultcf.titan.min_blob_size = ReadableSize(0);
+    let kv_db_opts = cfg.rocksdb.build_opt();
+    let kv_cfs_opts = cfg
         .rocksdb
-        .build_resources(Default::default(), cfg.storage.engine);
-    let kv_db_opts = cfg.rocksdb.build_opt(&resource, cfg.storage.engine);
-    let kv_cfs_opts = cfg.rocksdb.build_cf_opts(
-        &cfg.rocksdb.build_cf_resources(cache),
-        None,
-        cfg.storage.api_version(),
-        None,
-        cfg.storage.engine,
-    );
+        .build_cf_opts(&cache, None, cfg.storage.api_version());
 
     let raft_path = path.path().join(Path::new("titan"));
     let engines = Engines::new(
@@ -221,7 +211,7 @@ fn test_delete_files_in_range_for_titan() {
         .unwrap();
 
     // Flush and compact the kvs into L6.
-    engines.kv.flush_cfs(&[], true).unwrap();
+    engines.kv.flush_cfs(true).unwrap();
     engines.kv.compact_files_in_range(None, None, None).unwrap();
     let db = engines.kv.as_inner();
     let value = db.get_property_int("rocksdb.num-files-at-level0").unwrap();
@@ -264,9 +254,9 @@ fn test_delete_files_in_range_for_titan() {
     // Used to trigger titan gc
     let engine = &engines.kv;
     engine.put(b"1", b"1").unwrap();
-    engine.flush_cfs(&[], true).unwrap();
+    engine.flush_cfs(true).unwrap();
     engine.put(b"2", b"2").unwrap();
-    engine.flush_cfs(&[], true).unwrap();
+    engine.flush_cfs(true).unwrap();
     engine
         .compact_files_in_range(Some(b"0"), Some(b"3"), Some(1))
         .unwrap();
@@ -313,7 +303,6 @@ fn test_delete_files_in_range_for_titan() {
     engines
         .kv
         .delete_ranges_cfs(
-            &WriteOptions::default(),
             DeleteStrategy::DeleteFiles,
             &[Range::new(
                 &data_key(Key::from_raw(b"a").as_encoded()),
@@ -324,7 +313,6 @@ fn test_delete_files_in_range_for_titan() {
     engines
         .kv
         .delete_ranges_cfs(
-            &WriteOptions::default(),
             DeleteStrategy::DeleteByKey,
             &[Range::new(
                 &data_key(Key::from_raw(b"a").as_encoded()),
@@ -335,7 +323,6 @@ fn test_delete_files_in_range_for_titan() {
     engines
         .kv
         .delete_ranges_cfs(
-            &WriteOptions::default(),
             DeleteStrategy::DeleteBlobs,
             &[Range::new(
                 &data_key(Key::from_raw(b"a").as_encoded()),
@@ -411,13 +398,13 @@ fn test_delete_files_in_range_for_titan() {
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<&str>>();
-    apply_sst_cf_files_by_ingest(&tmp_file_paths, &engines1.kv, CF_DEFAULT).unwrap();
+    apply_sst_cf_file(&tmp_file_paths, &engines1.kv, CF_DEFAULT).unwrap();
     let tmp_file_paths = cf_file_write.tmp_file_paths();
     let tmp_file_paths = tmp_file_paths
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<&str>>();
-    apply_sst_cf_files_by_ingest(&tmp_file_paths, &engines1.kv, CF_WRITE).unwrap();
+    apply_sst_cf_file(&tmp_file_paths, &engines1.kv, CF_WRITE).unwrap();
 
     // Do scan on other DB.
     let mut r = Region::default();

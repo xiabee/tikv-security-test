@@ -169,8 +169,8 @@ impl PrepareBackup {
             while !regions.is_empty() {
                 let resp = self.rx.next().await.unwrap().unwrap();
                 assert_eq!(resp.ty, PrepareSnapshotBackupEventType::WaitApplyDone);
-                assert!(!resp.has_error(), "{resp:?}");
-                assert!(regions.remove(&resp.get_region().id), "{regions:?}");
+                assert!(!resp.has_error(), "{:?}", resp);
+                assert!(regions.remove(&resp.get_region().id), "{:?}", regions);
             }
         });
     }
@@ -185,30 +185,25 @@ impl PrepareBackup {
     }
 
     pub fn send_finalize(mut self) -> bool {
-        if matches!(
-            block_on(self.tx.send({
-                let mut req = PrepareSnapshotBackupRequest::new();
-                req.set_ty(PrepareSnapshotBackupRequestType::Finish);
-                (req, WriteFlags::default())
-            })),
-            Ok(_) | Err(grpcio::Error::RpcFinished(_))
-        ) {
-            block_on_timeout(
-                async {
-                    while let Some(item) = self.rx.next().await {
-                        let item = item.unwrap();
-                        if item.ty == PrepareSnapshotBackupEventType::UpdateLeaseResult {
-                            return item.last_lease_is_valid;
-                        }
+        block_on(self.tx.send({
+            let mut req = PrepareSnapshotBackupRequest::new();
+            req.set_ty(PrepareSnapshotBackupRequestType::Finish);
+            (req, WriteFlags::default())
+        }))
+        .unwrap();
+        block_on_timeout(
+            async {
+                while let Some(item) = self.rx.next().await {
+                    let item = item.unwrap();
+                    if item.ty == PrepareSnapshotBackupEventType::UpdateLeaseResult {
+                        return item.last_lease_is_valid;
                     }
-                    false
-                },
-                Duration::from_secs(2),
-            )
-            .expect("take too long to finalize the stream")
-        } else {
-            false
-        }
+                }
+                false
+            },
+            Duration::from_secs(2),
+        )
+        .expect("take too long to finalize the stream")
     }
 
     pub fn next(&mut self) -> PrepareSnapshotBackupResponse {
@@ -222,7 +217,7 @@ impl PrepareBackup {
 
 #[track_caller]
 pub fn must_wait_apply_success(res: &PrepareSnapshotBackupResponse) -> u64 {
-    assert!(!res.has_error(), "{res:?}");
+    assert!(!res.has_error(), "{:?}", res);
     assert_eq!(res.ty, PrepareSnapshotBackupEventType::WaitApplyDone);
     res.get_region().id
 }

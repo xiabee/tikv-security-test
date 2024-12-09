@@ -1,7 +1,5 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::fmt::{Debug, Formatter};
-
 use collections::HashMap;
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::{
@@ -20,7 +18,6 @@ pub enum ChangeRow {
         start_ts: TimeStamp,
         lock_type: LockType,
         value: Option<Value>,
-        generation: u64,
     },
     Commit {
         key: Key,
@@ -118,7 +115,6 @@ impl ChangeLog {
                             short_value,
                             ts,
                             lock_type,
-                            generation,
                             ..
                         } = lock;
                         let value = default.map_or(short_value, |v| Some(v.into_put().1));
@@ -127,7 +123,6 @@ impl ChangeLog {
                             start_ts: ts,
                             lock_type,
                             value,
-                            generation,
                         }
                     }),
                 (None, Some(KeyOp::Delete), _) => Some(ChangeRow::Commit {
@@ -178,25 +173,10 @@ pub(crate) fn decode_lock(key: &[u8], value: &[u8]) -> Option<Lock> {
     }
 }
 
+#[derive(Debug)]
 enum KeyOp {
     Put(Option<TimeStamp>, Vec<u8>),
     Delete,
-}
-
-impl Debug for KeyOp {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KeyOp::Put(ts, value) => {
-                write!(
-                    f,
-                    "Put(ts:{:?}, value:{:?})",
-                    ts,
-                    log_wrappers::Value(value)
-                )
-            }
-            KeyOp::Delete => write!(f, "Delete"),
-        }
-    }
 }
 
 impl KeyOp {
@@ -208,7 +188,7 @@ impl KeyOp {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct RowChange {
     write: Option<KeyOp>,
     lock: Option<KeyOp>,
@@ -234,31 +214,15 @@ fn group_row_changes(requests: Vec<Request>) -> (HashMap<Key, RowChange>, bool) 
                     CF_WRITE => {
                         if let Ok(ts) = key.decode_ts() {
                             let key = key.truncate_ts().unwrap();
-                            let row = changes.entry(key).or_default();
+                            let mut row = changes.entry(key).or_default();
                             assert!(row.write.is_none());
                             row.write = Some(KeyOp::Put(Some(ts), value));
                         }
                     }
                     CF_LOCK => {
-                        match changes.entry(key) {
-                            std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
-                                if occupied_entry.get().lock.is_some() {
-                                    error!(
-                                        "there is already row={:?} with same key processing key={:?} value={:?}",
-                                        occupied_entry.get(),
-                                        log_wrappers::Value::key(occupied_entry.key().as_encoded()),
-                                        log_wrappers::Value::value(&value),
-                                    );
-                                }
-                                assert!(occupied_entry.get().lock.is_none());
-                                occupied_entry.get_mut().lock = Some(KeyOp::Put(None, value));
-                            }
-                            std::collections::hash_map::Entry::Vacant(vacant_entry) => {
-                                let mut row_change = RowChange::default();
-                                row_change.lock = Some(KeyOp::Put(None, value));
-                                vacant_entry.insert(row_change);
-                            }
-                        };
+                        let mut row = changes.entry(key).or_default();
+                        assert!(row.lock.is_none());
+                        row.lock = Some(KeyOp::Put(None, value));
                     }
                     "" | CF_DEFAULT => {
                         if let Ok(ts) = key.decode_ts() {
@@ -276,7 +240,7 @@ fn group_row_changes(requests: Vec<Request>) -> (HashMap<Key, RowChange>, bool) 
                 match delete.cf.as_str() {
                     CF_LOCK => {
                         let key = Key::from_encoded(delete.take_key());
-                        let row = changes.entry(key).or_default();
+                        let mut row = changes.entry(key).or_default();
                         row.lock = Some(KeyOp::Delete);
                     }
                     "" | CF_WRITE | CF_DEFAULT => {}
@@ -398,7 +362,6 @@ mod tests {
                 start_ts: 1.into(),
                 value: Some(b"v1".to_vec()),
                 lock_type: LockType::Put,
-                generation: 0,
             },
             ChangeRow::Commit {
                 key: k1.clone(),
@@ -411,7 +374,6 @@ mod tests {
                 start_ts: 3.into(),
                 value: Some(b"v2".to_vec()),
                 lock_type: LockType::Put,
-                generation: 0,
             },
             ChangeRow::Commit {
                 key: k1.clone(),
@@ -424,7 +386,6 @@ mod tests {
                 start_ts: 4.into(),
                 value: Some(vec![b'v'; 512]),
                 lock_type: LockType::Put,
-                generation: 0,
             },
             ChangeRow::Commit {
                 key: k1.clone(),
@@ -437,7 +398,6 @@ mod tests {
                 start_ts: 5.into(),
                 value: Some(b"v3".to_vec()),
                 lock_type: LockType::Put,
-                generation: 0,
             },
             ChangeRow::Commit {
                 key: k1.clone(),
@@ -450,7 +410,6 @@ mod tests {
                 start_ts: 6.into(),
                 value: Some(b"v4".to_vec()),
                 lock_type: LockType::Put,
-                generation: 0,
             },
             ChangeRow::Commit {
                 key: k1.clone(),
@@ -463,7 +422,6 @@ mod tests {
                 start_ts: 7.into(),
                 value: Some(b"v5".to_vec()),
                 lock_type: LockType::Put,
-                generation: 0,
             },
             // Rollback of the txn@start_ts=7 will be missing as overlapped rollback is not
             // hanlded.
@@ -493,7 +451,6 @@ mod tests {
             Mutation::make_put(k1.clone(), b"v4".to_vec()),
             &None,
             SkipPessimisticCheck,
-            None,
         )
         .unwrap();
         one_pc_commit(true, &mut txn, 10.into());

@@ -75,7 +75,7 @@ impl<T: BitOp> super::AggrDefinitionParser for AggrFnDefinitionParserBitOp<T> {
         // bit operation outputs one column.
         out_schema.push(root_expr.take_field_type());
 
-        super::util::rewrite_exp_for_bit_op(src_schema, &mut exp)?;
+        super::util::rewrite_exp_for_bit_op(src_schema, &mut exp).unwrap();
         out_exp.push(exp);
 
         Ok(Box::new(AggrFnBitOp::<T>(std::marker::PhantomData)))

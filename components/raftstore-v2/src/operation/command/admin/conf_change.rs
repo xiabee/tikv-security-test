@@ -9,8 +9,8 @@
 
 use std::time::Instant;
 
-use engine_traits::{KvEngine, RaftEngine, RaftLogBatch};
-use fail::fail_point;
+use collections::HashSet;
+use engine_traits::{KvEngine, RaftEngine};
 use kvproto::{
     metapb::{self, PeerRole},
     raft_cmdpb::{AdminRequest, AdminResponse, ChangePeerRequest, RaftCmdRequest},
@@ -18,8 +18,8 @@ use kvproto::{
 };
 use protobuf::Message;
 use raft::prelude::*;
+use raft_proto::ConfChangeI;
 use raftstore::{
-    coprocessor::{RegionChangeEvent, RegionChangeReason},
     store::{
         metrics::{PEER_ADMIN_CMD_COUNTER_VEC, PEER_PROPOSE_LOG_SIZE_HISTOGRAM},
         util::{self, ChangePeerI, ConfChangeKind},
@@ -28,12 +28,13 @@ use raftstore::{
     Error, Result,
 };
 use slog::{error, info, warn};
-use tikv_util::{box_err, slog_panic};
+use tikv_util::box_err;
 
 use super::AdminCmdResult;
 use crate::{
     batch::StoreContext,
     raft::{Apply, Peer},
+    router::ApplyRes,
 };
 
 /// The apply result of conf change.
@@ -50,18 +51,12 @@ pub struct ConfChangeResult {
     pub region_state: RegionLocalState,
 }
 
-#[derive(Debug)]
-pub struct UpdateGcPeersResult {
-    index: u64,
-    region_state: RegionLocalState,
-}
-
 impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
     #[inline]
     pub fn propose_conf_change<T>(
         &mut self,
         ctx: &mut StoreContext<EK, ER, T>,
-        req: RaftCmdRequest,
+        mut req: RaftCmdRequest,
     ) -> Result<u64> {
         if self.raft_group().raft.has_pending_conf() {
             info!(
@@ -72,6 +67,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         }
         let data = req.write_to_bytes()?;
         let admin = req.get_admin_request();
+        let leader_role = self.peer().get_role();
         if admin.has_change_peer() {
             self.propose_conf_change_imp(ctx, admin.get_change_peer(), data)
         } else if admin.has_change_peer_v2() {
@@ -105,8 +101,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             self.peer(),
             changes.as_ref(),
             &cc,
-            self.is_in_force_leader(),
-            self.get_peer_heartbeats(),
+            false,
         )?;
 
         // TODO: check if the new peer is already in history record.
@@ -154,7 +149,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
 
         let remove_self = conf_change.region_state.get_state() == PeerState::Tombstone;
         self.storage_mut()
-            .set_region_state(conf_change.region_state.clone());
+            .set_region_state(conf_change.region_state);
         if self.is_leader() {
             info!(
                 self.logger,
@@ -162,8 +157,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 "region" => ?self.region(),
             );
             self.region_heartbeat_pd(ctx);
-            let demote_self =
-                tikv_util::store::is_learner(self.peer()) && !self.is_in_force_leader();
+            let demote_self = tikv_util::store::is_learner(self.peer());
             if remove_self || demote_self {
                 warn!(self.logger, "removing or demoting leader"; "remove" => remove_self, "demote" => demote_self);
                 let term = self.term();
@@ -186,46 +180,15 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                     }
                 }
             }
-            if self.is_leader() {
-                if has_new_peer.is_some() {
-                    // Speed up snapshot instead of waiting another heartbeat.
-                    self.raft_group_mut().ping();
-                    self.set_has_ready();
-                }
-                self.maybe_schedule_gc_peer_tick();
+            if has_new_peer.is_some() {
+                // Speed up snapshot instead of waiting another heartbeat.
+                self.raft_group_mut().ping();
+                self.set_has_ready();
             }
         }
-        ctx.store_meta
-            .lock()
-            .unwrap()
-            .set_region(self.region(), true, &self.logger);
-        // Update leader's peer list after conf change.
-        self.read_progress()
-            .update_leader_info(self.leader_id(), self.term(), self.region());
-        ctx.coprocessor_host.on_region_changed(
-            self.region(),
-            RegionChangeEvent::Update(RegionChangeReason::ChangePeer),
-            self.raft_group().raft.state,
-        );
         if remove_self {
-            // When self is destroyed, all metas will be cleaned in `start_destroy`.
             self.mark_for_destroy(None);
-        } else {
-            let region_id = self.region_id();
-            self.state_changes_mut()
-                .put_region_state(region_id, conf_change.index, &conf_change.region_state)
-                .unwrap();
-            self.set_has_extra_write();
         }
-    }
-
-    pub fn on_apply_res_update_gc_peers(&mut self, result: UpdateGcPeersResult) {
-        let region_id = self.region_id();
-        self.state_changes_mut()
-            .put_region_state(region_id, result.index, &result.region_state)
-            .unwrap();
-        self.set_has_extra_write();
-        self.storage_mut().set_region_state(result.region_state);
     }
 }
 
@@ -265,9 +228,10 @@ impl<EK: KvEngine, R> Apply<EK, R> {
         cc: ConfChangeV2,
         legacy: bool,
     ) -> Result<(AdminResponse, AdminCmdResult)> {
-        let region = self.region();
+        let region = self.region_state().get_region();
+        let peer_id = self.peer().get_id();
         let change_kind = ConfChangeKind::confchange_kind(changes.len());
-        info!(self.logger, "exec ConfChangeV2"; "kind" => ?change_kind, "legacy" => legacy, "epoch" => ?region.get_region_epoch(), "index" => index);
+        info!(self.logger, "exec ConfChangeV2"; "kind" => ?change_kind, "legacy" => legacy, "epoch" => ?region.get_region_epoch());
         let mut new_region = region.clone();
         match change_kind {
             ConfChangeKind::LeaveJoint => self.apply_leave_joint(&mut new_region),
@@ -285,11 +249,10 @@ impl<EK: KvEngine, R> Apply<EK, R> {
                         self.apply_single_change(kind, cp, &mut new_region)
                     };
                     if let Err(e) = res {
-                        error!(self.logger, "failed to apply conf change";
+                        error!(self.logger, "failed to apply conf change"; 
                         "changes" => ?changes,
                         "legacy" => legacy,
-                        "original_region" => ?region, "err" => ?e);
-                        return Err(e);
+                        "original region" => ?region, "err" => ?e);
                     }
                 }
                 let conf_ver = region.get_region_epoch().get_conf_ver() + changes.len() as u64;
@@ -302,33 +265,12 @@ impl<EK: KvEngine, R> Apply<EK, R> {
             "conf change successfully";
             "changes" => ?changes,
             "legacy" => legacy,
-            "original_region" => ?region,
-            "current_region" => ?new_region,
+            "original region" => ?region,
+            "current region" => ?new_region,
         );
         let my_id = self.peer().get_id();
         let state = self.region_state_mut();
-        let mut removed_records: Vec<_> = state.take_removed_records().into();
-        for p0 in state.get_region().get_peers() {
-            // No matching store ID means the peer must be removed.
-            if new_region
-                .get_peers()
-                .iter()
-                .all(|p1| p1.get_store_id() != p0.get_store_id())
-            {
-                removed_records.push(p0.clone());
-            }
-        }
-        // If a peer is replaced in the same store, the leader will keep polling the
-        // new peer on the same store, which implies that the old peer must be
-        // tombstone in the end.
-        removed_records.retain(|p0| {
-            new_region
-                .get_peers()
-                .iter()
-                .all(|p1| p1.get_store_id() != p0.get_store_id())
-        });
         state.set_region(new_region.clone());
-        state.set_removed_records(removed_records.into());
         let new_peer = new_region
             .get_peers()
             .iter()
@@ -342,7 +284,7 @@ impl<EK: KvEngine, R> Apply<EK, R> {
         }
         let mut resp = AdminResponse::default();
         resp.mut_change_peer().set_region(new_region);
-        let conf_change = ConfChangeResult {
+        let mut conf_change = ConfChangeResult {
             index,
             conf_change: cc,
             changes: changes.to_vec(),
@@ -369,10 +311,10 @@ impl<EK: KvEngine, R> Apply<EK, R> {
             change_num += 1;
         }
         if change_num == 0 {
-            slog_panic!(
-                self.logger,
-                "can't leave a non-joint config";
-                "region" => ?self.region_state()
+            panic!(
+                "{:?} can't leave a non-joint config, region: {:?}",
+                self.logger.list(),
+                self.region_state()
             );
         }
         let conf_ver = region.get_region_epoch().get_conf_ver() + change_num;
@@ -394,14 +336,6 @@ impl<EK: KvEngine, R> Apply<EK, R> {
 
         match change_type {
             ConfChangeType::AddNode => {
-                let add_node_fp = || {
-                    fail_point!(
-                        "apply_on_add_node_1_2",
-                        self.peer_id() == 2 && self.region_id() == 1,
-                        |_| {}
-                    )
-                };
-                add_node_fp();
                 PEER_ADMIN_CMD_COUNTER_VEC
                     .with_label_values(&["add_peer", "all"])
                     .inc();
@@ -498,11 +432,11 @@ impl<EK: KvEngine, R> Apply<EK, R> {
         if let Some(exist_peer) = tikv_util::store::find_peer(region, store_id) {
             let r = exist_peer.get_role();
             if r == PeerRole::IncomingVoter || r == PeerRole::DemotingVoter {
-                slog_panic!(
-                    self.logger,
-                    "can't apply confchange because configuration is still in joint state";
-                    "confchange" => ?cp,
-                    "region_state" => ?self.region_state()
+                panic!(
+                    "{:?} can't apply confchange because configuration is still in joint state, confchange: {:?}, region: {:?}",
+                    self.logger.list(),
+                    cp,
+                    self.region_state()
                 );
             }
         }
@@ -590,48 +524,5 @@ impl<EK: KvEngine, R> Apply<EK, R> {
             .with_label_values(&[metric, "success"])
             .inc();
         Ok(())
-    }
-
-    pub fn apply_update_gc_peer(
-        &mut self,
-        log_index: u64,
-        admin_req: &AdminRequest,
-    ) -> (AdminResponse, AdminCmdResult) {
-        let mut removed_records: Vec<_> = self.region_state_mut().take_removed_records().into();
-        let mut merged_records: Vec<_> = self.region_state_mut().take_merged_records().into();
-        let updates = admin_req.get_update_gc_peers().get_peer_id();
-        info!(
-            self.logger,
-            "update gc peer";
-            "index" => log_index,
-            "updates" => ?updates,
-            "removed_records" => ?removed_records,
-            "merged_records" => ?merged_records
-        );
-        removed_records.retain(|p| !updates.contains(&p.get_id()));
-        merged_records.retain_mut(|r| {
-            // Clean up source peers if they acknowledge GcPeerRequest.
-            let mut source_peers: Vec<_> = r.take_source_peers().into();
-            source_peers.retain(|p| !updates.contains(&p.get_id()));
-            r.set_source_peers(source_peers.into());
-            // Clean up source removed records (peers) if they acknowledge GcPeerRequest.
-            let mut source_removed_records: Vec<_> = r.take_source_removed_records().into();
-            source_removed_records.retain(|p| !updates.contains(&p.get_id()));
-            r.set_source_removed_records(source_removed_records.into());
-            // Clean up merged records if all source peers and source removed records are
-            // empty.
-            !r.get_source_peers().is_empty() || !r.get_source_removed_records().is_empty()
-        });
-        self.region_state_mut()
-            .set_removed_records(removed_records.into());
-        self.region_state_mut()
-            .set_merged_records(merged_records.into());
-        (
-            AdminResponse::default(),
-            AdminCmdResult::UpdateGcPeers(UpdateGcPeersResult {
-                index: log_index,
-                region_state: self.region_state().clone(),
-            }),
-        )
     }
 }

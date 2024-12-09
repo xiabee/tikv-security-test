@@ -15,9 +15,9 @@ use kvproto::{cdcpb::*, kvrpcpb::*, tikvpb_grpc::TikvClient};
 use pd_client::PdClient;
 use test_raftstore::*;
 use tikv_util::{debug, worker::Scheduler, HandyRwLock};
-use txn_types::{Key, TimeStamp};
+use txn_types::TimeStamp;
 
-use crate::{new_event_feed, new_event_feed_v2, ClientReceiver, TestSuite, TestSuiteBuilder};
+use crate::{new_event_feed, ClientReceiver, TestSuite, TestSuiteBuilder};
 
 #[test]
 fn test_cdc_double_scan_deregister() {
@@ -526,50 +526,6 @@ fn test_cdc_rawkv_resolved_ts() {
     handle.join().unwrap();
 }
 
-// Test one region can be subscribed multiple times in one stream with different
-// `request_id`s.
-#[test]
-fn test_cdc_stream_multiplexing() {
-    let cluster = new_server_cluster(0, 2);
-    cluster.pd_client.disable_default_operator();
-    let mut suite = TestSuiteBuilder::new().cluster(cluster).build();
-    let rid = suite.cluster.get_region(&[]).id;
-    let (mut req_tx, _, receive_event) = new_event_feed_v2(suite.get_region_cdc_client(rid));
-
-    // Subscribe the region with request_id 1.
-    let mut req = suite.new_changedata_request(rid);
-    req.request_id = 1;
-    block_on(req_tx.send((req, WriteFlags::default()))).unwrap();
-    receive_event(false);
-
-    // Subscribe the region with request_id 2.
-    fail::cfg("before_post_incremental_scan", "pause").unwrap();
-    let mut req = suite.new_changedata_request(rid);
-    req.request_id = 2;
-    block_on(req_tx.send((req, WriteFlags::default()))).unwrap();
-    receive_event(false);
-
-    // Request 2 can't receive a ResolvedTs, because it's not ready.
-    for _ in 0..10 {
-        let event = receive_event(true);
-        let req_id = event.get_resolved_ts().get_request_id();
-        assert_eq!(req_id, 1);
-    }
-
-    // After request 2 is ready, it must receive a ResolvedTs.
-    fail::remove("before_post_incremental_scan");
-    let mut request_2_ready = false;
-    for _ in 0..20 {
-        let event = receive_event(true);
-        let req_id = event.get_resolved_ts().get_request_id();
-        if req_id == 2 {
-            request_2_ready = true;
-            break;
-        }
-    }
-    assert!(request_2_ready);
-}
-
 // This case tests pending regions can still get region split/merge
 // notifications.
 #[test]
@@ -579,7 +535,7 @@ fn test_cdc_notify_pending_regions() {
     let mut suite = TestSuiteBuilder::new().cluster(cluster).build();
     let region = suite.cluster.get_region(&[]);
     let rid = region.id;
-    let (mut req_tx, _, receive_event) = new_event_feed_v2(suite.get_region_cdc_client(rid));
+    let (mut req_tx, _, receive_event) = new_event_feed(suite.get_region_cdc_client(rid));
 
     fail::cfg("cdc_before_initialize", "pause").unwrap();
     let mut req = suite.new_changedata_request(rid);
@@ -594,132 +550,4 @@ fn test_cdc_notify_pending_regions() {
         Some(Event_oneof_event::Error(ref e)) if e.has_region_not_found(),
     );
     fail::remove("cdc_before_initialize");
-}
-
-// The case check whether https://github.com/tikv/tikv/issues/17233 is fixed or not.
-#[test]
-fn test_delegate_fail_during_incremental_scan() {
-    let mut cluster = new_server_cluster(0, 1);
-    configure_for_lease_read(&mut cluster.cfg, Some(100), Some(10));
-    cluster.pd_client.disable_default_operator();
-    let mut suite = TestSuiteBuilder::new().cluster(cluster).build();
-    let region = suite.cluster.get_region(&[]);
-    let rid = region.id;
-    let cf_tso = block_on(suite.cluster.pd_client.get_tso()).unwrap();
-
-    let start_tso = cf_tso.next();
-    let pk = format!("key_{:03}", 0).into_bytes();
-    let mut mutations = Vec::with_capacity(10);
-    for i in 0..10 {
-        let mut mutation = Mutation::default();
-        mutation.set_op(Op::Put);
-        mutation.key = format!("key_{:03}", i).into_bytes();
-        mutation.value = vec![b'x'; 16];
-        mutations.push(mutation);
-    }
-    suite.must_kv_prewrite(rid, mutations, pk.clone(), start_tso);
-
-    fail::cfg("before_schedule_incremental_scan", "1*pause").unwrap();
-
-    let (mut req_tx, recv, receive_event) = new_event_feed_v2(suite.get_region_cdc_client(rid));
-    let mut req = suite.new_changedata_request(rid);
-    req.request_id = 100;
-    req.checkpoint_ts = cf_tso.into_inner();
-    req.set_start_key(Key::from_raw(b"a").into_encoded());
-    req.set_end_key(Key::from_raw(b"z").into_encoded());
-    block_on(req_tx.send((req.clone(), WriteFlags::default()))).unwrap();
-    std::thread::sleep(Duration::from_millis(500));
-
-    suite.cluster.must_split(&region, b"f");
-
-    // After the incremental scan is canceled, we can get the epoch_not_match error.
-    // And after the error is retrieved, no more entries can be received.
-    let mut get_epoch_not_match = false;
-    while !get_epoch_not_match {
-        for event in receive_event(false).events.to_vec() {
-            match event.event {
-                Some(Event_oneof_event::Error(err)) => {
-                    assert!(err.has_epoch_not_match(), "{:?}", err);
-                    get_epoch_not_match = true;
-                }
-                Some(Event_oneof_event::Entries(..)) => {
-                    assert!(!get_epoch_not_match);
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    fail::remove("before_schedule_incremental_scan");
-
-    let mut recver = recv.replace(None).unwrap();
-    recv_timeout(&mut recver, Duration::from_secs(1)).unwrap_err();
-    recv.replace(Some(recver));
-}
-
-// The case shows it's possible that unordered Prewrite events on one same key
-// can be sent to TiCDC clients. Generally it only happens when a region changes
-// during a Pipelined-DML transaction.
-//
-// To ensure TiCDC can handle the situation, `generation` should be carried in
-// Prewrite events.
-#[test]
-fn test_cdc_pipeline_dml() {
-    let mut cluster = new_server_cluster(0, 1);
-    configure_for_lease_read(&mut cluster.cfg, Some(100), Some(10));
-    cluster.pd_client.disable_default_operator();
-    let mut suite = TestSuiteBuilder::new().cluster(cluster).build();
-    let region = suite.cluster.get_region(&[]);
-    let rid = region.id;
-
-    let prewrite_tso = block_on(suite.cluster.pd_client.get_tso()).unwrap();
-    let (k, v) = (b"key".to_vec(), vec![b'x'; 16]);
-    let mut mutation = Mutation::default();
-    mutation.set_op(Op::Put);
-    mutation.key = k.clone();
-    mutation.value = v;
-    suite.must_kv_flush(rid, vec![mutation], k.clone(), prewrite_tso, 1);
-
-    fail::cfg("cdc_incremental_scan_start", "pause").unwrap();
-
-    let cf_tso = block_on(suite.cluster.pd_client.get_tso()).unwrap();
-    let (mut req_tx, _, receive_event) = new_event_feed_v2(suite.get_region_cdc_client(rid));
-    let mut req = suite.new_changedata_request(rid);
-    req.request_id = 1;
-    req.checkpoint_ts = cf_tso.into_inner();
-    block_on(req_tx.send((req, WriteFlags::default()))).unwrap();
-    sleep_ms(100);
-
-    let (k, v) = (b"key".to_vec(), vec![b'y'; 16]);
-    let mut mutation = Mutation::default();
-    mutation.set_op(Op::Put);
-    mutation.key = k.clone();
-    mutation.value = v;
-    suite.must_kv_flush(rid, vec![mutation], k.clone(), prewrite_tso, 2);
-
-    let events = receive_event(false).take_events().into_vec();
-    for entry in events[0].get_entries().get_entries() {
-        assert_eq!(entry.r_type, EventLogType::Prewrite);
-        assert_eq!(entry.generation, 2);
-        assert_eq!(entry.value, vec![b'y'; 16]);
-    }
-
-    let commit_tso = block_on(suite.cluster.pd_client.get_tso()).unwrap();
-    suite.must_kv_commit(rid, vec![b"key".to_vec()], prewrite_tso, commit_tso);
-
-    let events = receive_event(false).take_events().into_vec();
-    for entry in events[0].get_entries().get_entries() {
-        assert_eq!(entry.r_type, EventLogType::Commit);
-        assert_eq!(entry.start_ts, prewrite_tso.into_inner());
-        assert_eq!(entry.commit_ts, commit_tso.into_inner());
-    }
-
-    fail::remove("cdc_incremental_scan_start");
-
-    let events = receive_event(false).take_events().into_vec();
-    let entries = events[0].get_entries().get_entries();
-    assert_eq!(entries[0].r_type, EventLogType::Prewrite);
-    assert_eq!(entries[0].generation, 1);
-    assert_eq!(entries[0].value, vec![b'x'; 16]);
-    assert_eq!(entries[1].r_type, EventLogType::Initialized);
 }

@@ -18,31 +18,24 @@ use backup_stream::{
     },
     observer::BackupStreamObserver,
     router::{Router, TaskSelector},
-    utils, BackupStreamGrpcService, BackupStreamResolver, Endpoint, GetCheckpointResult,
-    RegionCheckpointOperation, RegionSet, Task,
+    utils, Endpoint, GetCheckpointResult, RegionCheckpointOperation, RegionSet, Service, Task,
 };
-use encryption::{BackupEncryptionManager, MultiMasterKeyBackend};
 use futures::{executor::block_on, AsyncWriteExt, Future, Stream, StreamExt};
 use grpcio::{ChannelBuilder, Server, ServerBuilder};
 use kvproto::{
     brpb::{CompressionType, Local, Metadata, StorageBackend},
-    encryptionpb::EncryptionMethod,
     kvrpcpb::*,
     logbackuppb::{SubscribeFlushEventRequest, SubscribeFlushEventResponse},
     logbackuppb_grpc::{create_log_backup, LogBackupClient},
     tikvpb::*,
 };
 use pd_client::PdClient;
-use raftstore::{router::CdcRaftRouter, RegionInfoAccessor};
-use resolved_ts::LeadershipResolver;
-use tempfile::TempDir;
+use raftstore::RegionInfoAccessor;
+use tempdir::TempDir;
 use test_pd_client::TestPdClient;
-use test_raftstore::{new_server_cluster, Cluster, Config, ServerCluster};
+use test_raftstore::{new_server_cluster, Cluster, ServerCluster};
 use test_util::retry;
-use tikv::{
-    config::{BackupStreamConfig, ResolvedTsConfig},
-    storage::txn::txn_status_cache::TxnStatusCache,
-};
+use tikv::config::{BackupStreamConfig, ResolvedTsConfig};
 use tikv_util::{
     codec::{
         number::NumberEncoder,
@@ -129,7 +122,6 @@ pub struct SuiteBuilder {
     nodes: usize,
     metastore_error: Box<dyn Fn(&str) -> Result<()> + Send + Sync>,
     cfg: Box<dyn FnOnce(&mut BackupStreamConfig)>,
-    cluster_cfg: Box<dyn FnOnce(&mut Config)>,
 }
 
 impl SuiteBuilder {
@@ -141,7 +133,6 @@ impl SuiteBuilder {
             cfg: Box::new(|cfg| {
                 cfg.enable = true;
             }),
-            cluster_cfg: Box::new(|_| {}),
         }
     }
 
@@ -150,7 +141,6 @@ impl SuiteBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn inject_meta_store_error<F>(mut self, f: F) -> Self
     where
         F: Fn(&str) -> Result<()> + Send + Sync + 'static,
@@ -159,20 +149,9 @@ impl SuiteBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn cfg(mut self, f: impl FnOnce(&mut BackupStreamConfig) + 'static) -> Self {
         let old_f = self.cfg;
         self.cfg = Box::new(move |cfg| {
-            old_f(cfg);
-            f(cfg);
-        });
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn cluster_cfg(mut self, f: impl FnOnce(&mut Config) + 'static) -> Self {
-        let old_f = self.cluster_cfg;
-        self.cluster_cfg = Box::new(move |cfg| {
             old_f(cfg);
             f(cfg);
         });
@@ -185,12 +164,10 @@ impl SuiteBuilder {
             nodes: n,
             metastore_error,
             cfg: cfg_f,
-            cluster_cfg: ccfg_f,
         } = self;
 
         info!("start test"; "case" => %case, "nodes" => %n);
-        let mut cluster = new_server_cluster(42, n);
-        ccfg_f(&mut cluster.cfg);
+        let cluster = new_server_cluster(42, n);
         let mut suite = Suite {
             endpoints: Default::default(),
             meta_store: ErrorStore {
@@ -205,8 +182,8 @@ impl SuiteBuilder {
             env: Arc::new(grpcio::Environment::new(1)),
             cluster,
 
-            temp_files: TempDir::new().unwrap(),
-            flushed_files: TempDir::new().unwrap(),
+            temp_files: TempDir::new("temp").unwrap(),
+            flushed_files: TempDir::new("flush").unwrap(),
             case_name: case,
         };
         for id in 1..=(n as u64) {
@@ -276,7 +253,7 @@ pub struct Suite {
     // The place to make services live as long as suite.
     servers: Vec<Server>,
 
-    pub temp_files: TempDir,
+    temp_files: TempDir,
     pub flushed_files: TempDir,
     case_name: String,
 }
@@ -361,7 +338,7 @@ impl Suite {
             .get(&id)
             .expect("must register endpoint first");
 
-        let serv = BackupStreamGrpcService::new(endpoint.scheduler());
+        let serv = Service::new(endpoint.scheduler());
         let builder =
             ServerBuilder::new(self.env.clone()).register_service(create_log_backup(serv));
         let mut server = builder.bind("127.0.0.1", 0).build().unwrap();
@@ -379,25 +356,12 @@ impl Suite {
         let worker = self.endpoints.get_mut(&id).unwrap();
         let sim = cluster.sim.wl();
         let raft_router = sim.get_server_router(id);
-        let raft_router = CdcRaftRouter(raft_router);
         let cm = sim.get_concurrency_manager(id);
         let regions = sim.region_info_accessors.get(&id).unwrap().clone();
         let ob = self.obs.get(&id).unwrap().clone();
         cfg.enable = true;
         cfg.temp_path = format!("/{}/{}", self.temp_files.path().display(), id);
-        let resolver = LeadershipResolver::new(
-            id,
-            cluster.pd_client.clone(),
-            Arc::clone(&self.env),
-            Arc::clone(&sim.security_mgr),
-            cluster.store_metas[&id]
-                .lock()
-                .unwrap()
-                .region_read_progress
-                .clone(),
-            Duration::from_secs(60),
-        );
-        let endpoint = Endpoint::new(
+        let endpoint: TestEndpoint = Endpoint::new(
             id,
             self.meta_store.clone(),
             cfg,
@@ -408,19 +372,18 @@ impl Suite {
             raft_router,
             cluster.pd_client.clone(),
             cm,
-            BackupStreamResolver::V1(resolver),
-            BackupEncryptionManager::new(
-                None,
-                EncryptionMethod::Plaintext,
-                MultiMasterKeyBackend::default(),
-                sim.encryption.clone(),
-            ),
-            Arc::new(TxnStatusCache::new_for_test()),
+            Arc::clone(&self.env),
+            cluster.store_metas[&id]
+                .lock()
+                .unwrap()
+                .region_read_progress
+                .clone(),
+            Arc::clone(&sim.security_mgr),
         );
         worker.start(endpoint);
     }
 
-    pub fn get_meta_cli(&self) -> MetadataClient<impl MetaStore> {
+    pub fn get_meta_cli(&self) -> MetadataClient<ErrorStore<SlashEtcStore>> {
         MetadataClient::new(self.meta_store.clone(), 0)
     }
 
@@ -445,7 +408,7 @@ impl Suite {
         ))
         .unwrap();
         let name = name.to_owned();
-        self.wait_with_router(move |r| r.get_task_handler(&name).is_ok())
+        self.wait_with_router(move |r| block_on(r.get_task_info(&name)).is_ok())
     }
 
     /// This function tries to calculate the global checkpoint from the flush
@@ -489,52 +452,6 @@ impl Suite {
             .await
     }
 
-    #[allow(dead_code)]
-    pub async fn write_records_batched(
-        &mut self,
-        from: usize,
-        n: usize,
-        for_table: i64,
-    ) -> HashSet<Vec<u8>> {
-        let mut inserted = HashSet::default();
-        let mut keys = HashMap::new();
-        let start_ts = self.cluster.pd_client.get_tso().await.unwrap();
-        for sn in (from..(from + n)).map(|x| x * 2) {
-            let sn = sn as u64;
-            let key = make_record_key(for_table, sn);
-            let enc_key = Key::from_raw(&key).into_encoded();
-            let region = self.cluster.get_region_id(&enc_key);
-            let v = keys.entry(region).or_insert_with(|| vec![]);
-            v.push((key, sn));
-        }
-        let commit_ts = self.cluster.pd_client.get_tso().await.unwrap();
-        for (region, keys) in keys {
-            let mut muts = vec![];
-            for (key, sn) in &keys {
-                let raw_key = make_record_key(for_table, *sn);
-                let value = if sn % 4 == 0 {
-                    Self::PROMISED_SHORT_VALUE.to_vec()
-                } else {
-                    Self::PROMISED_LONG_VALUE.to_vec()
-                };
-
-                let k = Key::from_raw(key).append_ts(commit_ts);
-                muts.push(mutation(raw_key, value));
-                inserted.insert(k.into_encoded());
-            }
-            let pk = muts[0].key.clone();
-            self.must_kv_prewrite(region, muts, pk, start_ts);
-            self.must_kv_commit(
-                region,
-                keys.into_iter().map(|(k, _)| k).collect(),
-                start_ts,
-                commit_ts,
-            );
-        }
-
-        inserted
-    }
-
     pub async fn write_records(
         &mut self,
         from: usize,
@@ -542,10 +459,10 @@ impl Suite {
         for_table: i64,
     ) -> HashSet<Vec<u8>> {
         let mut inserted = HashSet::default();
-        for sn in (from..(from + n)).map(|x| x * 2) {
-            let sn = sn as u64;
-            let key = make_record_key(for_table, sn);
-            let value = if sn % 4 == 0 {
+        for ts in (from..(from + n)).map(|x| x * 2) {
+            let ts = ts as u64;
+            let key = make_record_key(for_table, ts);
+            let value = if ts % 4 == 0 {
                 Self::PROMISED_SHORT_VALUE.to_vec()
             } else {
                 Self::PROMISED_LONG_VALUE.to_vec()
@@ -559,7 +476,7 @@ impl Suite {
             self.must_kv_commit(region, vec![key.clone()], start_ts, commit_ts);
             inserted.insert(make_encoded_record_key(
                 for_table,
-                sn,
+                ts,
                 commit_ts.into_inner(),
             ));
         }
@@ -596,7 +513,6 @@ impl Suite {
     }
 
     pub fn force_flush_files(&self, task: &str) {
-        // TODO: use the callback to make the test more stable.
         self.run(|| Task::ForceFlush(task.to_owned()));
         self.sync();
     }
@@ -931,14 +847,14 @@ impl Suite {
     }
 
     pub fn wait_with_router(&self, mut cond: impl FnMut(&Router) -> bool + Send + 'static + Clone) {
-        self.wait_with(move |ep| cond(&ep.range_router))
+        self.wait_with(move |ep: &mut TestEndpoint| cond(&ep.range_router))
     }
 
     pub fn wait_for_flush(&self) {
         self.wait_with_router(move |r| {
-            let task_names = r.select_task(TaskSelector::All.reference());
+            let task_names = block_on(r.select_task(TaskSelector::All.reference()));
             for task_name in task_names {
-                let tsk = r.get_task_handler(&task_name);
+                let tsk = block_on(r.get_task_info(&task_name));
                 if tsk.unwrap().is_flushing() {
                     return false;
                 }

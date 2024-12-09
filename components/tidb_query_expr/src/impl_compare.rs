@@ -33,19 +33,6 @@ pub fn compare_json<F: CmpOp>(lhs: Option<JsonRef>, rhs: Option<JsonRef>) -> Res
 
 #[rpn_fn(nullable)]
 #[inline]
-pub fn compare_vector_float32<F: CmpOp>(
-    lhs: Option<VectorFloat32Ref>,
-    rhs: Option<VectorFloat32Ref>,
-) -> Result<Option<i64>> {
-    Ok(match (lhs, rhs) {
-        (None, None) => F::compare_null(),
-        (None, _) | (_, None) => F::compare_partial_null(),
-        (Some(lhs), Some(rhs)) => Some(F::compare_order(lhs.cmp(&rhs)) as i64),
-    })
-}
-
-#[rpn_fn(nullable)]
-#[inline]
 pub fn compare_bytes<C: Collator, F: CmpOp>(
     lhs: Option<BytesRef>,
     rhs: Option<BytesRef>,
@@ -54,7 +41,7 @@ pub fn compare_bytes<C: Collator, F: CmpOp>(
         (None, None) => F::compare_null(),
         (None, _) | (_, None) => F::compare_partial_null(),
         (Some(lhs), Some(rhs)) => {
-            let ord = C::sort_compare(lhs, rhs, false)?;
+            let ord = C::sort_compare(lhs, rhs)?;
             Some(F::compare_order(ord) as i64)
         }
     })
@@ -992,8 +979,6 @@ mod tests {
                     Ordering::Equal,
                     Ordering::Equal,
                     Ordering::Equal,
-                    Ordering::Less,
-                    Ordering::Less,
                 ],
             ),
             (
@@ -1005,8 +990,6 @@ mod tests {
                     Ordering::Less,
                     Ordering::Less,
                     Ordering::Less,
-                    Ordering::Less,
-                    Ordering::Less,
                 ],
             ),
             (
@@ -1018,8 +1001,6 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Equal,
                     Ordering::Equal,
-                    Ordering::Equal,
-                    Ordering::Greater,
                 ],
             ),
             (
@@ -1031,8 +1012,6 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Equal,
                     Ordering::Equal,
-                    Ordering::Less,
-                    Ordering::Greater,
                 ],
             ),
             (
@@ -1044,8 +1023,6 @@ mod tests {
                     Ordering::Equal,
                     Ordering::Equal,
                     Ordering::Equal,
-                    Ordering::Less,
-                    Ordering::Less,
                 ],
             ),
             (
@@ -1057,16 +1034,12 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Equal,
                     Ordering::Equal,
-                    Ordering::Equal,
-                    Ordering::Greater,
                 ],
             ),
             (
                 "À\t",
                 "A",
                 [
-                    Ordering::Greater,
-                    Ordering::Greater,
                     Ordering::Greater,
                     Ordering::Greater,
                     Ordering::Greater,
@@ -1083,16 +1056,12 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Greater,
                     Ordering::Greater,
-                    Ordering::Greater,
-                    Ordering::Greater,
                 ],
             ),
             (
                 "a bc",
                 "ab ",
                 [
-                    Ordering::Less,
-                    Ordering::Less,
                     Ordering::Less,
                     Ordering::Less,
                     Ordering::Less,
@@ -1109,8 +1078,6 @@ mod tests {
                     Ordering::Less,
                     Ordering::Equal,
                     Ordering::Equal,
-                    Ordering::Equal,
-                    Ordering::Less,
                 ],
             ),
             (
@@ -1122,8 +1089,6 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Less,
                     Ordering::Less,
-                    Ordering::Less,
-                    Ordering::Greater,
                 ],
             ),
             (
@@ -1135,8 +1100,6 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Equal,
                     Ordering::Equal,
-                    Ordering::Greater,
-                    Ordering::Greater,
                 ],
             ),
             (
@@ -1148,8 +1111,6 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Less,
                     Ordering::Equal,
-                    Ordering::Equal,
-                    Ordering::Greater,
                 ],
             ),
         ];
@@ -1159,8 +1120,6 @@ mod tests {
             (Collation::Utf8Mb4Bin, 2),
             (Collation::Utf8Mb4GeneralCi, 3),
             (Collation::Utf8Mb4UnicodeCi, 4),
-            (Collation::Utf8Mb40900AiCi, 5),
-            (Collation::Utf8Mb40900Bin, 6),
         ];
 
         for (str_a, str_b, ordering_in_collations) in cases {

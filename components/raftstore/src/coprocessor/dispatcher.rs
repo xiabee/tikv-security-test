@@ -1,144 +1,20 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath] called by Fsm on_ready_compute_hash
-use std::{borrow::Cow, marker::PhantomData, mem, ops::Deref};
+use std::{marker::PhantomData, mem, ops::Deref};
 
-use engine_traits::{CfName, KvEngine, WriteBatch};
+use engine_traits::{CfName, KvEngine};
 use kvproto::{
-    metapb::{Region, RegionEpoch},
+    metapb::Region,
     pdpb::CheckPolicy,
     raft_cmdpb::{ComputeHashRequest, RaftCmdRequest},
-    raft_serverpb::RaftMessage,
 };
 use protobuf::Message;
 use raft::eraftpb;
-use read_write::WriteBatchObserver;
 use tikv_util::box_try;
 
-use super::{split_observer::SplitObserver, *};
-use crate::store::BucketRange;
-
-/// A handle for coprocessor to schedule some command back to raftstore.
-pub trait StoreHandle: Clone + Send {
-    fn update_approximate_size(&self, region_id: u64, size: Option<u64>, splitable: Option<bool>);
-    fn update_approximate_keys(&self, region_id: u64, keys: Option<u64>, splitable: Option<bool>);
-    fn ask_split(
-        &self,
-        region_id: u64,
-        region_epoch: RegionEpoch,
-        split_keys: Vec<Vec<u8>>,
-        source: Cow<'static, str>,
-    );
-    fn refresh_region_buckets(
-        &self,
-        region_id: u64,
-        region_epoch: RegionEpoch,
-        buckets: Vec<Bucket>,
-        bucket_ranges: Option<Vec<BucketRange>>,
-    );
-    fn update_compute_hash_result(
-        &self,
-        region_id: u64,
-        index: u64,
-        context: Vec<u8>,
-        hash: Vec<u8>,
-    );
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum SchedTask {
-    UpdateApproximateSize {
-        region_id: u64,
-        splitable: Option<bool>,
-        size: Option<u64>,
-    },
-    UpdateApproximateKeys {
-        region_id: u64,
-        splitable: Option<bool>,
-        keys: Option<u64>,
-    },
-    AskSplit {
-        region_id: u64,
-        region_epoch: RegionEpoch,
-        split_keys: Vec<Vec<u8>>,
-        source: Cow<'static, str>,
-    },
-    RefreshRegionBuckets {
-        region_id: u64,
-        region_epoch: RegionEpoch,
-        buckets: Vec<Bucket>,
-        bucket_ranges: Option<Vec<BucketRange>>,
-    },
-    UpdateComputeHashResult {
-        region_id: u64,
-        index: u64,
-        hash: Vec<u8>,
-        context: Vec<u8>,
-    },
-}
-
-impl StoreHandle for std::sync::mpsc::SyncSender<SchedTask> {
-    fn update_approximate_size(&self, region_id: u64, size: Option<u64>, splitable: Option<bool>) {
-        let _ = self.try_send(SchedTask::UpdateApproximateSize {
-            region_id,
-            splitable,
-            size,
-        });
-    }
-
-    fn update_approximate_keys(&self, region_id: u64, keys: Option<u64>, splitable: Option<bool>) {
-        let _ = self.try_send(SchedTask::UpdateApproximateKeys {
-            region_id,
-            splitable,
-            keys,
-        });
-    }
-
-    fn ask_split(
-        &self,
-        region_id: u64,
-        region_epoch: RegionEpoch,
-        split_keys: Vec<Vec<u8>>,
-        source: Cow<'static, str>,
-    ) {
-        let _ = self.try_send(SchedTask::AskSplit {
-            region_id,
-            region_epoch,
-            split_keys,
-            source,
-        });
-    }
-
-    fn refresh_region_buckets(
-        &self,
-        region_id: u64,
-        region_epoch: RegionEpoch,
-        buckets: Vec<Bucket>,
-        bucket_ranges: Option<Vec<BucketRange>>,
-    ) {
-        let _ = self.try_send(SchedTask::RefreshRegionBuckets {
-            region_id,
-            region_epoch,
-            buckets,
-            bucket_ranges,
-        });
-    }
-
-    fn update_compute_hash_result(
-        &self,
-        region_id: u64,
-        index: u64,
-        context: Vec<u8>,
-        hash: Vec<u8>,
-    ) {
-        let _ = self.try_send(SchedTask::UpdateComputeHashResult {
-            region_id,
-            index,
-            context,
-            hash,
-        });
-    }
-}
+use super::*;
+use crate::store::CasualRouter;
 
 struct Entry<T> {
     priority: u32,
@@ -290,31 +166,6 @@ impl_box_observer_g!(
     ConsistencyCheckObserver,
     WrappedConsistencyCheckObserver
 );
-impl_box_observer!(
-    BoxRaftMessageObserver,
-    RaftMessageObserver,
-    WrappedRaftMessageObserver
-);
-impl_box_observer!(
-    BoxExtraMessageObserver,
-    ExtraMessageObserver,
-    WrappedExtraMessageObserver
-);
-impl_box_observer!(
-    BoxRegionHeartbeatObserver,
-    RegionHeartbeatObserver,
-    WrappedRegionHeartbeatObserver
-);
-impl_box_observer!(
-    BoxWriteBatchObserver,
-    WriteBatchObserver,
-    WrappedBoxWriteBatchObserver
-);
-impl_box_observer!(
-    BoxSnapshotObserver,
-    SnapshotObserver,
-    WrappedBoxSnapshotObserver
-);
 
 /// Registry contains all registered coprocessors.
 #[derive(Clone)]
@@ -333,14 +184,6 @@ where
     read_index_observers: Vec<Entry<BoxReadIndexObserver>>,
     pd_task_observers: Vec<Entry<BoxPdTaskObserver>>,
     update_safe_ts_observers: Vec<Entry<BoxUpdateSafeTsObserver>>,
-    raft_message_observers: Vec<Entry<BoxRaftMessageObserver>>,
-    extra_message_observers: Vec<Entry<BoxExtraMessageObserver>>,
-    region_heartbeat_observers: Vec<Entry<BoxRegionHeartbeatObserver>>,
-    // For now, `write_batch_observer` and `snapshot_observer` can only have one
-    // observer solely because of simplicity. However, it is possible to have
-    // multiple observers in the future if needed.
-    write_batch_observer: Option<BoxWriteBatchObserver>,
-    snapshot_observer: Option<BoxSnapshotObserver>,
     // TODO: add endpoint
 }
 
@@ -358,11 +201,6 @@ impl<E: KvEngine> Default for Registry<E> {
             read_index_observers: Default::default(),
             pd_task_observers: Default::default(),
             update_safe_ts_observers: Default::default(),
-            raft_message_observers: Default::default(),
-            extra_message_observers: Default::default(),
-            region_heartbeat_observers: Default::default(),
-            write_batch_observer: None,
-            snapshot_observer: None,
         }
     }
 }
@@ -430,30 +268,6 @@ impl<E: KvEngine> Registry<E> {
     }
     pub fn register_update_safe_ts_observer(&mut self, priority: u32, qo: BoxUpdateSafeTsObserver) {
         push!(priority, qo, self.update_safe_ts_observers);
-    }
-
-    pub fn register_raft_message_observer(&mut self, priority: u32, qo: BoxRaftMessageObserver) {
-        push!(priority, qo, self.raft_message_observers);
-    }
-
-    pub fn register_extra_message_observer(&mut self, priority: u32, qo: BoxExtraMessageObserver) {
-        push!(priority, qo, self.extra_message_observers);
-    }
-
-    pub fn register_region_heartbeat_observer(
-        &mut self,
-        priority: u32,
-        qo: BoxRegionHeartbeatObserver,
-    ) {
-        push!(priority, qo, self.region_heartbeat_observers);
-    }
-
-    pub fn register_write_batch_observer(&mut self, write_batch_observer: BoxWriteBatchObserver) {
-        self.write_batch_observer = Some(write_batch_observer);
-    }
-
-    pub fn register_snapshot_observer(&mut self, snapshot_observer: BoxSnapshotObserver) {
-        self.snapshot_observer = Some(snapshot_observer);
     }
 }
 
@@ -525,8 +339,10 @@ where
 }
 
 impl<E: KvEngine> CoprocessorHost<E> {
-    pub fn new<C: StoreHandle + Clone + Send + 'static>(ch: C, cfg: Config) -> CoprocessorHost<E> {
-        // TODO load coprocessors from configuration
+    pub fn new<C: CasualRouter<E> + Clone + Send + 'static>(
+        ch: C,
+        cfg: Config,
+    ) -> CoprocessorHost<E> {
         let mut registry = Registry::default();
         registry.register_split_check_observer(
             200,
@@ -537,8 +353,10 @@ impl<E: KvEngine> CoprocessorHost<E> {
             BoxSplitCheckObserver::new(KeysCheckObserver::new(ch)),
         );
         registry.register_split_check_observer(100, BoxSplitCheckObserver::new(HalfCheckObserver));
-        registry.register_split_check_observer(400, BoxSplitCheckObserver::new(TableCheckObserver));
-        registry.register_admin_observer(100, BoxAdminObserver::new(SplitObserver));
+        registry.register_split_check_observer(
+            400,
+            BoxSplitCheckObserver::new(TableCheckObserver::default()),
+        );
         CoprocessorHost { registry, cfg }
     }
 
@@ -725,22 +543,8 @@ impl<E: KvEngine> CoprocessorHost<E> {
         );
     }
 
-    pub fn pre_transfer_leader(
-        &self,
-        r: &Region,
-        tr: &TransferLeaderRequest,
-    ) -> Result<Vec<ExtraMessage>> {
-        let mut ctx = ObserverContext::new(r);
-        let mut msgs = vec![];
-        for o in &self.registry.admin_observers {
-            if let Some(msg) = (o.observer).inner().pre_transfer_leader(&mut ctx, tr)? {
-                msgs.push(msg);
-            }
-            if ctx.bypass {
-                break;
-            }
-        }
-        Ok(msgs)
+    pub fn pre_transfer_leader(&self, r: &Region, tr: &TransferLeaderRequest) -> Result<()> {
+        try_loop_ob!(r, &self.registry.admin_observers, pre_transfer_leader, tr)
     }
 
     pub fn post_apply_snapshot(
@@ -754,13 +558,6 @@ impl<E: KvEngine> CoprocessorHost<E> {
         for observer in &self.registry.apply_snapshot_observers {
             let observer = observer.observer.inner();
             observer.post_apply_snapshot(&mut ctx, peer_id, snap_key, snap);
-        }
-    }
-
-    pub fn cancel_apply_snapshot(&self, region_id: u64, peer_id: u64) {
-        for observer in &self.registry.apply_snapshot_observers {
-            let observer = observer.observer.inner();
-            observer.cancel_apply_snapshot(region_id, peer_id);
         }
     }
 
@@ -841,14 +638,6 @@ impl<E: KvEngine> CoprocessorHost<E> {
             role
         );
     }
-    pub fn on_region_heartbeat(&self, region: &Region, region_stat: &RegionStat) {
-        loop_ob!(
-            region,
-            &self.registry.region_heartbeat_observers,
-            on_region_heartbeat,
-            region_stat
-        );
-    }
 
     /// `pre_persist` is called we we want to persist data or meta for a region.
     /// For example, in `finish_for` and `commit`,
@@ -878,24 +667,6 @@ impl<E: KvEngine> CoprocessorHost<E> {
         for observer in &self.registry.region_change_observers {
             let observer = observer.observer.inner();
             if !observer.pre_write_apply_state(&mut ctx) {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub fn on_extra_message(&self, r: &Region, msg: &ExtraMessage) {
-        for observer in &self.registry.extra_message_observers {
-            let observer = observer.observer.inner();
-            observer.on_extra_message(r, msg);
-        }
-    }
-
-    /// Returns false if the message should not be stepped later.
-    pub fn on_raft_message(&self, msg: &RaftMessage) -> bool {
-        for observer in &self.registry.raft_message_observers {
-            let observer = observer.observer.inner();
-            if !observer.on_raft_message(msg) {
                 return false;
             }
         }
@@ -947,27 +718,6 @@ impl<E: KvEngine> CoprocessorHost<E> {
             let observer = observer.observer.inner();
             observer.on_update_safe_ts(region_id, self_safe_ts, leader_safe_ts)
         }
-    }
-
-    pub fn on_create_apply_write_batch<WB: WriteBatch>(&self, wb: WB) -> WriteBatchWrapper<WB> {
-        let observable_wb = self
-            .registry
-            .write_batch_observer
-            .as_ref()
-            .map(|observer| observer.inner().create_observable_write_batch());
-        WriteBatchWrapper::new(wb, observable_wb)
-    }
-
-    pub fn on_snapshot(
-        &self,
-        region: &Region,
-        read_ts: u64,
-        seqno: u64,
-    ) -> Option<Box<dyn ObservedSnapshot>> {
-        self.registry
-            .snapshot_observer
-            .as_ref()
-            .map(move |observer| observer.inner().on_snapshot(region, read_ts, seqno))
     }
 
     pub fn shutdown(&self) {
@@ -1033,8 +783,6 @@ mod tests {
         OnUpdateSafeTs = 23,
         PrePersist = 24,
         PreWriteApplyState = 25,
-        OnRaftMessage = 26,
-        CancelApplySnapshot = 27,
     }
 
     impl Coprocessor for TestCoprocessor {}
@@ -1253,13 +1001,6 @@ mod tests {
             );
             false
         }
-
-        fn cancel_apply_snapshot(&self, _: u64, _: u64) {
-            self.called.fetch_add(
-                ObserverIndex::CancelApplySnapshot as usize,
-                Ordering::SeqCst,
-            );
-        }
     }
 
     impl CmdObserver<PanicEngine> for TestCoprocessor {
@@ -1281,14 +1022,6 @@ mod tests {
         fn on_update_safe_ts(&self, _: u64, _: u64, _: u64) {
             self.called
                 .fetch_add(ObserverIndex::OnUpdateSafeTs as usize, Ordering::SeqCst);
-        }
-    }
-
-    impl RaftMessageObserver for TestCoprocessor {
-        fn on_raft_message(&self, _: &RaftMessage) -> bool {
-            self.called
-                .fetch_add(ObserverIndex::OnRaftMessage as usize, Ordering::SeqCst);
-            true
         }
     }
 
@@ -1328,8 +1061,6 @@ mod tests {
             .register_cmd_observer(1, BoxCmdObserver::new(ob.clone()));
         host.registry
             .register_update_safe_ts_observer(1, BoxUpdateSafeTsObserver::new(ob.clone()));
-        host.registry
-            .register_raft_message_observer(1, BoxRaftMessageObserver::new(ob.clone()));
 
         let mut index: usize = 0;
         let region = Region::default();
@@ -1443,15 +1174,6 @@ mod tests {
 
         host.pre_write_apply_state(&region);
         index += ObserverIndex::PreWriteApplyState as usize;
-        assert_all!([&ob.called], &[index]);
-
-        let msg = RaftMessage::default();
-        host.on_raft_message(&msg);
-        index += ObserverIndex::OnRaftMessage as usize;
-        assert_all!([&ob.called], &[index]);
-
-        host.cancel_apply_snapshot(region.get_id(), 0);
-        index += ObserverIndex::CancelApplySnapshot as usize;
         assert_all!([&ob.called], &[index]);
     }
 

@@ -4,11 +4,11 @@ use std::ops::Deref;
 
 use async_trait::async_trait;
 use cloud::{
-    error::{Error, KmsError, OtherError, Result},
-    kms::{Config, CryptographyType, DataKeyPair, EncryptedKey, KeyId, KmsProvider, PlainKey},
+    error::{Error, KmsError, Result},
+    kms::{Config, DataKeyPair, EncryptedKey, KeyId, KmsProvider, PlainKey},
 };
 use rusoto_core::{request::DispatchSignedRequest, RusotoError};
-use rusoto_credential::{AwsCredentials, ProvideAwsCredentials, StaticProvider};
+use rusoto_credential::ProvideAwsCredentials;
 use rusoto_kms::{
     DecryptError, DecryptRequest, GenerateDataKeyError, GenerateDataKeyRequest, Kms, KmsClient,
 };
@@ -62,35 +62,17 @@ impl AwsKms {
         })
     }
 
+    fn new_with_dispatcher<D>(config: Config, dispatcher: D) -> Result<AwsKms>
+    where
+        D: DispatchSignedRequest + Send + Sync + 'static,
+    {
+        let credentials_provider = util::CredentialsProvider::new()?;
+        Self::new_with_creds_dispatcher(config, dispatcher, credentials_provider)
+    }
+
     pub fn new(config: Config) -> Result<AwsKms> {
         let dispatcher = util::new_http_client()?;
-        match config.aws.as_ref() {
-            Some(aws_config) => {
-                if let (Some(access_key), Some(secret_access_key)) = (
-                    aws_config.access_key.clone(),
-                    aws_config.secret_access_key.clone(),
-                ) {
-                    // Use provided AWS credentials
-                    let credentials = AwsCredentials::new(
-                        access_key,
-                        secret_access_key,
-                        None, // session token
-                        None, // expiration
-                    );
-                    let static_provider = StaticProvider::from(credentials);
-                    Self::new_with_creds_dispatcher(config, dispatcher, static_provider)
-                } else {
-                    // Fall back to default credentials provider
-                    let provider = util::CredentialsProvider::new()?;
-                    Self::new_with_creds_dispatcher(config, dispatcher, provider)
-                }
-            }
-            None => {
-                // No AWS config provided, use default credentials provider
-                let provider = util::CredentialsProvider::new()?;
-                Self::new_with_creds_dispatcher(config, dispatcher, provider)
-            }
-        }
+        Self::new_with_dispatcher(config, dispatcher)
     }
 }
 
@@ -137,7 +119,7 @@ impl KmsProvider for AwsKms {
                 let plaintext_key = response.plaintext.unwrap().as_ref().to_vec();
                 Ok(DataKeyPair {
                     encrypted: EncryptedKey::new(ciphertext_key)?,
-                    plaintext: PlainKey::new(plaintext_key, CryptographyType::AesGcm256)?,
+                    plaintext: PlainKey::new(plaintext_key)?,
                 })
             })
     }
@@ -166,13 +148,11 @@ fn classify_generate_data_key_error(err: RusotoError<GenerateDataKeyError>) -> E
         match &e {
             GenerateDataKeyError::NotFound(_) => Error::ApiNotFound(err.into()),
             GenerateDataKeyError::InvalidKeyUsage(_) => {
-                Error::KmsError(KmsError::Other(OtherError::from_box(err.into())))
+                Error::KmsError(KmsError::Other(err.into()))
             }
             GenerateDataKeyError::DependencyTimeout(_) => Error::ApiTimeout(err.into()),
             GenerateDataKeyError::KMSInternal(_) => Error::ApiInternal(err.into()),
-            _ => Error::KmsError(KmsError::Other(OtherError::from_box(
-                FixRusotoErrorDisplay(err).into(),
-            ))),
+            _ => Error::KmsError(KmsError::Other(FixRusotoErrorDisplay(err).into())),
         }
     } else {
         classify_error(err)
@@ -187,9 +167,7 @@ fn classify_decrypt_error(err: RusotoError<DecryptError>) -> Error {
             }
             DecryptError::DependencyTimeout(_) => Error::ApiTimeout(err.into()),
             DecryptError::KMSInternal(_) => Error::ApiInternal(err.into()),
-            _ => Error::KmsError(KmsError::Other(OtherError::from_box(
-                FixRusotoErrorDisplay(err).into(),
-            ))),
+            _ => Error::KmsError(KmsError::Other(FixRusotoErrorDisplay(err).into())),
         }
     } else {
         classify_error(err)
@@ -201,9 +179,7 @@ fn classify_error<E: std::error::Error + Send + Sync + 'static>(err: RusotoError
         RusotoError::HttpDispatch(_) => Error::ApiTimeout(err.into()),
         RusotoError::Credentials(_) => Error::ApiAuthentication(err.into()),
         e if e.is_retryable() => Error::ApiInternal(err.into()),
-        _ => Error::KmsError(KmsError::Other(OtherError::from_box(
-            FixRusotoErrorDisplay(err).into(),
-        ))),
+        _ => Error::KmsError(KmsError::Other(FixRusotoErrorDisplay(err).into())),
     }
 }
 
@@ -242,9 +218,6 @@ mod tests {
                 region: "ap-southeast-2".to_string(),
                 endpoint: String::new(),
             },
-            azure: None,
-            gcp: None,
-            aws: None,
         };
 
         let dispatcher =
@@ -288,9 +261,6 @@ mod tests {
                 region: "ap-southeast-2".to_string(),
                 endpoint: String::new(),
             },
-            azure: None,
-            gcp: None,
-            aws: None,
         };
 
         // IncorrectKeyException

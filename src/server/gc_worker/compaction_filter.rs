@@ -14,12 +14,15 @@ use std::{
 
 use engine_rocks::{
     raw::{
-        CompactionFilter, CompactionFilterContext, CompactionFilterDecision,
-        CompactionFilterFactory, CompactionFilterValueType,
+        new_compaction_filter_raw, CompactionFilter, CompactionFilterContext,
+        CompactionFilterDecision, CompactionFilterFactory, CompactionFilterValueType,
+        DBCompactionFilter,
     },
     RocksEngine, RocksMvccProperties, RocksWriteBatchVec,
 };
-use engine_traits::{KvEngine, MiscExt, MvccProperties, WriteBatch, WriteOptions};
+use engine_traits::{
+    KvEngine, MiscExt, Mutable, MvccProperties, WriteBatch, WriteBatchExt, WriteOptions,
+};
 use file_system::{IoType, WithIoType};
 use pd_client::{Feature, FeatureGate};
 use prometheus::{local::*, *};
@@ -27,7 +30,6 @@ use raftstore::coprocessor::RegionInfoProvider;
 use tikv_util::{
     time::Instant,
     worker::{ScheduleError, Scheduler},
-    Either,
 };
 use txn_types::{Key, TimeStamp, WriteRef, WriteType};
 
@@ -49,7 +51,7 @@ const COMPACTION_FILTER_GC_FEATURE: Feature = Feature::require(5, 0, 0);
 // these fields are not available when constructing
 // `WriteCompactionFilterFactory`.
 pub struct GcContext {
-    pub(crate) db: Option<RocksEngine>,
+    pub(crate) db: RocksEngine,
     pub(crate) store_id: u64,
     pub(crate) safe_point: Arc<AtomicU64>,
     pub(crate) cfg_tracker: GcWorkerConfigManager,
@@ -147,12 +149,12 @@ where
         safe_point: Arc<AtomicU64>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
-        gc_scheduler: Scheduler<GcTask<<EK as MiscExt>::DiskEngine>>,
+        gc_scheduler: Scheduler<GcTask<EK>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
     );
 }
 
-impl<EK> CompactionFilterInitializer<EK> for Option<EK>
+impl<EK> CompactionFilterInitializer<EK> for EK
 where
     EK: KvEngine,
 {
@@ -162,14 +164,14 @@ where
         _safe_point: Arc<AtomicU64>,
         _cfg_tracker: GcWorkerConfigManager,
         _feature_gate: FeatureGate,
-        _gc_scheduler: Scheduler<GcTask<<EK as MiscExt>::DiskEngine>>,
+        _gc_scheduler: Scheduler<GcTask<EK>>,
         _region_info_provider: Arc<dyn RegionInfoProvider>,
     ) {
         info!("Compaction filter is not supported for this engine.");
     }
 }
 
-impl CompactionFilterInitializer<RocksEngine> for Option<RocksEngine> {
+impl CompactionFilterInitializer<RocksEngine> for RocksEngine {
     fn init_compaction_filter(
         &self,
         store_id: u64,
@@ -198,23 +200,21 @@ impl CompactionFilterInitializer<RocksEngine> for Option<RocksEngine> {
 pub struct WriteCompactionFilterFactory;
 
 impl CompactionFilterFactory for WriteCompactionFilterFactory {
-    type Filter = WriteCompactionFilter;
-
     fn create_compaction_filter(
         &self,
         context: &CompactionFilterContext,
-    ) -> Option<(CString, Self::Filter)> {
+    ) -> *mut DBCompactionFilter {
         let gc_context_option = GC_CONTEXT.lock().unwrap();
         let gc_context = match *gc_context_option {
             Some(ref ctx) => ctx,
-            None => return None,
+            None => return std::ptr::null_mut(),
         };
 
         let safe_point = gc_context.safe_point.load(Ordering::Relaxed);
         if safe_point == 0 {
             // Safe point has not been initialized yet.
             debug!("skip gc in compaction filter because of no safe point");
-            return None;
+            return std::ptr::null_mut();
         }
 
         let (enable, skip_vcheck, ratio_threshold) = {
@@ -237,17 +237,14 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
             "ratio_threshold" => ratio_threshold,
         );
 
-        if db
-            .as_ref()
-            .map_or(false, RocksEngine::is_stalled_or_stopped)
-        {
+        if db.is_stalled_or_stopped() {
             debug!("skip gc in compaction filter because the DB is stalled");
-            return None;
+            return std::ptr::null_mut();
         }
 
         if !do_check_allowed(enable, skip_vcheck, &gc_context.feature_gate) {
             debug!("skip gc in compaction filter because it's not allowed");
-            return None;
+            return std::ptr::null_mut();
         }
         drop(gc_context_option);
         GC_COMPACTION_FILTER_PERFORM
@@ -258,12 +255,12 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
             GC_COMPACTION_FILTER_SKIP
                 .with_label_values(&[STAT_TXN_KEYMODE])
                 .inc();
-            return None;
+            return std::ptr::null_mut();
         }
 
         debug!(
             "gc in compaction filter"; "safe_point" => safe_point,
-            "files" => ?context.input_table_properties().iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            "files" => ?context.file_numbers(),
             "bottommost" => context.is_bottommost_level(),
             "manual" => context.is_manual_compaction(),
         );
@@ -276,64 +273,17 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
             (store_id, region_info_provider),
         );
         let name = CString::new("write_compaction_filter").unwrap();
-        Some((name, filter))
+        unsafe { new_compaction_filter_raw(name, filter) }
     }
 }
 
-pub struct DeleteBatch<B> {
-    pub batch: Either<B, Vec<Key>>,
-}
-
-impl<B: WriteBatch> DeleteBatch<B> {
-    fn new<EK>(db: &Option<EK>) -> Self
-    where
-        EK: KvEngine<WriteBatch = B>,
-    {
-        Self {
-            batch: match db {
-                Some(db) => Either::Left(db.write_batch_with_cap(DEFAULT_DELETE_BATCH_SIZE)),
-                None => Either::Right(Vec::with_capacity(64)),
-            },
-        }
-    }
-
-    // `key` has prefix `DATA_KEY`.
-    fn delete(&mut self, key: &[u8], ts: TimeStamp) -> Result<(), String> {
-        match &mut self.batch {
-            Either::Left(batch) => {
-                let key = Key::from_encoded_slice(key).append_ts(ts);
-                batch.delete(key.as_encoded())?;
-            }
-            Either::Right(keys) => {
-                let key = Key::from_encoded_slice(keys::origin_key(key)).append_ts(ts);
-                keys.push(key);
-            }
-        }
-        Ok(())
-    }
-
-    fn is_empty(&self) -> bool {
-        match &self.batch {
-            Either::Left(batch) => batch.is_empty(),
-            Either::Right(keys) => keys.is_empty(),
-        }
-    }
-
-    pub fn count(&self) -> usize {
-        match &self.batch {
-            Either::Left(batch) => batch.count(),
-            Either::Right(keys) => keys.len(),
-        }
-    }
-}
-
-pub struct WriteCompactionFilter {
+struct WriteCompactionFilter {
     safe_point: u64,
-    engine: Option<RocksEngine>,
+    engine: RocksEngine,
     is_bottommost_level: bool,
     encountered_errors: bool,
 
-    write_batch: DeleteBatch<RocksWriteBatchVec>,
+    write_batch: RocksWriteBatchVec,
     gc_scheduler: Scheduler<GcTask<RocksEngine>>,
     // A key batch which is going to be sent to the GC worker.
     mvcc_deletions: Vec<Key>,
@@ -362,7 +312,7 @@ pub struct WriteCompactionFilter {
 
 impl WriteCompactionFilter {
     fn new(
-        engine: Option<RocksEngine>,
+        engine: RocksEngine,
         safe_point: u64,
         context: &CompactionFilterContext,
         gc_scheduler: Scheduler<GcTask<RocksEngine>>,
@@ -372,7 +322,7 @@ impl WriteCompactionFilter {
         assert!(safe_point > 0);
         debug!("gc in compaction filter"; "safe_point" => safe_point);
 
-        let write_batch = DeleteBatch::new(&engine);
+        let write_batch = engine.write_batch_with_cap(DEFAULT_DELETE_BATCH_SIZE);
         WriteCompactionFilter {
             safe_point,
             engine,
@@ -452,6 +402,7 @@ impl WriteCompactionFilter {
         &mut self,
         _start_level: usize,
         key: &[u8],
+        _sequence: u64,
         value: &[u8],
         value_type: CompactionFilterValueType,
     ) -> Result<CompactionFilterDecision, String> {
@@ -518,8 +469,9 @@ impl WriteCompactionFilter {
 
     fn handle_filtered_write(&mut self, write: WriteRef<'_>) -> Result<(), String> {
         if write.short_value.is_none() && write.write_type == WriteType::Put {
-            self.write_batch
-                .delete(&self.mvcc_key_prefix, write.start_ts)?;
+            let prefix = Key::from_encoded_slice(&self.mvcc_key_prefix);
+            let def_key = prefix.append_ts(write.start_ts).into_encoded();
+            self.write_batch.delete(&def_key)?;
         }
         Ok(())
     }
@@ -547,40 +499,24 @@ impl WriteCompactionFilter {
         }
 
         if self.write_batch.count() > DEFAULT_DELETE_BATCH_COUNT || force {
-            let err = match &mut self.write_batch.batch {
-                Either::Left(wb) => {
-                    let mut wopts = WriteOptions::default();
-                    wopts.set_no_slowdown(true);
-                    match do_flush(wb, &wopts) {
-                        Ok(()) => {
-                            wb.clear();
-                            return Ok(());
-                        }
-                        Err(e) => Some(e),
-                    }
-                }
-                Either::Right(_) => None,
-            };
-
-            let wb = mem::replace(&mut self.write_batch, DeleteBatch::new(&self.engine));
-            self.orphan_versions += wb.count();
-            let id = ORPHAN_VERSIONS_ID.fetch_add(1, Ordering::Relaxed);
-            let region_info_provider = self.regions_provider.1.clone();
-            let task = GcTask::OrphanVersions {
-                wb,
-                id,
-                region_info_provider,
-            };
-            if let Some(e) = &err {
-                warn!(
-                    "compaction filter flush fail, dispatch to gc worker";
-                    "task" => %task, "err" => ?e,
+            let mut wopts = WriteOptions::default();
+            wopts.set_no_slowdown(true);
+            if let Err(e) = do_flush(&mut self.write_batch, &wopts) {
+                let wb = mem::replace(
+                    &mut self.write_batch,
+                    self.engine.write_batch_with_cap(DEFAULT_DELETE_BATCH_SIZE),
                 );
+                self.orphan_versions += wb.count();
+                let id = ORPHAN_VERSIONS_ID.fetch_add(1, Ordering::Relaxed);
+                let task = GcTask::OrphanVersions { wb, id };
+                warn!(
+                   "compaction filter flush fail, dispatch to gc worker";
+                   "task" => %task, "err" => ?e,
+                );
+                self.schedule_gc_task(task, true);
+                return Err(e);
             }
-            self.schedule_gc_task(task, true);
-            if let Some(err) = err {
-                return Err(err);
-            }
+            self.write_batch.clear();
         }
         Ok(())
     }
@@ -671,9 +607,7 @@ impl Drop for WriteCompactionFilter {
         if let Err(e) = self.flush_pending_writes_if_need(true) {
             error!("compaction filter flush writes fail"; "err" => ?e);
         }
-        if let Some(engine) = &self.engine {
-            engine.sync_wal().unwrap();
-        }
+        self.engine.sync_wal().unwrap();
 
         self.switch_key_metrics();
         self.flush_metrics();
@@ -690,6 +624,7 @@ impl CompactionFilter for WriteCompactionFilter {
         &mut self,
         level: usize,
         key: &[u8],
+        sequence: u64,
         value: &[u8],
         value_type: CompactionFilterValueType,
     ) -> CompactionFilterDecision {
@@ -698,7 +633,7 @@ impl CompactionFilter for WriteCompactionFilter {
             return CompactionFilterDecision::Keep;
         }
 
-        match self.do_filter(level, key, value, value_type) {
+        match self.do_filter(level, key, sequence, value, value_type) {
             Ok(decision) => decision,
             Err(e) => {
                 warn!("compaction filter meet error: {}", e);
@@ -785,9 +720,9 @@ pub fn check_need_gc(
     };
 
     let (mut sum_props, mut needs_gc) = (MvccProperties::new(), 0);
-    let table_props = context.input_table_properties();
-    for (_, table_prop) in table_props {
-        let user_props = table_prop.user_collected_properties();
+    for i in 0..context.file_numbers().len() {
+        let table_props = context.table_properties(i);
+        let user_props = table_props.user_collected_properties();
         if let Ok(props) = RocksMvccProperties::decode(user_props) {
             sum_props.add(&props);
             let (sst_needs_gc, skip_more_checks) = check_props(&props);
@@ -796,13 +731,13 @@ pub fn check_need_gc(
             }
             if skip_more_checks {
                 // It's the bottommost level or ratio_threshold is less than 1.
-                needs_gc = table_props.len();
+                needs_gc = context.file_numbers().len();
                 break;
             }
         }
     }
 
-    (needs_gc >= ((table_props.len() + 1) / 2)) || check_props(&sum_props).0
+    (needs_gc >= ((context.file_numbers().len() + 1) / 2)) || check_props(&sum_props).0
 }
 
 #[allow(dead_code)] // Some interfaces are not used with different compile options.
@@ -886,7 +821,7 @@ pub mod test_utils {
                     cfg.ratio_threshold = ratio_threshold;
                 }
                 cfg.enable_compaction_filter = true;
-                GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)), None)
+                GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)))
             };
             let feature_gate = {
                 let feature_gate = FeatureGate::default();
@@ -896,7 +831,7 @@ pub mod test_utils {
 
             let mut gc_context_opt = GC_CONTEXT.lock().unwrap();
             *gc_context_opt = Some(GcContext {
-                db: Some(engine.clone()),
+                db: engine.clone(),
                 store_id: 1,
                 safe_point,
                 cfg_tracker,
@@ -1066,7 +1001,7 @@ pub mod tests {
 
             // Wait up to 1 second, and treat as no task if timeout.
             if let Ok(Some(task)) = gc_runner.gc_receiver.recv_timeout(Duration::new(1, 0)) {
-                assert!(expect_tasks, "unexpected GC task");
+                assert!(expect_tasks, "a GC task is expected");
                 match task {
                     GcTask::GcKeys { keys, .. } => {
                         assert_eq!(keys.len(), 1);
@@ -1078,7 +1013,7 @@ pub mod tests {
                 }
                 return;
             }
-            assert!(!expect_tasks, "no GC task after 1 second");
+            assert!(!expect_tasks, "no GC task is expected");
         };
 
         // No key switch after the deletion mark.
@@ -1096,7 +1031,6 @@ pub mod tests {
         // Clean the engine, prepare for later tests.
         raw_engine
             .delete_ranges_cf(
-                &WriteOptions::default(),
                 CF_WRITE,
                 DeleteStrategy::DeleteFiles,
                 &[Range::new(b"z", b"zz")],

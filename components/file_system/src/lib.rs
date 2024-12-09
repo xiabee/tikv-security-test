@@ -29,17 +29,12 @@ pub use std::{
 use std::{
     io::{self, ErrorKind, Read, Write},
     path::Path,
-    pin::Pin,
     str::FromStr,
     sync::{Arc, Mutex},
-    task::{ready, Context, Poll},
 };
 
 pub use file::{File, OpenOptions};
-pub use io_stats::{
-    fetch_io_bytes, get_io_type, get_thread_io_bytes_total, init as init_io_stats_collector,
-    set_io_type,
-};
+pub use io_stats::{get_io_type, init as init_io_stats_collector, set_io_type};
 pub use metrics_manager::{BytesFetcher, MetricsManager};
 use online_config::ConfigValue;
 use openssl::{
@@ -52,7 +47,6 @@ pub use rate_limiter::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use strum::{EnumCount, EnumIter};
-use tokio::io::{AsyncRead, ReadBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IoOp {
@@ -78,7 +72,6 @@ pub enum IoType {
     Gc = 8,
     Import = 9,
     Export = 10,
-    RewriteLog = 11,
 }
 
 impl IoType {
@@ -95,7 +88,6 @@ impl IoType {
             IoType::Gc => "gc",
             IoType::Import => "import",
             IoType::Export => "export",
-            IoType::RewriteLog => "log_rewrite",
         }
     }
 }
@@ -119,10 +111,10 @@ impl Drop for WithIoType {
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Default)]
 pub struct IoBytes {
-    pub read: u64,
-    pub write: u64,
+    read: u64,
+    write: u64,
 }
 
 impl std::ops::Sub for IoBytes {
@@ -133,13 +125,6 @@ impl std::ops::Sub for IoBytes {
             read: self.read.saturating_sub(other.read),
             write: self.write.saturating_sub(other.write),
         }
-    }
-}
-
-impl std::ops::AddAssign for IoBytes {
-    fn add_assign(&mut self, rhs: Self) {
-        self.read += rhs.read;
-        self.write += rhs.write;
     }
 }
 
@@ -160,13 +145,8 @@ impl IoPriority {
         }
     }
 
-    fn from_u32(i: u32) -> Self {
-        match i {
-            0 => IoPriority::Low,
-            1 => IoPriority::Medium,
-            2 => IoPriority::High,
-            _ => panic!("unknown io priority {}", i),
-        }
+    fn unsafe_from_u32(i: u32) -> Self {
+        unsafe { std::mem::transmute(i) }
     }
 }
 
@@ -431,34 +411,6 @@ impl<R: Read> Read for Sha256Reader<R> {
         let len = self.reader.read(buf)?;
         self.hasher.lock().unwrap().update(&buf[..len])?;
         Ok(len)
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for Sha256Reader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let initial_filled_len = buf.filled().len();
-        ready!(Pin::new(&mut self.reader).poll_read(cx, buf))?;
-
-        let filled_len = buf.filled().len();
-        if initial_filled_len == filled_len {
-            return Poll::Ready(Ok(()));
-        }
-        let new_data = &buf.filled()[initial_filled_len..filled_len];
-
-        // Update the hasher with the read data
-        let mut hasher = self
-            .hasher
-            .lock()
-            .expect("failed to lock hasher in Sha256Reader async read");
-        if let Err(e) = hasher.update(new_data) {
-            return Poll::Ready(Err(io::Error::new(ErrorKind::Other, e)));
-        }
-
-        Poll::Ready(Ok(()))
     }
 }
 

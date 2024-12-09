@@ -24,7 +24,7 @@ impl TestSuite {
         // Disable background renew by setting `renew_interval` to 0, to make timestamp
         // allocation predictable.
         configure_for_causal_ts(&mut cluster, "0s", 100);
-        configure_for_merge(&mut cluster.cfg);
+        configure_for_merge(&mut cluster);
         cluster.run();
         cluster.pd_client.disable_default_operator();
 
@@ -208,7 +208,7 @@ fn test_leader_transfer() {
 #[test]
 fn test_region_merge() {
     let mut suite = TestSuite::new(3, ApiVersion::V2);
-    let keys = [b"rk0", b"rk1", b"rk2", b"rk3", b"rk4", b"rk5"];
+    let keys = vec![b"rk0", b"rk1", b"rk2", b"rk3", b"rk4", b"rk5"];
 
     suite.must_raw_put(keys[1], b"v1");
     suite.must_raw_put(keys[3], b"v3");

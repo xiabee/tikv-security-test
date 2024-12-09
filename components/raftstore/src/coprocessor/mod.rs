@@ -17,9 +17,8 @@ use kvproto::{
         AdminRequest, AdminResponse, RaftCmdRequest, RaftCmdResponse, Request,
         TransferLeaderRequest,
     },
-    raft_serverpb::{ExtraMessage, RaftApplyState},
+    raft_serverpb::RaftApplyState,
 };
-use pd_client::RegionStat;
 use raft::{eraftpb, StateRole};
 
 pub mod config;
@@ -30,23 +29,16 @@ mod metrics;
 pub mod region_info_accessor;
 mod split_check;
 pub mod split_observer;
-use kvproto::raft_serverpb::RaftMessage;
-mod read_write;
 
 pub use self::{
     config::{Config, ConsistencyCheckMethod},
     consistency_check::{ConsistencyCheckObserver, Raw as RawConsistencyCheckObserver},
     dispatcher::{
         BoxAdminObserver, BoxApplySnapshotObserver, BoxCmdObserver, BoxConsistencyCheckObserver,
-        BoxPdTaskObserver, BoxQueryObserver, BoxRaftMessageObserver, BoxRegionChangeObserver,
-        BoxRoleObserver, BoxSplitCheckObserver, BoxUpdateSafeTsObserver, CoprocessorHost, Registry,
-        StoreHandle,
+        BoxPdTaskObserver, BoxQueryObserver, BoxRegionChangeObserver, BoxRoleObserver,
+        BoxSplitCheckObserver, BoxUpdateSafeTsObserver, CoprocessorHost, Registry,
     },
     error::{Error, Result},
-    read_write::{
-        ObservableWriteBatch, ObservedSnapshot, SnapshotObserver, WriteBatchObserver,
-        WriteBatchWrapper,
-    },
     region_info_accessor::{
         Callback as RegionInfoCallback, RangeKey, RegionCollector, RegionInfo, RegionInfoAccessor,
         RegionInfoProvider, SeekRegionCallback,
@@ -92,7 +84,6 @@ pub struct RegionState {
     pub peer_id: u64,
     pub pending_remove: bool,
     pub modified_region: Option<Region>,
-    pub new_regions: Vec<Region>,
 }
 
 /// Context for exec observers of mutation to be applied to ApplyContext.
@@ -145,8 +136,8 @@ pub trait AdminObserver: Coprocessor {
         &self,
         _ctx: &mut ObserverContext<'_>,
         _tr: &TransferLeaderRequest,
-    ) -> Result<Option<ExtraMessage>> {
-        Ok(None)
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -224,8 +215,6 @@ pub trait ApplySnapshotObserver: Coprocessor {
     ) {
     }
 
-    fn cancel_apply_snapshot(&self, _: u64, _: u64) {}
-
     /// We call pre_apply_snapshot only when one of the observer returns true.
     fn should_pre_apply_snapshot(&self) -> bool {
         false
@@ -290,20 +279,15 @@ pub struct RoleChange {
     pub prev_lead_transferee: u64,
     /// Which peer is voted by itself.
     pub vote: u64,
-    pub initialized: bool,
-    pub peer_id: u64,
 }
 
 impl RoleChange {
-    #[cfg(any(test, feature = "testexport"))]
     pub fn new(state: StateRole) -> Self {
         RoleChange {
             state,
             leader_id: raft::INVALID_ID,
             prev_lead_transferee: raft::INVALID_ID,
             vote: raft::INVALID_ID,
-            initialized: true,
-            peer_id: raft::INVALID_ID,
         }
     }
 }
@@ -324,8 +308,6 @@ pub enum RegionChangeReason {
     PrepareMerge,
     CommitMerge,
     RollbackMerge,
-    SwitchWitness,
-    Flashback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -357,21 +339,6 @@ pub trait RegionChangeObserver: Coprocessor {
     fn pre_write_apply_state(&self, _: &mut ObserverContext<'_>) -> bool {
         true
     }
-}
-pub trait RegionHeartbeatObserver: Coprocessor {
-    fn on_region_heartbeat(&self, _: &mut ObserverContext<'_>, _: &RegionStat) {}
-}
-
-pub trait RaftMessageObserver: Coprocessor {
-    /// Returns false if the message should not be stepped later.
-    fn on_raft_message(&self, _: &RaftMessage) -> bool {
-        true
-    }
-}
-
-//
-pub trait ExtraMessageObserver: Coprocessor {
-    fn on_extra_message(&self, _: &Region, _: &ExtraMessage) {}
 }
 
 #[derive(Clone, Debug, Default)]
@@ -467,7 +434,7 @@ impl CmdObserveInfo {
     /// PiTR: Observer supports the `backup-log` function.
     /// RTS: Observer supports the `resolved-ts` advancing (and follower read,
     /// etc.).
-    pub fn observe_level(&self) -> ObserveLevel {
+    fn observe_level(&self) -> ObserveLevel {
         let cdc = if self.cdc_id.is_observing() {
             // `cdc` observe all data
             ObserveLevel::All
@@ -539,19 +506,6 @@ impl CmdBatch {
         assert_eq!(observe_info.rts_id.id, self.rts_id);
         assert_eq!(observe_info.pitr_id.id, self.pitr_id);
         self.cmds.push(cmd)
-    }
-
-    pub fn extend<I: IntoIterator<Item = Cmd>>(
-        &mut self,
-        observe_info: &CmdObserveInfo,
-        region_id: u64,
-        cmds: I,
-    ) {
-        assert_eq!(region_id, self.region_id);
-        assert_eq!(observe_info.cdc_id.id, self.cdc_id);
-        assert_eq!(observe_info.rts_id.id, self.rts_id);
-        assert_eq!(observe_info.pitr_id.id, self.pitr_id);
-        self.cmds.extend(cmds)
     }
 
     pub fn into_iter(self, region_id: u64) -> IntoIter<Cmd> {

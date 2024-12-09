@@ -7,7 +7,7 @@ use collections::HashSet;
 use prometheus::local::{LocalHistogram, LocalIntCounter};
 use raft::eraftpb::MessageType;
 use tikv_util::time::{Duration, Instant};
-use tracker::{Tracker, TrackerToken, GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN};
+use tracker::{Tracker, TrackerToken, GLOBAL_TRACKERS};
 
 use super::metrics::*;
 
@@ -68,84 +68,6 @@ impl RaftSendMessageMetrics {
     }
 }
 
-/// Buffered statistics for recording local raftstore message duration.
-///
-/// As it's only used for recording local raftstore message duration,
-/// and it will be manually reset preiodically, so it's not necessary
-/// to use `LocalHistogram`.
-#[derive(Default)]
-struct LocalHealthStatistics {
-    duration_sum: Duration,
-    count: u64,
-}
-
-impl LocalHealthStatistics {
-    #[inline]
-    fn observe(&mut self, dur: Duration) {
-        self.count += 1;
-        self.duration_sum += dur;
-    }
-
-    #[inline]
-    fn avg(&self) -> Duration {
-        if self.count > 0 {
-            Duration::from_micros(self.duration_sum.as_micros() as u64 / self.count)
-        } else {
-            Duration::default()
-        }
-    }
-
-    #[inline]
-    fn reset(&mut self) {
-        self.count = 0;
-        self.duration_sum = Duration::default();
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoType {
-    Disk = 0,
-    Network = 1,
-}
-
-/// Buffered statistics for recording the health of raftstore.
-#[derive(Default)]
-pub struct HealthStatistics {
-    // represents periodic latency on the disk io.
-    disk_io_dur: LocalHealthStatistics,
-    // represents the latency of the network io.
-    network_io_dur: LocalHealthStatistics,
-}
-
-impl HealthStatistics {
-    #[inline]
-    pub fn observe(&mut self, dur: Duration, io_type: IoType) {
-        match io_type {
-            IoType::Disk => self.disk_io_dur.observe(dur),
-            IoType::Network => self.network_io_dur.observe(dur),
-        }
-    }
-
-    #[inline]
-    pub fn avg(&self, io_type: IoType) -> Duration {
-        match io_type {
-            IoType::Disk => self.disk_io_dur.avg(),
-            IoType::Network => self.network_io_dur.avg(),
-        }
-    }
-
-    #[inline]
-    /// Reset HealthStatistics.
-    ///
-    /// Should be manually reset when the metrics are
-    /// accepted by slowness inspector.
-    pub fn reset(&mut self) {
-        self.disk_io_dur.reset();
-        self.network_io_dur.reset();
-    }
-}
-
 /// The buffered metrics counters for raft.
 pub struct RaftMetrics {
     // local counter
@@ -158,10 +80,7 @@ pub struct RaftMetrics {
 
     // local histogram
     pub store_time: LocalHistogram,
-    // the wait time for processing a raft command
     pub propose_wait_time: LocalHistogram,
-    // the wait time for processing a raft message
-    pub process_wait_time: LocalHistogram,
     pub process_ready: LocalHistogram,
     pub event_time: RaftEventDurationVec,
     pub peer_msg_len: LocalHistogram,
@@ -177,9 +96,6 @@ pub struct RaftMetrics {
     pub wf_persist_log: LocalHistogram,
     pub wf_commit_log: LocalHistogram,
     pub wf_commit_not_persist_log: LocalHistogram,
-
-    // local statistics for slowness
-    pub health_stats: HealthStatistics,
 
     pub check_stale_peer: LocalIntCounter,
     pub leader_missing: Arc<Mutex<HashSet<u64>>>,
@@ -202,7 +118,6 @@ impl RaftMetrics {
             raft_log_gc_skipped: RaftLogGcSkippedCounterVec::from(&RAFT_LOG_GC_SKIPPED_VEC),
             store_time: STORE_TIME_HISTOGRAM.local(),
             propose_wait_time: REQUEST_WAIT_TIME_HISTOGRAM.local(),
-            process_wait_time: RAFT_MESSAGE_WAIT_TIME_HISTOGRAM.local(),
             process_ready: PEER_RAFT_PROCESS_DURATION
                 .with_label_values(&["ready"])
                 .local(),
@@ -218,7 +133,6 @@ impl RaftMetrics {
             wf_persist_log: STORE_WF_PERSIST_LOG_DURATION_HISTOGRAM.local(),
             wf_commit_log: STORE_WF_COMMIT_LOG_DURATION_HISTOGRAM.local(),
             wf_commit_not_persist_log: STORE_WF_COMMIT_NOT_PERSIST_LOG_DURATION_HISTOGRAM.local(),
-            health_stats: HealthStatistics::default(),
             check_stale_peer: CHECK_STALE_PEER_COUNTER.local(),
             leader_missing: Arc::default(),
             last_flush_time: Instant::now_coarse(),
@@ -242,7 +156,6 @@ impl RaftMetrics {
 
         self.store_time.flush();
         self.propose_wait_time.flush();
-        self.process_wait_time.flush();
         self.process_ready.flush();
         self.event_time.flush();
         self.peer_msg_len.flush();
@@ -298,61 +211,47 @@ impl StoreWriteMetrics {
 /// Tracker for the durations of a raftstore request.
 /// If a global tracker is not available, it will fallback to an Instant.
 #[derive(Debug, Clone, Copy)]
-pub struct TimeTracker {
-    token: TrackerToken,
-    start: std::time::Instant,
-}
-
-impl Default for TimeTracker {
-    #[inline]
-    fn default() -> Self {
-        let token = tracker::get_tls_tracker_token();
-        let start = std::time::Instant::now();
-        let tracker = TimeTracker { token, start };
-        if token == INVALID_TRACKER_TOKEN {
-            return tracker;
-        }
-
-        GLOBAL_TRACKERS.with_tracker(token, |tracker| {
-            tracker.metrics.write_instant = Some(start);
-        });
-        tracker
-    }
+pub enum TimeTracker {
+    Tracker(TrackerToken),
+    Instant(std::time::Instant),
 }
 
 impl TimeTracker {
-    #[inline]
     pub fn as_tracker_token(&self) -> Option<TrackerToken> {
-        if self.token == INVALID_TRACKER_TOKEN {
-            None
-        } else {
-            Some(self.token)
+        match self {
+            TimeTracker::Tracker(tt) => Some(*tt),
+            TimeTracker::Instant(_) => None,
         }
     }
 
-    #[inline]
     pub fn observe(
         &self,
         now: std::time::Instant,
         local_metric: &LocalHistogram,
         tracker_metric: impl FnOnce(&mut Tracker) -> &mut u64,
-    ) -> u64 {
-        let dur = now.saturating_duration_since(self.start);
-        local_metric.observe(dur.as_secs_f64());
-        if self.token == INVALID_TRACKER_TOKEN {
-            return 0;
-        }
-        GLOBAL_TRACKERS.with_tracker(self.token, |tracker| {
-            let metric = tracker_metric(tracker);
-            if *metric == 0 {
-                *metric = dur.as_nanos() as u64;
+    ) {
+        match self {
+            TimeTracker::Tracker(t) => {
+                if let Some(dur) = GLOBAL_TRACKERS
+                    .with_tracker(*t, |tracker| {
+                        tracker.metrics.write_instant.map(|write_instant| {
+                            let dur = now.saturating_duration_since(write_instant);
+                            let metric = tracker_metric(tracker);
+                            if *metric == 0 {
+                                *metric = dur.as_nanos() as u64;
+                            }
+                            dur
+                        })
+                    })
+                    .flatten()
+                {
+                    local_metric.observe(dur.as_secs_f64());
+                }
             }
-        });
-        dur.as_nanos() as u64
-    }
-
-    #[inline]
-    pub fn reset(&mut self, start: std::time::Instant) {
-        self.start = start;
+            TimeTracker::Instant(t) => {
+                let dur = now.saturating_duration_since(*t);
+                local_metric.observe(dur.as_secs_f64());
+            }
+        }
     }
 }

@@ -11,11 +11,8 @@ pub const MIN_FSP: i8 = 0;
 /// `DEFAULT_FSP` is the default digit of fractional seconds part.
 /// `MySQL` use 0 as the default Fsp.
 pub const DEFAULT_FSP: i8 = 0;
-/// `DEFAULT_DIV_FRAC_INCR` is the default value of decimal divide precision
-/// inrements.
-pub const DEFAULT_DIV_FRAC_INCR: u8 = 4;
 
-pub fn check_fsp(fsp: i8) -> Result<u8> {
+fn check_fsp(fsp: i8) -> Result<u8> {
     if fsp == UNSPECIFIED_FSP {
         return Ok(DEFAULT_FSP as u8);
     }
@@ -33,7 +30,6 @@ pub mod enums;
 pub mod json;
 pub mod set;
 pub mod time;
-pub mod vector;
 
 pub use self::{
     decimal::{dec_encoded_len, Decimal, DecimalDecoder, DecimalEncoder, Res, RoundMode},
@@ -45,5 +41,4 @@ pub use self::{
     },
     set::{Set, SetRef},
     time::{Time, TimeDecoder, TimeEncoder, TimeType, Tz},
-    vector::{VectorFloat32, VectorFloat32Decoder, VectorFloat32Encoder, VectorFloat32Ref},
 };

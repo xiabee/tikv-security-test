@@ -29,6 +29,8 @@ impl super::AggrDefinitionParser for AggrFnDefinitionParserFirst {
         out_schema: &mut Vec<FieldType>,
         out_exp: &mut Vec<RpnExpression>,
     ) -> Result<Box<dyn AggrFunction>> {
+        use std::convert::TryFrom;
+
         use tidb_query_datatype::FieldTypeAccessor;
 
         assert_eq!(root_expr.get_tp(), ExprType::First);
@@ -62,7 +64,6 @@ impl super::AggrDefinitionParser for AggrFnDefinitionParserFirst {
                 Bytes => BytesRef<'static>,
                 Enum => EnumRef<'static>,
                 Set => SetRef<'static>,
-                VectorFloat32 => VectorFloat32Ref<'static>,
             ],
             match eval_type {
                 EvalType::TT => Ok(Box::new(AggrFnFirst::<TT>::new())),

@@ -92,7 +92,6 @@ impl<E: Extremum> super::AggrDefinitionParser for AggrFnDefinitionParserExtremum
                 Decimal => &'static Decimal,
                 DateTime => &'static DateTime,
                 Json => JsonRef<'static>,
-                VectorFloat32 => VectorFloat32Ref<'static>,
             ],
             match eval_type {
                 EvalType::T => Ok(Box::new(AggFnExtremum::<T, E>::new())),
@@ -184,12 +183,7 @@ where
             return Ok(());
         }
 
-        if C::sort_compare(
-            self.extremum.as_ref().unwrap(),
-            value.as_ref().unwrap(),
-            false,
-        )? == E::ORD
-        {
+        if C::sort_compare(self.extremum.as_ref().unwrap(), value.as_ref().unwrap())? == E::ORD {
             self.extremum = value.map(|x| x.into_owned_value());
         }
         Ok(())

@@ -37,7 +37,6 @@ pub enum ScalarValue {
     Json(Option<super::Json>),
     Enum(Option<super::Enum>),
     Set(Option<super::Set>),
-    VectorFloat32(Option<super::VectorFloat32>),
 }
 
 impl ScalarValue {
@@ -62,9 +61,6 @@ impl ScalarValue {
             ScalarValue::Json(x) => ScalarValueRef::Json(x.as_ref().map(|x| x.as_ref())),
             ScalarValue::Enum(x) => ScalarValueRef::Enum(x.as_ref().map(|x| x.as_ref())),
             ScalarValue::Set(x) => ScalarValueRef::Set(x.as_ref().map(|x| x.as_ref())),
-            ScalarValue::VectorFloat32(x) => {
-                ScalarValueRef::VectorFloat32(x.as_ref().map(|x| x.as_ref()))
-            }
         }
     }
 
@@ -137,7 +133,6 @@ impl_from! { Bytes }
 impl_from! { DateTime }
 impl_from! { Duration }
 impl_from! { Json }
-impl_from! { VectorFloat32 }
 
 impl From<Option<f64>> for ScalarValue {
     #[inline]
@@ -160,25 +155,10 @@ impl<'a> From<Option<BytesRef<'a>>> for ScalarValue {
     }
 }
 
-impl<'a> From<Option<VectorFloat32Ref<'a>>> for ScalarValue {
-    #[inline]
-    fn from(s: Option<VectorFloat32Ref<'a>>) -> ScalarValue {
-        ScalarValue::VectorFloat32(s.map(|x| x.to_owned()))
-    }
-}
-
 impl From<f64> for ScalarValue {
     #[inline]
     fn from(s: f64) -> ScalarValue {
         ScalarValue::Real(Real::new(s).ok())
-    }
-}
-
-impl From<&str> for ScalarValue {
-    #[inline]
-    fn from(s: &str) -> ScalarValue {
-        let bytes = Bytes::from(s);
-        ScalarValue::Bytes(Some(bytes))
     }
 }
 
@@ -205,7 +185,6 @@ pub enum ScalarValueRef<'a> {
     Json(Option<JsonRef<'a>>),
     Enum(Option<EnumRef<'a>>),
     Set(Option<SetRef<'a>>),
-    VectorFloat32(Option<VectorFloat32Ref<'a>>),
 }
 
 impl<'a> ScalarValueRef<'a> {
@@ -222,7 +201,6 @@ impl<'a> ScalarValueRef<'a> {
             ScalarValueRef::Json(x) => ScalarValue::Json(x.map(|x| x.to_owned())),
             ScalarValueRef::Enum(x) => ScalarValue::Enum(x.map(|x| x.to_owned())),
             ScalarValueRef::Set(x) => ScalarValue::Set(x.map(|x| x.to_owned())),
-            ScalarValueRef::VectorFloat32(x) => ScalarValue::VectorFloat32(x.map(|x| x.to_owned())),
         }
     }
 
@@ -324,17 +302,6 @@ impl<'a> ScalarValueRef<'a> {
                 }
                 Ok(())
             }
-            ScalarValueRef::VectorFloat32(val) => {
-                match val {
-                    None => {
-                        output.write_evaluable_datum_null()?;
-                    }
-                    Some(val) => {
-                        output.write_evaluable_datum_vector_float32(*val)?;
-                    }
-                }
-                Ok(())
-            }
             // TODO: we should implement enum/set encode
             ScalarValueRef::Enum(_) => unimplemented!(),
             ScalarValueRef::Set(_) => unimplemented!(),
@@ -377,7 +344,7 @@ impl<'a> ScalarValueRef<'a> {
         field_type: &FieldType,
     ) -> crate::codec::Result<Ordering> {
         Ok(match_template! {
-            TT = [Real, Decimal, DateTime, Duration, Json, Enum, VectorFloat32],
+            TT = [Real, Decimal, DateTime, Duration, Json, Enum],
             match (self, other) {
                 (ScalarValueRef::TT(v1), ScalarValueRef::TT(v2)) => v1.cmp(v2),
                 (ScalarValueRef::Int(v1), ScalarValueRef::Int(v2)) => compare_int(&v1.cloned(), &v2.cloned(), field_type),
@@ -387,7 +354,7 @@ impl<'a> ScalarValueRef<'a> {
                 (ScalarValueRef::Bytes(Some(v1)), ScalarValueRef::Bytes(Some(v2))) => {
                     match_template_collator! {
                         TT, match field_type.collation()? {
-                            Collation::TT => TT::sort_compare(v1, v2, false)?
+                            Collation::TT => TT::sort_compare(v1, v2)?
                         }
                     }
                 }
@@ -436,40 +403,7 @@ impl_as_ref! { Duration, as_duration }
 
 impl ScalarValue {
     #[inline]
-    pub fn as_enum(&self) -> Option<EnumRef<'_>> {
-        match self {
-            ScalarValue::Enum(x) => x.as_ref().map(|x| x.as_ref()),
-            other => panic!(
-                "Cannot cast {} scalar value into {}",
-                other.eval_type(),
-                stringify!(Int),
-            ),
-        }
-    }
-}
-
-impl ScalarValue {
-    #[inline]
-    pub fn as_set(&self) -> Option<SetRef<'_>> {
-        match self {
-            ScalarValue::Set(x) => x.as_ref().map(|x| x.as_ref()),
-            other => panic!(
-                "Cannot cast {} scalar value into {}",
-                other.eval_type(),
-                stringify!(Int),
-            ),
-        }
-    }
-}
-
-impl ScalarValue {
-    #[inline]
     pub fn as_json(&self) -> Option<JsonRef<'_>> {
-        EvaluableRef::borrow_scalar_value(self)
-    }
-
-    #[inline]
-    pub fn as_vector_float32(&self) -> Option<VectorFloat32Ref<'_>> {
         EvaluableRef::borrow_scalar_value(self)
     }
 }
@@ -477,11 +411,6 @@ impl ScalarValue {
 impl<'a> ScalarValueRef<'a> {
     #[inline]
     pub fn as_json(&'a self) -> Option<JsonRef<'a>> {
-        EvaluableRef::borrow_scalar_value_ref(*self)
-    }
-
-    #[inline]
-    pub fn as_vector_float32(&'a self) -> Option<VectorFloat32Ref<'a>> {
         EvaluableRef::borrow_scalar_value_ref(*self)
     }
 }

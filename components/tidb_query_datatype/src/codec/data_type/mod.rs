@@ -7,7 +7,6 @@ mod chunked_vec_enum;
 mod chunked_vec_json;
 mod chunked_vec_set;
 mod chunked_vec_sized;
-mod chunked_vec_vector_float32;
 mod logical_rows;
 mod scalar;
 mod vector;
@@ -18,10 +17,10 @@ pub use logical_rows::{LogicalRows, BATCH_MAX_SIZE, IDENTICAL_LOGICAL_ROWS};
 macro_rules! match_template_evaltype {
     ($t:tt, $($tail:tt)*) => {{
         #[allow(unused_imports)]
-        use $crate::codec::data_type::{Int, Real, Decimal, Bytes, DateTime, Duration, Json, Set, Enum, VectorFloat32};
+        use $crate::codec::data_type::{Int, Real, Decimal, Bytes, DateTime, Duration, Json, Set, Enum};
 
         match_template::match_template! {
-            $t = [Int, Real, Decimal, Bytes, DateTime, Duration, Json, Set, Enum, VectorFloat32],
+            $t = [Int, Real, Decimal, Bytes, DateTime, Duration, Json, Set, Enum],
             $($tail)*
         }}
     }
@@ -39,7 +38,6 @@ pub use chunked_vec_enum::ChunkedVecEnum;
 pub use chunked_vec_json::ChunkedVecJson;
 pub use chunked_vec_set::ChunkedVecSet;
 pub use chunked_vec_sized::ChunkedVecSized;
-pub use chunked_vec_vector_float32::ChunkedVecVectorFloat32;
 
 // Dynamic eval types.
 pub use self::{
@@ -49,7 +47,6 @@ pub use self::{
 use super::Result;
 pub use crate::codec::mysql::{
     json::JsonRef, Decimal, Duration, Enum, EnumRef, Json, JsonType, Set, SetRef, Time as DateTime,
-    VectorFloat32, VectorFloat32Ref,
 };
 use crate::{codec::convert::ConvertTo, expr::EvalContext, EvalType};
 
@@ -107,21 +104,9 @@ where
     }
 }
 
-impl AsMySqlBool for VectorFloat32 {
-    fn as_mysql_bool(&self, _context: &mut EvalContext) -> Result<bool> {
-        Ok(!self.as_ref().is_empty())
-    }
-}
-
 impl<'a> AsMySqlBool for JsonRef<'a> {
     fn as_mysql_bool(&self, _context: &mut EvalContext) -> Result<bool> {
         Ok(!self.is_zero())
-    }
-}
-
-impl<'a> AsMySqlBool for VectorFloat32Ref<'a> {
-    fn as_mysql_bool(&self, _context: &mut EvalContext) -> Result<bool> {
-        Ok(!self.is_empty())
     }
 }
 
@@ -147,15 +132,6 @@ impl<'a> AsMySqlBool for Option<BytesRef<'a>> {
 }
 
 impl<'a> AsMySqlBool for Option<JsonRef<'a>> {
-    fn as_mysql_bool(&self, context: &mut EvalContext) -> Result<bool> {
-        match self {
-            None => Ok(false),
-            Some(ref v) => v.as_mysql_bool(context),
-        }
-    }
-}
-
-impl<'a> AsMySqlBool for Option<VectorFloat32Ref<'a>> {
     fn as_mysql_bool(&self, context: &mut EvalContext) -> Result<bool> {
         match self {
             None => Ok(false),
@@ -272,7 +248,7 @@ macro_rules! impl_evaluable_type {
             }
 
             #[inline]
-            fn borrow_scalar_value_ref(v: ScalarValueRef<'_>) -> Option<&Self> {
+            fn borrow_scalar_value_ref<'a>(v: ScalarValueRef<'a>) -> Option<&'a Self> {
                 match v {
                     ScalarValueRef::$ty(x) => x,
                     other => panic!(
@@ -379,7 +355,6 @@ impl_evaluable_ret! { Duration, ChunkedVecSized<Self> }
 impl_evaluable_ret! { Json, ChunkedVecJson }
 impl_evaluable_ret! { Enum, ChunkedVecEnum }
 impl_evaluable_ret! { Set, ChunkedVecSet }
-impl_evaluable_ret! { VectorFloat32, ChunkedVecVectorFloat32 }
 
 pub trait EvaluableRef<'a>: Clone + std::fmt::Debug + Send + Sync {
     const EVAL_TYPE: EvalType;
@@ -526,12 +501,6 @@ impl<'a> UnsafeRefInto<SetRef<'static>> for SetRef<'a> {
     }
 }
 
-impl<'a> UnsafeRefInto<VectorFloat32Ref<'static>> for VectorFloat32Ref<'a> {
-    unsafe fn unsafe_into(self) -> VectorFloat32Ref<'static> {
-        std::mem::transmute(self)
-    }
-}
-
 impl<'a> EvaluableRef<'a> for JsonRef<'a> {
     const EVAL_TYPE: EvalType = EvalType::Json;
     type EvaluableType = Json;
@@ -580,58 +549,6 @@ impl<'a> EvaluableRef<'a> for JsonRef<'a> {
 
     #[inline]
     fn from_owned_value(value: &'a Json) -> Self {
-        value.as_ref()
-    }
-}
-
-impl<'a> EvaluableRef<'a> for VectorFloat32Ref<'a> {
-    const EVAL_TYPE: EvalType = EvalType::VectorFloat32;
-    type EvaluableType = VectorFloat32;
-    type ChunkedType = &'a ChunkedVecVectorFloat32;
-
-    #[inline]
-    fn borrow_scalar_value(v: &'a ScalarValue) -> Option<Self> {
-        match v {
-            ScalarValue::VectorFloat32(x) => x.as_ref().map(|x| x.as_ref()),
-            other => panic!(
-                "Cannot cast {} scalar value into {}",
-                other.eval_type(),
-                stringify!(VectorFloat32),
-            ),
-        }
-    }
-
-    #[inline]
-    fn borrow_scalar_value_ref(v: ScalarValueRef<'a>) -> Option<Self> {
-        match v {
-            ScalarValueRef::VectorFloat32(x) => x,
-            other => panic!(
-                "Cannot cast {} scalar value into {}",
-                other.eval_type(),
-                stringify!(VectorFloat32),
-            ),
-        }
-    }
-
-    #[inline]
-    fn borrow_vector_value(v: &VectorValue) -> &ChunkedVecVectorFloat32 {
-        match v {
-            VectorValue::VectorFloat32(x) => x,
-            other => panic!(
-                "Cannot cast {} scalar value into {}",
-                other.eval_type(),
-                stringify!(VectorFloat32),
-            ),
-        }
-    }
-
-    #[inline]
-    fn into_owned_value(self) -> Self::EvaluableType {
-        self.to_owned()
-    }
-
-    #[inline]
-    fn from_owned_value(value: &'a VectorFloat32) -> Self {
         value.as_ref()
     }
 }

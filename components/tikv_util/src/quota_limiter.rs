@@ -129,14 +129,6 @@ impl<'a> Sample {
     pub fn add_cpu_time(&mut self, time: Duration) {
         self.cpu_time += time;
     }
-
-    pub fn enable_cpu_limit(&mut self) {
-        self.enable_cpu_limit = true;
-    }
-
-    pub fn cpu_time(&self) -> Duration {
-        self.cpu_time
-    }
 }
 
 pub struct CpuObserveGuard<'a> {
