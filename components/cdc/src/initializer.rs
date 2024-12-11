@@ -1,5 +1,8 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 use api_version::ApiV2;
 use crossbeam::atomic::AtomicCell;
@@ -17,10 +20,10 @@ use kvproto::{
 };
 use raftstore::{
     coprocessor::ObserveId,
-    router::RaftStoreRouter,
+    router::CdcHandle,
     store::{
         fsm::ChangeObserver,
-        msg::{Callback, ReadResponse, SignificantMsg},
+        msg::{Callback, ReadResponse},
     },
 };
 use resolved_ts::{Resolver, TsSource};
@@ -48,22 +51,13 @@ use txn_types::{Key, KvPair, Lock, LockType, OldValue, TimeStamp};
 
 use crate::{
     channel::CdcEvent,
-    delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState},
+    delegate::{post_init_downstream, Delegate, DownstreamId, DownstreamState, ObservedRange},
     endpoint::Deregister,
     metrics::*,
     old_value::{near_seek_old_value, new_old_value_cursor, OldValueCursors},
     service::ConnId,
     Error, Result, Task,
 };
-
-struct ScanStat {
-    // Fetched bytes to the scanner.
-    emit: usize,
-    // Bytes from the device, `None` if not possible to get it.
-    disk_read: Option<usize>,
-    // Perf delta for RocksDB.
-    perf_delta: ReadPerfContext,
-}
 
 pub(crate) enum KvEntry {
     TxnEntry(TxnEntry),
@@ -76,15 +70,17 @@ pub(crate) enum Scanner<S: Snapshot> {
 }
 
 pub(crate) struct Initializer<E> {
-    pub(crate) engine: E,
+    pub(crate) tablet: Option<E>,
     pub(crate) sched: Scheduler<Task>,
     pub(crate) sink: crate::channel::Sink,
 
+    pub(crate) observed_range: ObservedRange,
     pub(crate) region_id: u64,
     pub(crate) region_epoch: RegionEpoch,
     pub(crate) observe_id: ObserveId,
     pub(crate) downstream_id: DownstreamId,
     pub(crate) downstream_state: Arc<AtomicCell<DownstreamState>>,
+    pub(crate) scan_truncated: Arc<AtomicBool>,
     pub(crate) conn_id: ConnId,
     pub(crate) request_id: u64,
     pub(crate) checkpoint_ts: TimeStamp,
@@ -104,13 +100,13 @@ pub(crate) struct Initializer<E> {
 }
 
 impl<E: KvEngine> Initializer<E> {
-    pub(crate) async fn initialize<T: 'static + RaftStoreRouter<E>>(
+    pub(crate) async fn initialize<T: 'static + CdcHandle<E>>(
         &mut self,
-        change_cmd: ChangeObserver,
-        raft_router: T,
+        change_observer: ChangeObserver,
+        cdc_handle: T,
         concurrency_semaphore: Arc<Semaphore>,
         memory_quota: Arc<MemoryQuota>,
-    ) -> Result<()> {
+    ) -> Result<InitializeStats> {
         fail_point!("cdc_before_initialize");
         let _permit = concurrency_semaphore.acquire().await;
 
@@ -126,24 +122,22 @@ impl<E: KvEngine> Initializer<E> {
         let (incremental_scan_barrier_cb, incremental_scan_barrier_fut) =
             tikv_util::future::paired_future_callback();
         let barrier = CdcEvent::Barrier(Some(incremental_scan_barrier_cb));
-        if let Err(e) = raft_router.significant_send(
+        if let Err(e) = cdc_handle.capture_change(
             self.region_id,
-            SignificantMsg::CaptureChange {
-                cmd: change_cmd,
-                region_epoch,
-                callback: Callback::read(Box::new(move |resp| {
-                    if let Err(e) = sched.schedule(Task::InitDownstream {
-                        region_id,
-                        downstream_id,
-                        downstream_state,
-                        sink,
-                        incremental_scan_barrier: barrier,
-                        cb: Box::new(move || cb(resp)),
-                    }) {
-                        error!("cdc schedule cdc task failed"; "error" => ?e);
-                    }
-                })),
-            },
+            region_epoch,
+            change_observer,
+            Callback::read(Box::new(move |resp| {
+                if let Err(e) = sched.schedule(Task::InitDownstream {
+                    region_id,
+                    downstream_id,
+                    downstream_state,
+                    sink,
+                    incremental_scan_barrier: barrier,
+                    cb: Box::new(move || cb(resp)),
+                }) {
+                    error!("cdc schedule cdc task failed"; "error" => ?e);
+                }
+            })),
         ) {
             warn!("cdc send capture change cmd failed";
             "region_id" => self.region_id, "error" => ?e);
@@ -167,7 +161,7 @@ impl<E: KvEngine> Initializer<E> {
         &mut self,
         mut resp: ReadResponse<impl EngineSnapshot>,
         memory_quota: Arc<MemoryQuota>,
-    ) -> Result<()> {
+    ) -> Result<InitializeStats> {
         if let Some(region_snapshot) = resp.snapshot {
             let region = region_snapshot.get_region().clone();
             assert_eq!(self.region_id, region.get_id());
@@ -189,7 +183,7 @@ impl<E: KvEngine> Initializer<E> {
         snap: S,
         region: Region,
         memory_quota: Arc<MemoryQuota>,
-    ) -> Result<()> {
+    ) -> Result<InitializeStats> {
         CDC_SCAN_TASKS.with_label_values(&["ongoing"]).inc();
         defer!(CDC_SCAN_TASKS.with_label_values(&["ongoing"]).dec());
 
@@ -198,7 +192,7 @@ impl<E: KvEngine> Initializer<E> {
         let observe_id = self.observe_id;
         let conn_id = self.conn_id;
         let kv_api = self.kv_api;
-        let on_cancel = || -> Result<()> {
+        let on_cancel = || -> Result<InitializeStats> {
             info!("cdc async incremental scan canceled";
                 "region_id" => region_id,
                 "downstream_id" => ?downstream_id,
@@ -211,10 +205,12 @@ impl<E: KvEngine> Initializer<E> {
             return on_cancel();
         }
 
+        self.observed_range.update_region_key_range(&region);
         debug!("cdc async incremental scan";
             "region_id" => region_id,
             "downstream_id" => ?downstream_id,
             "observe_id" => ?self.observe_id,
+            "all_key_covered" => ?self.observed_range.all_key_covered,
             "start_key" => log_wrappers::Value::key(snap.lower_bound().unwrap_or_default()),
             "end_key" => log_wrappers::Value::key(snap.upper_bound().unwrap_or_default()));
 
@@ -267,6 +263,7 @@ impl<E: KvEngine> Initializer<E> {
             DownstreamState::Initializing | DownstreamState::Stopped
         ));
 
+        let mut stats = InitializeStats::default();
         while !done {
             // When downstream_state is Stopped, it means the corresponding
             // delegate is stopped. The initialization can be safely canceled.
@@ -275,7 +272,9 @@ impl<E: KvEngine> Initializer<E> {
             }
             let cursors = old_value_cursors.as_mut();
             let resolver = resolver.as_mut();
-            let entries = self.scan_batch(&mut scanner, cursors, resolver).await?;
+            let entries = self
+                .scan_batch(&mut scanner, cursors, resolver, &mut stats)
+                .await?;
             if let Some(None) = entries.last() {
                 // If the last element is None, it means scanning is finished.
                 done = true;
@@ -287,6 +286,7 @@ impl<E: KvEngine> Initializer<E> {
             sink_time += start_sink.saturating_elapsed();
         }
 
+        fail_point!("before_post_incremental_scan");
         if !post_init_downstream(&self.downstream_state) {
             return on_cancel();
         }
@@ -304,7 +304,7 @@ impl<E: KvEngine> Initializer<E> {
 
         CDC_SCAN_DURATION_HISTOGRAM.observe(takes.as_secs_f64());
         CDC_SCAN_SINK_DURATION_HISTOGRAM.observe(duration_to_sec(sink_time));
-        Ok(())
+        Ok(stats)
     }
 
     // It's extracted from `Initializer::scan_batch` to avoid becoming an
@@ -315,7 +315,7 @@ impl<E: KvEngine> Initializer<E> {
         scanner: &mut Scanner<S>,
         mut old_value_cursors: Option<&mut OldValueCursors<S::Iter>>,
         entries: &mut Vec<Option<KvEntry>>,
-    ) -> Result<ScanStat> {
+    ) -> Result<InitializeStats> {
         let mut read_old_value = |v: &mut OldValue, stats: &mut Statistics| -> Result<()> {
             let (wc, dc) = match old_value_cursors {
                 Some(ref mut x) => (&mut x.write, &mut x.default),
@@ -330,21 +330,28 @@ impl<E: KvEngine> Initializer<E> {
             Ok(())
         };
 
+        let mut stats = InitializeStats::default();
+
         // This code block shouldn't be switched to other threads.
         let mut total_bytes = 0;
         let mut total_size = 0;
         let perf_instant = ReadPerfInstant::new();
         let inspector = self_thread_inspector().ok();
         let old_io_stat = inspector.as_ref().and_then(|x| x.io_stat().unwrap_or(None));
-        let mut stats = Statistics::default();
         while total_bytes <= self.max_scan_batch_bytes && total_size < self.max_scan_batch_size {
             total_size += 1;
             match scanner {
                 Scanner::TxnKvScanner(scanner) => match scanner.next_entry()? {
                     Some(mut entry) => {
-                        read_old_value(entry.old_value(), &mut stats)?;
-                        total_bytes += entry.size();
-                        entries.push(Some(KvEntry::TxnEntry(entry)));
+                        let key = match entry {
+                            TxnEntry::Prewrite { ref lock, .. } => &lock.0,
+                            TxnEntry::Commit { ref write, .. } => &write.0,
+                        };
+                        if self.observed_range.contains_encoded_key(key) {
+                            read_old_value(entry.old_value(), &mut stats.old_value)?;
+                            total_bytes += entry.size();
+                            entries.push(Some(KvEntry::TxnEntry(entry)));
+                        }
                     }
                     None => {
                         entries.push(None);
@@ -368,19 +375,17 @@ impl<E: KvEngine> Initializer<E> {
                 }
             }
         }
-        flush_oldvalue_stats(&stats, TAG_INCREMENTAL_SCAN);
+        flush_oldvalue_stats(&stats.old_value, TAG_INCREMENTAL_SCAN);
         let new_io_stat = inspector.as_ref().and_then(|x| x.io_stat().unwrap_or(None));
-        let disk_read = match (old_io_stat, new_io_stat) {
+
+        stats.scan.emit = total_bytes;
+        stats.scan.disk_read = match (old_io_stat, new_io_stat) {
             (Some(s1), Some(s2)) => Some((s2.read - s1.read) as usize),
             _ => None,
         };
-        let perf_delta = perf_instant.delta();
-        let emit = total_bytes;
-        Ok(ScanStat {
-            emit,
-            disk_read,
-            perf_delta,
-        })
+        stats.scan.perf_delta = perf_instant.delta();
+
+        Ok(stats)
     }
 
     async fn scan_batch<S: Snapshot>(
@@ -388,22 +393,22 @@ impl<E: KvEngine> Initializer<E> {
         scanner: &mut Scanner<S>,
         old_value_cursors: Option<&mut OldValueCursors<S::Iter>>,
         resolver: Option<&mut Resolver>,
+        stats: &mut InitializeStats,
     ) -> Result<Vec<Option<KvEntry>>> {
         let mut entries = Vec::with_capacity(self.max_scan_batch_size);
-        let ScanStat {
-            emit,
-            disk_read,
-            perf_delta,
-        } = self.do_scan(scanner, old_value_cursors, &mut entries)?;
+        let delta_stats = self.do_scan(scanner, old_value_cursors, &mut entries)?;
+        stats.add(&delta_stats);
 
-        TLS_CDC_PERF_STATS.with(|x| *x.borrow_mut() += perf_delta);
+        TLS_CDC_PERF_STATS.with(|x| *x.borrow_mut() += delta_stats.scan.perf_delta);
         tls_flush_perf_stats();
-        if let Some(bytes) = disk_read {
+        if let Some(bytes) = delta_stats.scan.disk_read {
             CDC_SCAN_DISK_READ_BYTES.inc_by(bytes as _);
             self.scan_speed_limiter.consume(bytes).await;
         }
-        CDC_SCAN_BYTES.inc_by(emit as _);
-        self.fetch_speed_limiter.consume(emit as _).await;
+        CDC_SCAN_BYTES.inc_by(delta_stats.scan.emit as _);
+        self.fetch_speed_limiter
+            .consume(delta_stats.scan.emit as _)
+            .await;
 
         if let Some(resolver) = resolver {
             // Track the locks.
@@ -437,7 +442,11 @@ impl<E: KvEngine> Initializer<E> {
             events.push(CdcEvent::Barrier(Some(cb)));
             barrier = Some(fut);
         }
-        if let Err(e) = self.sink.send_all(events).await {
+        if let Err(e) = self
+            .sink
+            .send_all(events, self.scan_truncated.clone())
+            .await
+        {
             error!("cdc send scan event failed"; "req_id" => ?self.request_id);
             return Err(Error::Sink(e));
         }
@@ -490,9 +499,10 @@ impl<E: KvEngine> Initializer<E> {
             }
         } else {
             Deregister::Downstream {
+                conn_id: self.conn_id,
+                request_id: self.request_id,
                 region_id: self.region_id,
                 downstream_id: self.downstream_id,
-                conn_id: self.conn_id,
                 err: Some(err),
             }
         };
@@ -503,6 +513,8 @@ impl<E: KvEngine> Initializer<E> {
     }
 
     fn ts_filter_is_helpful<S: Snapshot>(&self, snap: &S) -> bool {
+        fail_point!("ts_filter_is_helpful_always_true", |_| true);
+
         if self.ts_filter_ratio < f64::EPSILON {
             return false;
         }
@@ -510,7 +522,11 @@ impl<E: KvEngine> Initializer<E> {
         let start_key = data_key(snap.lower_bound().unwrap_or_default());
         let end_key = data_end_key(snap.upper_bound().unwrap_or_default());
         let range = Range::new(&start_key, &end_key);
-        let collection = match self.engine.table_properties_collection(CF_WRITE, &[range]) {
+        let tablet = match self.tablet.as_ref() {
+            Some(t) => t,
+            None => return false,
+        };
+        let collection = match tablet.table_properties_collection(CF_WRITE, &[range]) {
             Ok(collection) => collection,
             Err(_) => return false,
         };
@@ -550,6 +566,33 @@ impl<E: KvEngine> Initializer<E> {
     }
 }
 
+#[derive(Default, Debug)]
+pub struct InitializeStats {
+    pub old_value: Statistics,
+    pub scan: ScanStats,
+}
+
+#[derive(Default, Debug)]
+pub struct ScanStats {
+    // Fetched bytes to the scanner.
+    emit: usize,
+    // Bytes from the device, `None` if not possible to get it.
+    disk_read: Option<usize>,
+    // Perf delta for RocksDB.
+    perf_delta: ReadPerfContext,
+}
+
+impl InitializeStats {
+    fn add(&mut self, other: &InitializeStats) {
+        self.old_value.add(&other.old_value);
+        self.scan.emit += other.scan.emit;
+        if let Some(x) = self.scan.disk_read.as_mut() {
+            *x += other.scan.disk_read.unwrap_or_default();
+        }
+        self.scan.perf_delta += other.scan.perf_delta;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -569,7 +612,7 @@ mod tests {
         cdcpb::{EventLogType, Event_oneof_event},
         errorpb::Error as ErrorHeader,
     };
-    use raftstore::{coprocessor::ObserveHandle, store::RegionSnapshot};
+    use raftstore::{coprocessor::ObserveHandle, router::CdcRaftRouter, store::RegionSnapshot};
     use resolved_ts::TxnLocks;
     use test_raftstore::MockRaftStoreRouter;
     use tikv::{
@@ -592,7 +635,7 @@ mod tests {
     use tokio::runtime::{Builder, Runtime};
 
     use super::*;
-    use crate::txn_souce::TxnSource;
+    use crate::txn_source::TxnSource;
 
     struct ReceiverRunnable<T: Display + Send> {
         tx: Sender<T>,
@@ -630,32 +673,31 @@ mod tests {
     ) {
         let (receiver_worker, rx) = new_receiver_worker();
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (sink, drain) = crate::channel::channel(buffer, quota);
+        let (sink, drain) = crate::channel::channel(ConnId::default(), buffer, quota);
 
         let pool = Builder::new_multi_thread()
             .thread_name("test-initializer-worker")
             .worker_threads(4)
-            .after_start_wrapper(|| {})
-            .before_stop_wrapper(|| {})
+            .with_sys_hooks()
             .build()
             .unwrap();
         let downstream_state = Arc::new(AtomicCell::new(DownstreamState::Initializing));
         let initializer = Initializer {
-            engine: engine.unwrap_or_else(|| {
+            tablet: engine.or_else(|| {
                 TestEngineBuilder::new()
                     .build_without_cache()
                     .unwrap()
                     .kv_engine()
-                    .unwrap()
             }),
             sched: receiver_worker.scheduler(),
             sink,
-
+            observed_range: ObservedRange::default(),
             region_id: 1,
             region_epoch: RegionEpoch::default(),
             observe_id: ObserveId::new(),
             downstream_id: DownstreamId::new(),
             downstream_state,
+            scan_truncated: Arc::new(Default::default()),
             conn_id: ConnId::new(),
             request_id: 0,
             checkpoint_ts: 1.into(),
@@ -678,6 +720,12 @@ mod tests {
 
         let mut expected_locks = BTreeMap::<TimeStamp, TxnLocks>::new();
 
+        // Only observe ["", "b\0x90"]
+        let observed_range = ObservedRange::new(
+            Key::from_raw(&[]).into_encoded(),
+            Key::from_raw(&[b'k', 90]).into_encoded(),
+        )
+        .unwrap();
         let mut total_bytes = 0;
         // Pessimistic locks should not be tracked
         for i in 0..10 {
@@ -693,12 +741,14 @@ mod tests {
             total_bytes += v.len();
             let ts = TimeStamp::new(i as _);
             must_prewrite_put(&mut engine, k, v, k, ts);
-            let txn_locks = expected_locks.entry(ts).or_insert_with(|| {
-                let mut txn_locks = TxnLocks::default();
-                txn_locks.sample_lock = Some(k.to_vec().into());
-                txn_locks
-            });
-            txn_locks.lock_count += 1;
+            if i < 90 {
+                let txn_locks = expected_locks.entry(ts).or_insert_with(|| {
+                    let mut txn_locks = TxnLocks::default();
+                    txn_locks.sample_lock = Some(k.to_vec().into());
+                    txn_locks
+                });
+                txn_locks.lock_count += 1;
+            }
         }
 
         let region = Region::default();
@@ -713,6 +763,7 @@ mod tests {
             ChangeDataRequestKvApi::TiDb,
             false,
         );
+        initializer.observed_range = observed_range.clone();
         let check_result = || loop {
             let task = rx.recv().unwrap();
             match task {
@@ -726,7 +777,14 @@ mod tests {
         // To not block test by barrier.
         pool.spawn(async move {
             let mut d = drain.drain();
-            while d.next().await.is_some() {}
+            while let Some((e, _)) = d.next().await {
+                if let CdcEvent::Event(e) = e {
+                    for e in e.get_entries().get_entries() {
+                        let key = Key::from_raw(&e.key).into_encoded();
+                        assert!(observed_range.contains_encoded_key(&key), "{:?}", e);
+                    }
+                }
+            }
         });
 
         let memory_quota = Arc::new(MemoryQuota::new(usize::MAX));
@@ -802,7 +860,6 @@ mod tests {
         let mut engine = TestEngineBuilder::new().build_without_cache().unwrap();
 
         let mut total_bytes = 0;
-
         for i in 10..100 {
             let (k, v) = (&[b'k', i], &[b'v', i]);
             total_bytes += k.len();
@@ -1023,7 +1080,7 @@ mod tests {
             mock_initializer(total_bytes, total_bytes, buffer, None, kv_api, false);
 
         let change_cmd = ChangeObserver::from_cdc(1, ObserveHandle::new());
-        let raft_router = MockRaftStoreRouter::new();
+        let raft_router = CdcRaftRouter(MockRaftStoreRouter::new());
         let concurrency_semaphore = Arc::new(Semaphore::new(1));
         let memory_quota = Arc::new(MemoryQuota::new(usize::MAX));
 

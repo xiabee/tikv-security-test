@@ -141,7 +141,7 @@ where
             .start_coarse_timer();
         box_try!(
             self.engine
-                .compact_range(cf_name, start_key, end_key, false, 1 /* threads */,)
+                .compact_range_cf(cf_name, start_key, end_key, false, 1 /* threads */,)
         );
         compact_range_timer.observe_duration();
         info!(
@@ -272,14 +272,13 @@ fn collect_ranges_need_compact(
 mod tests {
     use std::{thread::sleep, time::Duration};
 
-    use engine_rocks::{raw::CompactOptions, util::get_cf_handle};
     use engine_test::{
         ctor::{CfOptions, DbOptions},
         kv::{new_engine, new_engine_opt, KvTestEngine},
     };
     use engine_traits::{
-        MiscExt, Mutable, SyncMutable, WriteBatch, WriteBatchExt, CF_DEFAULT, CF_LOCK, CF_RAFT,
-        CF_WRITE,
+        CompactExt, MiscExt, Mutable, SyncMutable, WriteBatch, WriteBatchExt, CF_DEFAULT, CF_LOCK,
+        CF_RAFT, CF_WRITE,
     };
     use keys::data_key;
     use tempfile::Builder;
@@ -323,9 +322,7 @@ mod tests {
             let _ = db.disable_manual_compaction();
 
             // Manually compact range.
-            let handle = get_cf_handle(db.as_inner(), CF_DEFAULT).unwrap();
-            db.as_inner()
-                .compact_range_cf_opt(handle, &CompactOptions::new(), None, None);
+            let _ = db.compact_range_cf(CF_DEFAULT, None, None, false, 1);
 
             // Get the total SST files size after compact range.
             let new_sst_files_size = db.get_total_sst_files_size_cf(CF_DEFAULT).unwrap().unwrap();
@@ -336,9 +333,7 @@ mod tests {
             let _ = db.enable_manual_compaction();
 
             // Manually compact range.
-            let handle = get_cf_handle(db.as_inner(), CF_DEFAULT).unwrap();
-            db.as_inner()
-                .compact_range_cf_opt(handle, &CompactOptions::new(), None, None);
+            let _ = db.compact_range_cf(CF_DEFAULT, None, None, false, 1);
 
             // Get the total SST files size after compact range.
             let new_sst_files_size = db.get_total_sst_files_size_cf(CF_DEFAULT).unwrap().unwrap();

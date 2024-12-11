@@ -10,9 +10,9 @@ use pd_client::PdClient;
 use raft::StateRole;
 use raftstore::{
     coprocessor::{ObserveHandle, RegionInfoProvider},
-    store::{fsm::ChangeObserver, SignificantRouter},
+    router::CdcHandle,
+    store::fsm::ChangeObserver,
 };
-use resolved_ts::LeadershipResolver;
 use tikv::storage::Statistics;
 use tikv_util::{
     box_err, debug, info, sys::thread::ThreadBuildWrapper, time::Instant, warn, worker::Scheduler,
@@ -22,7 +22,7 @@ use txn_types::TimeStamp;
 
 use crate::{
     annotate,
-    endpoint::ObserveOp,
+    endpoint::{BackupStreamResolver, ObserveOp},
     errors::{Error, Result},
     event_loader::InitialDataLoader,
     future,
@@ -135,7 +135,7 @@ trait InitialScan: Clone + Sync + Send + 'static {
 impl<E, RT> InitialScan for InitialDataLoader<E, RT>
 where
     E: KvEngine,
-    RT: SignificantRouter<E> + Sync + Clone + 'static,
+    RT: CdcHandle<E> + Sync + 'static,
 {
     async fn do_initial_scan(
         &self,
@@ -328,10 +328,12 @@ where
 /// Create a pool for doing initial scanning.
 fn create_scan_pool(num_threads: usize) -> ScanPool {
     tokio::runtime::Builder::new_multi_thread()
-        .after_start_wrapper(move || {
-            file_system::set_io_type(file_system::IoType::Replication);
-        })
-        .before_stop_wrapper(|| {})
+        .with_sys_and_custom_hooks(
+            move || {
+                file_system::set_io_type(file_system::IoType::Replication);
+            },
+            || {},
+        )
         .thread_name("log-backup-scan")
         .enable_time()
         .worker_threads(num_threads)
@@ -351,19 +353,20 @@ where
     ///
     /// a two-tuple, the first is the handle to the manager, the second is the
     /// operator loop future.
-    pub fn start<E, HInit>(
+    pub fn start<E, HInit, HChkLd>(
         initial_loader: InitialDataLoader<E, HInit>,
         regions: R,
         observer: BackupStreamObserver,
         meta_cli: MetadataClient<S>,
         pd_client: Arc<PDC>,
         scan_pool_size: usize,
-        leader_checker: LeadershipResolver,
+        resolver: BackupStreamResolver<HChkLd, E>,
         advance_ts_interval: Duration,
     ) -> (Self, future![()])
     where
         E: KvEngine,
-        HInit: SignificantRouter<E> + Clone + Sync + 'static,
+        HInit: CdcHandle<E> + Sync + 'static,
+        HChkLd: CdcHandle<E> + 'static,
     {
         let (tx, rx) = channel(MESSAGE_BUFFER_SIZE);
         let scan_pool_handle = spawn_executors(initial_loader.clone(), scan_pool_size);
@@ -380,7 +383,7 @@ where
             scans: FutureWaitGroup::new(),
             advance_ts_interval,
         };
-        let fut = op.clone().region_operator_loop(rx, leader_checker);
+        let fut = op.clone().region_operator_loop(rx, resolver);
         (op, fut)
     }
 
@@ -402,11 +405,14 @@ where
     }
 
     /// the handler loop.
-    async fn region_operator_loop(
+    async fn region_operator_loop<E, RT>(
         self,
         mut message_box: Receiver<ObserveOp>,
-        mut leader_checker: LeadershipResolver,
-    ) {
+        mut resolver: BackupStreamResolver<RT, E>,
+    ) where
+        E: KvEngine,
+        RT: CdcHandle<E> + 'static,
+    {
         while let Some(op) = message_box.recv().await {
             // Skip some trivial resolve commands.
             if !matches!(op, ObserveOp::ResolveRegions { .. }) {
@@ -474,7 +480,7 @@ where
                         warn!("waiting for initial scanning done timed out, forcing progress!"; 
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
-                    let regions = leader_checker
+                    let regions = resolver
                         .resolve(
                             self.subs.current_regions(),
                             min_ts,

@@ -18,9 +18,9 @@ use online_config::{self, ConfigChange, ConfigManager, OnlineConfig};
 use pd_client::PdClient;
 use raftstore::{
     coprocessor::{CmdBatch, ObserveHandle, ObserveId},
-    router::RaftStoreRouter,
+    router::CdcHandle,
     store::{
-        fsm::StoreMeta,
+        fsm::store::StoreRegionMeta,
         util::{
             self, ReadState, RegionReadProgress, RegionReadProgressCore, RegionReadProgressRegistry,
         },
@@ -76,7 +76,7 @@ impl Drop for ResolverStatus {
         let mut bytes = 0;
         let num_locks = locks.len();
         for lock in locks {
-            bytes += lock.heap_size();
+            bytes += lock.approximate_heap_size();
         }
         if bytes > ON_DROP_WARN_HEAP_SIZE {
             warn!("drop huge ResolverStatus";
@@ -101,10 +101,12 @@ impl ResolverStatus {
         };
         // Check if adding a new lock or unlock will exceed the memory
         // quota.
-        memory_quota.alloc(lock.heap_size()).map_err(|e| {
-            fail::fail_point!("resolved_ts_on_pending_locks_memory_quota_exceeded");
-            Error::MemoryQuotaExceeded(e)
-        })?;
+        memory_quota
+            .alloc(lock.approximate_heap_size())
+            .map_err(|e| {
+                fail::fail_point!("resolved_ts_on_pending_locks_memory_quota_exceeded");
+                Error::MemoryQuotaExceeded(e)
+            })?;
         locks.push(lock);
         Ok(())
     }
@@ -138,13 +140,12 @@ impl ResolverStatus {
         } = self else {
             panic!("region {:?} resolver has ready", region_id)
         };
-        let memory_quota = memory_quota.clone();
         // Must take locks, otherwise it may double free memory quota on drop.
         let locks = std::mem::take(locks);
         (
             *tracked_index,
-            locks.into_iter().map(move |lock| {
-                memory_quota.free(lock.heap_size());
+            locks.into_iter().map(|lock| {
+                memory_quota.free(lock.approximate_heap_size());
                 lock
             }),
         )
@@ -165,10 +166,10 @@ enum PendingLock {
 }
 
 impl HeapSize for PendingLock {
-    fn heap_size(&self) -> usize {
+    fn approximate_heap_size(&self) -> usize {
         match self {
             PendingLock::Track { key, .. } | PendingLock::Untrack { key, .. } => {
-                key.as_encoded().heap_size()
+                key.as_encoded().approximate_heap_size()
             }
         }
     }
@@ -367,12 +368,12 @@ impl ObserveRegion {
     }
 }
 
-pub struct Endpoint<T, E: KvEngine> {
+pub struct Endpoint<T, E: KvEngine, S> {
     store_id: Option<u64>,
     cfg: ResolvedTsConfig,
     memory_quota: Arc<MemoryQuota>,
     advance_notify: Arc<Notify>,
-    store_meta: Arc<Mutex<StoreMeta>>,
+    store_meta: Arc<Mutex<S>>,
     region_read_progress: RegionReadProgressRegistry,
     regions: HashMap<u64, ObserveRegion>,
     scanner_pool: ScannerPool<T, E>,
@@ -383,10 +384,11 @@ pub struct Endpoint<T, E: KvEngine> {
 }
 
 // methods that are used for metrics and logging
-impl<T, E> Endpoint<T, E>
+impl<T, E, S> Endpoint<T, E, S>
 where
-    T: 'static + RaftStoreRouter<E>,
+    T: 'static + CdcHandle<E>,
     E: KvEngine,
+    S: StoreRegionMeta,
 {
     fn collect_stats(&mut self) -> Stats {
         fn is_leader(store_id: Option<u64>, leader_store_id: Option<u64>) -> bool {
@@ -395,7 +397,6 @@ where
 
         let store_id = self.get_or_init_store_id();
         let mut stats = Stats::default();
-        let regions = &mut self.regions;
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
                 let (leader_info, leader_store_id) = read_progress.dump_leader_info();
@@ -411,7 +412,7 @@ where
                 if is_leader(store_id, leader_store_id) {
                     // leader resolved-ts
                     if resolved_ts < stats.min_leader_resolved_ts.resolved_ts {
-                        let resolver = regions.get_mut(region_id).map(|x| &mut x.resolver);
+                        let resolver = self.regions.get_mut(region_id).map(|x| &mut x.resolver);
                         stats
                             .min_leader_resolved_ts
                             .set(*region_id, resolver, &core, &leader_info);
@@ -441,7 +442,7 @@ where
             match &observed_region.resolver_status {
                 ResolverStatus::Pending { locks, .. } => {
                     for l in locks {
-                        stats.heap_size += l.heap_size() as i64;
+                        stats.heap_size += l.approximate_heap_size() as i64;
                     }
                     stats.unresolved_count += 1;
                 }
@@ -639,16 +640,17 @@ where
     }
 }
 
-impl<T, E> Endpoint<T, E>
+impl<T, E, S> Endpoint<T, E, S>
 where
-    T: 'static + RaftStoreRouter<E>,
+    T: 'static + CdcHandle<E>,
     E: KvEngine,
+    S: StoreRegionMeta,
 {
     pub fn new(
         cfg: &ResolvedTsConfig,
         scheduler: Scheduler<Task>,
-        raft_router: T,
-        store_meta: Arc<Mutex<StoreMeta>>,
+        cdc_handle: T,
+        store_meta: Arc<Mutex<S>>,
         pd_client: Arc<dyn PdClient>,
         concurrency_manager: ConcurrencyManager,
         env: Arc<Environment>,
@@ -656,14 +658,14 @@ where
     ) -> Self {
         let (region_read_progress, store_id) = {
             let meta = store_meta.lock().unwrap();
-            (meta.region_read_progress.clone(), meta.store_id)
+            (meta.region_read_progress().clone(), meta.store_id())
         };
         let advance_worker =
             AdvanceTsWorker::new(pd_client.clone(), scheduler.clone(), concurrency_manager);
-        let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, raft_router);
+        let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, cdc_handle);
         let store_resolver_gc_interval = Duration::from_secs(60);
         let leader_resolver = LeadershipResolver::new(
-            store_id.unwrap(),
+            store_id,
             pd_client.clone(),
             env,
             security_mgr,
@@ -672,7 +674,7 @@ where
         );
         let scan_concurrency_semaphore = Arc::new(Semaphore::new(cfg.incremental_scan_concurrency));
         let ep = Self {
-            store_id,
+            store_id: Some(store_id),
             cfg: cfg.clone(),
             memory_quota: Arc::new(MemoryQuota::new(cfg.memory_quota.0 as usize)),
             advance_notify: Arc::new(Notify::new()),
@@ -832,8 +834,8 @@ where
             let region;
             {
                 let meta = self.store_meta.lock().unwrap();
-                match meta.regions.get(&region_id) {
-                    Some(r) => region = r.clone(),
+                match meta.reader(region_id) {
+                    Some(r) => region = r.region.as_ref().clone(),
                     None => return,
                 }
             }
@@ -956,8 +958,8 @@ where
     fn get_or_init_store_id(&mut self) -> Option<u64> {
         self.store_id.or_else(|| {
             let meta = self.store_meta.lock().unwrap();
-            self.store_id = meta.store_id;
-            meta.store_id
+            self.store_id = Some(meta.store_id());
+            self.store_id
         })
     }
 
@@ -1099,10 +1101,11 @@ impl fmt::Display for Task {
     }
 }
 
-impl<T, E> Runnable for Endpoint<T, E>
+impl<T, E, S> Runnable for Endpoint<T, E, S>
 where
-    T: 'static + RaftStoreRouter<E>,
+    T: 'static + CdcHandle<E>,
     E: KvEngine,
+    S: StoreRegionMeta,
 {
     type Task = Task;
 
@@ -1287,10 +1290,11 @@ struct ResolverStats {
 
 const METRICS_FLUSH_INTERVAL: u64 = 10_000; // 10s
 
-impl<T, E> RunnableWithTimer for Endpoint<T, E>
+impl<T, E, S> RunnableWithTimer for Endpoint<T, E, S>
 where
-    T: 'static + RaftStoreRouter<E>,
+    T: 'static + CdcHandle<E>,
     E: KvEngine,
+    S: StoreRegionMeta,
 {
     fn on_timeout(&mut self) {
         let stats = self.collect_stats();

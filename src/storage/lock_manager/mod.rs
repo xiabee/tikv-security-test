@@ -97,6 +97,7 @@ pub struct KeyLockWaitInfo {
     pub key: Key,
     pub lock_digest: LockDigest,
     pub lock_info: LockInfo,
+    pub allow_lock_with_conflict: bool,
 }
 
 /// Uniquely identifies a lock-waiting request in a `LockManager`.
@@ -115,7 +116,6 @@ pub struct UpdateWaitForEvent {
     pub start_ts: TimeStamp,
     pub is_first_lock: bool,
     pub wait_info: KeyLockWaitInfo,
-    pub diag_ctx: DiagnosticContext,
 }
 
 /// `LockManager` manages transactions waiting for locks held by other

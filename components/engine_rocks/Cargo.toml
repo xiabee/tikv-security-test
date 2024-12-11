@@ -1,14 +1,16 @@
 [package]
 name = "engine_rocks"
 version = "0.0.1"
-edition = "2018"
+edition = "2021"
 publish = false
 
 [features]
+trace-lifetime = []
 jemalloc = ["rocksdb/jemalloc"]
 portable = ["rocksdb/portable"]
 sse = ["rocksdb/sse"]
 failpoints = ["fail/failpoints"]
+testexport = []
 
 # Disables runtime checks of invariants required by RocksDB that are redundant
 # with assertions inside RocksDB itself. This makes it possible to test those
@@ -40,12 +42,12 @@ online_config = { workspace = true }
 prometheus = { version = "0.13", features = ["nightly"] }
 prometheus-static-metric = "0.5"
 protobuf = "2"
-raft = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
+raft = { workspace = true }
 regex = "1"
 serde = "1.0"
 serde_derive = "1.0"
-slog = { version = "2.3", features = ["max_level_trace", "release_max_level_debug"] }
-slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
+slog = { workspace = true }
+slog-global = { workspace = true }
 slog_derive = "0.2"
 tempfile = "3.0"
 tikv_alloc = { workspace = true }
@@ -58,7 +60,7 @@ txn_types = { workspace = true }
 git = "https://github.com/tikv/rust-rocksdb.git"
 package = "rocksdb"
 features = ["encryption"]
-branch = "tikv-6.5"
+branch = "tikv-7.5"
 
 [dev-dependencies]
 rand = "0.8"

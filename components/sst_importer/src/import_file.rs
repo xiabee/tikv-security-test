@@ -16,6 +16,7 @@ use engine_traits::{
     iter_option, EncryptionKeyManager, Iterator, KvEngine, RefIterable, SstMetaInfo, SstReader,
 };
 use file_system::{get_io_rate_limiter, sync_dir, File, OpenOptions};
+use keys::data_key;
 use kvproto::{import_sstpb::*, kvrpcpb::ApiVersion};
 use tikv_util::time::Instant;
 use uuid::{Builder as UuidBuilder, Uuid};
@@ -65,7 +66,7 @@ impl ImportPath {
             key_manager.link_file(temp_str, save_str)?;
             let r = file_system::rename(&self.temp, &self.save);
             let del_file = if r.is_ok() { temp_str } else { save_str };
-            if let Err(e) = key_manager.delete_file(del_file) {
+            if let Err(e) = key_manager.delete_file(del_file, None) {
                 warn!("fail to remove encryption metadata during 'save'";
                       "file" => ?self, "err" => ?e);
             }
@@ -153,7 +154,7 @@ impl ImportFile {
             manager.link_file(tmp_str, save_str)?;
             let r = file_system::rename(&self.path.temp, &self.path.save);
             let del_file = if r.is_ok() { tmp_str } else { save_str };
-            if let Err(e) = manager.delete_file(del_file) {
+            if let Err(e) = manager.delete_file(del_file, None) {
                 warn!("fail to remove encryption metadata during finishing importing files.";
                       "err" => ?e);
             }
@@ -169,7 +170,7 @@ impl ImportFile {
         let path = &self.path.temp;
         if path.exists() {
             if let Some(ref manager) = self.key_manager {
-                manager.delete_file(path.to_str().unwrap())?;
+                manager.delete_file(path.to_str().unwrap(), None)?;
             }
             file_system::remove_file(path)?;
         }
@@ -299,7 +300,7 @@ impl ImportDir {
         if path.exists() {
             file_system::remove_file(path)?;
             if let Some(manager) = key_manager {
-                manager.delete_file(path.to_str().unwrap())?;
+                manager.delete_file(path.to_str().unwrap(), None)?;
             }
         }
 
@@ -357,7 +358,7 @@ impl ImportDir {
                     let sst_reader = RocksSstReader::open_with_env(path_str, Some(env))?;
 
                     for &(start, end) in TIDB_RANGES_COMPLEMENT {
-                        let opt = iter_option(start, end, false);
+                        let opt = iter_option(&data_key(start), &data_key(end), false);
                         let mut iter = sst_reader.iter(opt)?;
                         if iter.seek(start)? {
                             error!(

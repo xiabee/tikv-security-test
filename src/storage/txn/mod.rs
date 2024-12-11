@@ -6,6 +6,7 @@ pub mod commands;
 pub mod flow_controller;
 pub mod sched_pool;
 pub mod scheduler;
+pub mod txn_status_cache;
 
 mod actions;
 mod latch;
@@ -32,7 +33,7 @@ pub use self::{
     },
     commands::{Command, RESOLVE_LOCK_BATCH_SIZE},
     latch::{Latches, Lock},
-    scheduler::Scheduler,
+    scheduler::TxnScheduler,
     store::{
         EntryBatch, FixtureStore, FixtureStoreScanner, Scanner, SnapshotStore, Store, TxnEntry,
         TxnEntryScanner, TxnEntryStore,
@@ -250,6 +251,7 @@ pub mod tests {
             must_err as must_acquire_pessimistic_lock_err,
             must_err_return_value as must_acquire_pessimistic_lock_return_value_err,
             must_pessimistic_locked, must_succeed as must_acquire_pessimistic_lock,
+            must_succeed_allow_lock_with_conflict as must_acquire_pessimistic_lock_allow_lock_with_conflict,
             must_succeed_for_large_txn as must_acquire_pessimistic_lock_for_large_txn,
             must_succeed_impl as must_acquire_pessimistic_lock_impl,
             must_succeed_return_value as must_acquire_pessimistic_lock_return_value,

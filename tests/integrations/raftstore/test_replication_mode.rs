@@ -1,17 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    iter::FromIterator,
-    sync::{mpsc, Arc},
-    thread,
-    time::Duration,
-};
+use std::{iter::FromIterator, sync::Arc, thread, time::Duration};
 
 use kvproto::replication_modepb::*;
 use pd_client::PdClient;
 use raft::eraftpb::ConfChangeType;
 use test_raftstore::*;
-use tikv_util::{config::*, HandyRwLock};
+use tikv_util::{config::*, mpsc::future, HandyRwLock};
 
 fn prepare_cluster() -> Cluster<ServerCluster> {
     let mut cluster = new_server_cluster(0, 3);
@@ -66,7 +61,7 @@ fn test_dr_auto_sync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -88,7 +83,7 @@ fn test_dr_auto_sync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -96,7 +91,7 @@ fn test_dr_auto_sync() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -179,7 +174,7 @@ fn test_sync_recover_after_apply_snapshot() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -187,7 +182,7 @@ fn test_sync_recover_after_apply_snapshot() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -326,7 +321,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -334,7 +329,7 @@ fn test_switching_replication_mode() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -362,7 +357,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -390,7 +385,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -399,7 +394,7 @@ fn test_switching_replication_mode() {
     // already enable group commit.
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
 }
 
@@ -421,7 +416,7 @@ fn test_replication_mode_allowlist() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -429,7 +424,7 @@ fn test_replication_mode_allowlist() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
 
     // clear allowlist.
@@ -509,7 +504,7 @@ fn test_migrate_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -517,7 +512,7 @@ fn test_migrate_replication_mode() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -555,7 +550,7 @@ fn test_migrate_majority_to_drautosync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
